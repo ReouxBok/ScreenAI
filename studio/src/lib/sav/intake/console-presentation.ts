@@ -11,6 +11,10 @@ const statuses: Record<string, string> = {
   followup_pending: "Actions confirmées, suivi en attente", followup_started: "Suivi démarré", context_changed: "Nouvelles preuves à vérifier",
   not_applicable_sensitive: "Fermeture vérifiée · apprentissage exclu", summary_finished: "Bilan terminé", qualified_other: "Autres · classement qualifié",
   confirmed: "Actions confirmées", refused: "Poursuite arrêtée", superseded: "Version remplacée", v2_customer_return: "Retour client repris sur le dossier V2",
+  // SAV-92: routed to a team queue with their named reason (console projection only, no automatic action).
+  context_required: "Contexte à compléter par l’équipe", crm_review_required: "Changement HubSpot à arbitrer",
+  execution_superseded: "Ancienne exécution obsolète, décision attendue", followup_partial: "Suivi partiel (limite de couverture)",
+  sensitive_team: "Dossier sensible : décision de l’équipe",
 };
 const reasons: Array<[RegExp, string]> = [
   [/FORWARDED_ORIGIN_UNVERIFIED/, "Mail transféré sans instruction de l’expéditeur. Identifier la demande originale et vérifier son ticket dans HubSpot."],
@@ -99,11 +103,13 @@ export function intakeBlockedCauseLabel(cause: string | null | undefined) { retu
 /** Console PR-1: `technical_wait` stays the stable API code; this names the real sub-cause from the status and reason the console already reads
  * (no extra query, no amount). Anything not recognised is said to be unclassified, never guessed. */
 export type IntakeBlockedSubCause = "followup_queued" | "followup_incomplete" | "sources_changed" | "verification_pending" | "revalidation_running" | "analysis_queued" | "budget_deferred" | "unclassified"
+  /** SAV-92 (B): V1 asked the team for missing HubSpot context; (B) an AI call whose cost is still to confirm; (C) a context change never retried. */
+  | "context_required" | "usage_uncertain" | "context_changed_stalled"
   /** SAV-88: the dossier already has a ticket the team sees; only the follow-up is waiting. */
   | "ticket_tracked";
 const subCauseLabels: Record<IntakeBlockedSubCause, string> = {
   followup_queued: "Premier suivi en file : le rattrapage le traitera au prochain passage",
-  followup_incomplete: "Suivi incomplet : une source n’a pas été lue, le rattrapage la relira",
+  followup_incomplete: "Suivi incomplet : la lecture d’une source a échoué ; nouvelle lecture au suivi quotidien",
   sources_changed: "Sources modifiées : nouvelle vérification nécessaire",
   verification_pending: "Vérification HubSpot/Gmail en attente",
   revalidation_running: "Choix enregistré : vérification en cours",
@@ -111,23 +117,37 @@ const subCauseLabels: Record<IntakeBlockedSubCause, string> = {
   budget_deferred: "Plafond IA atteint : reprise automatique quand il se libère",
   unclassified: "Attente technique : cause non classée, ouvrir le dossier",
   ticket_tracked: "Ticket créé, suivi en cours : l’équipe le voit dans HubSpot",
+  context_required: "Contexte à compléter par l’équipe : V1 attend une information HubSpot (historique, tickets ou fiche)",
+  usage_uncertain: "Coût IA à confirmer : aucun nouvel appel tant qu’il n’est pas rapproché (aucun reset)",
+  context_changed_stalled: "Incident : contexte changé sans nouvelle tentative depuis plus de 24 h",
 };
 export const intakeSubCauseLabel = (sub: IntakeBlockedSubCause) => subCauseLabels[sub];
 /** A console row; `ticketId` (thread ticket, SAV-88) is optional so older callers keep their labels. */
-export type IntakeBlockedRow = { blockedCause?: string | null; status: string; reason?: string | null; ticketId?: string | null };
-export function intakeBlockedSubCause(row: IntakeBlockedRow): IntakeBlockedSubCause | null {
+export type IntakeBlockedRow = { blockedCause?: string | null; status: string; reason?: string | null; ticketId?: string | null;
+  /** SAV-92 (C): current run attempts and last update, read with the row; optional so older callers keep their labels. */
+  runAttempts?: number | null; runUpdatedAt?: string | Date | null };
+/** Raw CRM read reasons (lowercase) that leave V1 without the context it needs: the team completes it (SAV-92 B). */
+const CONTEXT_READ_REASONS = /^(ticket_limit|history_limit|contact_limit|page_limit|request_limit|batch_limit|partial_batch|partial_response|total_mismatch|pagination_cycle|read_unavailable|cancelled|history_date_unknown|ticket_content_unavailable|ticket_membership_conflict|conflicting_contact|aliases_unavailable|archived_contact|history_incomplete|ticket_search_incomplete|contact_lookup_incomplete|association_incomplete|same_issue_unresolved)$/;
+export const INTAKE_CONTEXT_CHANGED_STALL_MS = 24 * 3_600_000;
+export function intakeBlockedSubCause(row: IntakeBlockedRow, now: Date = new Date()): IntakeBlockedSubCause | null {
   if (row.blockedCause !== "technical_wait") return null;
-  const sub = technicalWaitSubCause(row);
+  const sub = technicalWaitSubCause(row, now);
   // SAV-88 (SAV-82 follow-up): with a real ticket nothing waits for an analysis any more: the ticket is followed.
   // A pending HubSpot/Gmail check stays named as such.
   return row.ticketId && sub === "analysis_queued" ? "ticket_tracked" : sub;
 }
-function technicalWaitSubCause(row: IntakeBlockedRow): IntakeBlockedSubCause {
+function technicalWaitSubCause(row: IntakeBlockedRow, now: Date): IntakeBlockedSubCause {
   const reason = row.reason ?? "";
   if (/DAILY_BUDGET_DEFERRED|ROLLING_BUDGET_DEFERRED|Plafond (quotidien|d’analyse)/.test(reason)) return "budget_deferred";
+  if (/USAGE_UNCERTAIN|SETTLEMENT_UNCERTAIN|^usage_uncertain$|Coût IA à confirmer/.test(reason)) return "usage_uncertain";
+  if (row.status === "context_required" || CONTEXT_READ_REASONS.test(reason) || /^Contexte à compléter/.test(reason)) return "context_required";
   if (row.status === "human_revalidation" || row.status === "human_revalidation_wait") return "revalidation_running";
   if (row.status === "followup_pending") return /incompl/i.test(reason) ? "followup_incomplete" : "followup_queued";
-  if (row.status === "context_changed" || /SEMANTIC_CONTEXT_CHANGED|CONTEXT_CHANGED|CRM_CHANGED|SOURCES_STALE|sources (locales )?(ont changé|doivent)/i.test(reason)) return "sources_changed";
+  if (row.status === "context_changed" || /SEMANTIC_CONTEXT_CHANGED|CONTEXT_CHANGED|CRM_CHANGED|SOURCES_STALE|sources (locales )?(ont changé|doivent)/i.test(reason)) {
+    // SAV-92 (C): a context change no attempt ever took up for more than 24 h is an incident, named as such.
+    const since = row.runUpdatedAt ? new Date(row.runUpdatedAt).getTime() : NaN;
+    return row.runAttempts === 0 && Number.isFinite(since) && now.getTime() - since > INTAKE_CONTEXT_CHANGED_STALL_MS ? "context_changed_stalled" : "sources_changed";
+  }
   if (row.status === "waiting" && (!reason || /CRM_READ_|vérification technique/i.test(reason))) return "verification_pending";
   if (row.status === "pending" || row.status === "analysing" || (row.status === "processing" && !reason) || /Nouvelle entrée en attente/.test(reason)) return "analysis_queued";
   return "unclassified";
@@ -196,4 +216,50 @@ export function intakeHandoff(input: IntakeHandoffInput) {
     why: "why" in t ? (t as { why: string }).why : undefined }));
   return { causes: causes.map(c => intakeContextReasonLabels[c] ?? intakeBlockedCauseLabel(c) ?? c), actions, tickets,
     missing: input.judgement?.missing ?? [], rationale: input.judgement?.rationale };
+}
+
+/** SAV-92: where the console shows a dossier that waits on the team. Pure presentation: it never schedules, sends,
+ * resets or re-reads anything; the projection stores the result, the automatic pipeline is unchanged. */
+export type IntakeTeamRoute = { view: "to_validate" | "sensitive"; status: string; reason: string };
+/** Dependencies that already carry a durable blocking marker with their own team label (console cause). */
+const MARKED_CONTEXT_DEPENDENCIES = new Set(["private_resource_unavailable", "forwarded_origin_unverified", "other_evidence_unavailable"]);
+/** (B) A V1 run that waits for context only the team can give (collect_context, no human choice yet). A scheduled
+ * automatic read retry or transient retry is a next action, not a team request: it stays where it is. */
+export function intakeContextRequiredRoute(input: { disposition?: { kind: string; reasons?: readonly string[] } | null; progressKind?: string | null;
+  runState: string; readRetryScheduled?: boolean; retryScheduled?: boolean }): IntakeTeamRoute | null {
+  if (input.runState !== "waiting" || input.disposition?.kind !== "collect_context" || input.progressKind === "human_choice") return null;
+  if (input.readRetryScheduled || input.retryScheduled) return null;
+  const reasons = [...new Set(input.disposition.reasons ?? [])];
+  if (reasons.some(r => MARKED_CONTEXT_DEPENDENCIES.has(r))) return null;
+  const causes = reasons.map(r => intakeContextReasonLabels[r]).filter((l): l is string => Boolean(l));
+  const actions = [...new Set(reasons.map(r => intakeExpectedActions[r]).filter((a): a is string => Boolean(a)))];
+  return { view: "to_validate", status: "context_required",
+    reason: `Contexte à compléter par l’équipe : ${causes.length ? causes.join(" ; ") : "information manquante non précisée par l’analyse"}. `
+      + (actions.length ? actions.join(" ") : "Lire le dossier, puis indiquer le ticket ou la création.") + " Aucune action automatique n’est lancée." };
+}
+/** (C) A V1 execution stopped for a human decision (CRM change to arbitrate). When a newer analysis exists, the old
+ * execution is shown obsolete: it sent nothing and nothing will be sent from it; the team decides on the current one. */
+export function intakeExecutionDecisionRoute(input: { progress: { state: string; confirmed: boolean; runId: string | null; version: number;
+  crmRecheck?: { humanRequired: boolean } | null; crmDelta?: Parameters<typeof intakeCrmDeltaLabel>[0]; effects: readonly { state: string }[] } | null;
+  run: { id: string; version: number; state: string } }): IntakeTeamRoute | null {
+  const p = input.progress;
+  if (!p || p.confirmed || p.state !== "waiting" || !p.crmRecheck?.humanRequired) return null;
+  const sent = p.effects.some(e => e.state !== "planned");
+  const delta = intakeCrmDeltaLabel(p.crmDelta ?? null);
+  if (p.runId !== input.run.id && input.run.version > p.version && !sent)
+    return { view: "to_validate", status: "execution_superseded",
+      reason: `Exécution de la version ${p.version} obsolète : une analyse plus récente (version ${input.run.version}) existe. Aucune action n’a été envoyée par l’ancienne exécution et aucune ne le sera. `
+        + `${delta ? `${delta} ` : ""}Décision de l’équipe : vérifier le dossier dans HubSpot, puis rattacher, créer ou marquer traité.` };
+  return { view: "to_validate", status: "crm_review_required",
+    reason: `Changement HubSpot à arbitrer${sent ? " (des actions déjà confirmées sont conservées)" : " ; aucune action envoyée"}. ${delta ? `${delta} ` : ""}Prochaine étape : ${nextSteps.human_decision}.` };
+}
+/** Statuses where a dossier is actively moving on its own (analysis or verification running, choice being revalidated). */
+const ACTIVE_STATUSES = new Set(["processing", "pending", "analysing", "running", "human_revalidation", "v2_customer_return", "external_completion_pending", "paused"]);
+/** (Sensitive) A finance/cancellation dossier is never left in a technical wait: it is shown in the team's sensitive queue
+ * with the reason it was waiting on, while the automatic pipeline keeps its own state. */
+export function intakeSensitiveRoute(result: { view: string | null; status: string; reason: string | null }, sensitive: boolean): IntakeTeamRoute | null {
+  if (!sensitive || result.view !== null || ACTIVE_STATUSES.has(result.status)) return null;
+  const why = intakeReasonLabel(result.reason) ?? "";
+  return { view: "sensitive", status: "sensitive_team",
+    reason: `Dossier sensible (résiliation ou facturation) : décision de l’équipe, jamais en attente technique. État : ${intakeStatusLabel(result.status)}.${why ? ` ${why}` : ""}` };
 }

@@ -15,7 +15,8 @@ import { SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKED_AFTER_MINUTES, intakeActi
 import { readSavAgentPause, type SavAgentPauseState } from "./agent-pause";
 import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 import { intakeDossierSensitive } from "./observation-binding";
-import { intakeBlockedSubCause } from "./console-presentation";
+import { intakeBlockedSubCause, intakeContextRequiredRoute, intakeExecutionDecisionRoute, intakeSensitiveRoute } from "./console-presentation";
+import { observationCoverage, observationLimitsLabel, publicObservationSourceCodes } from "../observation-coverage";
 import { readIntakeExecutionProgress } from "./executor";
 import { invalidIntakeAddressMetadata, SAV_INTAKE_INVALID_SOURCE } from "./source-validation";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
@@ -31,6 +32,8 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
     .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   const [run] = await db.select().from(savIntakeRuns).where(and(eq(savIntakeRuns.threadId, threadId), eq(savIntakeRuns.isCurrent, true)));
   let result: ConsoleProjection = { view: null, status: "processing", reason: null };
+  // SAV-92: whether the current mail already has a V1 decision or execution (a sensitive dossier is then never left in a technical wait).
+  let decided = false;
   if (message && await readSavExternalCompletion(message)) result = { view: null, status: "external_completion_pending", reason: "Traitement externe enregistré ; les commandes et résultats restent à rapprocher avant clôture administrative." };
   else if (await intakeThreadHumanHeld(threadId)) result = { view: "to_validate", status: "human_hold", reason: "L’équipe garde la main sur ce dossier. L’automatisation reste en pause ; une décision humaine est attendue." };
   else if (message && await intakeMessageHistorical(message.id)) result = { view: "completed", status: "historical_outside_automation", reason: "Historique — hors automatisation. Le statut HubSpot et les preuves sont conservés." };
@@ -46,6 +49,7 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
     const [pending] = await db.select().from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.parentRunId, run.id), sql`${savIntakeHumanEvents.state} in ('pending','reading','waiting')`)).limit(1);
     const progress = await readIntakeExecutionProgress(run.messageId);
     const local = await db.transaction(async tx => savIntakeSourceSnapshot(tx, message, new Date()));
+    decided = Boolean(plan || progress);
     if (refused) result = { view: "to_validate", status: "human_refused", reason: "Proposition refusée par un opérateur" };
     else if (pending) result = { view: null, status: "human_revalidation", reason: "Choix enregistré, revalidation en cours" };
     // An initial queued run has no recorded source to compare yet. Preserve
@@ -61,32 +65,51 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
         const [observation] = binding ? await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, binding.observationId)) : [];
         const [cycle] = observation ? await db.select().from(savObservationCycles).where(and(eq(savObservationCycles.observationId, observation.id), eq(savObservationCycles.cycle, observation.cycle))) : [];
         const sensitive = Boolean(binding?.sensitive || await intakeDossierSensitive(threadId,progress.ticketId));
-        const started = Boolean(observation?.lastSyncAt && !observation.sourceErrors.length && observation.state !== "sources_incomplete" && cycle && cycle.status !== "unknown");
+        // SAV-92 (A): a coverage limit (size/count bound, identical at every re-read) gives a partial follow-up, never an
+        // "incomplete" one waiting forever; only a real read error keeps the follow-up pending its next daily read.
+        const coverage = observation ? observationCoverage(observation.sourceErrors) : null;
+        const started = Boolean(observation?.lastSyncAt && coverage !== "incomplete" && cycle && cycle.status !== "unknown");
         const finished = started && observation!.closed && Boolean(cycle && (sensitive || ["resolved","closed_without_resolution","abandoned","duplicate"].includes(cycle.qualification ?? "") || ["new","already_covered","amendment","not_reusable","insufficient_evidence","conflict","candidate_revision_required","specialist_review_required","candidate_created","candidate_updated","candidate_linked","admitted","grouped","not_applicable"].includes(cycle.learningDisposition ?? "")));
         result = finished ? { view: "completed", status: sensitive ? "not_applicable_sensitive" : "summary_finished", reason: null }
-          : started ? { view: sensitive ? "sensitive" : "learning", status: "followup_started", reason: null }
-          : { view: null, status: "followup_pending", reason: observation?.sourceErrors.length ? "Collecte du suivi incomplète" : "Actions confirmées, premier suivi en attente" };
+          : started ? { view: sensitive ? "sensitive" : "learning", status: coverage === "partial" ? "followup_partial" : "followup_started", reason: coverage === "partial" ? observationLimitsLabel(observation!.sourceErrors) : null }
+          : { view: null, status: "followup_pending", reason: coverage === "incomplete" ? followupIncompleteReason(observation!.sourceErrors, observation!.nextSyncAt) : "Actions confirmées, premier suivi en attente" };
       }
     } else if (plan?.progress.kind === "qualified_other" && progress?.state === "refused" && progress.effects.length === 0) result = { view: "other", status: "qualified_other", reason: payload.other ? `${payload.other.label} · règle ${payload.other.ruleId}` : "Classement confirmé par un opérateur" };
     else if (plan?.decision.disposition.kind === "request_identification"
       && (payload.input as {humanResolution?:{suppressOutbound?:boolean}} | undefined)?.humanResolution?.suppressOutbound)
       result = {view:"to_validate",status:"identity_pending_approval",reason:"Demande analysée. Le mail d’identification attend votre accord ; aucun envoi par la reprise."};
-    else if (progress) result = { view: null, status: progress.state, reason: progress.reason };
+    // SAV-92 (C): an execution stopped for a human decision goes to the team's queue; an older one is shown obsolete.
+    else if (progress) result = intakeExecutionDecisionRoute({ progress, run }) ?? { view: null, status: progress.state, reason: progress.reason };
     else if (plan?.progress.view === "to_validate") result = { view: "to_validate", status: "human_choice", reason: payload.reason ?? null };
     else if (plan?.progress.kind === "qualified_other") result = { view: "other", status: "qualified_other", reason: payload.other ? `${payload.other.label} · règle ${payload.other.ruleId}` : "Classement confirmé par un opérateur" };
     else if (plan?.decision.disposition.kind === "no_ticket" && plan.decision.disposition.reason === "acknowledgement_only")
       result = {view:"completed",status:"acknowledgement_only",reason:"Accusé de réception sans nouvelle demande ; aucun ticket fermé par ce classement."};
-    else result = { view: null, status: run.state, reason: payload.reason ?? null };
+    // SAV-92 (B): a V1 request for context the team must give is a team decision, not a technical wait.
+    else result = intakeContextRequiredRoute({ disposition: plan?.decision.disposition, progressKind: plan?.progress.kind, runState: run.state,
+      readRetryScheduled: payload.readRecovery?.state === "scheduled",
+      retryScheduled: run.state === "waiting" && !run.leaseToken && Boolean(run.leaseUntil && run.leaseUntil > new Date()) })
+      ?? { view: null, status: run.state, reason: payload.reason ?? null };
     } catch (error) {
       if (!invalidIntakeAddressMetadata(error)) throw error;
       result = { view: null, status: "waiting", reason: SAV_INTAKE_INVALID_SOURCE };
     }
+  }
+  // SAV-92 (sensitive): a finance/cancellation dossier with a V1 decision is never left in a technical wait.
+  if (decided && result.view === null) {
+    const route = intakeSensitiveRoute(result, true);
+    if (route && await intakeDossierSensitive(threadId, thread?.hubspotTicketId ?? null)) result = route;
   }
   await beforePublish?.();
   const published = await db.update(savIntakeConsole).set({ ...result, projectedEpoch: projection.epoch,
     messageId: message?.id ?? null, runId: run?.id ?? null, version: run?.version ?? null })
     .where(and(eq(savIntakeConsole.threadId, threadId), eq(savIntakeConsole.epoch, projection.epoch))).returning({ id: savIntakeConsole.threadId });
   return published.length === 1;
+}
+/** "Collecte du suivi incomplète" with the named read errors and the next daily read: never a promise without a date. */
+function followupIncompleteReason(sourceErrors: readonly unknown[], nextSyncAt: Date | null) {
+  const codes = publicObservationSourceCodes(sourceErrors).filter(c => c.kind === "error").map(c => c.code);
+  const next = nextSyncAt ? nextSyncAt.toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: "Europe/Paris" }) : null;
+  return `Ticket créé et actions confirmées. Collecte du suivi incomplète (${codes.join(", ") || "lecture échouée"})${next ? ` ; nouvelle lecture prévue le ${next}` : ""}.`;
 }
 export async function refreshIntakeConsole(limit = 20) {
   if (!await intakeConsoleInstalled()) return { skipped: "migration_absent" };
@@ -106,6 +129,8 @@ export function intakeBlockedPause(state: SavAgentPauseState): IntakeBlockedPaus
 /** Current run blocked: durable blocking marker, or a technical wait/analysis older than the threshold.
  * Shared by the console list, its counters and the monitor, so moving a dossier never hides the incident. */
 /** A scheduled automatic retry (waiting, no lease token, future leaseUntil) is a next action, not an incident, until its due time passes. */
+/** SAV-92 (A): a run whose mail already has a confirmed execution (ticket and actions done) is not an incident even if it
+ * was left waiting: no code moves a run after its execution is confirmed. Its follow-up is shown on its own. */
 export function intakeBlockedRunSql(threadId: ReturnType<typeof sql>, pause: IntakeBlockedPause = INTAKE_NOT_PAUSED) {
   // An analysis stuck from before the pause stays an incident; waiting for a claim does not.
   const states = pause.analysisPaused ? sql`('analysing')` : sql`('pending', 'waiting', 'analysing')`;
@@ -113,7 +138,8 @@ export function intakeBlockedRunSql(threadId: ReturnType<typeof sql>, pause: Int
   return sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and (
     ${intakeActiveBlockSql(sql`br.id`)}
     or (br.state in ${states} and ${since} < now() - make_interval(mins => ${SAV_INTAKE_BLOCKED_AFTER_MINUTES})
-      and not coalesce(br.state = 'waiting' and br.lease_token is null and br.lease_until > now(), false))))`;
+      and not coalesce(br.state = 'waiting' and br.lease_token is null and br.lease_until > now(), false)
+      and not exists(select 1 from sav.intake_executions be where be.message_id = br.message_id and be.state = 'confirmed'))))`;
 }
 export function intakeBlockedCauseSql(threadId: ReturnType<typeof sql>, pause: IntakeBlockedPause = INTAKE_NOT_PAUSED) {
   // SAV-88: an attempts_exhausted lifted by the rescue claimed on the same run no longer blocks (see attempt-policy.ts).
@@ -175,6 +201,9 @@ export async function listIntakeConsole(options: { mailboxId?: string; view?: Sa
       retryAt: sql<string | null>`case when ${effectiveView} is null then ${intakeRetryAtSql(sql`${savIntakeConsole.threadId}`)} else null end`,
       // SAV-88: the ticket the team already sees names the real state of a dossier waiting for an analysis.
       ticketId: sql<string | null>`(select tt.hubspot_ticket_id from sav.threads tt where tt.id = ${savIntakeConsole.threadId})`,
+      // SAV-92 (C): read only, to name a context change no attempt ever took up for more than 24 h.
+      runAttempts: sql<number | null>`(select cr.attempts from sav.intake_runs cr where cr.thread_id = ${savIntakeConsole.threadId} and cr.is_current limit 1)`,
+      runUpdatedAt: sql<string | null>`(select cr.updated_at from sav.intake_runs cr where cr.thread_id = ${savIntakeConsole.threadId} and cr.is_current limit 1)`,
       view: effectiveView, status: sql<string>`case when ${completed} then 'handled_externally' when ${other} then 'human_other' when ${review} then 'human_review' when ${marked} then 'external_completion_pending' when ${held} then 'human_hold' when ${savIntakeConsole.status}='external_completion_pending' then 'processing' when ${historicalMessageSql()} then 'historical_outside_automation' when ${savIntakeConsole.epoch}<>${savIntakeConsole.projectedEpoch} then 'processing' else ${savIntakeConsole.status} end`,
       reason: sql<string | null>`case when ${completed} then 'Traité hors Studio — clôture administrative de ce message. Aucun verdict IA, fermeture HubSpot ou apprentissage terminé ne sont déclarés.' when ${other} then 'Autres — classement humain de ce message.' when ${review} then 'Décision confiée à l’équipe pour ce message.' when ${marked} then 'Traitement externe enregistré ; commande humaine ou résultat externe à rapprocher.' when ${held} then 'L’équipe garde la main sur ce dossier. L’automatisation reste en pause ; une décision humaine est attendue.' when ${savIntakeConsole.status}='external_completion_pending' then null when ${historicalMessageSql()} then 'Historique — hors automatisation. Aucun ticket HubSpot fermé par ce classement.' when ${savIntakeConsole.epoch}=${savIntakeConsole.projectedEpoch} then ${savIntakeConsole.reason} else null end`,
     }).from(savIntakeConsole).leftJoin(savMessages, latestMessageJoin).where(and(common, selected))

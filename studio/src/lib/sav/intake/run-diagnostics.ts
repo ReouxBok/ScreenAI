@@ -13,6 +13,7 @@ import { savAttachmentReasonSchema, savAttachmentStatusSchema } from "../attachm
 import { intakeContextReasonLabels } from "./console-presentation";
 import { publicIntakeSchemaIssues } from "./schema-diagnostics";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
+import { observationCoverage, publicObservationSourceCodes } from "../observation-coverage";
 
 const object = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
 const publicCodes = new Set<string>([...Object.keys(intakeContextReasonLabels), ...savAttachmentReasonSchema.options, ...savAttachmentStatusSchema.options,
@@ -120,8 +121,11 @@ async function readExecutionDiagnostic(tx: ReadTx, messageId: string) {
   // Follow-up of a confirmed execution: bound, or the named condition that holds it (SAV-45 C).
   const [binding] = row.state === "confirmed" ? await tx.select({ observationId: savIntakeObservationBindings.observationId }).from(savIntakeObservationBindings).where(eq(savIntakeObservationBindings.executionId, row.id)).limit(1) : [];
   const [observation] = binding ? await tx.select({ state: savResolutionObservations.state, sourceErrors: savResolutionObservations.sourceErrors }).from(savResolutionObservations).where(eq(savResolutionObservations.id, binding.observationId)) : [];
-  const followup = row.state !== "confirmed" ? null : binding ? { bound: true, blocker: null, observationState: observation?.state ?? null, sourceErrors: Array.isArray(observation?.sourceErrors) ? observation.sourceErrors.length : null }
-    : { bound: false, blocker: readable ? (await intakeObservationBlocker(tx, row.id).catch(() => ({ blocker: "unknown" as const }))).blocker ?? "scan_pending" : "unknown", observationState: null, sourceErrors: null };
+  const followup = row.state !== "confirmed" ? null : binding ? { bound: true, blocker: null, observationState: observation?.state ?? null, sourceErrors: Array.isArray(observation?.sourceErrors) ? observation.sourceErrors.length : null,
+      // SAV-92 (A): the named codes (allow-listed families, never an id, address or provider message) and the coverage they give.
+      sourceErrorCodes: Array.isArray(observation?.sourceErrors) ? publicObservationSourceCodes(observation.sourceErrors) : [],
+      coverage: Array.isArray(observation?.sourceErrors) ? observationCoverage(observation.sourceErrors) : null }
+    : { bound: false, blocker: readable ? (await intakeObservationBlocker(tx, row.id).catch(() => ({ blocker: "unknown" as const }))).blocker ?? "scan_pending" : "unknown", observationState: null, sourceErrors: null, sourceErrorCodes: [], coverage: null };
   const reason = readable ? code(payload.reason) : null, crmDelta = readable ? publicIntakeCrmDelta(payload.crmDelta) : null, crmRecheck = readable ? publicCrmRecheck(payload.crmRecheck) : null;
   return { readable, state: ["pending", "running", "waiting", "uncertain", "confirmed", "refused"].includes(row.state) ? row.state : null, runVersion: row.runVersion, updatedAt: row.updatedAt,
     reason, crmDelta, crmRecheck, followup, originalCrmRecorded: readable ? Boolean(object(payload.originalCrm).entries) : null, effects: publicExecutionEffects(effects), effectsTruncated: effects.length > 20,
