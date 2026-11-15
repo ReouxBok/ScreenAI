@@ -7,6 +7,7 @@ import { savCaseEvents, savCaseReplyValidations, savCaseTimers, savCases, savInt
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { readCaseBlockHold } from "./case-block-hold";
+import { readCaseTeamPartWait } from "./case-team-part-wait";
 import { caseAdmissionStatus, caseRequestFamilyProven, decideCaseAdmission, type CaseAdmissionInput } from "./admission-policy";
 import {
   SAV_CASE_ADMISSION_TEAM_REASONS, SAV_CASE_CONTRACT_REVISION, SAV_CASE_DEDUPE_PATTERNS, SAV_CASE_EVENT_DIRECTIONS, SAV_CASE_EVENT_KIND_DIRECTIONS, SAV_CASE_OWNER_TRANSITIONS, SAV_CASE_OWNERS,
@@ -785,12 +786,15 @@ export async function readCaseDiagnostics(ticketId: string) {
   const [timer] = await db.select().from(savCaseTimers).where(eq(savCaseTimers.caseId, row.id)).orderBy(desc(savCaseTimers.createdAt), desc(savCaseTimers.id)).limit(1);
   const pause = timer?.state === "scheduled" ? await readSavAgentPause(db, "v2") : null;
   const hold = await readCaseBlockHold(row.id, db);
+  const teamPart = await readCaseTeamPartWait(row.id, db);
   return { caseId: row.id, version: row.version, owner: row.owner, phase: row.phase, sensitivity: row.sensitivity, threadCount: row.threadIds.length,
     // Visible instead of a silent failure: a row no declared upgrade can read.
     contractRevision: row.contractRevision, contractSupported: row.contractRevision === SAV_CASE_CONTRACT_REVISION || row.contractRevision in SAV_CASE_CONTRACT_UPGRADES,
     eventCount: events?.total ?? 0, lastEventKind: last?.kind ?? null, updatedAt: row.updatedAt.toISOString(),
     // SAV-18: held by its block's switch (off, paused, unreadable): a visible wait, never a silent skip.
     blockHold: hold ? { blockId: hold.blockId, reason: hold.reason, since: hold.since } : null,
+    // SAV-92 (review batch 3, B1): a reply naming a team part whose notice could not be queued; bounded, then the whole mail goes to the team.
+    teamPartWait: teamPart ? { code: teamPart.code, detail: teamPart.detail, passes: teamPart.passes, since: teamPart.since, lastAt: teamPart.lastAt, handedToTeam: teamPart.handedToTeam } : null,
     admission: row.admissionTarget === null ? null : {
       target: row.admissionTarget, reason: row.admissionReason, policyRevision: row.admissionPolicyRevision,
       since: row.admissionDecidedAt?.toISOString() ?? null, inputNewer: row.admissionVersion === null || row.admissionInputVersion > row.admissionVersion,

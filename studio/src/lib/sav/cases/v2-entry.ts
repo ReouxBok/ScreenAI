@@ -17,6 +17,7 @@ import { hubspotTicketOwnerReader, type CaseOwnerReadTransport } from "./admissi
 import { admissionPolicyPort, admissionPolicyRevisionPort, qualifyTicketIdentity, type AdmissionPolicyRecord, type V1AdmissionAdapterPolicy } from "./admission-runtime";
 import { savCaseRecordingEnabled, v1IntentHash, type CaseTx } from "./case-store";
 import { caseIdsStillHeldByBlock, markCaseBlockHold } from "./case-block-hold";
+import { settleCaseTeamPartWait, SAV_CASE_TEAM_PART_WAIT_CODE } from "./case-team-part-wait";
 import { caseDedupeKey, SAV_CASE_ACCESS_BLOCK_ID, type CaseAdmissionQualification, type CaseTeamPartReason } from "./case-types";
 import { readCaseAccessScope } from "./investigation-access-scope";
 import { caseAccessScopeConfigReader } from "./investigation-pilot-readers";
@@ -421,6 +422,12 @@ export async function continueCaseAfterCommit(caseId: string, trigger: CaseConti
       await markContinuation(caseId, trigger, null);
       // SAV-18: a block held by its switch is a durable, visible wait (console, diagnostics), cleared by the next pass that is not held.
       await markCaseBlockHold(caseId, report.status === "block_held" ? { blockId: report.detail ?? SAV_CASE_ACCESS_BLOCK_ID, reason: report.reason ?? "block_setting_invalid" } : null);
+      // Review batch 3 (B1): a reply naming a team part whose notice could not be queued is a visible, bounded wait (never a silent retry at each sweep):
+      // marked with its closed code, then, at the bound, the whole mail goes to the team. A failure of this step never undoes the pass.
+      const teamPartRefused = report.status === "proposal_refused" && report.reason === SAV_CASE_TEAM_PART_WAIT_CODE;
+      const wait = await settleCaseTeamPartWait(caseId, teamPartRefused ? { ...(report.detail ? { detail: report.detail } : {}) } : null)
+        .catch(error => { console.error("sav_v2_entry_team_part_wait", { caseId, errorCode: errorCode(error) }); return null; });
+      if (teamPartRefused) console.warn("sav_v2_entry_team_part_wait", { caseId, state: wait?.state ?? "unmarked", ...(wait && "passes" in wait ? { passes: wait.passes } : {}) });
       return report;
     }
     code = "point_not_bound";
