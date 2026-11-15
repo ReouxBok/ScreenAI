@@ -23,7 +23,9 @@ export function savIntakeNoiseFilterMode(env: Record<string, string | undefined>
 /** Closed list of rules, in priority order (the first one present is the verdict's reason).
  * STRONG rules: the only ones that can route a mail to "Autre" (mode on).
  * - DELIVERY_STATUS: Content-Type multipart/report; report-type=delivery-status (RFC 3464 DSN).
- * - MAILER_DAEMON: sender mailer-daemon@ or postmaster@ AND a non-delivery wording in the subject or body.
+ * - MAILER_DAEMON: sender mailer-daemon@ AND a machine header (delivery-status report, or Auto-Submitted
+ *   other than "no") AND a non-delivery wording in the subject or body. postmaster@ is always weak: a person
+ *   may write from it.
  * - AUTO_REPLIED: Auto-Submitted is exactly "auto-replied" (RFC 3834) AND an absence/autoreply wording
  *   in the subject or body.
  * WEAK rules: recorded for measurement only (observe and on), they NEVER route a mail. A group alias, a
@@ -33,7 +35,7 @@ export function savIntakeNoiseFilterMode(env: Record<string, string | undefined>
  * - WEAK_AUTO_GENERATED: Auto-Submitted: auto-generated.
  * - WEAK_AUTO_SUBMITTED_OTHER: another Auto-Submitted keyword (other than "no"), or auto-replied without wording.
  * - WEAK_X_AUTOREPLY: X-Autoreply or X-Autorespond.
- * - WEAK_DAEMON_SENDER: mailer-daemon@ or postmaster@ without non-delivery wording. */
+ * - WEAK_DAEMON_SENDER: postmaster@ (always), or mailer-daemon@ without a machine header or without wording. */
 export const SAV_INTAKE_NOISE_STRONG_REASONS = ["SAV_NOISE_DELIVERY_STATUS", "SAV_NOISE_MAILER_DAEMON", "SAV_NOISE_AUTO_REPLIED"] as const;
 export const SAV_INTAKE_NOISE_WEAK_REASONS = ["SAV_NOISE_WEAK_LIST_HEADERS", "SAV_NOISE_WEAK_PRECEDENCE", "SAV_NOISE_WEAK_AUTO_GENERATED",
   "SAV_NOISE_WEAK_AUTO_SUBMITTED_OTHER", "SAV_NOISE_WEAK_X_AUTOREPLY", "SAV_NOISE_WEAK_DAEMON_SENDER"] as const;
@@ -94,7 +96,7 @@ export type SavIntakeNoiseVerdict = {
 };
 
 const deliveryReport = /^multipart\/report\s*;(?:[^;]*;)*\s*report-type\s*=\s*"?delivery-status"?\s*(?:;|$)/i;
-const daemonLocal = /^(?:mailer[-_.]?daemon|postmaster)$/;
+const mailerDaemonLocal = /^mailer[-_.]?daemon$/;
 const fold = (text: string) => text.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
 // Wordings checked on folded text (no accents, lower case).
 const nonDelivery = /delivery status notification|undeliverable|undelivered|delivery (?:has )?failed|mail delivery (?:failed|subsystem)|could ?n[o']t be delivered|could not be delivered|address not found|returned mail|message not delivered|non remis|n'a pas pu etre (?:remis|distribue|livre|delivre)|echec de (?:la )?(?:remise|livraison|distribution)|adresse introuvable|user unknown|mailbox unavailable/;
@@ -117,11 +119,15 @@ export function savIntakeNoiseSignals(input: Pick<SavIntakeNoiseInput, "fromEmai
   const captured = header("x-studio-noise-headers") === "v1";
   const text = `${fold(input.subject ?? "")}\n${fold(input.bodyText ?? "")}`;
   const signals = new Set<SavIntakeNoiseReason>();
-  if (parsed && deliveryReport.test(header("content-type"))) signals.add("SAV_NOISE_DELIVERY_STATUS");
-  if (daemonLocal.test(localPart(input.fromEmail))) signals.add(nonDelivery.test(text) ? "SAV_NOISE_MAILER_DAEMON" : "SAV_NOISE_WEAK_DAEMON_SENDER");
+  const report = parsed && deliveryReport.test(header("content-type"));
+  if (report) signals.add("SAV_NOISE_DELIVERY_STATUS");
   const autoSubmitted = parsed ? header("auto-submitted") : "";
   // RFC 3834: one keyword, optional parameters. Anything else (lists, unknown keywords) is weak.
   const keyword = /^([a-z-]+)\s*(?:;[^,]*)?$/i.exec(autoSubmitted)?.[1].toLowerCase();
+  const local = localPart(input.fromEmail);
+  // A sender address alone is never proof: mailer-daemon needs a machine header and the wording; postmaster stays weak.
+  if (mailerDaemonLocal.test(local)) signals.add((report || autoSubmitted && keyword !== "no") && nonDelivery.test(text) ? "SAV_NOISE_MAILER_DAEMON" : "SAV_NOISE_WEAK_DAEMON_SENDER");
+  else if (local === "postmaster") signals.add("SAV_NOISE_WEAK_DAEMON_SENDER");
   if (autoSubmitted && keyword !== "no") {
     if (keyword === "auto-replied" && autoReplyWording.test(text)) signals.add("SAV_NOISE_AUTO_REPLIED");
     else if (keyword === "auto-generated") signals.add("SAV_NOISE_WEAK_AUTO_GENERATED");

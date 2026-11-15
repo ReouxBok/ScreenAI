@@ -146,6 +146,17 @@ it("P2a on: a second bounce from the same mailer-daemon is filtered once the fir
   expect(served.fetcher).toHaveBeenCalled();
 });
 
+it("review 2 on: a person writing from postmaster@ about a non-delivery, and a bare mailer-daemon, stay on the normal path", async () => {
+  const plain = { ...base, "content-type": "text/plain; charset=UTF-8" };
+  const person = await run("on", await mail({ from: "postmaster@client.example.invalid", headers: plain, subject: "Mail non remis", body: "Bonjour, votre mail n'a pas pu être remis, pouvez-vous vérifier ?" }));
+  expect(person.current?.payload.noise).toMatchObject({ verdict: "keep", strength: "weak", reason: "SAV_NOISE_WEAK_DAEMON_SENDER", routed: false });
+  expect(person.fetcher).toHaveBeenCalled();
+  expect(person.current?.payload.plan?.progress.kind).not.toBe("qualified_other");
+  const bare = await run("on", await mail({ from: "mailer-daemon@bare.example.invalid", headers: plain }));
+  expect(bare.current?.payload.noise).toMatchObject({ verdict: "keep", strength: "weak", reason: "SAV_NOISE_WEAK_DAEMON_SENDER", routed: false });
+  expect(bare.fetcher).toHaveBeenCalled();
+});
+
 it("P2b on: a delivery report with its attached original goes to Autre, never to a vague wait", async () => {
   const on = await run("on", await mail({ attachments: [{ filename: "original.eml", mimeType: "message/rfc822" }] }));
   expect(on.fetcher).not.toHaveBeenCalled();

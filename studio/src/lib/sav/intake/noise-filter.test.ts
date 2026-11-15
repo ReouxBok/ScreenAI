@@ -31,8 +31,8 @@ describe("SAV-92 noise filter flag", () => {
 describe("SAV-92 strong rules: the only ones that can route to Autre", () => {
   it.each([
     ["a delivery-status report", input({ fromEmail: "notify@example.invalid", subject: "Notification", bodyText: "Rapport." }), "SAV_NOISE_DELIVERY_STATUS"],
-    ["mailer-daemon with non-delivery wording", input({ headers: parsed }), "SAV_NOISE_MAILER_DAEMON"],
-    ["postmaster with French non-delivery wording", input({ headers: parsed, fromEmail: "postmaster@example.invalid", subject: "Message non remis", bodyText: "Votre message n'a pas pu être distribué." }), "SAV_NOISE_MAILER_DAEMON"],
+    ["mailer-daemon with Auto-Submitted and non-delivery wording", input({ headers: { ...parsed, "auto-submitted": "auto-replied" } }), "SAV_NOISE_MAILER_DAEMON"],
+    ["mailer-daemon with Auto-Submitted and French wording", input({ headers: { ...parsed, "auto-submitted": "auto-generated" }, subject: "Message non remis", bodyText: "Votre message n'a pas pu être distribué." }), "SAV_NOISE_MAILER_DAEMON"],
     ["auto-replied with an absence wording", input({ headers: absenceHeaders, fromEmail: "person@example.invalid", subject: "Réponse automatique : Re: fictif", bodyText: "Je suis absente jusqu'au 20 novembre." }), "SAV_NOISE_AUTO_REPLIED"],
     ["auto-replied, out of office in English", input({ headers: absenceHeaders, fromEmail: "person@example.invalid", subject: "Out of Office", bodyText: "Back on Monday." }), "SAV_NOISE_AUTO_REPLIED"],
   ] as const)("%s → noise", (_label, value, reason) => {
@@ -55,6 +55,11 @@ describe("SAV-92 weak rules never route (cases reproduced by the review)", () =>
     ["auto-replied without any absence wording", input({ ...person, headers: absenceHeaders }), "SAV_NOISE_WEAK_AUTO_SUBMITTED_OTHER"],
     ["X-Autoreply alone", input({ ...person, headers: { ...parsed, "x-autoreply": "yes" } }), "SAV_NOISE_WEAK_X_AUTOREPLY"],
     ["mailer-daemon without non-delivery wording", input({ ...person, fromEmail: "mailer-daemon@example.invalid", headers: parsed }), "SAV_NOISE_WEAK_DAEMON_SENDER"],
+    ["review 2: a person writing from postmaster@client about a non-delivery", input({ fromEmail: "postmaster@client.example.invalid", headers: parsed, subject: "Mail non remis",
+      bodyText: "Bonjour, votre mail n'a pas pu être remis, pouvez-vous vérifier ?" }), "SAV_NOISE_WEAK_DAEMON_SENDER"],
+    ["review 2: postmaster even with Auto-Submitted and wording", input({ fromEmail: "postmaster@client.example.invalid", headers: { ...parsed, "auto-submitted": "auto-generated" } }), "SAV_NOISE_WEAK_AUTO_GENERATED"],
+    ["review 2: mailer-daemon with wording but no machine header", input({ headers: parsed }), "SAV_NOISE_WEAK_DAEMON_SENDER"],
+    ["review 2: mailer-daemon with wording and Auto-Submitted: no", input({ headers: { ...parsed, "auto-submitted": "no" } }), "SAV_NOISE_WEAK_DAEMON_SENDER"],
     ["a real newsletter", input({ fromEmail: "news@lists.example.invalid", subject: "Lettre fictive", bodyText: "Nouveautés. Se désinscrire.", headers: newsletterHeaders }), "SAV_NOISE_WEAK_LIST_HEADERS"],
   ] as const)("%s → keep (weak, measured)", (_label, value, reason) => {
     const verdict = savIntakeNoiseVerdict(value);
