@@ -1,4 +1,4 @@
-import type { SavRetrievalCandidate } from "../request-retrieval";
+import type { SavRetrievalBackend, SavRetrievalCandidate } from "../request-retrieval";
 import { prepareCaseReplyText, type CaseReplyAiMode } from "../cases/case-reply-outbound";
 import {
   emptyCaseBody, SAV_CASE_ADMISSION_REVISION, SAV_CASE_CONTRACT_REVISION, SAV_CASE_REQUEST_FAMILIES,
@@ -8,10 +8,14 @@ import { caseDecisionRejectionLabels, SAV_CASE_ACCESS_URL, type CaseDecisionReje
 import { buildCaseCustomerAttachments, withCaseCustomerAttachments } from "../cases/investigation-customer-attachments";
 import { buildCaseCustomerContext, maskCaseCustomerText, type CaseCustomerContext } from "../cases/investigation-customer-context";
 import {
+  SAV_CASE_ACCESS_SCOPE_REVISION, SAV_CASE_BLOCK_SCOPE_REVISION, SAV_CASE_BLOCK_SCOPES_BUNDLE, type CaseBlockScopesBundle, type CaseScopePart,
+} from "../cases/investigation-access-scope";
+import { selectCaseKnowledge } from "../cases/investigation-knowledge";
+import {
   runCaseInvestigation, type CaseInvestigationAttempt, type CaseInvestigationModelRequest, type CaseInvestigationModelResult, type CaseInvestigationPorts,
   type CaseInvestigationProgress, type CaseInvestigationRecord, type CaseInvestigationReport,
 } from "../cases/investigation-runner";
-import type { SavBlockMode } from "./block-attribution";
+import type { SavBlockDraft, SavBlockMode } from "./block-attribution";
 import type { SavReplayDecisionInput, SavReplayDecisionOutput } from "./block-replay";
 
 /*
@@ -29,6 +33,14 @@ import type { SavReplayDecisionInput, SavReplayDecisionOutput } from "./block-re
  * Money: a dedicated in-memory meter, a per-run cap (2 USD by default, 10 USD at most) and a per-mail cap. Each call reserves its worst case
  * before it is sent; a reservation that does not fit is refused and the call is never sent (the runner reads it as a deferral, nothing spent).
  * An uncertain call keeps its reservation. The production spend register and call ledger are never touched.
+ *
+ * Review batch 3 (M1): the runner gets the SAME block-scope port production wires (`accessScope`, read by `readCaseAccessScope` inside the
+ * runner, no fork): the block's family check, « every source shown = an `answer` source of the scope », the scope-first arrangement, the first
+ * reply template (when the scope names one), `admission_not_current_input` and the multi-block path all run. The scope is the APPROVED one
+ * when the caller gives it (the production values, `--scope <file.json>`), else the block DRAFT converted to a scope (its attribution cards
+ * at the version retrieved: `answer`; its support cards: `orient_only`). The knowledge port is the production selection
+ * (`selectCaseKnowledge`: per-request coverage, relevance and pool) over an in-memory backend holding the cards already retrieved for this
+ * mail (no new embedding). Every detail says which scope was checked; a run without one says « not checked ».
  */
 
 export const SAV_REPLAY_SPEND_LIMITS = Object.freeze({ defaultRunUsd: 2, maxRunUsd: 10, defaultMailUsd: 0.5 });
@@ -40,13 +52,20 @@ export const SAV_REPLAY_STUB_MODEL = "sav-replay-stub.v1";
 // Spend meter (in memory, micro-dollars)
 // ---------------------------------------------------------------------------------------------------------------------------------
 
-export type SavReplaySpendTotals = Readonly<{ runCapUsd: number; mailCapUsd: number; calls: number; refused: number; reservedUsd: number; actualUsd: number; committedUsd: number }>;
+export type SavReplaySpendTotals = Readonly<{ runCapUsd: number; mailCapUsd: number; calls: number; refused: number; reservedUsd: number; actualUsd: number; committedUsd: number;
+  /** Review batch 3 (B3): the knowledge search's query embeddings, counted at an estimate (never measured): calls, queries and estimated USD. */
+  embeddingCalls: number; embeddingQueries: number; embeddingEstimatedUsd: number; embeddingRefused: number }>;
 export type SavReplaySpendMeter = {
   readonly runCapUsd: number; readonly mailCapUsd: number;
   /** Reserves the worst case of one call for this mail, or refuses it (nothing may then be sent). */
   reserve(mailRef: string, amountUsd: number): { ok: true; id: number } | { ok: false; reason: "run_cap" | "mail_cap" };
   /** Settles a reservation: the actual cost, or null to keep the reserved amount (unknown or uncertain usage, never free). */
   settle(id: number, actualUsd: number | null): void;
+  /**
+   * B3: charges one search call's query embeddings at their estimate against the RUN cap (the per-mail cap is the decision's), before it is
+   * sent; refused when it does not fit (the search is then not sent). The estimate is kept as spent: no usage is reported for an embedding.
+   */
+  chargeEmbedding(queries: number, amountUsd: number): boolean;
   /** Whether one more call of this worst case still fits the run cap. */
   fits(amountUsd: number): boolean;
   mailCommittedUsd(mailRef: string): number;
@@ -63,7 +82,7 @@ export function createSavReplaySpendMeter(options: Readonly<{ runCapUsd?: number
   if (!(Number.isFinite(mailCapUsd) && mailCapUsd > 0 && mailCapUsd <= runCapUsd)) throw new Error("SAV_REPLAY_MAIL_BUDGET_INVALID");
   const runCap = micro(runCapUsd), mailCap = micro(mailCapUsd);
   const open = new Map<number, { mail: string; amount: number }>(), byMail = new Map<string, number>();
-  let committed = 0, reserved = 0, actual = 0, calls = 0, refused = 0, next = 1;
+  let committed = 0, reserved = 0, actual = 0, calls = 0, refused = 0, next = 1, embeddingCalls = 0, embeddingQueries = 0, embedded = 0, embeddingRefused = 0;
   const add = (mail: string, amount: number) => { committed += amount; byMail.set(mail, (byMail.get(mail) ?? 0) + amount); };
   return {
     runCapUsd, mailCapUsd,
@@ -84,9 +103,33 @@ export function createSavReplaySpendMeter(options: Readonly<{ runCapUsd?: number
       // Settled at what was reported; a report above the reservation is kept as reported (counted, never hidden).
       add(held.mail, spent - held.amount); actual += spent;
     },
+    chargeEmbedding(queries, amountUsd) {
+      const amount = micro(amountUsd);
+      if (committed + amount > runCap) { embeddingRefused++; return false; }
+      committed += amount; embedded += amount; embeddingCalls++; embeddingQueries += Math.max(0, queries);
+      return true;
+    },
     fits: amountUsd => committed + micro(amountUsd) <= runCap,
     mailCommittedUsd: mailRef => usdOf(byMail.get(mailRef) ?? 0),
-    totals: () => ({ runCapUsd, mailCapUsd, calls, refused, reservedUsd: usdOf(reserved), actualUsd: usdOf(actual), committedUsd: usdOf(committed) }),
+    totals: () => ({ runCapUsd, mailCapUsd, calls, refused, reservedUsd: usdOf(reserved), actualUsd: usdOf(actual), committedUsd: usdOf(committed),
+      embeddingCalls, embeddingQueries, embeddingEstimatedUsd: usdOf(embedded), embeddingRefused }),
+  };
+}
+
+/**
+ * B3: the estimate of ONE query embedding of the knowledge search (a query is at most 900 characters, about 300 tokens). Deliberately high:
+ * about 30 times the list price of a Gemini embedding of that size, so the estimate never under-counts. Never measured, never a production price.
+ */
+export const SAV_REPLAY_EMBEDDING_ESTIMATE_USD_PER_QUERY = 0.0001;
+
+/** B3: the search backend with each call's query embeddings charged to the meter BEFORE it is sent; a charge that does not fit is never sent (it throws). */
+export function meteredSavReplaySearch(backend: SavRetrievalBackend, meter: SavReplaySpendMeter, perQueryUsd = SAV_REPLAY_EMBEDDING_ESTIMATE_USD_PER_QUERY): SavRetrievalBackend {
+  return {
+    readRevision: () => backend.readRevision(),
+    async search(queries, limit) {
+      if (!meter.chargeEmbedding(queries.length, queries.length * perQueryUsd)) throw new Error("SAV_REPLAY_EMBEDDING_BUDGET");
+      return backend.search(queries, limit);
+    },
   };
 }
 
@@ -177,10 +220,11 @@ const subjectOf = (text: string, at: string) => {
 type ReplayCase = { snapshot: CaseSnapshot; events: CaseEvent[]; customerTexts: Record<string, string>; customerContext?: CaseCustomerContext };
 
 /** A synthetic case from one mail: one request per given part (the whole text by default), admitted for the agent under the replay policy. */
-export function synthesizeSavReplayCase(source: Extract<SavReplayCaseSource, { kind: "synthetic" }>, now: Date): ReplayCase {
+export function synthesizeSavReplayCase(source: Extract<SavReplayCaseSource, { kind: "synthetic" }>, now: Date, policyRevision: string = SAV_REPLAY_POLICY_REVISION): ReplayCase {
   const at = now.toISOString(), caseId = `replay:${source.ref}`.slice(0, 200), messageId = source.messageId ?? `replay-${source.ref}`.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 120);
   const parts = source.requests?.length ? source.requests : [{ text: source.text }];
-  const openRequests = parts.map((part, index) => ({ id: `r${index + 1}`, summary: maskCaseCustomerText(part.text).replace(/\s+/g, " ").slice(0, 4000) || "Demande",
+  // The summary is the relay's own label (`openedSummary`), never the request's words: as in production, the search reads the subject, not the label.
+  const openRequests = parts.map((part, index) => ({ id: `r${index + 1}`, summary: `Demande « ${part.family ?? source.family} » relevée par l'analyse V1 du mail ${messageId}.`,
     family: part.family ?? source.family, status: part.team ? "handed_off" as const : "open" as const, openedAt: at, subject: subjectOf(part.text, at) }));
   const qualification: CaseAdmissionQualification = { identity: { status: "unknown" }, crmContext: "unknown", teamSignals: [],
     requests: openRequests.map((row, index) => ({ requestId: row.id, family: row.family,
@@ -188,7 +232,7 @@ export function synthesizeSavReplayCase(source: Extract<SavReplayCaseSource, { k
   const snapshot: CaseSnapshot = { contractRevision: SAV_CASE_CONTRACT_REVISION, caseId, ticketId: "replay-ticket", threadIds: ["replay-thread"], version: 2,
     owner: "agent", phase: "queued", sensitivity: "none", createdAt: at, updatedAt: at, body: { ...emptyCaseBody(), openRequests }, admissionInputVersion: 1,
     admission: { revision: SAV_CASE_ADMISSION_REVISION, target: "agent", reasons: [], nextStep: "none", families: [...new Set(openRequests.map(row => row.family))], sensitivity: "none",
-      policyRevision: SAV_REPLAY_POLICY_REVISION, decidedAt: at, version: 2, inputVersion: 1, qualification } };
+      policyRevision, decidedAt: at, version: 2, inputVersion: 1, qualification } };
   const events: CaseEvent[] = [{ id: "replay-e1", caseId, kind: "inbound_confirmed", dedupeKey: `inbound:${messageId}`, caseVersion: 1, direction: "customer_inbound",
     occurredAt: at, sourceRef: { type: "email", id: messageId }, detail: null, createdAt: at }];
   let customerContext = buildCaseCustomerContext({ latestMessageId: "replay-m1", messages: [{ id: "replay-m1", direction: "inbound", at, subject: source.subject, text: source.text }],
@@ -206,7 +250,7 @@ export function synthesizeSavReplayCase(source: Extract<SavReplayCaseSource, { k
  * A stored case as the agent would take it: its requests, facts, questions, trials, sensitivity and journal unchanged; only the owner and the
  * admission are those of an agent admitted under the replay policy (the requests the entry gave the team stay the team's).
  */
-export function adaptSavReplayStoredCase(source: Extract<SavReplayCaseSource, { kind: "stored" }>, now: Date): ReplayCase {
+export function adaptSavReplayStoredCase(source: Extract<SavReplayCaseSource, { kind: "stored" }>, now: Date, policyRevision: string = SAV_REPLAY_POLICY_REVISION): ReplayCase {
   const { snapshot, events } = source.stored, at = now.toISOString();
   const stored = snapshot.admission?.qualification;
   const teamParts = new Set((stored?.requests ?? []).filter(row => row.provenance.kind === "team_part").map(row => row.requestId));
@@ -215,8 +259,45 @@ export function adaptSavReplayStoredCase(source: Extract<SavReplayCaseSource, { 
       ? (stored!.requests.find(item => item.requestId === row.id)!.provenance) : { kind: "qualified_rule" as const, ruleId: "sav-replay", revision: "sav-replay", at, blockId: source.blockId } })) };
   return { events: [...events], customerTexts: { ...source.stored.customerTexts }, ...(source.stored.customerContext ? { customerContext: source.stored.customerContext } : {}),
     snapshot: { ...snapshot, owner: "agent", admission: { revision: SAV_CASE_ADMISSION_REVISION, target: "agent", reasons: [], nextStep: "none",
-      families: [...new Set(snapshot.body.openRequests.map(row => row.family))], sensitivity: snapshot.sensitivity, policyRevision: SAV_REPLAY_POLICY_REVISION, decidedAt: at,
+      families: [...new Set(snapshot.body.openRequests.map(row => row.family))], sensitivity: snapshot.sensitivity, policyRevision, decidedAt: at,
       version: snapshot.version, inputVersion: snapshot.admissionInputVersion, qualification } } };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// The block's scope (M1)
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+/** The approved scope values, exactly as production configures them: Access's datum, the other blocks' list, and the policy they are bound to. */
+export type SavReplayApprovedScopes = Readonly<{ policyRevision: string; access?: unknown; blocks?: unknown }>;
+/** What the runner's `accessScope` port answers in a replay, and where it comes from. */
+export type SavReplayBlockScope = Readonly<{ source: "approved" | "draft"; policyRevision: string; value: CaseBlockScopesBundle }>;
+export const SAV_REPLAY_DRAFT_SCOPE_REVISION = "sav-replay-draft-scope.v1";
+
+const part = (value: unknown): CaseScopePart => value === undefined || value === null ? { state: "absent" } : { state: "read", value };
+
+/**
+ * The scope the replay checks the block against, as production's configuration port gives it (a bundle: Access's datum and the block list).
+ * Approved values given: those, unchanged, bound to their own policy (the replay's admission is then decided under that policy). Otherwise the
+ * block draft as a scope, bound to the replay policy: its attribution cards at the version this mail's search returned are `answer` sources,
+ * its support cards `orient_only`; a card the search did not return is not listed (it could not be read anyway). A draft card listed twice
+ * is listed once. No card of the block retrieved: the scope is empty, hence invalid, and the runner refuses exactly as production would.
+ */
+export function savReplayBlockScope(block: SavBlockDraft, candidates: readonly SavRetrievalCandidate[], approved?: SavReplayApprovedScopes): SavReplayBlockScope {
+  if (approved) return { source: "approved", policyRevision: approved.policyRevision,
+    value: { [SAV_CASE_BLOCK_SCOPES_BUNDLE]: true, access: part(approved.access), blocks: part(approved.blocks) } };
+  const answer = new Set(block.cardIds), orient = new Set(block.supportCardIds ?? []);
+  const sources = [...new Map(candidates.filter(card => answer.has(card.id) || orient.has(card.id))
+    .map(card => [card.id, { knowledgeId: card.id, contentVersionId: card.contentVersionId, use: answer.has(card.id) ? "answer" as const : "orient_only" as const }])).values()];
+  const common = { policyRevision: SAV_REPLAY_POLICY_REVISION, revision: SAV_REPLAY_DRAFT_SCOPE_REVISION, sources };
+  const isAccess = block.blockId === "access";
+  return { source: "draft", policyRevision: SAV_REPLAY_POLICY_REVISION, value: { [SAV_CASE_BLOCK_SCOPES_BUNDLE]: true,
+    access: isAccess ? { state: "read", value: { schema: SAV_CASE_ACCESS_SCOPE_REVISION, family: "access", ...common } } : { state: "absent" },
+    blocks: isAccess ? { state: "absent" } : { state: "read", value: [{ schema: SAV_CASE_BLOCK_SCOPE_REVISION, blockId: block.blockId, family: savReplayBlockFamily(block.blockId, block.family), ...common }] } } };
+}
+
+/** The production selection's backend in a replay: the cards already retrieved for this mail, for every query (no embedding, no network). */
+function savReplayRetrievedBackend(cards: readonly SavRetrievalCandidate[]): SavRetrievalBackend {
+  return { readRevision: async () => "sav-replay-retrieved", search: async (queries, limit) => queries.map(() => cards.slice(0, limit).map(card => structuredClone(card))) };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -245,6 +326,8 @@ export type SavReplayDecisionDetail = Readonly<{
   modelCalls: number; model: string; transport: SavReplayModelTransport["kind"];
   cost: Readonly<{ calls: number; estimatedUsd: number; reservedUsd: number; actualUsd: number }>;
   budget: "ok" | "run_cap" | "mail_cap";
+  /** M1: the block scope the runner checked (`approved` or `draft`), or `not_checked` when the run was given none (then nothing here proves the block's scope). */
+  scope: "approved" | "draft" | "not_checked";
 }>;
 
 export type SavReplayDecisionRunOptions = Readonly<{
@@ -252,6 +335,8 @@ export type SavReplayDecisionRunOptions = Readonly<{
   /** The cards the replay retrieved for this mail, ranked (the knowledge port of the run: a plain list). */
   knowledge: readonly SavRetrievalCandidate[];
   blockMode: SavBlockMode; locale?: string;
+  /** M1: the block scope the runner's `accessScope` port answers (the decision port always gives one). Absent: unchecked, and said so. */
+  scope?: SavReplayBlockScope;
 }>;
 
 /** The runner's ports for a replay. Exported for the zero-effect proof: memory, constants and one injected model call, nothing else. */
@@ -262,12 +347,18 @@ export function savReplayInvestigationPorts(replay: ReplayCase, options: SavRepl
     scope: { locale: options.locale ?? "fr-FR", audience: "support" },
     pauseState: async () => "running",
     readCase: async caseId => caseId === replay.snapshot.caseId ? { snapshot: structuredClone(replay.snapshot), events: structuredClone(replay.events) } : null,
-    admissionPolicyRevision: async () => SAV_REPLAY_POLICY_REVISION,
+    admissionPolicyRevision: async () => options.scope?.policyRevision ?? SAV_REPLAY_POLICY_REVISION,
     // The admission is decided on the replayed input: a re-evaluation (a write) is never needed, and refused if ever asked.
     reevaluateAdmission: async () => { throw new Error("SAV_REPLAY_NO_WRITE"); },
     claim: async () => ({ token: "sav-replay-lease", actionsPaused: false }),
     release: async () => {},
-    knowledge: async () => [...options.knowledge],
+    // The production per-request selection (coverage, relevance, pool) over the cards already retrieved; without a scope, the plain list as before.
+    knowledge: async (snapshot, context) => options.scope
+      ? selectCaseKnowledge(snapshot, savReplayRetrievedBackend(options.knowledge), { locale: options.locale ?? "fr-FR", audience: "support", now: options.now,
+          customerWords: context?.customerWords ?? null })
+      : [...options.knowledge],
+    // M1: the same port production wires; the runner itself reads and checks it (`readCaseAccessScope`), as in production.
+    ...(options.scope ? { accessScope: async () => options.scope!.value } : {}),
     ...(replay.customerContext ? { customerContext: async () => structuredClone(replay.customerContext!) } : {}),
     customerTexts: async () => ({ ...replay.customerTexts }),
     revisions: async () => ({ rules: SAV_REPLAY_POLICY_REVISION, playbookId: "sav-replay", model: options.model.model, prompt: "production" }),
@@ -313,7 +404,8 @@ const requestAction = (validation: CaseDecisionValidation | null, requestId: str
 
 /** Runs the production decision path on one replayed case, in memory, and reads back what the agent would have done and written. */
 export async function runSavReplayDecision(source: SavReplayCaseSource, options: SavReplayDecisionRunOptions): Promise<SavReplayDecisionDetail> {
-  const replay = source.kind === "synthetic" ? synthesizeSavReplayCase(source, options.now) : adaptSavReplayStoredCase(source, options.now);
+  const policyRevision = options.scope?.policyRevision ?? SAV_REPLAY_POLICY_REVISION;
+  const replay = source.kind === "synthetic" ? synthesizeSavReplayCase(source, options.now, policyRevision) : adaptSavReplayStoredCase(source, options.now, policyRevision);
   const { ports, progress, records, spend } = savReplayInvestigationPorts(replay, options);
   const report = await runCaseInvestigation(replay.snapshot.caseId, "observe", ports);
   const record = records.at(-1) ?? null, saved = [...progress.values()].at(-1) ?? null;
@@ -355,6 +447,7 @@ export async function runSavReplayDecision(source: SavReplayCaseSource, options:
     attachments: files.map(file => ({ id: file.id, name: file.name, type: file.type, kind: file.kind, notAttached: file.notAttached, v1Reading: file.v1Reading !== null })),
     modelCalls: report.modelCalls, model: options.model.model, transport: options.model.kind,
     cost: { calls: spend.calls, estimatedUsd: spend.estimated, reservedUsd: spend.reserved, actualUsd: spend.actual }, budget: spend.budget,
+    scope: options.scope?.source ?? "not_checked",
   };
 }
 
@@ -367,7 +460,7 @@ export async function runSavReplayDecision(source: SavReplayCaseSource, options:
  * item names them), or the stored case as read. The spend meter is shared by the whole run: once its run cap refuses a call, the replay
  * stops deciding (`budget: "run_cap"`).
  */
-export function createSavReplayDecisionPort(options: Readonly<{ model: SavReplayModelTransport; meter: SavReplaySpendMeter; now: Date; locale?: string }>):
+export function createSavReplayDecisionPort(options: Readonly<{ model: SavReplayModelTransport; meter: SavReplaySpendMeter; now: Date; locale?: string; scopes?: SavReplayApprovedScopes }>):
   (input: SavReplayDecisionInput) => Promise<SavReplayDecisionOutput> {
   return async input => {
     const item = input.item;
@@ -377,8 +470,9 @@ export function createSavReplayDecisionPort(options: Readonly<{ model: SavReplay
       ? { kind: "stored", blockId: input.block.blockId, stored: input.stored }
       : { kind: "synthetic", ref: input.ref.replace(/^[a-z]+:/, ""), subject: input.subject ?? "", text: input.text, family, blockId: input.block.blockId,
           ...(input.messageId ? { messageId: input.messageId } : {}), ...(extras?.requests ? { requests: extras.requests } : {}), ...(extras?.attachments ? { attachments: extras.attachments } : {}) };
-    const detail = await runSavReplayDecision(source, { model: options.model, meter: options.meter, now: options.now, mailRef: input.ref, knowledge: input.candidates ?? [],
-      blockMode: input.block.mode, ...(options.locale ? { locale: options.locale } : {}) });
+    const knowledge = input.candidates ?? [];
+    const detail = await runSavReplayDecision(source, { model: options.model, meter: options.meter, now: options.now, mailRef: input.ref, knowledge,
+      blockMode: input.block.mode, ...(options.locale ? { locale: options.locale } : {}), scope: savReplayBlockScope(input.block, knowledge, options.scopes) });
     return { action: detail.action, reply: detail.reply?.text ?? null, refusals: [...new Set(detail.refusals.flatMap(row => row.codes))], costUsd: detail.cost.actualUsd,
       estimatedUsd: detail.cost.estimatedUsd, budget: detail.budget, detail };
   };

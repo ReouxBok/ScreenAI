@@ -7,8 +7,8 @@ import { SAV_REPLY_NOTICE } from "../reply-format";
 import type { SavBlockDraft } from "./block-attribution";
 import type { SavReplayItem } from "./block-replay";
 import {
-  createSavReplaySpendMeter, createSavReplayStubModel, runSavReplayDecision, savReplayInvestigationPorts, synthesizeSavReplayCase, SAV_REPLAY_STUB_MODEL,
-  type SavReplayModelTransport,
+  createSavReplaySpendMeter, createSavReplayStubModel, runSavReplayDecision, savReplayBlockScope, savReplayInvestigationPorts, synthesizeSavReplayCase, SAV_REPLAY_EMBEDDING_ESTIMATE_USD_PER_QUERY,
+  SAV_REPLAY_POLICY_REVISION, SAV_REPLAY_STUB_MODEL, type SavReplayModelTransport,
 } from "./replay-decision";
 import { createSavReplayLiveModel } from "./replay-decision-live";
 import { runSavBlockReplayWithDecision } from "./replay-run";
@@ -265,5 +265,77 @@ describe("phase 1b replay: the live transport (fake network only)", () => {
   it("is not built without an approved spend policy (no guessed price)", () => {
     expect(() => createSavReplayLiveModel({ env: { ...env, SAV_V2_SPEND_POLICY_JSON: undefined } })).toThrow("SAV_REPLAY_LIVE_V2_SPEND_POLICY_ABSENT");
     expect(() => createSavReplayLiveModel({ env: { ...env, SAV_V2_MODEL: "other-model" } })).toThrow("SAV_V2_TRANSPORT_POLICY_INVALID");
+  });
+});
+
+describe("review batch 3 (M1): the replay checks the block's scope through the production runner, as production does", () => {
+  const other = candidate("card-other", "Paramètres du profil", 0.83, ["Ouvrez les paramètres du profil."]);
+  const access = blocks[0]!;
+  const stepOf = (card: SavRetrievalCandidate) => (card.resolution as { steps: string[] }).steps[0]!;
+  const answerWith = (card: SavRetrievalCandidate) => ({ caseVersion: 2, understanding: { requests: [{ id: "r1", summary: "Connexion", family: "access", status: "open" }], newFacts: [] },
+    nextAction: { kind: "answer", requestIds: ["r1"], steps: [{ text: stepOf(card), knowledge: { knowledgeId: card.id, contentVersionId: card.contentVersionId }, newFactIds: [] }], expectedResult: "Connexion rétablie." },
+    reply: { text: `Bonjour,\n\n1. ${stepOf(card)}\n\nLien de connexion : ${SAV_CASE_ACCESS_URL}`, citations: [{ knowledgeId: card.id, contentVersionId: card.contentVersionId }], impossibilityClaims: [], accountAdvice: "none" } });
+  const source = { kind: "synthetic" as const, ref: "m1", subject: "Connexion", text: login, family: "access" as const, blockId: "access" };
+  const decide = (card: SavRetrievalCandidate, scope?: ReturnType<typeof savReplayBlockScope>) => runSavReplayDecision(source, { model: createSavReplayStubModel({ outputs: [answerWith(card), answerWith(card), answerWith(card)] }),
+    meter: createSavReplaySpendMeter(), now, mailRef: "m1", knowledge: [other, CARDS.login], blockMode: "automatic", ...(scope ? { scope } : {}) });
+
+  it("a reply citing a retrieved card OUTSIDE the block's scope: accepted without the scope (the gap of the review), refused with it, like production", async () => {
+    const unchecked = await decide(other);
+    expect(unchecked).toMatchObject({ outcome: "accepted", action: "answer", scope: "not_checked" });
+    const checked = await decide(other, savReplayBlockScope(access, [other, CARDS.login]));
+    expect(checked).toMatchObject({ outcome: "needs_review", action: "team", reply: null, scope: "draft" });
+    expect(checked.refusals[0]!.codes).toEqual(expect.arrayContaining(["access_source_out_of_scope"]));
+    // The block's own card at its retrieved version passes the same check.
+    expect(await decide(CARDS.login, savReplayBlockScope(access, [other, CARDS.login]))).toMatchObject({ outcome: "accepted", action: "answer", scope: "draft" });
+  });
+
+  it("the draft scope lists the block's retrieved cards (answer) and support cards (orient_only) only, and the runner reads it through the production port", async () => {
+    const scope = savReplayBlockScope({ ...access, supportCardIds: ["card-other"] }, [other, CARDS.login, CARDS.phone]);
+    expect(scope).toMatchObject({ source: "draft", policyRevision: SAV_REPLAY_POLICY_REVISION, value: { access: { state: "read", value: { family: "access",
+      sources: [{ knowledgeId: "card-other", use: "orient_only" }, { knowledgeId: "card-login", contentVersionId: "card-login-v1", use: "answer" }] } }, blocks: { state: "absent" } } });
+    // Orient only: may orient, never support an answer.
+    const oriented = await decide(other, scope);
+    expect(oriented.refusals[0]!.codes).toEqual(expect.arrayContaining(["access_source_orient_only"]));
+    const replay = synthesizeSavReplayCase(source, now);
+    const wired = savReplayInvestigationPorts(replay, { model: createSavReplayStubModel(), meter: createSavReplaySpendMeter(), now, mailRef: "m1", knowledge: [CARDS.login], blockMode: "automatic", scope });
+    expect(Object.keys(wired.ports)).toContain("accessScope");
+  });
+
+  it("an approved scope is checked under its own policy; another block's family or another policy is refused before any call, as production would", async () => {
+    const approved = { policyRevision: "policy-syn-r1", access: { schema: "sav-case-access-scope-2026-11-03.v1", policyRevision: "policy-syn-r1", revision: "scope-syn-r1", family: "access",
+      sources: [{ knowledgeId: "card-login", contentVersionId: "card-login-v1", use: "answer" }] } };
+    expect(await decide(CARDS.login, savReplayBlockScope(access, [], approved))).toMatchObject({ outcome: "accepted", scope: "approved" });
+    const stale = await decide(CARDS.login, savReplayBlockScope(access, [], { ...approved, policyRevision: "policy-syn-r2" }));
+    expect(stale).toMatchObject({ runner: "skipped", action: "team", team: { reason: "gate:access_scope_missing:scope_policy_mismatch" }, modelCalls: 0 });
+    // A non-Access block whose draft names a family its scope cannot carry: refused (`scope_invalid`), never decided.
+    const phone = await runSavReplayDecision({ kind: "synthetic", ref: "t1", subject: "", text: "Mon agent téléphonique est muet", family: "other", blockId: "telephony" },
+      { model: createSavReplayStubModel(), meter: createSavReplaySpendMeter(), now, mailRef: "t1", knowledge: [CARDS.phone], blockMode: "shadow",
+        scope: savReplayBlockScope({ ...blocks[1]!, family: "other" }, [CARDS.phone]) });
+    expect(phone).toMatchObject({ runner: "skipped", team: { reason: "gate:block_scope_missing:telephony:scope_invalid" }, modelCalls: 0 });
+  });
+
+  it("the replay run always checks a scope and says which one in the summary", async () => {
+    const { report, summary } = await run([{ kind: "phrase", text: login }]);
+    const decision = report.items[0]!.decision;
+    expect(decision.status === "done" && decision.detail!.scope).toBe("draft");
+    expect(summary).toContain("Périmètre du bloc : vérifié par le chemin de production (brouillon du bloc");
+    expect(summary).not.toContain("non vérifié");
+  });
+});
+
+describe("review batch 3 (B3): the knowledge search's embeddings are counted in the replay's budget", () => {
+  it("each search call is charged at its estimate before it is sent; past the run cap the search is not sent", async () => {
+    const { spend, summary } = await run([{ kind: "phrase", id: "a", text: login }, { kind: "phrase", id: "b", text: "Je veux être remboursé de ma facture" }]);
+    expect(spend).toMatchObject({ embeddingCalls: 2, embeddingQueries: 2, embeddingRefused: 0 });
+    expect(spend.embeddingEstimatedUsd).toBeCloseTo(2 * SAV_REPLAY_EMBEDDING_ESTIMATE_USD_PER_QUERY, 6);
+    expect(spend.committedUsd).toBeCloseTo(2 * SAV_REPLAY_EMBEDDING_ESTIMATE_USD_PER_QUERY, 6);
+    expect(summary).toContain("Recherche de fiches : 2 appel(s) d'embedding (2 requête(s))");
+    const search = fakeSearch(), sent = vi.fn(search.search);
+    const capped = await runSavBlockReplayWithDecision({ blockId: "access", blocks, now, items: [{ kind: "phrase", id: "a", text: login }, { kind: "phrase", id: "b", text: login }],
+      ports: { search: { ...search, search: sent } }, budget: { runUsd: SAV_REPLAY_EMBEDDING_ESTIMATE_USD_PER_QUERY, mailUsd: SAV_REPLAY_EMBEDDING_ESTIMATE_USD_PER_QUERY } });
+    // The first search fits the cap exactly; every later one is refused before it is sent (its two attempts), never paid.
+    expect(sent).toHaveBeenCalledTimes(1);
+    expect(capped.report.items.map(item => item.status)).toEqual(["ok", "search_unavailable"]);
+    expect(capped.spend).toMatchObject({ embeddingCalls: 1, embeddingRefused: 2 });
   });
 });

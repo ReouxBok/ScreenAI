@@ -7,6 +7,14 @@ import type { SavReplaySpendTotals } from "./replay-decision";
  */
 
 const usd = (value: number) => `${value.toFixed(4)} USD`;
+const SCOPE_LABELS: Record<string, string> = { approved: "périmètre approuvé (valeurs de production fournies)", draft: "brouillon du bloc converti en périmètre (ses fiches à la version retrouvée)" };
+/** M1: which block scope the decisions were checked against; a decision without one is said NOT checked, never hidden. */
+function scopeLine(scopes: readonly string[]): string {
+  if (!scopes.length) return "aucune décision calculée.";
+  const unchecked = scopes.filter(scope => scope === "not_checked").length;
+  const kinds = [...new Set(scopes.filter(scope => scope !== "not_checked"))].map(scope => SCOPE_LABELS[scope] ?? scope);
+  return `${kinds.length ? `vérifié par le chemin de production (${kinds.join(" ; ")})` : ""}${unchecked ? `${kinds.length ? " ; " : ""}**non vérifié pour ${unchecked} décision(s)** : ne pas s'en servir pour activer le bloc` : ""}.`;
+}
 const cut = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
 
 export function savReplayMarkdownSummary(report: SavReplayReport, context: Readonly<{ blockId: string; model: string; transport: "stub" | "live"; spend: SavReplaySpendTotals; replies?: number }>): string {
@@ -25,6 +33,8 @@ export function savReplayMarkdownSummary(report: SavReplayReport, context: Reado
     `- Décisions calculées : ${done.length} ; réponses : ${count(detail => detail.action === "answer")} ; questions : ${count(detail => detail.action === "ask")} ; équipe : ${count(detail => detail.action === "team" || detail.action === "handoff")} ; sans réponse : ${count(detail => detail.reply === null && detail.action !== "team" && detail.action !== "handoff")}.`,
     `- Refus du validateur : ${refusals.size ? [...refusals].map(([code, value]) => `${code} (${value})`).join(", ") : "aucun"}.`,
     `- Coût : estimé ${usd(report.totals.decisionEstimatedUsd)}, réel ${usd(context.spend.actualUsd)}, plafond ${usd(context.spend.runCapUsd)} par rejeu et ${usd(context.spend.mailCapUsd)} par mail ; appels refusés par le plafond : ${context.spend.refused}.`,
+    `- Recherche de fiches : ${context.spend.embeddingCalls} appel(s) d'embedding (${context.spend.embeddingQueries} requête(s)), estimé ${usd(context.spend.embeddingEstimatedUsd)}, compté dans le plafond${context.spend.embeddingRefused ? ` ; ${context.spend.embeddingRefused} refusé(s) par le plafond` : ""}.`,
+    `- Périmètre du bloc : ${scopeLine(done.map(row => row.detail.scope))}`,
     ...(report.totals.budgetStopped ? ["- **Plafond atteint : le rejeu a cessé de décider.** Les éléments suivants sont marqués « skipped_budget »."] : []),
     "",
     "## Réponses que l'agent aurait envoyées",

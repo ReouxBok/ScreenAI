@@ -1,6 +1,9 @@
 import { runSavBlockReplay, SAV_REPLAY_LIMITS, type SavReplayItem, type SavReplayPorts, type SavReplayReport } from "./block-replay";
 import type { SavBlockAttributionThresholds, SavBlockDraft } from "./block-attribution";
-import { createSavReplayDecisionPort, createSavReplaySpendMeter, createSavReplayStubModel, type SavReplayModelTransport, type SavReplaySpendTotals } from "./replay-decision";
+import {
+  createSavReplayDecisionPort, createSavReplaySpendMeter, createSavReplayStubModel, meteredSavReplaySearch, type SavReplayApprovedScopes, type SavReplayModelTransport,
+  type SavReplaySpendTotals,
+} from "./replay-decision";
 import { savReplayMarkdownSummary } from "./replay-summary";
 
 /*
@@ -19,6 +22,8 @@ export type SavBlockReplayRunInput = Readonly<{
   /** Per-run cap (default 2 USD, at most 10 USD) and per-mail cap (default 0.5 USD, at most the run cap). */
   budget?: Readonly<{ runUsd?: number; mailUsd?: number }>;
   locale?: string; thresholds?: SavBlockAttributionThresholds;
+  /** M1: the approved scope values (production's), checked by the runner; absent: the block draft converted to a scope (`savReplayBlockScope`). */
+  scopes?: SavReplayApprovedScopes;
 }>;
 export type SavBlockReplayRunResult = Readonly<{ report: SavReplayReport; summary: string; spend: SavReplaySpendTotals; model: string; transport: "stub" | "live" }>;
 
@@ -26,12 +31,13 @@ export async function runSavBlockReplayWithDecision(input: SavBlockReplayRunInpu
   if (!input.blocks.some(block => block.blockId === input.blockId)) throw new Error("SAV_REPLAY_BLOCK_UNKNOWN");
   const meter = createSavReplaySpendMeter({ ...(input.budget?.runUsd !== undefined ? { runCapUsd: input.budget.runUsd } : {}), ...(input.budget?.mailUsd !== undefined ? { mailCapUsd: input.budget.mailUsd } : {}) });
   const model = input.model ?? createSavReplayStubModel();
-  const decide = createSavReplayDecisionPort({ model, meter, now: input.now, ...(input.locale ? { locale: input.locale } : {}) });
+  const decide = createSavReplayDecisionPort({ model, meter, now: input.now, ...(input.locale ? { locale: input.locale } : {}), ...(input.scopes ? { scopes: input.scopes } : {}) });
   const report = await runSavBlockReplay(input.items, {
     blocks: input.blocks, now: input.now, ...(input.locale ? { locale: input.locale } : {}), ...(input.thresholds ? { thresholds: input.thresholds } : {}),
     // The meter is the authority on money; the replay's own bound only caps the number of decided mails.
     decision: { enabled: true, blockId: input.blockId, maxCalls: SAV_REPLAY_LIMITS.decisionMaxCalls, maxCostUsd: meter.runCapUsd },
-  }, { ...input.ports, decide });
+    // B3: every search call's query embeddings are charged to the same meter (estimated) before it is sent.
+  }, { ...input.ports, search: meteredSavReplaySearch(input.ports.search, meter), decide });
   const spend = meter.totals();
   return { report, spend, model: model.model, transport: model.kind, summary: savReplayMarkdownSummary(report, { blockId: input.blockId, model: model.model, transport: model.kind, spend }) };
 }
