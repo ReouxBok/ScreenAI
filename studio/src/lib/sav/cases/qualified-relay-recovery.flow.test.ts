@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, like } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { auditLogs, savIntakeEffects, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeHumanEvents, savIntakeRuns, savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
+import { auditLogs, savCases, savIntakeEffects, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeHumanEvents, savIntakeRuns, savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
 // V1's model path must never be reached by the relay or its catch-up.
@@ -435,5 +435,56 @@ describe("manual qualification renewal on an already agent-owned case", () => {
     onOwnerRead = async () => { await setPause("v2", "fully_paused"); };
     expect(await manualQualificationPorts(next).relay(w.messageId)).not.toMatchObject({ owner: "agent" });
     expect(await bindings()).toHaveLength(1);
+  });
+});
+
+describe("multi-thread (15/11): the real test shape, a tester's new mail in a NEW thread that V1 attached to the ticket it created", () => {
+  /** Thread B: a new mail of the tester (another subject) V1 linked to the existing ticket, plus the team's outbound answer; gathered in the case. */
+  async function secondThread(caseId: string, threadA: string, from = SENDER) {
+    const threadId = randomUUID();
+    await f.db.insert(savThreads).values({ id: threadId, mailboxId, gmailThreadId: `thread-${threadId}`, subject: "Je n'arrive pas à me connecter", customerEmail: SENDER });
+    for (const [i, m] of [{ direction: "inbound" as const, from }, { direction: "outbound" as const, from: "support@example.invalid" }].entries())
+      await f.db.insert(savMessages).values({ id: randomUUID(), threadId, mailboxId, direction: m.direction, fromEmail: m.from, toEmails: ["support@example.invalid"],
+        subject: "Je n'arrive pas à me connecter", bodyCiphertext: encryptSavPayload({ text: BODY, attachments: [], headers: {} }), receivedAt: new Date(windowStart + i * 60_000), gmailMessageId: `gm-${randomUUID()}` });
+    await f.db.update(savCases).set({ threadIds: [threadA, threadId] }).where(eq(savCases.id, caseId));
+    return threadId;
+  }
+  /** The real operator route (preview, then run) on a message; the continuation double only reports whether the scope lets the case through. */
+  const runOn = async (e: Record<string, string | undefined>, messageId: string) => {
+    const ports = manualQualificationPorts(e);
+    ports.continue = vi.fn(async (caseId: string) => ({ status: (await savV2QualificationCaseAllowed(e, caseId)).allowed ? "qualified_no_model_fixture" : "qualification_out_of_scope" }));
+    const preview = await manualQualification({ operation: "preview", messageId }, e, ports);
+    if (preview.status !== "ready") return preview;
+    return manualQualification({ operation: "run", messageId, expected: preview.expected }, e, ports);
+  };
+
+  it("agent-owned case, new revision on thread A's exact subject: the operator run on the creating mail binds A, thread B is a tester thread, the case continues", async () => {
+    const w = await waitingCase(); owners.set(w.ticketId, V2_OWNER);
+    await recordCaseAfterConfirmedIntake(w.messageId, deps(env()));
+    expect((await readCaseByTicket(w.ticketId))?.owner).toBe("agent");
+    await secondThread(w.caseId, w.threadId);
+    const next = { ...env(), SAV_V2_INVESTIGATION: "observe" };
+    expect(await savV2QualificationCaseAllowed(next, w.caseId)).toEqual({ allowed: false, reason: "qualification_thread_unbound" });
+    vi.stubGlobal("fetch", network);
+    expect(await runOn(next, w.messageId)).toMatchObject({ status: "attempted", caseId: w.caseId, outcome: "qualified_no_model_fixture" });
+    expect(await savV2QualificationCaseAllowed(next, w.caseId)).toEqual({ allowed: true });
+    expect(requests.every(r => r.method === "GET")).toBe(true);
+  });
+  it("case still waiting for the V2 owner (attribution pending): the same operator run attributes AND binds; thread B is accepted", async () => {
+    const w = await waitingCase();
+    await secondThread(w.caseId, w.threadId);
+    owners.set(w.ticketId, V2_OWNER); vi.stubGlobal("fetch", network);
+    const next = { ...env(), SAV_V2_INVESTIGATION: "observe" };
+    expect(await runOn(next, w.messageId)).toMatchObject({ status: "attempted", caseId: w.caseId, outcome: "qualified_no_model_fixture" });
+    expect(await readCaseByTicket(w.ticketId)).toMatchObject({ owner: "agent" });
+  });
+  it("thread B written by another address: the case stays out of scope and is never continued", async () => {
+    const w = await waitingCase(); owners.set(w.ticketId, V2_OWNER);
+    await recordCaseAfterConfirmedIntake(w.messageId, deps(env()));
+    await secondThread(w.caseId, w.threadId, "colleague@example.invalid");
+    const next = { ...env(), SAV_V2_INVESTIGATION: "observe" };
+    vi.stubGlobal("fetch", network);
+    expect(await runOn(next, w.messageId)).toMatchObject({ status: "refused", code: "relay_not_agent" });
+    expect(await savV2QualificationCaseAllowed(next, w.caseId)).toEqual({ allowed: false, reason: "qualification_foreign_thread" });
   });
 });

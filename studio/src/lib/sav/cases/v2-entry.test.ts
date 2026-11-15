@@ -16,6 +16,7 @@ import { caseDedupeKey } from "./case-types";
 import { recordCaseAfterConfirmedIntake, sweepCaseRelays } from "./intake-boundary";
 import { scheduleJ2ForConfirmedQuestion } from "./timer-store";
 import { continueCaseAfterCommit, customerReturnGate, sweepCaseContinuations, v2EntryRelayDeps } from "./v2-entry";
+import { SAV_V2_QUALIFICATION_SCOPE_SCHEMA, savV2QualificationScopeHash } from "./qualification-scope";
 
 // The real entry of V1's runtime on the real stores (PGlite). Only the network is a double: every mail, ticket, owner and policy is SYNTHETIC, nothing is called for real.
 let f: Awaited<ReturnType<typeof createSavTestDb>>, policyId: string, ticketSeq = 8_600_000;
@@ -473,5 +474,51 @@ describe("SAV-18 : un dossier retenu par son bloc (arrêt ou pause) attend de fa
       expect(woken.filter(seen => seen === id)).toHaveLength(1);
       expect(await readCaseBlockHold(id)).toBeNull();
     }
+  });
+});
+
+describe("qualification scope (15/11) : la reprise n'est plus affamée par des dossiers hors périmètre, et chaque saut est visible sans donnée personnelle", () => {
+  const OLD = new Date("2000-01-01T00:00:00.000Z");
+  const scoped = () => {
+    const scope = { schema: SAV_V2_QUALIFICATION_SCOPE_SCHEMA as typeof SAV_V2_QUALIFICATION_SCOPE_SCHEMA, revision: `q-syn-entry-${randomUUID().slice(0, 8)}`, senderEmail: "client.fictif@example.invalid", hubspotContactId: "100000777",
+      initialSubject: "Connexion fictive", notBefore: new Date(Date.now() - 3600_000).toISOString(), expiresAt: new Date(Date.now() + 3600_000).toISOString() };
+    return { scope, env: { ...ON, SAV_V2_SCOPE_MODE: "qualification", SAV_V2_QUALIFICATION_SCOPE_JSON: JSON.stringify(scope) } };
+  };
+  const bind = async (scope: ReturnType<typeof scoped>["scope"], threadId: string) => f.db.insert(savSyncState).values({ key: `sav-v2-qualification-thread.v1:${scope.revision}`, status: "bound",
+    cursor: JSON.stringify({ threadId, messageId: randomUUID(), configHash: savV2QualificationScopeHash(scope), boundAt: new Date().toISOString() }) });
+  /** An agent case, queued after a crash between its commit and its continuation (no failure mark), dated so that the oldest come first. */
+  const queuedCase = async (offsetMs: number) => {
+    const w = await waitingWithReturn();
+    await customerReturnGate(w.run.id, entry({ continuation: async () => { throw Error("SAV_SYN_CRASH"); } }));
+    await f.db.delete(auditLogs).where(and(eq(auditLogs.entityId, w.caseId), eq(auditLogs.action, "sav_v2_continuation_failed")));
+    await f.db.update(savCases).set({ updatedAt: new Date(OLD.getTime() + offsetMs) }).where(eq(savCases.id, w.caseId));
+    return w;
+  };
+  let infos: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => { infos = vi.spyOn(console, "info").mockImplementation(() => {}); });
+  afterEach(() => { infos.mockRestore(); });
+
+  it("4 dossiers hors périmètre plus anciens + 1 dans le périmètre : le dossier du testeur est repris dès la première passe, les autres ne prennent aucune place", async () => {
+    const { scope, env } = scoped();
+    const outside: string[] = [];
+    for (let i = 0; i < 4; i++) outside.push((await queuedCase(30_000 + i * 1000)).caseId);
+    const tester = await queuedCase(40_000);
+    await bind(scope, tester.threadId);
+    const woken: string[] = [];
+    const outcome = await sweepCaseContinuations({ ...entry({ continuation: async ({ caseId }: { caseId: string }) => { woken.push(caseId); return { status: "started" }; } }), env });
+    expect(woken).toContain(tester.caseId);
+    expect(woken.filter(id => outside.includes(id))).toEqual([]);
+    expect(outcome).toMatchObject({ outOfScope: expect.any(Number) });
+    expect((outcome as { outOfScope: number }).outOfScope).toBeGreaterThanOrEqual(4);
+  });
+  it("un dossier hors périmètre : `sav_v2_continuation_skipped` avec seulement l'id du dossier et un code fermé ; `investigation_off` aussi", async () => {
+    const { env } = scoped();
+    const w = await queuedCase(50_000);
+    expect(await continueCaseAfterCommit(w.caseId, "sweep", entry({ env, continuation: async () => ({ status: "started" }) }))).toEqual({ status: "qualification_out_of_scope" });
+    expect(infos).toHaveBeenCalledWith("sav_v2_continuation_skipped", { caseId: w.caseId, reason: "qualification_thread_unbound" });
+    expect(await continueCaseAfterCommit(w.caseId, "sweep", { env: ON })).toEqual({ status: "investigation_off" });
+    expect(infos).toHaveBeenCalledWith("sav_v2_continuation_skipped", { caseId: w.caseId, reason: "investigation_off" });
+    const logged = JSON.stringify(infos.mock.calls.filter((call: unknown[]) => call[0] === "sav_v2_continuation_skipped"));
+    expect(logged).not.toMatch(/@|fictive|fictif|Connexion/i);
   });
 });

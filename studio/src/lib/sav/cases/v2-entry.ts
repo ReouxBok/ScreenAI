@@ -326,7 +326,11 @@ export async function continueCaseAfterCommit(caseId: string, trigger: CaseConti
   let code: string;
   // SAV-80: no investigation, retrieval or model cost for a case outside the qualification scope or after it expired. Not a failure: nothing is marked.
   const scoped = await savV2QualificationCaseAllowed(input.env, caseId).catch(() => ({ allowed: false as const, reason: "qualification_unreadable" }));
-  if (!scoped.allowed) return { status: "qualification_out_of_scope" };
+  if (!scoped.allowed) {
+    // Visible, ids and closed codes only (never an address, subject or text): why a case the agent holds was not continued.
+    console.info("sav_v2_continuation_skipped", { caseId, reason: scoped.reason });
+    return { status: "qualification_out_of_scope" };
+  }
   try {
     const point = input.continuation === undefined ? await loadCaseContinuationPoint() : input.continuation;
     if (point) {
@@ -343,6 +347,8 @@ export async function continueCaseAfterCommit(caseId: string, trigger: CaseConti
   return { status: "failed", code };
 }
 
+/** How many queued cases the sweep reads the qualification scope of, at most, to fill its slots. */
+const SCOPE_SCAN = 50;
 /** Durable catch-up after a crash between a commit and its trigger, or a failed trigger: the cases the agent holds that are still queued, bounded. A pause stops it.
  * Never tried or not failing first, then the failure tried longest ago: a case that keeps failing cannot hold a slot against the others. */
 export async function sweepCaseContinuations(input: EntryDeps & { limit?: number }) {
@@ -357,8 +363,18 @@ export async function sweepCaseContinuations(input: EntryDeps & { limit?: number
     .where(and(eq(auditLogs.entityType, FAILURE_MARK.entityType), eq(auditLogs.action, FAILURE_MARK.action), inArray(auditLogs.entityId, candidates.map(row => row.id)))) : [];
   const failedAt = new Map(marks.map(mark => [mark.id, Date.parse(String((mark.meta as { lastAt?: unknown } | null)?.lastAt)) || 0]));
   // Stable sort: untouched cases keep their oldest-first order.
-  const queued = candidates.filter(row => !held.has(row.id)).sort((a, b) => (failedAt.get(a.id) ?? -1) - (failedAt.get(b.id) ?? -1)).slice(0, limit);
-  const outcome = { tried: 0, failed: {} as Record<string, number> };
+  const ordered = candidates.filter(row => !held.has(row.id)).sort((a, b) => (failedAt.get(a.id) ?? -1) - (failedAt.get(b.id) ?? -1));
+  // SAV-80: a case outside the qualification scope is never updated by its continuation, so it would keep the oldest slots forever and starve newer
+  // cases. The scope is read first (no database in the open mode or for a closed scope), over a bounded window, and only allowed cases take a slot.
+  const queued: { id: string }[] = [];
+  let outOfScope = 0;
+  for (const row of ordered.slice(0, SCOPE_SCAN)) {
+    if (queued.length >= limit) break;
+    const scoped = await savV2QualificationCaseAllowed(input.env, row.id).catch(() => ({ allowed: false as const, reason: "qualification_unreadable" }));
+    if (scoped.allowed) queued.push(row); else outOfScope++;
+  }
+  if (outOfScope) console.info("sav_v2_continuation_sweep_out_of_scope", { count: outOfScope });
+  const outcome = { tried: 0, failed: {} as Record<string, number>, ...(outOfScope ? { outOfScope } : {}) };
   for (const { id } of queued) {
     outcome.tried++;
     const result = await continueCaseAfterCommit(id, "sweep", input);

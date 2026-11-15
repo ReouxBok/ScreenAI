@@ -1,6 +1,6 @@
 import "server-only";
 import { createHash } from "node:crypto";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import { savCases, savMessages, savSyncState } from "@/db/schema";
@@ -15,6 +15,12 @@ import { savCases, savMessages, savSyncState } from "@/db/schema";
  * the hash of the exact configuration: any change of contact, sender, subject or window under the same revision refuses, it never
  * reinterprets an older thread. No value lives in code: root sets the configuration. SAV-81: a mail V1 already confirmed on the ticket it
  * created can bind through the relay too, only with the same checks, V1's proofs and a fresh V2 owner reading (see `v2EntryRelayDeps`).
+ * Multi-thread (15/11): a real customer often writes a NEW mail outside the first thread, and V1 attaches it to the same ticket, so the case
+ * gathers 2+ threads. The binding is unchanged (the exact initial subject still selects only the FIRST thread), but a case is allowed when the
+ * bound thread is among its threads AND every other thread is a « tester thread »: at least one inbound message, EVERY inbound message from
+ * exactly the scope's sender (outbound messages are fine), and its first message received inside [notBefore, expiresAt). Its subject may be
+ * anything. A message is allowed on the bound thread, or on a tester thread that shares a case with the bound thread, always inbound from the
+ * exact sender. Anything else is refused with a closed reason (`qualification_foreign_thread`, `qualification_thread_outside_window`, ...).
  */
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -137,7 +143,7 @@ async function checkOrBind(env: Env, input: Readonly<{ messageId: string; primar
   return bound.threadId === admissible.threadId ? ALLOWED : refuse("qualification_other_thread_bound");
 }
 
-/** A stored message V2 would act on (a relay attribution, a customer return): it must be on the bound thread and from the exact sender. */
+/** A stored message V2 would act on (a relay attribution, a customer return): inbound from the exact sender, on the bound thread or a tester thread of the test case. */
 export async function savV2QualificationMessageAllowed(env: Env, messageId: string, now: Date = new Date(), given?: Db): Promise<SavV2ScopeDecision> {
   const read = readSavV2QualificationScope(env, now);
   if (read.mode === "open") return ALLOWED;
@@ -150,12 +156,27 @@ export async function savV2QualificationMessageAllowed(env: Env, messageId: stri
   if (bound.configHash !== read.configHash) return refuse("qualification_scope_changed");
   const [message] = await db.select({ threadId: savMessages.threadId, direction: savMessages.direction, fromEmail: savMessages.fromEmail }).from(savMessages).where(eq(savMessages.id, messageId));
   if (!message) return refuse("qualification_message_missing");
-  if (message.threadId !== bound.threadId) return refuse("qualification_other_thread");
   if (message.direction !== "inbound" || message.fromEmail !== read.scope.senderEmail) return refuse("qualification_sender_mismatch");
+  if (message.threadId === bound.threadId) return ALLOWED;
+  // Another thread: only a tester thread already gathered with the bound thread in one case (V1 attached the tester's new mail to the test ticket).
+  const [shared] = await db.select({ id: savCases.id }).from(savCases)
+    .where(and(sql`${bound.threadId}::uuid = any(${savCases.threadIds})`, sql`${message.threadId}::uuid = any(${savCases.threadIds})`)).limit(1);
+  if (!shared) return refuse("qualification_other_thread");
+  return testerThread(db, read.scope, message.threadId);
+}
+
+/** A thread other than the bound one, gathered in the test case: every inbound message from the exact sender (at least one), first message inside the window. */
+async function testerThread(db: Db, scope: SavV2QualificationScope, threadId: string): Promise<SavV2ScopeDecision> {
+  const rows = await db.select({ direction: savMessages.direction, fromEmail: savMessages.fromEmail, receivedAt: savMessages.receivedAt }).from(savMessages)
+    .where(eq(savMessages.threadId, threadId)).orderBy(asc(savMessages.receivedAt), asc(savMessages.createdAt), asc(savMessages.id));
+  const inbound = rows.filter(row => row.direction === "inbound");
+  if (!inbound.length || inbound.some(row => row.fromEmail !== scope.senderEmail)) return refuse("qualification_foreign_thread");
+  const at = rows[0]!.receivedAt.getTime();
+  if (at < Date.parse(scope.notBefore) || at >= Date.parse(scope.expiresAt)) return refuse("qualification_thread_outside_window");
   return ALLOWED;
 }
 
-/** A case V2 would investigate or act for: its threads must be exactly the bound thread, nothing more. */
+/** A case V2 would investigate or act for: the bound thread among its threads, every other one a tester thread. */
 export async function savV2QualificationCaseAllowed(env: Env, caseId: string, now: Date = new Date(), given?: Db): Promise<SavV2ScopeDecision> {
   const read = readSavV2QualificationScope(env, now);
   if (read.mode === "open") return ALLOWED;
@@ -168,5 +189,11 @@ export async function savV2QualificationCaseAllowed(env: Env, caseId: string, no
   if (bound.configHash !== read.configHash) return refuse("qualification_scope_changed");
   const [row] = await db.select({ threadIds: savCases.threadIds }).from(savCases).where(and(eq(savCases.id, caseId)));
   if (!row) return refuse("qualification_case_missing");
-  return row.threadIds.length === 1 && row.threadIds[0] === bound.threadId ? ALLOWED : refuse("qualification_other_thread");
+  if (!row.threadIds.includes(bound.threadId)) return refuse("qualification_other_thread");
+  for (const threadId of new Set(row.threadIds)) {
+    if (threadId === bound.threadId) continue;
+    const tester = await testerThread(db, read.scope, threadId);
+    if (!tester.allowed) return tester;
+  }
+  return ALLOWED;
 }
