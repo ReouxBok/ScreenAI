@@ -16,6 +16,7 @@ import { latestInvestigationInput } from "./investigation-runner";
 import { parseIncidentContext, revalidateIncidentContext } from "./investigation-incidents";
 import type { IncidentReader } from "./investigation-incidents-contract";
 import { unprovenFixClaim } from "@/lib/knowledge/temporary-incident-schema";
+import { CASE_REPLY_STUDIO_CORRECTION_BASIS } from "./case-reply-validation";
 
 export const SAV_PILOT_PROVENANCE_REVISION = "sav-pilot-provenance-2026-11-04.v1";
 export const SAV_PILOT_PROVENANCE_REASONS = [
@@ -47,7 +48,10 @@ const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]
 // The substance is what is compared: the decided text under either mention. WHICH mention may be sent is the persisted authorization basis' business (`case-reply-mode.ts`).
 const sameFinalText = (decided: string, proposed: string, purpose: CaseReplyProposal["purpose"]) => (["fr", "en"] as const).some(language => (["manual_reviewed", "automated"] as const).some(mode => prepareCaseReplyText(decided, language, mode, purpose) === proposed));
 
-export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal, "caseId" | "triggerEventId" | "purpose" | "text">, deps: PilotProvenanceDeps): Promise<PilotProvenance> {
+export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal, "caseId" | "triggerEventId" | "purpose" | "text">, deps: PilotProvenanceDeps,
+  /** SAV-92: a text an administrator corrected in the Studio (persisted correction basis only). It skips the text comparison, nothing else: the latest decision,
+   * its trigger and purpose, the scope, every source and every incident are still proven, and the incident claims are read on the corrected text too. */
+  options: Readonly<{ humanCorrection?: boolean }> = {}): Promise<PilotProvenance> {
   const policyRevision = await deps.currentPolicyRevision();
   const events = await listCaseEvents(proposal.caseId), inputKey = latestInvestigationInput(events);
   const read = inputKey ? readCaseInvestigationProgress(events, inputKey) : null;
@@ -64,14 +68,14 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
   if (!draft.reply) return unproven("reply_not_from_decision");
   // A decision about an older input does not answer the latest one; another text or purpose is not this decision's reply.
   if (draft.triggerEventId !== proposal.triggerEventId) return unproven("decision_not_latest");
-  if (draft.reply.purpose !== proposal.purpose || !sameFinalText(draft.reply.text, proposal.text, draft.reply.purpose)) return unproven("reply_not_from_decision");
+  if (draft.reply.purpose !== proposal.purpose || (!options.humanCorrection && !sameFinalText(draft.reply.text, proposal.text, draft.reply.purpose))) return unproven("reply_not_from_decision");
   const rawIncidents = read.record.decision?.temporaryIncidents;
   if (rawIncidents !== undefined) {
     const incidents = parseIncidentContext(rawIncidents);
     if (!incidents) return unproven("temporary_incident_unproven");
     if (!await revalidateIncidentContext(incidents, deps.readTemporaryIncidents, deps.now())) return unproven("temporary_incident_unproven");
     if (incidents.entries.length) {
-      if (incidents.entries.some(entry => unprovenFixClaim(draft.reply!.text, entry.fixLevel))) return unproven("temporary_incident_claim_unproven");
+      if (incidents.entries.some(entry => unprovenFixClaim(draft.reply!.text, entry.fixLevel) || (options.humanCorrection === true && unprovenFixClaim(proposal.text, entry.fixLevel)))) return unproven("temporary_incident_claim_unproven");
     }
   }
   // The type decides, never an empty list: only a real question may rest on no source; an answer must show what supports it.
@@ -96,9 +100,9 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
 
 /** The port of C's store and driver: a refusal code with its reasons, or null when the provenance is proven. A reader that throws is no proof. */
 export function pilotProvenanceGate(deps: PilotProvenanceDeps) {
-  return async (proposal: CaseReplyProposal): Promise<string | null> => {
+  return async (proposal: CaseReplyProposal, context?: Readonly<{ basis?: string | null }>): Promise<string | null> => {
     try {
-      const read = await readPilotReplyProvenance(proposal, deps);
+      const read = await readPilotReplyProvenance(proposal, deps, { humanCorrection: context?.basis === CASE_REPLY_STUDIO_CORRECTION_BASIS });
       return read.status === "proven" ? null : [...read.reasons].sort().join(",");
     } catch { return "decision_unreadable"; }
   };

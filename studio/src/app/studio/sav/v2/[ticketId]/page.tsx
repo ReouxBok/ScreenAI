@@ -10,7 +10,10 @@ import { requireIntakeConsoleStaff } from "@/lib/sav/intake/console-auth";
 import { safeStudioHref } from "@/lib/ui/navigation-history";
 import { BackLink } from "@/components/ui/back-link";
 import { Badge, PageHeader, Status } from "@/components/ui/primitives";
+import { caseReplyEditableBody } from "@/lib/sav/cases/case-reply-outbound";
+import { caseReplyReviewSensitive, encodeCaseReplyReviewToken } from "@/lib/sav/cases/case-reply-review-token";
 import { describeCaseReply, describeCaseReplyDetail, readCaseReplies, readCaseReply, summarizeCaseReplies } from "../case-replies";
+import { ReplyReviewPanel } from "../reply-review-panel";
 import { caseReplyReaders } from "../case-replies-port";
 import { caseDossierReaders } from "../case-dossier-port";
 import { caseViewerOf, describeHandoffNotice, readCaseCards, readCaseHandoffNotice, readCaseMails } from "../case-dossier-read";
@@ -26,8 +29,9 @@ import styles from "../v2.module.css";
 export const dynamic = "force-dynamic";
 const date = (value: string | null | undefined) => value && Number.isFinite(Date.parse(value)) ? formatParisDateTime(new Date(value)) : "date illisible";
 
-// One V2 case, strictly read-only: select-only readers of poles A/B/C, no model, CRM or Gmail call.
-// The page approves and sends nothing and shows no button: what was decided or sent is only what the registry recorded.
+// One V2 case: select-only readers of poles A/B/C, no model, CRM or Gmail call. What was decided or sent is only what the registry recorded.
+// SAV-92: an administrator (and only one) gets the decision panel of a PROPOSED reply when the agent's sends are supervised; the panel posts to the
+// administrators' route, which re-checks everything server side. A member sees no button.
 export default async function SavV2CasePage({ params, searchParams }: { params: Promise<{ ticketId: string }>; searchParams: Promise<{ returnTo?: string; replies?: string; reply?: string }> }) {
   const staff = await requireIntakeConsoleStaff();
   const { ticketId } = await params;
@@ -57,6 +61,10 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
     view.situation.kind === "team_required" ? readCaseHandoffNotice(caseDossierReaders, viewer, snapshot.caseId) : null]);
   const notice = noticeRead ? describeHandoffNotice(noticeRead, { enabled: readHandoffNoticeConfig(process.env).mode === "on" }) : null;
   const repliesSummary = summarizeCaseReplies(replies);
+  // SAV-92: the decision is offered only on what the page itself read: the selected reply, still proposed, with the case version shown above.
+  const reviewable = admin && effects.mode === "supervised" && reply.state === "ok" && reply.reply.validation === "proposed" ? reply.reply : null;
+  let reviewBody: string | null = null;
+  if (reviewable) { try { reviewBody = caseReplyEditableBody(reviewable.proposal.text); } catch { reviewBody = null; } }
   const cardLine = (ref: { knowledgeId: string; contentVersionId: string }) => { const card = cardsRead.state === "ok" ? cardsRead.titleOf(ref) : null;
     return <li key={`${ref.knowledgeId}/${ref.contentVersionId}`}>{card ? <>{card.title} <span className={styles.small}>version {card.version}</span></> : <span className={styles.small}>Fiche {ref.knowledgeId}, version {ref.contentVersionId}{cardsRead.state === "ok" ? " : introuvable dans la base" : " : titre non lu"}</span>}</li>; };
   const fallback = back && new URL(back, "https://studio.invalid").pathname === "/studio/sav/v2" ? back : `/studio/sav/v2?ticket=${ticketId}`;
@@ -64,7 +72,7 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
   const here = (extra: { replies?: string; reply?: string }, anchor: string) =>
     `/studio/sav/v2/${ticketId}?${new URLSearchParams(Object.entries({ returnTo: fallback, ...extra }).filter((entry): entry is [string, string] => Boolean(entry[1])))}#${anchor}`;
   return <>
-    <PageHeader back={<BackLink fallback={fallback}>Retour</BackLink>} title={`Ticket ${view.ticketId}`} status={<><Badge>Lecture seule</Badge>{view.sensitive ? <Badge tone="danger">Sensible : équipe</Badge> : null}</>}
+    <PageHeader back={<BackLink fallback={fallback}>Retour</BackLink>} title={`Ticket ${view.ticketId}`} status={<>{reviewable ? <Badge tone="warning">Réponse à valider</Badge> : <Badge>Lecture seule</Badge>}{view.sensitive ? <Badge tone="danger">Sensible : équipe</Badge> : null}</>}
       description={`${view.owner} · ${view.phase} · version ${view.version}, mise à jour ${date(view.updatedAt)}`}/>
     {view.humanHold?.state === "taken" ? <p className={styles.notice} role="status">Ticket pris par une personne de l’équipe le {date(view.humanHold.since)} : l’agent V2 n’investigue pas, ne propose rien, ne répond pas et ne relance pas, même après un nouveau mail du client. Cette page l’affiche seulement.</p>
       : view.humanHold?.state === "team_not_taken" ? <p className={styles.notice} role="status">Dossier confié à l’équipe, pas encore pris par une personne : l’agent V2 n’agit pas sur ce dossier. Cette page l’affiche seulement.</p>
@@ -174,7 +182,8 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
       </div>
       <div className={styles.seam} id="v2-approval">
         <h3>Validation humaine de l’envoi</h3>
-        <p>Rien ne peut être validé ni envoyé depuis cette page, et une proposition n’y est jamais présentée comme validée. Seule une décision enregistrée par le registre compte : voir « Réponse préparée ou envoyée, et preuves ».</p>
+        {admin ? <p>Un administrateur peut approuver, corriger ou refuser une réponse proposée, dans « Réponse sélectionnée » ci-dessous. Une proposition n’est jamais présentée comme validée : seule une décision enregistrée par le registre compte.</p>
+          : <p>Seul un administrateur du Studio peut valider, corriger ou refuser une réponse proposée. Rien ne peut être validé ni envoyé depuis cette page avec votre rôle, et une proposition n’y est jamais présentée comme validée. Seule une décision enregistrée par le registre compte : voir « Réponse préparée ou envoyée, et preuves ».</p>}
       </div>
       <div className={styles.seam} id="v2-note">
         <h3>Note interne HubSpot</h3>
@@ -219,6 +228,8 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
               {o.lines.length > 1 ? <ul>{o.lines.slice(1).map((line, i) => <li key={i} className={styles.small}>{line}</li>)}</ul> : null}
             </div>; })() : null}
             <p>{shown.validation}</p>
+            {reviewable && reviewable.id === reply.reply.id && reviewBody !== null ? <ReplyReviewPanel key={`${reviewable.id}:${view.version}`} body={reviewBody} sensitive={caseReplyReviewSensitive(snapshot)}
+              token={encodeCaseReplyReviewToken({ validationId: reviewable.id, payloadHash: reviewable.payloadHash, caseVersion: snapshot.version })}/> : null}
             {reply.reply.authorizationBasis ? <p className={styles.small}>Base de la décision enregistrée : {reply.reply.authorizationBasis}</p> : null}
           </>; })()}
       </div>}

@@ -281,7 +281,7 @@ describe("case page: pole C's reply registry, read only (SAV-10 raccord)", () =>
     readers.get.mockResolvedValueOnce(replyDetail());
     const html = await render({ reply: replyId(1) });
     expect(readers.get).toHaveBeenCalledWith({ validationId: replyId(1), caseId }, expect.anything());
-    for (const text of ["client@example.test", "Bonjour, pouvez-vous vérifier vos indésirables ?", "Question posée", "aucune validation n’est possible depuis le Studio", "qui peut valider n’est pas encore décidé"]) expect(html).toContain(text);
+    for (const text of ["client@example.test", "Bonjour, pouvez-vous vérifier vos indésirables ?", "Question posée", "seul un administrateur du Studio peut valider, corriger ou refuser cette réponse"]) expect(html).toContain(text);
     expect(html).not.toMatch(/<form|<button|type="submit"/);
     readers.get.mockResolvedValueOnce(replyDetail({ caseId: "20000000-0000-4000-8000-000000000999" }));
     const other = await render({ reply: replyId(1) }); expect(other).toContain("Aucune réponse avec cet identifiant pour ce dossier"); expect(other).not.toContain("client@example.test"); expect(other).not.toContain("pouvez-vous vérifier");
@@ -289,6 +289,27 @@ describe("case page: pole C's reply registry, read only (SAV-10 raccord)", () =>
     expect(await render({ reply: replyId(1) })).toContain("Lecture de la réponse impossible");
     readers.get.mockClear();
     expect(await render({ reply: "../1" })).toContain("Identifiant de réponse invalide"); expect(readers.get).not.toHaveBeenCalled();
+  });
+  it("SAV-92: an administrator gets the decision panel of a PROPOSED reply when sends are supervised, bound to the case version shown; nobody else does", async () => {
+    const readers = connect(); readers.list.mockResolvedValue({ items: [], next: null });
+    const admin = { id: "20000000-0000-4000-8000-000000000003", email: "admin@example.test", role: "admin" };
+    vi.stubEnv("SAV_CASE_EFFECTS", "supervised");
+    mocks.staff.mockResolvedValueOnce(admin); readers.get.mockResolvedValueOnce(replyDetail());
+    const html = await render({ reply: replyId(1) });
+    for (const text of ["Décision de l’administrateur", "Approuver et envoyer", "Corriger puis envoyer", "Refuser", "Réponse à valider", "Un administrateur peut approuver, corriger ou refuser"]) expect(html).toContain(text);
+    expect(html).toContain("<button"); expect(mocks.write).not.toHaveBeenCalled();
+    // Sensitive: only the decline is offered.
+    mocks.staff.mockResolvedValueOnce(admin); readers.get.mockResolvedValueOnce(replyDetail());
+    mocks.byTicket.mockResolvedValueOnce(snapshot({}, { openRequests: [{ id: "m1/r0", summary: "Demande de remboursement synthétique", family: "subscription", status: "open", openedAt: "2026-10-31T08:00:00.000Z" }] }));
+    const sensitive = await render({ reply: replyId(1) });
+    expect(sensitive).toContain("Dossier sensible : aucun envoi depuis ce bouton"); expect(sensitive).not.toContain("Approuver et envoyer"); expect(sensitive).toContain("Refuser");
+    // A member, an already decided reply, or sends not supervised: no panel, no button.
+    readers.get.mockResolvedValueOnce(replyDetail());
+    expect(await render({ reply: replyId(1) })).not.toMatch(/<form|<button|type="submit"/);
+    mocks.staff.mockResolvedValueOnce(admin); readers.get.mockResolvedValueOnce(replyDetail({ validation: "approved", approvability: { ok: false, reason: "already_decided" } }));
+    expect(await render({ reply: replyId(1) })).not.toContain("Décision de l’administrateur");
+    vi.unstubAllEnvs(); mocks.staff.mockResolvedValueOnce(admin); readers.get.mockResolvedValueOnce(replyDetail());
+    expect(await render({ reply: replyId(1) })).not.toContain("Décision de l’administrateur");
   });
   it("a refused role or an unknown case reads nothing from the registry", async () => {
     const readers = connect();
