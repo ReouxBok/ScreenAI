@@ -23,6 +23,8 @@ export type SavBlockTestPhraseKind = "positive" | "neighbour" | "trap";
 export type SavBlockTestPhrase = Readonly<{ text: string; kind: SavBlockTestPhraseKind; expectedCardId?: string; expected?: "team" | "ask" | string }>;
 export type SavBlockDraft = Readonly<{
   blockId: string; label?: string; mode: SavBlockMode;
+  /** The request family of this block's cases in a replay (default: the block id when it names a family, else `usage`). */
+  family?: CaseRequestFamily;
   /** Attribution cards: one block each. */
   cardIds: readonly string[];
   /** Cards read as supporting knowledge only (never attribute). */
