@@ -83,7 +83,9 @@ describe("replay: report and zero effect", () => {
     for (const file of ["block-replay.ts", "block-attribution.ts", "routing-measure.ts", "block-replay-ports.ts"]) {
       const source = readFileSync(path.join(__dirname, file), "utf8");
       const imports = [...source.matchAll(/from\s+["']([^"']+)["']/g)].map(match => match[1]!);
-      expect(imports.filter(target => forbidden.test(target)), file).toEqual([]);
+      // Phase 1b: the read ports reach the case store for its two reads only (checked just below), never its writes.
+      const allowed = file === "block-replay-ports.ts" && /import \{ listCaseEvents, readCase \} from "\.\.\/cases\/case-store";/.test(source) ? ["../cases/case-store"] : [];
+      expect(imports.filter(target => forbidden.test(target) && !allowed.includes(target)), file).toEqual([]);
     }
     const ports = readFileSync(path.join(__dirname, "block-replay-ports.ts"), "utf8");
     expect(ports).not.toMatch(/\.(insert|update|delete)\(|\.execute\(|transaction\(/);
