@@ -10,7 +10,7 @@
 import { createHash } from "node:crypto";
 import { crmRecordUrl } from "../intake/crm-display";
 import type { EffectIntent } from "../intake/execution-types";
-import { caseRequestSearchText, caseTeamPartRequests, type CaseSnapshot, type CaseTrial } from "./case-types";
+import { caseRequestSearchText, caseTeamPartRequests, SAV_CASE_AGENT_REQUESTS_PER_MAIL, type CaseSnapshot, type CaseTrial } from "./case-types";
 import { SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { buildCaseHandoffSummary, caseHandoffSummaryLines, type CaseHandoffSummary } from "./case-handoff-summary";
 import { investigationHandoffCommand, readCaseInvestigationProgress, SAV_CASE_INVESTIGATION_RECORD_KIND, type CaseInvestigationJournalEvent } from "./investigation-record";
@@ -79,7 +79,7 @@ export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
   diagnosis_out_of_tools: "le diagnostic dépasse les outils de l'agent",
   repeated_failure: "les essais de l'agent ont échoué à répétition",
   decision_refused: "le validateur a refusé deux fois la décision de l'agent pour ce message",
-  outside_active_blocks: "cette partie du message n'est couverte par aucun bloc actif de l'agent",
+  outside_active_blocks: "cette partie du message est laissée à l'équipe : aucun bloc actif de l'agent ne la couvre, ou elle dépasse la limite de demandes d'une réponse",
   team_part_handoff_unavailable: "la partie équipe du message n'a pas pu être signalée à temps : le mail entier revient à l'équipe",
 };
 /** SAV-92: the fixed next human action of a team part. The agent keeps the rest of the case. */
@@ -116,8 +116,11 @@ function teamPartHandoffAction(snapshot: Pick<CaseSnapshot, "body"> & Partial<Pi
   const parts = recorded ? snapshot.body.openRequests.filter(row => row.status === "handed_off" && recorded.includes(row.id))
     : caseTeamPartRequests({ admission: snapshot.admission ?? null, body: snapshot.body });
   if (!parts.length) return null;
-  const described = parts.map(row => caseRequestSearchText(row));
-  const need = `Partie du message à reprendre par l'équipe (${parts.length} demande${parts.length > 1 ? "s" : ""}) : ${described.map(text => text ? `« ${text} »` : "demande non décrite, voir le mail du client").join(" ; ")}`;
+  // Counter-review n°2: a part left for the request limit is covered by a block; the team reads why it is theirs.
+  const overLimit = new Set((snapshot.admission?.qualification.requests ?? []).filter(row => row.provenance.kind === "team_part" && row.provenance.reason === "request_limit").map(row => row.requestId));
+  const quoted = (row: typeof parts[number]) => { const text = caseRequestSearchText(row); return text ? `« ${text} »` : "demande non décrite, voir le mail du client"; };
+  const described = parts.map(row => overLimit.has(row.id) ? `${quoted(row)} (couverte par un bloc, mais au-delà de ${SAV_CASE_AGENT_REQUESTS_PER_MAIL} demandes par réponse)` : quoted(row));
+  const need = `Partie du message à reprendre par l'équipe (${parts.length} demande${parts.length > 1 ? "s" : ""}) : ${described.join(" ; ")}`;
   return { kind: "handoff" as const, reason: "outside_active_blocks" as const, report: { need, expected: null, observed: null, trialIds: [] as string[], hypotheses: [] as string[],
     missingInformation: [] as string[], expectedIntervention: HANDOFF_TEAM_PART_INTERVENTION } };
 }
@@ -131,8 +134,15 @@ const TEAM_PART_WAIT_HANDOFF_REASON = "team_part_handoff_unavailable";
 export function teamPartWaitHandedOff(events: readonly CaseInvestigationJournalEvent[], version: number) {
   return teamPartWaitTransfer(events, version) !== undefined;
 }
+/**
+ * Counter-review n°2 (dfd02e0): the bound's transfer belongs to the decision at `version` only if no newer decision was recorded between the two (any
+ * `observation_recorded` is a newer input). Otherwise it is the bound of a LATER mail: this decision's reply did leave, its partial notice stays true.
+ * The send fence (case-handoff-notice-store.ts) applies the same condition.
+ */
 const teamPartWaitTransfer = (events: readonly CaseInvestigationJournalEvent[], version: number) => events.filter(event => event.kind === "owner_changed" && event.caseVersion > version
-  && event.detail?.transition === "handoff" && event.detail.reason === TEAM_PART_WAIT_HANDOFF_REASON).sort((a, b) => a.caseVersion - b.caseVersion)[0];
+  && event.detail?.transition === "handoff" && event.detail.reason === TEAM_PART_WAIT_HANDOFF_REASON
+  && !events.some(other => other.kind === "observation_recorded" && other.caseVersion > version && other.caseVersion < event.caseVersion))
+  .sort((a, b) => a.caseVersion - b.caseVersion)[0];
 /** Its own key, never the partial notice's (that key may already hold a queued partial notice, which the send fence then cancels). */
 const wholeMailInputKey = (inputKey: string) => `${inputKey}+whole-mail`;
 

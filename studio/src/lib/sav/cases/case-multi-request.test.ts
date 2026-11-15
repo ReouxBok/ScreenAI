@@ -330,6 +330,8 @@ describe("two requests of the active block and one no block covers: ONE reply th
     expect(notice).toMatchObject({ ok: true, reason: "outside_active_blocks", report: { expectedIntervention: HANDOFF_TEAM_PART_INTERVENTION } });
     const need = (notice as { report: { need: string } }).report.need;
     expect(need).toContain(LOGIN_ADDRESS);
+    expect(need).toContain(`« ${LOGIN_ADDRESS} » (couverte par un bloc, mais au-delà de 4 demandes par réponse)`);
+    expect(HANDOFF_REASON_LABELS.outside_active_blocks).toMatch(/dépasse la limite de demandes/);
     for (const quote of quotes.slice(0, 4)) expect(need).not.toContain(quote);
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });

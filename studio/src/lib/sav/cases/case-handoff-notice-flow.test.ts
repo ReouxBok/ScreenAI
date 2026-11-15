@@ -660,6 +660,57 @@ describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case not
 });
 
 describe("SAV-92 counter-review of 66e648a: the bound of the team-part wait, on the real send fence", () => {
+  /** One mail of the case: an Access request for the agent, one the team keeps (`team_part`). */
+  const twoPartMail = async (ticketId: string, threadId: string, gmail: string) => {
+    const r1 = caseRequestId(gmail, "r1"), r2 = caseRequestId(gmail, "r2");
+    const admission: CaseAdmissionInput = { policy: POLICY, qualification: qualification([ruled(r1), { requestId: r2, family: "unknown", provenance: { kind: "team_part", reason: "no_block_match", at: AT } }]) };
+    return (await openCaseEvent({ ticketId, threadId, admission, opens: [
+      { id: r1, summary: "Demande de connexion.", subject: subject("Connexion impossible à la plateforme.") },
+      { id: r2, summary: "Demande hors blocs.", subject: subject(`Question hors blocs du mail ${gmail}.`) },
+    ], kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(gmail), sourceRef: { type: "email", id: gmail }, occurredAt: new Date().toISOString() })).case;
+  };
+  /** Answers EVERY open request (the coverage rule), the team parts aside. */
+  const answerAll: Answer = request => {
+    const u = understood(request.snapshot), cited = refOf(LOGIN);
+    return { status: "ok", output: { caseVersion: request.snapshot.version, understanding: u,
+      nextAction: { kind: "answer", requestIds: u.requests.map(row => row.id), steps: [{ text: "Suivre la fiche citée.", knowledge: cited }], expectedResult: "La connexion fonctionne." },
+      reply: { text: `Bonjour, voici la marche à suivre depuis ${ACCESS} : suivre la fiche.`, citations: [cited], impossibilityClaims: [], accountAdvice: "none" } } };
+  };
+
+  it("counter-review n°2: mail 1 answered with its partial notice queued, then mail 2 reaches the bound: mail 1's partial notice leaves as is, ONE whole-mail notice for mail 2", async () => {
+    const ticketId = String(++ticketSeq), threadId = randomUUID();
+    await f.db.insert(savThreads).values({ id: threadId, mailboxId, gmailThreadId: `gmail-${threadId}`, customerEmail: CUSTOMER }).onConflictDoNothing();
+    crmReading = () => goodCrm(ticketId); kb.cards = [LOGIN];
+    const c = await twoPartMail(ticketId, threadId, "syn-bound-m1");
+    // Mail 1: answered, its partial notice queued by the hook (not delivered yet).
+    expect(await investigate(c.caseId, [answerAll], { keepAdmission: true })).toMatchObject({ status: "recorded", outcome: "accepted" });
+    const [first] = (await noticeRows()).filter(row => row.caseId === c.caseId);
+    expect(first).toBeDefined();
+    // Mail 2 of the same case: answered too, but its team part cannot be noticed (no hook) until the bound: the whole mail 2 goes to the team.
+    await twoPartMail(ticketId, threadId, "syn-bound-m2");
+    expect(await investigate(c.caseId, [answerAll], { keepAdmission: true, hook: false })).toMatchObject({ status: "recorded", outcome: "accepted" });
+    for (let n = 0; n < SAV_CASE_TEAM_PART_WAIT_BOUNDS.maxPasses; n++) await settleCaseTeamPartWait(c.caseId, { detail: "disabled" });
+    expect(await readCase(c.caseId)).toMatchObject({ owner: "human", body: { handoff: { reason: "team_part_handoff_unavailable" } } });
+    // Mail 1's partial notice is still true (its reply did leave): the fence lets it go, with its partial text.
+    await pass(); await pass();
+    const [sent] = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.id, first!.id));
+    expect(sent!.state).toBe("confirmed");
+    expect(posts()).toHaveLength(1);
+    expect(messageOf()).toMatch(/Partie du message à reprendre par l'équipe/);
+    expect(messageOf()).not.toMatch(/Mail entier/);
+    // The notice back: ONE whole-mail notice, for mail 2 only.
+    await enqueue(c.caseId); await enqueue(c.caseId);
+    await pass(); await pass();
+    const rows = (await noticeRows()).filter(row => row.caseId === c.caseId);
+    const whole = rows.filter(row => row.replyKey.endsWith("+whole-mail"));
+    expect(whole).toHaveLength(1);
+    expect(whole[0]!.replyKey).not.toBe(`${first!.replyKey}+whole-mail`);
+    expect(whole[0]!.state).toBe("confirmed");
+    expect(posts()).toHaveLength(2);
+    expect(messageOf()).toMatch(/Mail entier à reprendre/);
+    expect(messageOf()).toMatch(/aucune réponse envoyée/);
+  });
+
   it("bound reached, then the notice back on: the queued partial notice never leaves, ONE notice says « mail entier, aucune réponse envoyée »", async () => {
     const ticketId = String(++ticketSeq), threadId = randomUUID(), gmail = "syn-whole-mail";
     await f.db.insert(savThreads).values({ id: threadId, mailboxId, gmailThreadId: `gmail-${threadId}`, customerEmail: CUSTOMER }).onConflictDoNothing();

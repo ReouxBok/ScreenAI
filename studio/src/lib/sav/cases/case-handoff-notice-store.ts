@@ -205,8 +205,12 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
     // Counter-review of 66e648a: a partial "team part" notice whose wait reached its bound never leaves (the whole mail went to the team, the agent sent
     // nothing): the fixed whole-mail notice, under its own key, carries the case. The detail is encrypted: the transfer is found by its command key.
     if (payload.facts.reason === "outside_active_blocks") {
+      // Counter-review n°2 (dfd02e0): only the bound of THIS decision's input: no newer decision (`observation_recorded`) between it and the transfer.
+      // The bound of a later mail leaves this partial notice alone: its reply did leave.
       const [whole] = await tx.select({ id: savCaseEvents.id }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, caseId), gt(savCaseEvents.caseVersion, recordedVersion),
-        eq(savCaseEvents.kind, "owner_changed"), like(savCaseEvents.dedupeKey, "cmd:team-part-wait-handoff-v%"))).limit(1);
+        eq(savCaseEvents.kind, "owner_changed"), like(savCaseEvents.dedupeKey, "cmd:team-part-wait-handoff-v%"),
+        sql`not exists (select 1 from sav.case_events as decided where decided.case_id = ${caseId} and decided.kind = 'observation_recorded'
+          and decided.case_version > ${recordedVersion} and decided.case_version < ${savCaseEvents.caseVersion})`)).limit(1);
       if (whole) return fault("CANCELLED_WHOLE_MAIL_HANDED_OFF");
     }
     // The lock waits above can cross the lease expiry: judged again against a clock read after the last of them.
