@@ -13,6 +13,7 @@ import { releaseIntakeHumanHold } from "@/lib/sav/intake/human-hold-release";
 import { recordIntakeHumanCommand } from "@/lib/sav/intake/human-commands";
 import { requestIntakeReinvestigation, reconcileThreadIdentification } from "@/lib/sav/intake/operator-recovery";
 import { reconcileIntakeNoteForClosure } from "@/lib/sav/intake/note-recovery";
+import { reconcileIntakeUncertainEffect } from "@/lib/sav/intake/effect-reconciliation";
 import { recordOperatorCommand, readOperatorPanel } from "@/lib/sav/intake-ux/operator-commands";
 import { savAgentPauseAdministrator, setSavAgentPause, readSavAgentPausePanel } from "@/lib/sav/intake/agent-pause-admin";
 import { readSavAgentPause, SAV_AGENT_PAUSE_LEVELS } from "@/lib/sav/intake/agent-pause";
@@ -242,6 +243,15 @@ const reconcileNote = studioMcpWrite("reconcile_note", "Vérifier la note déjà
     await reconcileIntakeNoteForClosure({ threadId: input.threadId, messageId: found.version.messageId });
     return done("Note existante et rattachement vérifiés. Aucune note créée ni aucun mail envoyé.");
   }, { idempotent: false });
+const reconcileEffect = studioMcpWrite("reconcile_effect", "Rapprocher l’action incertaine depuis son reçu",
+  "Vérifie dans HubSpot, en lecture seule, l’unique action incertaine du message courant (note ou email : création avec reçu, ou rattachement au ticket) à partir du reçu déjà enregistré. Aucun identifiant n’est accepté de l’appelant ; rien n’est recréé ni renvoyé ; un résultat non prouvé est refusé sans rien changer. Administrateurs.",
+  { threadId: z.uuid(), versionToken: dossierInput.versionToken }, async (context, input) => {
+    const found = await currentDossier({ ...input, idempotencyKey: "" }); if (!found.ok) return found.result;
+    if (!intakeDossierActions(found.data, intakeDossierView(found.data), context.staff).administratorVerifications || !found.version.messageId) return unavailable("Le rapprochement");
+    const result = await reconcileIntakeUncertainEffect({ threadId: input.threadId, messageId: found.version.messageId }, found.version);
+    if (!result.reconciled) return alreadyDone("Aucune action incertaine : déjà rapprochée. Rien n’a été modifié.");
+    return done("Action existante vérifiée et attribuée à son reçu. Rien n’a été recréé ni envoyé ; le traitement normal reprendra s’il le peut.", { kind: result.kind });
+  }, { idempotent: false });
 const reconcileIdentification = studioMcpWrite("reconcile_identification", "Rapprocher les envois d’identification",
   "Rapproche les demandes d’identification déjà envoyées avec leurs reçus. Ne renvoie aucun mail. Administrateurs.",
   { threadId: z.uuid(), versionToken: dossierInput.versionToken }, async (context, input) => {
@@ -272,5 +282,5 @@ const getAgentPause = { name: "get_agent_pause", title: "État de pause de l’a
   async run() { const panel = await readSavAgentPausePanel(); return { outcome: "done", code: "OK", message: "OK", data: panel } as StudioMcpResult; } } as unknown as StudioMcpTool;
 
 export const studioMcpWriteTools: StudioMcpTool[] = [closeHandledOutside, classifyInvalidSource, classifyOther, releaseHold, recordChoice,
-  requestReinvestigation, continueDossier, reconcileNote, reconcileIdentification, setAgentPause];
+  requestReinvestigation, continueDossier, reconcileNote, reconcileEffect, reconcileIdentification, setAgentPause];
 export const studioMcpPauseReadTool = getAgentPause;
