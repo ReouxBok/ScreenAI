@@ -4,7 +4,7 @@
 //   continueCaseAfterCommit the real trigger after a commit; sweepCaseContinuations its durable catch-up. A failure stays visible (log and one durable marker per case), never swallowed
 // It writes no HubSpot owner, invents no owner id, policy, rule or right: anything absent from the environment admits nobody.
 import "server-only";
-import { and, asc, eq, gt } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, lte } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { auditLogs, savCaseEvents, savCases, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeRuns, savMessages, savSyncState, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
@@ -484,11 +484,18 @@ export async function sweepCaseContinuations(input: EntryDeps & { limit?: number
   const db = requireDb();
   if (await relayPaused(db)) return { skipped: "paused" as const };
   const limit = Math.min(Math.max(input.limit ?? 4, 1), 20);
-  const [saved] = await db.select({ cursor: savSyncState.cursor }).from(savSyncState).where(eq(savSyncState.key, CONTINUATION_CURSOR));
+  const [saved] = await db.select({ cursor: savSyncState.cursor, version: savSyncState.processedCount }).from(savSyncState).where(eq(savSyncState.key, CONTINUATION_CURSOR));
   const after = saved?.cursor && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(saved.cursor) ? saved.cursor : null;
   const candidates = await db.select({ id: savCases.id }).from(savCases)
     .where(and(eq(savCases.owner, "agent"), eq(savCases.phase, "queued"), after ? gt(savCases.id, after) : undefined))
     .orderBy(asc(savCases.id)).limit(SCOPE_SCAN);
+  // Tail and head are disjoint, even when the cursor case was deleted. Count both reads
+  // against the same cap; no case can be revisited within this passage.
+  if (after && candidates.length < SCOPE_SCAN) {
+    candidates.push(...await db.select({ id: savCases.id }).from(savCases)
+      .where(and(eq(savCases.owner, "agent"), eq(savCases.phase, "queued"), lte(savCases.id, after)))
+      .orderBy(asc(savCases.id)).limit(SCOPE_SCAN - candidates.length));
+  }
   const held = await caseIdsStillHeldByBlock(candidates.map(row => row.id), db);
   const outcome = { tried: 0, failed: {} as Record<string, number>, outOfScope: 0 };
   let handled = 0;
@@ -505,10 +512,18 @@ export async function sweepCaseContinuations(input: EntryDeps & { limit?: number
     }
     handled++;
   }
-  // A short, fully handled page ends the lap. New cases behind the cursor are visited on the next lap.
   const cursor = handled === candidates.length && candidates.length < SCOPE_SCAN ? null : candidates[handled - 1]!.id;
-  await db.insert(savSyncState).values({ key: CONTINUATION_CURSOR, cursor, status: "idle", updatedAt: new Date() })
-    .onConflictDoUpdate({ target: savSyncState.key, set: { cursor, updatedAt: new Date() } });
+  // Compare-and-set: a concurrent passage that already committed wins. A stale
+  // passage never overwrites its progress, including after a complete lap (ABA).
+  // processedCount is this cursor's revision, not a case/budget/attempt counter.
+  if (saved) {
+    await db.update(savSyncState).set({ cursor, processedCount: saved.version + 1, updatedAt: new Date() })
+      .where(and(eq(savSyncState.key, CONTINUATION_CURSOR), eq(savSyncState.processedCount, saved.version),
+        saved.cursor === null ? isNull(savSyncState.cursor) : eq(savSyncState.cursor, saved.cursor)));
+  } else {
+    await db.insert(savSyncState).values({ key: CONTINUATION_CURSOR, cursor, status: "idle", processedCount: 1, updatedAt: new Date() })
+      .onConflictDoNothing({ target: savSyncState.key });
+  }
   if (outcome.outOfScope) console.info("sav_v2_continuation_sweep_out_of_scope", { count: outcome.outOfScope });
   return { tried: outcome.tried, failed: outcome.failed, ...(outcome.outOfScope ? { outOfScope: outcome.outOfScope } : {}) };
 }

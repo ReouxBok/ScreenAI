@@ -525,7 +525,7 @@ describe("qualification scope (15/11) : la reprise n'est plus affamée par des d
     await f.db.insert(savCases).values(ids.map((id, i) => ({ ...template!, id, ticketId: String(910_000 + i), threadIds: i === 50 ? [tester.threadId] : [] })));
     const continuation = vi.fn(async () => ({ status: "started" }));
     expect(await sweepCaseContinuations({ env, continuation })).toEqual({ tried: 0, failed: {}, outOfScope: 50 });
-    expect(await sweepCaseContinuations({ env, continuation })).toEqual({ tried: 1, failed: {} });
+    expect(await sweepCaseContinuations({ env, continuation })).toEqual({ tried: 1, failed: {}, outOfScope: 49 });
     expect(continuation).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ caseId: ids[50], trigger: "sweep" }));
   });
   it("un dossier hors périmètre : `sav_v2_continuation_skipped` avec seulement l'id du dossier et un code fermé ; `investigation_off` aussi", async () => {

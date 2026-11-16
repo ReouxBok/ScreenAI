@@ -30,9 +30,9 @@ it("50 excluded cases cannot starve the 51st allowed case; the persisted cursor 
   const continuation = vi.fn(async () => ({ status: "started" }));
   expect(await sweepCaseContinuations({ env, continuation })).toEqual({ tried: 0, failed: {}, outOfScope: 50 });
   expect(scope).toHaveBeenCalledTimes(50); expect(await cursor()).toBe(id(50));
-  expect(await sweepCaseContinuations({ env, continuation })).toEqual({ tried: 1, failed: {} });
+  expect(await sweepCaseContinuations({ env, continuation })).toEqual({ tried: 1, failed: {}, outOfScope: 49 });
   expect(continuation).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ caseId: id(51), trigger: "sweep" }));
-  expect(await cursor()).toBeNull();
+  expect(await cursor()).toBe(id(49));
 });
 it("205 cases are all continued in 11 bounded passes despite changed timestamps and repeated failures", async () => {
   const ids = await seed(205), seen: string[] = [];
@@ -46,12 +46,12 @@ it("205 cases are all continued in 11 bounded passes despite changed timestamps 
   try {
     for (let pass = 0; pass < 11; pass++) {
       scope.mockClear();
-      expect(await sweepCaseContinuations({ env, limit: 20, continuation })).toMatchObject({ tried: pass === 10 ? 5 : 20 });
+      expect(await sweepCaseContinuations({ env, limit: 20, continuation })).toMatchObject({ tried: 20 });
       expect(scope.mock.calls.length).toBeLessThanOrEqual(40); // includes the continuation's scope recheck
     }
-    expect(seen).toEqual(ids); expect(await cursor()).toBeNull();
+    expect(seen).toEqual([...ids, ...ids.slice(0, 15)]); expect(await cursor()).toBe(id(15));
     await sweepCaseContinuations({ env, limit: 1, continuation });
-    expect(seen.at(-1)).toBe(ids[0]);
+    expect(seen.at(-1)).toBe(ids[15]);
   } finally { errors.mockRestore(); }
 });
 it("50 held cases advance the scan without taking continuation slots", async () => {
@@ -75,7 +75,34 @@ it("OFF preserves the cursor and an empty tail wraps to revisit cases behind it"
   expect(await sweepCaseContinuations({ env: {}, continuation })).toEqual({ skipped: "off" });
   expect(await cursor()).toBe(saved);
   await f.db.update(savSyncState).set({ cursor: id(99) }).where(eq(savSyncState.key, KEY));
-  expect(await sweepCaseContinuations({ env, continuation })).toEqual({ tried: 0, failed: {} });
+  expect(await sweepCaseContinuations({ env, continuation })).toEqual({ tried: 2, failed: {} });
   expect(await cursor()).toBeNull();
-  await sweepCaseContinuations({ env, continuation }); expect(continuation).toHaveBeenCalledTimes(3);
+  await sweepCaseContinuations({ env, continuation }); expect(continuation).toHaveBeenCalledTimes(5);
+});
+
+it("five pending cases fill four slots on every passage without revisiting a case", async () => {
+  await seed(5);
+  const continuation = vi.fn(async (_input: { caseId: string }) => ({ status: "started" }));
+  for (let pass = 0; pass < 6; pass++) {
+    continuation.mockClear();
+    expect(await sweepCaseContinuations({ env, continuation })).toEqual({ tried: 4, failed: {} });
+    expect(new Set(continuation.mock.calls.map(args => (args[0] as { caseId: string }).caseId)).size).toBe(4);
+  }
+});
+it.each(["absent", "existing", "full-lap"])("a delayed concurrent passage cannot overwrite the winning cursor (%s)", async mode => {
+  await seed(5);
+  if (mode !== "absent") await f.db.insert(savSyncState).values({ key: KEY, cursor: null });
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const slow = sweepCaseContinuations({ env, limit: 1, continuation: async () => {
+    entered(); await held; return { status: "started" };
+  } });
+  await started;
+  try {
+    expect(await sweepCaseContinuations({ env, limit: mode === "full-lap" ? 20 : 4,
+      continuation: async () => ({ status: "started" }) })).toEqual({ tried: mode === "full-lap" ? 5 : 4, failed: {} });
+    expect(await cursor()).toBe(mode === "full-lap" ? null : id(4));
+  } finally { release(); await slow; }
+  expect(await cursor()).toBe(mode === "full-lap" ? null : id(4));
 });
