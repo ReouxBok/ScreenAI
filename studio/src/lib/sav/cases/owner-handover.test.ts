@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { savIntakeExecutionPolicies, savIntakeExecutions, savMailboxes, savMessages, savThreads, staffUsers } from "@/db/schema";
+import { auditLogs, savIntakeExecutionPolicies, savIntakeExecutions, savMailboxes, savMessages, savThreads, staffUsers } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
 // The real executor must never be loaded here: every test injects its progress reader.
@@ -53,6 +53,7 @@ async function scheduled(id?: string) {
   return { e, token, now: new Date(e.occurredAt + 305_000) };
 }
 const customer = async () => ({ owner: "902", pipeline: "0", lastEmailAt: Date.parse(RECEIVED), lastDirection: "customer" as const });
+const marker = async (id: string) => (await f.db.select().from(auditLogs).where(eq(auditLogs.entityId, id)))[0]!.technicalMetadata;
 it("filters source, portal, value, property and V1 owner", () => {
   expect(isOwnerHandoverEvent(event(), ENV)).toBe(true);
   expect(isOwnerHandoverEvent({ ...event(), changeSource: "MOBILE" }, ENV)).toBe(true);
@@ -69,6 +70,7 @@ it("duplicate receipts start once; wake is consumed once; grace is open before w
   expect(await ownerHandoverGraceOpen(id)).toBe(true);
   expect(await requestOwnerHandover(s.e, { env: ENV, start: vi.fn() })).toEqual({ status: "not_reserved" });
   expect(await runOwnerHandover(id, s.token, { env: ENV, now: s.now, readTicket })).toEqual({ status: "no_confirmed_v1_mail" });
+  expect(await marker(id)).toMatchObject({ state: "rejected", outcome: "no_confirmed_v1_mail" });
   expect(await ownerHandoverGraceOpen(id)).toBe(false);
   expect(await runOwnerHandover(id, s.token, { env: ENV, now: s.now, readTicket })).toEqual({ status: "not_consumed" });
   expect(readTicket).toHaveBeenCalledTimes(1);
@@ -112,6 +114,37 @@ it("sweep excludes a confirmed ticket during the grace", async () => {
   expect(await readCaseByTicket(source.ticketId)).toBeNull();
 });
 
+it("delayed wake keeps the sweep blocked beyond its scheduled time", async () => {
+  const source = await intake(), e = event(source.ticketId, Date.now() - 600_000);
+  await requestOwnerHandover(e, { env: ENV, start: async () => {} });
+  expect(await ownerHandoverGraceOpen(source.ticketId)).toBe(true);
+  await sweepCaseRelays({ deps: { env: ENV, ...confirmed(source.ticketId) } });
+  expect(await readCaseByTicket(source.ticketId)).toBeNull();
+});
+
+it("sweep during CRM reading stays blocked until team-last is durable", async () => {
+  const source = await intake(), s = await scheduled(source.ticketId);
+  const readTicket = async () => {
+    expect(await ownerHandoverGraceOpen(source.ticketId)).toBe(true);
+    await sweepCaseRelays({ deps: { env: ENV, ...confirmed(source.ticketId) } });
+    expect(await readCaseByTicket(source.ticketId)).toBeNull();
+    return { ...await customer(), lastDirection: "team" as const };
+  };
+  expect(await runOwnerHandover(source.ticketId, s.token, { env: ENV, now: s.now, readTicket })).toEqual({ status: "team_replied_last" });
+  expect(await marker(source.ticketId)).toMatchObject({ state: "team_replied_last", teamLastAt: RECEIVED });
+  await sweepCaseRelays({ deps: { env: ENV, ...confirmed(source.ticketId) } });
+  expect(await readCaseByTicket(source.ticketId)).toBeNull();
+});
+
+it("an interrupted CRM read keeps a durable block instead of releasing the sweep", async () => {
+  const source = await intake(), s = await scheduled(source.ticketId);
+  await expect(runOwnerHandover(source.ticketId, s.token, { env: ENV, now: s.now, readTicket: async () => { throw Error("SYNTHETIC_CRM_FAILURE"); } })).rejects.toThrow("SYNTHETIC_CRM_FAILURE");
+  expect(await marker(source.ticketId)).toMatchObject({ state: "consumed" });
+  expect(await ownerHandoverGraceOpen(source.ticketId)).toBe(true);
+  await sweepCaseRelays({ deps: { env: ENV, ...confirmed(source.ticketId) } });
+  expect(await readCaseByTicket(source.ticketId)).toBeNull();
+});
+
 it("team last also blocks sweep after the wake", async () => {
   const source = await intake(), s = await scheduled(source.ticketId);
   expect(await runOwnerHandover(source.ticketId, s.token, { env: ENV, now: s.now, readTicket: async () => ({ ...await customer(), lastDirection: "team" as const }) })).toEqual({ status: "team_replied_last" });
@@ -120,18 +153,29 @@ it("team last also blocks sweep after the wake", async () => {
 });
 it("admitted relay continues the agent case once", async () => {
   const source = await intake(), s = await scheduled(source.ticketId), caseId = randomUUID();
-  const relay = vi.fn<typeof recordCaseAfterConfirmedIntake>(async () => ({ caseId, version: 1, created: false, appended: false, owner: "agent", relay: "intake_effects_confirmed", admission: null }));
-  const continuation = vi.fn(async () => ({ status: "queued" }));
+  const relay = vi.fn<typeof recordCaseAfterConfirmedIntake>(async () => {
+    expect(await ownerHandoverGraceOpen(source.ticketId)).toBe(true);
+    await sweepCaseRelays({ deps: { env: ENV, ...confirmed(source.ticketId) } });
+    expect(await readCaseByTicket(source.ticketId)).toBeNull();
+    return { caseId, version: 1, created: false, appended: false, owner: "agent", relay: "intake_effects_confirmed", admission: null };
+  });
+  const continuation = vi.fn(async () => {
+    expect(await marker(source.ticketId)).toMatchObject({ state: "admitted", caseId });
+    expect(await ownerHandoverGraceOpen(source.ticketId)).toBe(false);
+    return { status: "queued" };
+  });
   expect(await runOwnerHandover(source.ticketId, s.token, { env: ENV, now: s.now, readTicket: customer, relay, continuation })).toEqual({ status: "queued" });
   expect(relay.mock.calls[0]![0]).toBe(source.messageId);
   expect(continuation).toHaveBeenCalledTimes(1);
+  expect(await marker(source.ticketId)).toMatchObject({ state: "admitted", caseId });
   await runOwnerHandover(source.ticketId, s.token, { env: ENV, now: s.now, readTicket: customer, relay, continuation });
   expect(continuation).toHaveBeenCalledTimes(1);
 });
 
-it("failed workflow start retains grace and can be retried by the same receipt", async () => {
-  const e = event(), failing = vi.fn(async () => { throw Error("SYNTHETIC_START_FAILED"); });
+it("failed workflow start retains durable grace beyond wake time and can be retried by the same receipt", async () => {
+  const e = event(undefined, Date.now() - 600_000), failing = vi.fn(async () => { throw Error("SYNTHETIC_START_FAILED"); });
   await expect(requestOwnerHandover(e, { env: ENV, start: failing })).rejects.toThrow("SAV_OWNER_HANDOVER_START_FAILED");
+  expect(await marker(e.objectId)).toMatchObject({ state: "start_failed" });
   expect(await ownerHandoverGraceOpen(e.objectId)).toBe(true);
   const start = vi.fn(async () => {});
   expect(await requestOwnerHandover(e, { env: ENV, start })).toMatchObject({ status: "scheduled" });

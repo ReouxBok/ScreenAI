@@ -1355,8 +1355,14 @@ export async function processHubspotReceiptGroup(receiptIds: string[]) {
     const events = claimed.map(receipt => hubspotEventSchema.parse(receipt.payload));
     // Each receipt can carry an owner change even when the latest one is a stage change.
     const { requestOwnerHandover } = await import("./cases/owner-handover");
-    for (const item of [...events].sort((a, b) => (a.occurredAt ?? 0) - (b.occurredAt ?? 0)))
-      await requestOwnerHandover(item, { env: process.env });
+    for (const item of [...events].sort((a, b) => (a.occurredAt ?? 0) - (b.occurredAt ?? 0))) {
+      try { await requestOwnerHandover(item, { env: process.env }); }
+      catch {
+        // Workflow start has its own durable start_failed marker. Keep ordinary
+        // snapshot/stage receipts independent; never log CRM payloads or errors.
+        console.error("sav_v2_owner_handover_request_failed", { ticketId: String(item.objectId ?? ""), code: "SAV_OWNER_HANDOVER_REQUEST_FAILED" });
+      }
+    }
     const event = events.sort((a, b) => (b.occurredAt ?? 0) - (a.occurredAt ?? 0))[0];
     // Every raw receipt remains durable; one fresh snapshot covers this bounded
     // group for the same object. Mark each claimed event only after it succeeds.

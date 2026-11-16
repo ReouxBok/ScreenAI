@@ -55,8 +55,10 @@ export async function requestOwnerHandover(event: OwnerEvent, options: { env: En
   return { status: "scheduled", wakeAt };
 }
 
-/** SQL form also protects the first relay of a case that does not exist yet. */
-export const noOwnerHandoverGrace = (ticketId: unknown) => sql`not exists (select 1 from public.audit_logs h where h.action = ${OWNER_HANDOVER_MARK.action} and h.entity_type = ${OWNER_HANDOVER_MARK.entityType} and h.entity_id = ${ticketId} and ((h.technical_metadata->>'state' in ('starting', 'start_failed') and (h.technical_metadata->>'wakeAt')::timestamptz > now()) or (h.technical_metadata->>'state' = 'team_replied_last' and not exists (select 1 from sav.intake_executions e join sav.messages m on m.id = e.message_id where e.ticket_id = h.entity_id and e.state = 'confirmed' and m.direction = 'inbound' and m.received_at > (h.technical_metadata->>'teamLastAt')::timestamptz))))`;
+/** The deadline permits a wake; only a durable outcome releases the sweep. Consumed
+ * means checks are in progress, including a delayed or interrupted CRM read.
+ * SQL form also protects the first relay of a case that does not exist yet. */
+export const noOwnerHandoverGrace = (ticketId: unknown) => sql`not exists (select 1 from public.audit_logs h where h.action = ${OWNER_HANDOVER_MARK.action} and h.entity_type = ${OWNER_HANDOVER_MARK.entityType} and h.entity_id = ${ticketId} and ((h.technical_metadata->>'state' in ('starting', 'start_failed', 'consumed')) or (h.technical_metadata->>'state' = 'team_replied_last' and not exists (select 1 from sav.intake_executions e join sav.messages m on m.id = e.message_id where e.ticket_id = h.entity_id and e.state = 'confirmed' and m.direction = 'inbound' and m.received_at > (h.technical_metadata->>'teamLastAt')::timestamptz))))`;
 export async function ownerHandoverGraceOpen(ticketId: string) {
   const [row] = await requireDb().select({ clear: noOwnerHandoverGrace(ticketId) }).from(auditLogs).limit(1);
   return row ? !row.clear : false;
@@ -75,7 +77,19 @@ export async function runOwnerHandover(ticketId: string, token: string, options:
     await tx.update(auditLogs).set({ technicalMetadata: { ...row.technicalMetadata, state: "consumed" } }).where(eq(auditLogs.id, row.id));
     return true;
   });
-  const done = (status: string) => { console.info("sav_v2_owner_handover", { ticketId, status }); return { status }; };
+  const settle = async (state: string, detail: Record<string, string> = {}) => requireDb().transaction(async tx => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`owner-handover:${ticketId}`}))`);
+    const [row] = await tx.select().from(auditLogs).where(whereMark(ticketId)).for("update");
+    if (row?.technicalMetadata.token !== token || row.technicalMetadata.state !== "consumed") return false;
+    await tx.update(auditLogs).set({ technicalMetadata: { ...row.technicalMetadata, state, ...detail } }).where(eq(auditLogs.id, row.id));
+    return true;
+  });
+  const done = async (status: string) => {
+    // Does not overwrite a newer owner event, team-last, or an admitted result.
+    if (consumed) await settle("rejected", { outcome: status });
+    console.info("sav_v2_owner_handover", { ticketId, status });
+    return { status };
+  };
   if (!consumed) return done("not_consumed");
   if (!ownerHandoverEnabled(options.env)) return done("off");
   if (await relayPaused(requireDb())) return done("paused");
@@ -83,12 +97,7 @@ export async function runOwnerHandover(ticketId: string, token: string, options:
   if (ticket.owner !== v2HubspotOwnerId(options.env) || ticket.pipeline !== "0") return done("owner_or_pipeline_changed");
   if (ticket.lastDirection === "team") {
     // Keep the sweep from replaying the older customer mail after this wake stops.
-    await requireDb().transaction(async tx => {
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`owner-handover:${ticketId}`}))`);
-      const [row] = await tx.select().from(auditLogs).where(whereMark(ticketId)).for("update");
-      if (row?.technicalMetadata.token === token && row.technicalMetadata.state === "consumed")
-        await tx.update(auditLogs).set({ technicalMetadata: { ...row.technicalMetadata, state: "team_replied_last", teamLastAt: new Date(ticket.lastEmailAt).toISOString() } }).where(eq(auditLogs.id, row.id));
-    });
+    if (!await settle("team_replied_last", { teamLastAt: new Date(ticket.lastEmailAt).toISOString() })) return done("replaced");
     return done("team_replied_last");
   } // Existing J2 remains untouched; no new reminder is invented.
   if (ticket.lastDirection !== "customer") return done("history_unavailable");
@@ -102,8 +111,9 @@ export async function runOwnerHandover(ticketId: string, token: string, options:
   if (current?.technicalMetadata.token !== token || current.technicalMetadata.state !== "consumed") return done("replaced");
   const result = await (options.relay ?? recordCaseAfterConfirmedIntake)(source.id, v2EntryRelayDeps(options.env));
   if (!("owner" in result) || result.owner !== "agent") return done("not_admitted");
-  const [beforeContinue] = await requireDb().select().from(auditLogs).where(whereMark(ticketId));
-  if (beforeContinue?.technicalMetadata.token !== token || beforeContinue.technicalMetadata.state !== "consumed") return done("replaced");
+  // The relay has committed the case. Release the sweep only after this durable
+  // result, and before starting its continuation (which can fail independently).
+  if (!await settle("admitted", { caseId: result.caseId })) return done("replaced");
   const outcome = await (options.continuation ?? continueCaseAfterCommit)(result.caseId, "relay", { env: options.env, immediateDeadlineMs: Date.now() + CASE_WAKE_STEP_BUDGET_MS });
   return done(outcome.status);
 }

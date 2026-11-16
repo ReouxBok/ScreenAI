@@ -1,14 +1,27 @@
-import { expect, it, vi } from "vitest";
+import { beforeEach, expect, it, vi } from "vitest";
 const f = vi.hoisted(() => ({ request: vi.fn(async (_event: { propertyName?: string }, _options: unknown) => ({ status: "off" })), mark: vi.fn(), refresh: vi.fn() }));
 vi.mock("./cases/owner-handover", () => ({ requestOwnerHandover: f.request }));
 vi.mock("./service", () => ({ claimWebhookReceipt: async (id: string) => ({ id, payload: { subscriptionType: "ticket.propertyChange", objectId: "880", propertyName: id === "owner" ? "hubspot_owner_id" : "hs_pipeline_stage", occurredAt: id === "owner" ? 1000 : 2000 } }), markWebhookReceipt: f.mark }));
 vi.mock("./observations", () => ({ hasSavTicketObservation: async () => true, refreshSavTicketObservations: f.refresh }));
 import { processHubspotReceiptGroup } from "./hubspot";
+beforeEach(() => { vi.clearAllMocks(); });
 it("mixed owner and stage receipts read BOTH events, refresh once and mark both", async () => {
   expect(await processHubspotReceiptGroup(["stage", "owner"])).toEqual(["stage", "owner"]);
   expect(f.request.mock.calls.map(call => (call[0] as { propertyName: string }).propertyName)).toEqual(["hubspot_owner_id", "hs_pipeline_stage"]);
   expect(f.refresh).toHaveBeenCalledTimes(1);
   expect(f.mark).toHaveBeenCalledTimes(2);
+});
+
+it("owner workflow start failure never fails the legitimate stage receipt", async () => {
+  const trace = vi.spyOn(console, "error").mockImplementation(() => {});
+  f.request.mockRejectedValueOnce(Error("SAV_OWNER_HANDOVER_START_FAILED"));
+  try {
+    expect(await processHubspotReceiptGroup(["owner", "stage"])).toEqual(["owner", "stage"]);
+    expect(f.request).toHaveBeenCalledTimes(2);
+    expect(f.refresh).toHaveBeenCalledExactlyOnceWith("880");
+    expect(f.mark.mock.calls).toEqual([["owner", "processed"], ["stage", "processed"]]);
+    expect(trace).toHaveBeenCalledWith("sav_v2_owner_handover_request_failed", { ticketId: "880", code: "SAV_OWNER_HANDOVER_REQUEST_FAILED" });
+  } finally { trace.mockRestore(); }
 });
 
 import { afterEach } from "vitest";
