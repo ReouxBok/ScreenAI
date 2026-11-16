@@ -15,11 +15,11 @@ let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, policyId:
 const network = vi.fn(() => { throw Error("NETWORK_FORBIDDEN"); });
 const at = new Date("2026-11-16T10:00:00.000Z");
 const run = (input: Record<string, unknown> = {}) => listV2Cases(v2InventoryInput.parse(input));
-async function fixture(options: { id?: string; phase?: string; owner?: string; received?: Date; handoff?: string } = {}) {
+async function fixture(options: { id?: string; phase?: string; owner?: string; received?: Date; createdAt?: Date; handoff?: string } = {}) {
   const gmailId = randomUUID();
   const [thread] = await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: randomUUID(), customerEmail: "private@example.invalid" }).returning();
   const [message] = await f.db.insert(savMessages).values({ threadId: thread!.id, mailboxId, gmailMessageId: gmailId, direction: "inbound", fromEmail: "private@example.invalid", toEmails: [], subject: "PRIVATE_SUBJECT", bodyCiphertext: encryptSavPayload({ text: "PRIVATE_BODY" }), receivedAt: options.received ?? at }).returning();
-  const [row] = await f.db.insert(savCases).values({ id: options.id, ticketId: String(++sequence), threadIds: [thread!.id], owner: options.owner ?? "agent", phase: options.phase ?? "queued", admissionTarget: "agent", contractRevision: SAV_CASE_CONTRACT_REVISION, payloadCiphertext: encryptSavPayload({ ...emptyCaseBody(), handoff: options.handoff ? { reason: options.handoff } : null }) }).returning();
+  const [row] = await f.db.insert(savCases).values({ id: options.id, createdAt: options.createdAt, ticketId: String(++sequence), threadIds: [thread!.id], owner: options.owner ?? "agent", phase: options.phase ?? "queued", admissionTarget: "agent", contractRevision: SAV_CASE_CONTRACT_REVISION, payloadCiphertext: encryptSavPayload({ ...emptyCaseBody(), handoff: options.handoff ? { reason: options.handoff } : null }) }).returning();
   await f.db.insert(savCaseEvents).values({ caseId: row!.id, kind: "inbound_confirmed", direction: "customer_inbound", dedupeKey: `inbound:${gmailId}`, caseVersion: 1, occurredAt: options.received ?? at, payloadCiphertext: encryptSavPayload({ sourceRef: { type: "email", id: gmailId }, detail: null }) });
   return { caseId: row!.id, threadId: thread!.id, messageId: message!.id };
 }
@@ -58,10 +58,15 @@ it("defaults to 25, caps at 100, validates dates and binds encrypted cursors to 
   await expect(run({ cursor: `${first.nextCursor}x` })).rejects.toThrow("CURSOR_INVALID");
   await expect(run({ from: "2026-11-17T00:00:00Z", until: "2026-11-16T00:00:00Z" })).rejects.toThrow("WINDOW_INVALID");
 });
-it("filters by inclusive first customer date and state, not case creation date", async () => {
-  const c = await fixture({ phase: "awaiting_customer" }); await fixture({ received: new Date("2026-11-15") });
+it("scopes by inclusive immutable creation date, independently of customer dates and state", async () => {
+  const c = await fixture({ phase: "awaiting_customer", createdAt: at, received: new Date("2099-01-01") });
+  await fixture({ createdAt: at, received: new Date("2026-11-15") });
+  await fixture({ createdAt: new Date(at.getTime() - 1) });
+  await fixture({ createdAt: new Date(at.getTime() + 1) });
   const page = await run({ from: at.toISOString(), until: at.toISOString(), state: "awaiting_customer" });
-  expect(page.attendus).toBe(1); expect(page.rows[0]).toMatchObject({ ...c, receivedAt: at.toISOString(), replyDelaySeconds: null });
+  expect(page).toMatchObject({ attendus: 2, statesFilterApplied: true, filteredOut: 1, nextCursor: null });
+  expect(page.rows).toHaveLength(1);
+  expect(page.rows[0]).toMatchObject({ ...c, receivedAt: "2099-01-01T00:00:00.000Z", replyDelaySeconds: null });
 });
 it("calculates delay from confirmed reply, never ack; note requires association", async () => {
   const c = await fixture({ phase: "resolved" });
@@ -90,7 +95,11 @@ it("separates verified usage from held or conservatively settled costs", async (
 });
 it("covers pause/failure and cases without V1 link", async () => {
   await fixture({ owner: "system_hold" }); await fixture({ phase: "blocked_technical" });
-  expect((await run({ state: "paused" })).attendus).toBe(1); expect((await run({ state: "failed" })).attendus).toBe(1);
+  for (const state of ["paused", "failed"]) {
+    const page = await run({ state });
+    expect(page).toMatchObject({ attendus: 2, filteredOut: 1, statesFilterApplied: true });
+    expect(page.rows).toHaveLength(1); expect(page.rows[0]!.state).toBe(state);
+  }
   await f.db.insert(savCases).values({ ticketId: String(++sequence), owner: "agent", phase: "queued", admissionTarget: "agent", contractRevision: SAV_CASE_CONTRACT_REVISION, payloadCiphertext: encryptSavPayload(emptyCaseBody()) });
   expect((await run()).rows.find(r => r.receivedAt === null)).toMatchObject({ threadId: null, messageId: null, replyDelaySeconds: null });
 });
@@ -161,15 +170,18 @@ it("uses at most 15 queries for 100 cases with histories and keeps cursor below 
     expect(Buffer.byteLength(page.nextCursor!)).toBeLessThan(1024);
   } finally { state.db = f.db; }
 });
-it("preserves microsecond keysets and bounds customer dates by snapshotAt", async () => {
+it("preserves microsecond keysets and bounds creation dates by snapshotAt", async () => {
   const a = await fixture({ received: new Date("2099-01-01") });
   const b = await fixture(), c = await fixture();
   await f.client.query("update sav.cases set created_at='2026-11-01T00:00:00.000001Z' where id=$1", [b.caseId]);
   await f.client.query("update sav.cases set created_at='2026-11-01T00:00:00.000002Z' where id=$1", [c.caseId]);
   const first = await run({ limit: 1, until: "2099-01-02T00:00:00Z" });
   const next = await run({ limit: 1, until: "2099-01-02T00:00:00Z", cursor: first.nextCursor });
-  expect(first.attendus).toBe(2); expect(first.rows[0]!.caseId).toBe(b.caseId); expect(next.rows[0]!.caseId).toBe(c.caseId);
-  expect(next.rows.some(row => row.caseId === a.caseId)).toBe(false);
+  expect(first.attendus).toBe(3); expect(first.rows[0]!.caseId).toBe(b.caseId); expect(next.rows[0]!.caseId).toBe(c.caseId);
+  const last = await run({ limit: 1, until: "2099-01-02T00:00:00Z", cursor: next.nextCursor });
+  expect(last.rows[0]!.caseId).toBe(a.caseId); expect(last.nextCursor).toBeNull();
+  await fixture({ createdAt: new Date("2099-01-01") });
+  expect((await run({ until: "2099-01-02T00:00:00Z" })).attendus).toBe(3);
 });
 it("fails explicitly instead of decrypting an unbounded observation history", async () => {
   const c = await fixture();
@@ -185,11 +197,31 @@ it.each(["count", "bytes"])("keeps costs unknown when spend registry %s exceeds 
   expect((await run()).rows[0]!.cost).toEqual({ confirmedMicroUsd: null, reservedMicroUsd: null, reason: "receipt_unreadable" });
 });
 
-it("reports filtered membership changes explicitly", async () => {
-  await fixture(); const c = await fixture();
-  const first = await run({ limit: 1, state: "processing" });
+it.each([undefined, "processing"])("keeps Astra's B < A < C scope exhaustive across state swaps (filter=%s)", async state => {
+  const b = await fixture({ phase: "awaiting_customer", createdAt: new Date("2026-11-01T00:00:00Z") });
+  const a = await fixture({ createdAt: new Date("2026-11-02T00:00:00Z") });
+  const c = await fixture({ createdAt: new Date("2026-11-03T00:00:00Z") });
+  const first = await run({ limit: 2, state });
+  expect(first.attendus).toBe(3);
+  expect(first.rows.map(row => row.caseId)).toEqual(state ? [a.caseId] : [b.caseId, a.caseId]);
+  expect(first.filteredOut).toBe(state ? 1 : 0);
+  await f.db.update(savCases).set({ phase: "queued" }).where(eq(savCases.id, b.caseId));
   await f.db.update(savCases).set({ phase: "awaiting_customer" }).where(eq(savCases.id, c.caseId));
-  await expect(run({ cursor: first.nextCursor, state: "processing" })).rejects.toThrow("MEMBERSHIP_CHANGED");
+  const second = await run({ limit: 2, state, cursor: first.nextCursor });
+  expect(second).toMatchObject({ attendus: 3, statesFilterApplied: !!state, filteredOut: state ? 1 : 0, nextCursor: null });
+  expect(second.rows.map(row => row.caseId)).toEqual(state ? [] : [c.caseId]);
+  const controlled = first.rows.length + first.filteredOut + second.rows.length + second.filteredOut;
+  expect(controlled).toBe(first.attendus);
+  expect(controlled).toBe(second.attendus);
+});
+
+it("advances through a fully filtered page even when no rows are displayed", async () => {
+  await fixture({ phase: "awaiting_customer" }); await fixture();
+  const first = await run({ state: "processing", limit: 1 });
+  expect(first).toMatchObject({ attendus: 2, filteredOut: 1, statesFilterApplied: true, rows: [] });
+  expect(first.nextCursor).not.toBeNull();
+  const second = await run({ state: "processing", limit: 1, cursor: first.nextCursor });
+  expect(second.rows).toHaveLength(1); expect(second.filteredOut).toBe(0); expect(second.nextCursor).toBeNull();
 });
 
 it("accepts postgres-js array results as well as PGlite row envelopes", async () => {

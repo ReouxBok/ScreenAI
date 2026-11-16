@@ -8,15 +8,15 @@ import { SAV_CASE_ADMISSION_TEAM_REASONS } from "./case-types";
 
 export const v2InventoryStates = ["processing", "awaiting_customer", "reply_sent", "handed_to_team", "failed", "paused"] as const;
 export const v2InventoryInput = z.object({
-  from: z.iso.datetime({ offset: true }).optional().describe("Depuis : date inclusive du premier mail client V2."),
-  until: z.iso.datetime({ offset: true }).optional().describe("Jusqu’à : date inclusive du premier mail client V2."),
-  state: z.enum(v2InventoryStates).optional().describe("processing : en cours ; awaiting_customer : en attente du client ; reply_sent : réponse envoyée ; handed_to_team : transféré à l’équipe ; failed : échec ; paused : en pause."),
+  from: z.iso.datetime({ offset: true }).optional().describe("Depuis : date inclusive de création du dossier V2."),
+  until: z.iso.datetime({ offset: true }).optional().describe("Jusqu’à : date inclusive de création du dossier V2."),
+  state: z.enum(v2InventoryStates).optional().describe("Filtre d’affichage seulement, sans retirer de dossiers du parcours ; processing : en cours ; awaiting_customer : en attente du client ; reply_sent : réponse envoyée ; handed_to_team : transféré à l’équipe ; failed : échec ; paused : en pause."),
   limit: z.number().int().min(1).max(100).default(25),
   cursor: z.string().min(1).max(1023).optional().describe("Curseur opaque durable ; conserver les mêmes filtres. Taille constante ; périmètre borné par snapshotAt."),
 }).strict();
 type Input = z.infer<typeof v2InventoryInput>;
 const timestamp = z.string().max(64).refine(value => Number.isFinite(Date.parse(value)));
-const cursorSchema = z.object({ v: z.literal(2), filters: z.string(), after: z.object({ createdAt: timestamp, id: z.uuid() }), snapshotAt: timestamp, attendus: z.number().int().nonnegative() }).strict();
+const cursorSchema = z.object({ v: z.literal(3), filters: z.string(), after: z.object({ createdAt: timestamp, id: z.uuid() }), snapshotAt: timestamp, attendus: z.number().int().nonnegative() }).strict();
 const invalid = (): never => { throw Error("SAV_V2_INVENTORY_CURSOR_INVALID"); };
 const handoffCodes = new Set<string>([...SAV_CASE_ADMISSION_TEAM_REASONS, "explicit_human_request", "sensitive_request", "knowledge_missing", "knowledge_conflict",
   "evidence_inaccessible", "diagnosis_out_of_tools", "repeated_failure", "out_of_scope", "decision_refused", "validator_refusals", "awaiting_v2_attribution"]);
@@ -47,8 +47,8 @@ const stateSql = sql<typeof v2InventoryStates[number]>`case
   else 'processing' end`;
 
 /** Read-only, compact (created_at, id) keyset. The DB timestamp freezes the creation
- * boundary; first-customer dates are bounded by min(until, snapshotAt). Mutable
- * states/values are read afresh. Histories are bounded and fail explicitly on overflow.
+ * boundary; scope uses only immutable creation dates in [from, min(until, snapshotAt)].
+ * Mutable states are display-only filters; every traversed case is listed or filtered out. Histories are bounded and fail explicitly on overflow.
  * No external call, write, lock or payload upgrade. */
 export async function listV2Cases(raw: Input) {
   const input = v2InventoryInput.parse(raw);
@@ -65,18 +65,16 @@ export async function listV2Cases(raw: Input) {
     const snapshotAt = cursor?.snapshotAt ?? (await queryBatch<{ value: string }>(tx, sql`select clock_timestamp()::text as value`)).rows[0]!.value;
     const observedAt = new Date(snapshotAt).toISOString();
     const scope = and(
-      sql`${savCases.createdAt} <= ${snapshotAt}::timestamptz`,
-      input.from ? sql`${receivedAt}::timestamptz >= ${input.from}::timestamptz` : undefined,
-      sql`((${!input.from && !input.until} and ${receivedAt} is null) or ${receivedAt}::timestamptz <= least(${input.until ?? snapshotAt}::timestamptz, ${snapshotAt}::timestamptz))`,
-      input.state ? eq(stateSql, input.state) : undefined,
+      input.from ? sql`${savCases.createdAt} >= ${input.from}::timestamptz` : undefined,
+      sql`${savCases.createdAt} <= least(${input.until ?? snapshotAt}::timestamptz, ${snapshotAt}::timestamptz)`,
     );
     const attendus = Number((await tx.select({ count: sql<number>`count(*)` }).from(savCases).where(scope))[0]!.count);
-    // Changes to filtered membership are reported, rather than silently claiming exhaustiveness.
+    // Deletions still invalidate the traversal rather than silently claiming exhaustiveness.
     if (cursor && attendus !== cursor.attendus) throw Error("SAV_V2_INVENTORY_MEMBERSHIP_CHANGED");
     const page = await tx.select({ id: savCases.id, createdAt: sql<string>`${savCases.createdAt}::text`, threadIds: savCases.threadIds, phase: savCases.phase, state: stateSql, payload: savCases.payloadCiphertext, receivedAt })
       .from(savCases).where(and(scope, cursor ? sql`(${savCases.createdAt}, ${savCases.id}) > (${cursor.after.createdAt}::timestamptz, ${cursor.after.id}::uuid)` : undefined))
       .orderBy(asc(savCases.createdAt), asc(savCases.id)).limit(input.limit + 1);
-    if (!page.length) return { attendus, observedAt, rows: [], nextCursor: null };
+    if (!page.length) return { attendus, observedAt, statesFilterApplied: !!input.state, filteredOut: 0, rows: [], nextCursor: null };
     const ids = page.slice(0, input.limit).map(row => row.id);
     const idArray = `{${ids.join(",")}}`;
     // One batch per table, with at most 1000 history records per case plus an overflow sentinel.
@@ -145,8 +143,10 @@ export async function listV2Cases(raw: Input) {
     const eventsByCase = groupBy(eventRows.rows, row => row.caseId);
     const callsByCase = groupBy(callRows.rows, row => row.caseId);
     const rows = [];
+    let filteredOut = 0;
     // Only public counters/codes are projected. Encrypted event/body content never leaves this function.
     for (const row of page.slice(0, input.limit)) {
+      if (input.state && row.state !== input.state) { filteredOut++; continue; }
       const entry = entries.rows.find(e => e.caseId === row.id);
       const message = entry ? messageRows.find(m => m.gmailId === entry.key.slice("inbound:".length) && row.threadIds.includes(m.threadId)) : undefined;
       const executions = executionsByCase.get(row.id) ?? [];
@@ -196,6 +196,6 @@ export async function listV2Cases(raw: Input) {
       });
     }
     const last = page.slice(0, input.limit).at(-1);
-    return { attendus, observedAt, rows, nextCursor: page.length > input.limit && last ? encryptSavPayload({ v: 2, filters, after: { createdAt: last.createdAt, id: last.id }, snapshotAt, attendus }) : null };
+    return { attendus, observedAt, statesFilterApplied: !!input.state, filteredOut, rows, nextCursor: page.length > input.limit && last ? encryptSavPayload({ v: 3, filters, after: { createdAt: last.createdAt, id: last.id }, snapshotAt, attendus }) : null };
   }, { isolationLevel: "repeatable read", accessMode: "read only" });
 }
