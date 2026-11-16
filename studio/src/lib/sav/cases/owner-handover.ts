@@ -1,12 +1,14 @@
 import "server-only";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { auditLogs, savIntakeExecutions, savMessages } from "@/db/schema";
+import { auditLogs, savCases, savIntakeExecutions, savMessages } from "@/db/schema";
 import { savContentHash } from "../crypto";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 import { savV2WakeWorkflowsEnabled, CASE_WAKE_STEP_BUDGET_MS } from "./case-v2-latency-wakes";
 import { recordCaseAfterConfirmedIntake, relayPaused, v2HubspotOwnerId } from "./intake-boundary";
-import { continueCaseAfterCommit, savV2EntryEnabled, v2EntryRelayDeps } from "./v2-entry";
+import { savCaseRecordingEnabled } from "./case-store";
+// v2-entry is loaded lazily: intake-boundary imports this module, and a static v2-entry import would pull the CRM readers into every relay importer.
+import type { continueCaseAfterCommit } from "./v2-entry";
 
 type Env = Record<string, string | undefined>;
 export type OwnerEvent = { subscriptionType: string; propertyName?: string; propertyValue?: string; portalId?: number; objectId?: string | number; occurredAt?: number; eventId?: number; changeSource?: string };
@@ -16,7 +18,9 @@ const MAX_HANDOVER_AGE_MS = 3_600_000;
 const handoverExpired = (metadata: Record<string, unknown>, now: number) => Number(metadata.occurredAt) + MAX_HANDOVER_AGE_MS <= now;
 const MAX_RECOVERY_RETRIES = 3;
 const whereMark = (id: string) => and(eq(auditLogs.action, OWNER_HANDOVER_MARK.action), eq(auditLogs.entityType, OWNER_HANDOVER_MARK.entityType), eq(auditLogs.entityId, id));
-export const ownerHandoverEnabled = (env: Env) => env.SAV_V2_OWNER_HANDOVER === "on" && savV2EntryEnabled(env) && savV2WakeWorkflowsEnabled(env);
+/** Same condition as `savV2EntryEnabled` (v2-entry), read here without loading that module. */
+const entryEnabled = (env: Env) => env.SAV_V2_ENTRY === "on" && savCaseRecordingEnabled(env);
+export const ownerHandoverEnabled = (env: Env) => env.SAV_V2_OWNER_HANDOVER === "on" && entryEnabled(env) && savV2WakeWorkflowsEnabled(env);
 export function isOwnerHandoverEvent(event: OwnerEvent, env: Env) {
   const owner = v2HubspotOwnerId(env);
   return !!owner && event.subscriptionType === "ticket.propertyChange" && event.propertyName === "hubspot_owner_id"
@@ -107,6 +111,13 @@ export async function ownerHandoverGraceOpen(ticketId: string) {
   return row ? !row.clear : false;
 }
 
+/** Same fence for an EXISTING agent case: since durable stops (#285) a case stopped on a human owner stays queued and
+ * resumes as soon as the owner reads V2. During the grace, or after a team-last check, only this hand-over decides. */
+export async function ownerHandoverHoldsCase(caseId: string) {
+  const [row] = await requireDb().select({ clear: noOwnerHandoverGrace(savCases.ticketId) }).from(savCases).where(eq(savCases.id, caseId)).limit(1);
+  return row ? !row.clear : false;
+}
+
 type TicketState = { owner: string | null; pipeline: string | null; lastEmailAt: number; lastDirection: "customer" | "team" | "unknown" };
 export async function runOwnerHandover(ticketId: string, token: string, options: {
   env: Env; now?: Date; readTicket?: (id: string) => Promise<TicketState>;
@@ -167,11 +178,12 @@ export async function runOwnerHandover(ticketId: string, token: string, options:
     await settle("abandoned", { outcome: "switch_off", abandonedAt: new Date().toISOString() });
     return done("off");
   }
-  const result = await (options.relay ?? recordCaseAfterConfirmedIntake)(source.id, v2EntryRelayDeps(options.env));
+  const entry = await import("./v2-entry");
+  const result = await (options.relay ?? recordCaseAfterConfirmedIntake)(source.id, entry.v2EntryRelayDeps(options.env));
   if (!("owner" in result) || result.owner !== "agent") return done("not_admitted");
   // The relay has committed the case. Release the sweep only after this durable
   // result, and before starting its continuation (which can fail independently).
   if (!await settle("admitted", { caseId: result.caseId })) return done("replaced");
-  const outcome = await (options.continuation ?? continueCaseAfterCommit)(result.caseId, "relay", { env: options.env, immediateDeadlineMs: Date.now() + CASE_WAKE_STEP_BUDGET_MS });
+  const outcome = await (options.continuation ?? entry.continueCaseAfterCommit)(result.caseId, "relay", { env: options.env, immediateDeadlineMs: Date.now() + CASE_WAKE_STEP_BUDGET_MS });
   return done(outcome.status);
 }

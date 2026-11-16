@@ -432,6 +432,12 @@ export type CaseContinuationOutcome = { status: string } | { status: "failed"; c
 /** Called after the commit, on every path. It never undoes or fails what was committed; what went wrong is logged and marked, and the sweep tries the case again. */
 export async function continueCaseAfterCommit(caseId: string, trigger: CaseContinuationTrigger, input: EntryDeps): Promise<CaseContinuationOutcome> {
   let code: string;
+  // Owner hand-over (#271): in its grace, or once it found the team wrote last, nothing resumes the case (no reply, no
+  // stop change); the hand-over continues it itself, or a newer customer mail lifts the block. Unreadable fails closed: the sweep retries.
+  if (await (await import("./owner-handover")).ownerHandoverHoldsCase(caseId).catch(() => true)) {
+    console.info("sav_v2_continuation_skipped", { caseId, reason: "owner_handover_pending" });
+    return { status: "owner_handover_pending" };
+  }
   // No investigation or cost outside qualification; keep a durable operator task.
   const scoped = await savV2QualificationCaseAllowed(input.env, caseId).catch(() => ({ allowed: false as const, reason: "qualification_unreadable" }));
   if (!scoped.allowed) {

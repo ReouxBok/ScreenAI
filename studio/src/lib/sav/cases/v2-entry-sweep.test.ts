@@ -106,3 +106,19 @@ it.each(["absent", "existing", "full-lap"])("a delayed concurrent passage cannot
   } finally { release(); await slow; }
   expect(await cursor()).toBe(mode === "full-lap" ? null : id(4));
 });
+it("owner hand-over (#271): grace and team-last hold an existing agent case; no continuation, durable stop untouched; admitted releases it", async () => {
+  const [held, graced] = await seed(2);
+  const mark = (entityId: string, technicalMetadata: Record<string, string | number>, action = "sav_v2_owner_handover", entityType = "sav_hubspot_ticket") =>
+    f.db.insert(auditLogs).values({ actorEmail: "system", action, entityType, entityId, technicalMetadata });
+  await mark("900000", { state: "team_replied_last", occurredAt: Date.now() - 7_200_000, teamLastAt: new Date(Date.now() - 7_200_000).toISOString() });
+  await mark("900001", { state: "starting", occurredAt: Date.now() });
+  await mark(held!, { code: "ticket_owner_human", failures: 1 }, "sav_v2_continuation_failed", "sav_v2_case");
+  const continuation = vi.fn(async () => ({ status: "started" }));
+  expect(await sweepCaseContinuations({ env, continuation })).toEqual({ tried: 2, failed: {} });
+  expect(continuation).not.toHaveBeenCalled();
+  const stop = await f.db.select().from(auditLogs).where(eq(auditLogs.entityId, held!));
+  expect(stop[0]!.technicalMetadata).toEqual({ code: "ticket_owner_human", failures: 1 });
+  await f.db.update(auditLogs).set({ technicalMetadata: { state: "admitted", occurredAt: Date.now() } }).where(eq(auditLogs.entityId, "900001"));
+  await sweepCaseContinuations({ env, continuation });
+  expect(continuation).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ caseId: graced, trigger: "sweep" }));
+});
