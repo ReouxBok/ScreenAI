@@ -359,10 +359,27 @@ function unusedAlternative(action: Extract<CaseDecisionProposal["nextAction"], {
 // Broad roots are intentional: a doubt about login requires the URL. Its presence
 // anywhere in the reply satisfies this requirement, including another paragraph.
 const LOGIN_REFERENCE = /\b(?:(?:re|de)?connect\w*|connexion\w*|identif\w*|acced\w*|acces|log\w*|sign[ -]?in)\b/;
-// A closed observational grammar proves the no-procedure exemption. Match the
-// whole text: an unknown wording or an appended instruction is never permission.
-const ACCESS_CLARIFICATION = /^(?:quel message(?: d'erreur)? (?:voyez-vous|s'affiche(?: a l'ecran)?)|quel (?:navigateur|appareil|systeme d'exploitation) utilisez-vous|quelle version du navigateur utilisez-vous|quel resultat obtenez-vous(?: apres l'operation)?)\s*\?$/;
-const isAccessClarification = (text: string) => ACCESS_CLARIFICATION.test(squash(text));
+// Every sentence must ask for information. Greetings and courtesy are framing,
+// never an exemption for a second instruction or an unknown statement.
+const INFORMATION_QUESTION = /^(?:(?:quel|quelle|quels|quelles)\b|depuis quand\b|pouvez-vous (?:preciser|indiquer|me dire|m'envoyer une capture)\b|avez-vous\b|est-ce que\b|sur (?:quel|quelle|quels|quelles) (?:appareil|navigateur)\b) .+$/;
+// An interrogative form can still prescribe an operation. Deny those verbs even
+// inside a longer information question (including past/conditional forms).
+const CLARIFICATION_OPERATION = /\b(?:ouvrir|ouvert\w*|ouvre\w*|session\w*|espace\w*|aller|allez|alliez|rendre|rendez|retourner|retourne\w*|rejoindre|rejoigne\w*|reessay\w*|reessai\w*|essayer|essay\w*|tenter|tente\w*|cliquer|cliqu\w*|saisir|saisiss\w*|entrer|entrez|entriez|fermer|ferme\w*|vider|videz|supprimer|supprime\w*|installer|installe\w*|telecharger|telecharge\w*|actualiser|actualise\w*|rafraich\w*|recommencer|recommence\w*|effectuer|effectue\w*|faire|faites|fait|desactiver|desactive\w*|activer|active\w*|changer|change\w*|utiliser|veuillez)\b/;
+function isAccessClarification(text: string) {
+  const value = squash(text);
+  if (LOGIN_REFERENCE.test(value) || CLARIFICATION_OPERATION.test(value)) return false;
+  const parts = value.split("?");
+  if (parts.length < 2) return false;
+  // Only fixed courtesies may follow the final question mark.
+  const tail = parts.pop()!.trim();
+  if (tail && !/^(?:merci(?: beaucoup| d'avance)?|(?:bien )?cordialement)[.!]?$/.test(tail)) return false;
+  return parts.every(part => {
+    const question = part.trim().replace(/^(?:bonjour|bonsoir|salut)(?:\s*[,!.]\s*|\s+)/, "")
+      .replace(/,?\s*s'il vous plait$/, "").trim();
+    // A period, semicolon or newline cannot hide a free-standing instruction.
+    return !/[.!;:\n]/.test(question) && INFORMATION_QUESTION.test(question);
+  });
+}
 function accessLinkMissing(text: string, loginProcedure?: boolean) {
   if (accessLinks(text).present) return false;
   if (!smartValidator()) return true;

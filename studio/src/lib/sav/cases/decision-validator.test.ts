@@ -934,6 +934,68 @@ describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
       decision.nextAction = ask(undefined, text);
     }
   });
+  const informationQuestions = [
+    "Bonjour, quel navigateur utilisez-vous ?",
+    "Pouvez-vous préciser le message affiché ?",
+    "Depuis quand rencontrez-vous ce problème ?",
+    "Quelle version du système utilisez-vous ?",
+    "Quels messages voyez-vous à l’écran ?",
+    "Pouvez-vous indiquer votre navigateur ?",
+    "Pouvez-vous me dire ce qui s’affiche à l’écran ?",
+    "Pouvez-vous m’envoyer une capture de l’écran ?",
+    "Avez-vous un message d’erreur ?",
+    "Est-ce que le problème est permanent ?",
+    "Sur quel appareil constatez-vous ce problème ?",
+    "Sur quel navigateur rencontrez-vous ce problème ?",
+    "Bonsoir ! Quelle page voyez-vous ? Merci.",
+    "Bonjour, pouvez-vous préciser le résultat obtenu, s’il vous plaît ?",
+    "Quel appareil utilisez-vous ? Depuis quand observez-vous ce problème ?",
+  ];
+  const disguisedInstructions = [
+    "Pouvez-vous ouvrir votre session ?",
+    "Est-ce que vous pouvez vous connecter ?",
+    "Pouvez-vous aller dans votre espace ?",
+    "Pouvez-vous réessayer de vous connecter ?",
+    "Quel navigateur pouvez-vous ouvrir pour vous connecter ?",
+    "Avez-vous la possibilité d’ouvrir une session ?",
+    "Pouvez-vous me dire le résultat puis ouvrir votre session ?",
+    "Depuis quand rencontrez-vous ce problème, pouvez-vous vous reconnecter ?",
+    "Quel navigateur utilisez-vous ? Pouvez-vous aller dans votre espace personnel ?",
+    "Pouvez-vous m’envoyer une capture après avoir ouvert votre session ?",
+  ];
+  it.each(informationQuestions)("information question without link, ON only: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    mode(true); accepted(decision, ctx);
+    expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true, loginProcedure: false })).toEqual([]);
+    mode(false); expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+  });
+  it.each(disguisedInstructions)("disguised connection instruction still requires a link: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    for (const on of [true, false]) {
+      mode(on); expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+    }
+  });
+  it.each([
+    "Quel navigateur utilisez-vous ? Ouvrez une fenêtre privée.",
+    "Quel navigateur utilisez-vous ? Pouvez-vous cliquer sur le bouton ?",
+    "Quel navigateur utilisez-vous ? Quel résultat obtenez-vous, puis réessayez ?",
+    "Quel navigateur utilisez-vous ? Texte libre.",
+    "Pouvez-vous préciser le message affiché",
+  ])("each sentence must remain an information question: %s", text => {
+    mode(true); const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+  });
+  it("checks every structured question as well as the complete reply", () => {
+    mode(true); const { decision, ctx } = accessQuestion(informationQuestions[0]);
+    decision.nextAction = { ...ask(), questions: [
+      ...ask(undefined, informationQuestions[0]).questions,
+      ...ask(undefined, disguisedInstructions[0]).questions,
+    ] };
+    expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+  });
   it.each(["Procédure de connexion", "Procédure sans catégorie"])("requires URL for a cited Access procedure, including unknown category: %s", title => {
     mode(true);
     const { decision, ctx } = accessQuestion("Ouvrez une fenêtre privée.");
