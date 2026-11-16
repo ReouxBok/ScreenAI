@@ -6,7 +6,6 @@ import { measureCaseContextFixture, type CaseContextFixture } from "./investigat
 import { compactCaseKnowledgeContent, selectCaseKnowledgePassages } from "./investigation-prompt-compact";
 import { caseDecisionProviderSchema, caseInvestigationPrompt, caseInvestigationPromptRevision, prepareCaseGeminiDecisionRequest } from "./investigation-v2-providers";
 import { buildCaseCustomerContext } from "./investigation-customer-context";
-import { expandInvestigationContext } from "./investigation-context-view";
 import type { CaseInvestigationModelRequest } from "./investigation-runner";
 
 const fixture = JSON.parse(readFileSync(new URL("./fixtures/syn-context-budget.v1.json", import.meta.url), "utf8")) as CaseContextFixture;
@@ -73,30 +72,36 @@ describe("SAV-92 compact prompt (offline, synthetic, attachments off)", () => {
 const noise = (seed: string, count = 180) => Array.from({ length: count }, (_, i) => hash(`${seed}:${i}`).slice(0, 12)).join(" ");
 const largeCard = (seed = "base") => Array.from({ length: 12 }, (_, i) => `## Présentation ${i}\n${noise(`${seed}:${i}`)}`).join("\n\n")
   + "\n\n## Présentation zéphyr\nDétail pertinent : diagnostic zéphyr dans le panneau de démonstration.\n\n## Prérequis\nSession de démonstration ouverte.\n\n## Étapes\nDiagnostic zéphyr : ouvrir le panneau synthétique.\n\n## Exceptions\nNe jamais appliquer aux invités.\n\n## Version\nÉdition exacte SYN-2026.11.";
-const unpack = (body: string) => {
-  const payload = JSON.parse(JSON.parse(body).contents[0].parts[0].text);
-  return payload.encoding ? expandInvestigationContext(payload) as Record<string, unknown> : payload;
-};
 
 describe("SAV-92 customer envelope and whole passages", () => {
-  it("keeps unfamiliar sections and qualifications inside otherwise optional prose", () => {
+  for (const prerequisite of ["Nécessite un abonnement Pro", "Réservé aux administrateurs"]) {
+    it(`preserves or refuses the whole procedure with Description prerequisite: ${prerequisite}`, () => {
+      const steps = `## Étapes\n${"Ouvrir le panneau. ".repeat(314)}`;
+      const content = `## Description\n${prerequisite}\n\n${steps}`;
+      expect(Buffer.byteLength(steps)).toBeLessThanOrEqual(6_000);
+      expect(Buffer.byteLength(content)).toBeGreaterThan(6_000);
+      expect(selectCaseKnowledgePassages(content, {}, "panneau démonstration", 6_000)).toBeNull();
+      const selected = selectCaseKnowledgePassages(content, {}, "panneau démonstration", Buffer.byteLength(content));
+      expect(selected).toContain(prerequisite);
+      expect(selected).toContain(steps);
+      expect(selected).toBe(content);
+    });
+  }
+  it("keeps descriptive and unfamiliar sections together, refusing if they cannot all fit", () => {
     const content = `## Présentation\n${noise("background")}\n\nAttention : appliquer seulement au compte de démonstration.\n\n## Branche inconnue\nCondition opérationnelle à conserver intégralement.`;
-    const selected = selectCaseKnowledgePassages(content, {}, "background", 400)!;
-    expect(selected).toContain("Attention : appliquer seulement au compte de démonstration.");
-    expect(selected).toContain("## Branche inconnue\nCondition opérationnelle à conserver intégralement.");
+    expect(selectCaseKnowledgePassages(content, {}, "background", 400)).toBeNull();
+    expect(selectCaseKnowledgePassages(content, {}, "background", Buffer.byteLength(content))).toBe(content);
     expect(selectCaseKnowledgePassages("Texte inconnu sans section.".repeat(50), {}, "texte", 400)).toBeNull();
   });
-  it("selects a relevant late passage, keeping prerequisites, exception and exact version deterministically", () => {
+  it("refuses a large card regardless of query instead of guessing which prose qualifies its steps", () => {
     const content = largeCard();
-    const selected = selectCaseKnowledgePassages(content, {}, "diagnostic zéphyr", 4_000)!;
-    expect(selected).toBe(selectCaseKnowledgePassages(content, {}, "diagnostic zéphyr", 4_000));
-    for (const literal of ["Détail pertinent : diagnostic zéphyr", "Session de démonstration ouverte.", "Diagnostic zéphyr", "Ne jamais appliquer aux invités.", "SYN-2026.11"]) expect(selected).toContain(literal);
-    expect(Buffer.byteLength(selected)).toBeLessThanOrEqual(4_000);
-    expect(selectCaseKnowledgePassages(content, {}, "diagnostic zéphyr", 10)).toBeNull();
-    process.stdout.write(JSON.stringify([{ fixture: "large-card", beforeBytes: Buffer.byteLength(content), afterBytes: Buffer.byteLength(selected), bound: 4_000 }]) + "\n");
+    for (const query of ["diagnostic zéphyr", "", "Présentation"]) {
+      expect(selectCaseKnowledgePassages(content, {}, query, 4_000)).toBeNull();
+      expect(selectCaseKnowledgePassages(content, {}, query, Buffer.byteLength(content))).toBe(content);
+    }
   });
 
-  it("keeps the customer words, CRM history, facts and failed trials under size pressure, and legacy OFF bytes", () => {
+  it("refuses size pressure without changing customer words, CRM history, facts, failed trials or legacy OFF bytes", () => {
     const req = request();
     req.customerContext = buildCaseCustomerContext({ latestMessageId: "latest", messages: [
       { id: "earlier", direction: "outbound", at: "2026-11-01T10:00:00Z", subject: "Synthétique", text: "Vérifier les spams." },
@@ -110,16 +115,15 @@ describe("SAV-92 customer envelope and whole passages", () => {
     const beforeBytes = Buffer.byteLength(caseGeminiDecisionBody(initialPrompt, initialPrompt.payload, 4096));
     expect(beforeBytes).toBeGreaterThan(26_000);
     const on = prepareCaseGeminiDecisionRequest(req, { ...env, SAV_V2_PROMPT_COMPACT: "on" });
-    expect(on.ok).toBe(true);
-    if (!on.ok) throw Error("preflight");
-    const payload = unpack(on.body);
-    expect(payload.customerContext).toEqual(req.customerContext);
-    expect(payload.facts).toEqual(req.snapshot.body.facts);
-    expect(payload.trials).toEqual(req.snapshot.body.trials);
-    expect(Buffer.byteLength(on.body)).toBeLessThanOrEqual(26_000);
+    expect(on).toMatchObject({ ok: false, diagnostic: { code: "input_too_large", networkAttempted: false } });
+    const preserved = caseInvestigationPrompt(req, { compact: true }).payload;
+    expect(preserved.customerContext).toEqual(req.customerContext);
+    expect(preserved.facts).toEqual(req.snapshot.body.facts);
+    expect(preserved.trials).toEqual(req.snapshot.body.trials);
+    expect(preserved.knowledge.map(card => card.content)).toEqual(req.knowledge.map(card => card.content));
     const off = prepareCaseGeminiDecisionRequest(req, { ...env, SAV_V2_PROMPT_COMPACT: "off" });
     expect(off).toEqual(prepareCaseGeminiDecisionRequest(req, env));
-    process.stdout.write(JSON.stringify([{ fixture: "customer-pressure", beforeBytes, afterBytes: on.metadata.inputBytes, bound: 26_000 }]) + "\n");
+    process.stdout.write(JSON.stringify([{ fixture: "customer-pressure", beforeBytes, refused: !on.ok, bound: 26_000 }]) + "\n");
   });
 
   it("refuses before network when mandatory evidence alone exceeds the bound, preserving the input", () => {

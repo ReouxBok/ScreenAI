@@ -31,36 +31,14 @@ export function compactCaseKnowledgeContent(content: string, resolution: unknown
   }).join("");
 }
 
-/** Whole passages, never rewritten. Operational sections and qualifications are mandatory;
- * if those alone exceed the envelope, refuse selection rather than lose a condition.
- * Query terms rank optional prose only, with source order as the stable tie-breaker.
+/**
+ * Without authored dependency metadata, any prose can qualify the procedure,
+ * including a Description paragraph. Treat the deduplicated card as one passage:
+ * a heading or query score cannot prove that omitted prose is dispensable.
+ * Refuse selection when it does not fit; callers retain the complete card for
+ * the existing request-level preflight rather than sending a partial procedure.
  */
-export function selectCaseKnowledgePassages(content: string, resolution: unknown, query: string, maxBytes: number): string | null {
+export function selectCaseKnowledgePassages(content: string, resolution: unknown, _query: string, maxBytes: number): string | null {
   const compact = compactCaseKnowledgeContent(content, resolution);
-  const size = (text: string) => new TextEncoder().encode(text).length;
-  if (size(compact) <= maxBytes) return compact;
-  const tokens = (text: string) => new Set(text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
-  const terms = tokens(query);
-  const operational = /(?:étapes?|steps?|procédure|prérequis|prerequisites?|exceptions?|avertissements?|warnings?|versions?|sources?|résolution|resolution|dépannage|troubleshooting|escalad|conditions?|limitations?|sécurité|security)/iu;
-  const optionalHeading = /^(?:présentation|introduction|contexte|historique|description|exemples?|background|overview|examples?)\b/iu;
-  const qualification = /(?:exception|attention|avertissement|warning|\bne\b|\bpas\b|\bnot\b|\bnever\b|sauf|except|uniquement|only|prérequis|prerequisite|version|avant|before|interdit|unless|si |if )/iu;
-  const passages = compact.split(/(?=^#{1,6}\s)/m).flatMap(section => {
-    const match = /^(#{1,6}\s+([^\n]+)\n)([\s\S]*)$/.exec(section);
-    // Unfamiliar or unheaded prose may carry a condition we cannot classify.
-    // Only explicitly descriptive sections are candidates for omission.
-    if (!match || operational.test(match[2]) || !optionalHeading.test(match[2])) return [{ text: section, mandatory: true }];
-    const heading = match[1], body = match[3];
-    return body.split(/\n\s*\n/).filter(text => text.trim()).map(text => ({ text: heading + text, mandatory: qualification.test(heading + text) }));
-  }).map((row, index) => ({ ...row, index, bytes: size(row.text), score: [...tokens(row.text)].filter(term => terms.has(term)).length }));
-  const selected = new Set(passages.filter(row => row.mandatory).map(row => row.index));
-  const render = () => passages.filter(row => selected.has(row.index)).map(row => row.text).join("\n\n");
-  let used = passages.filter(row => row.mandatory).reduce((sum, row) => sum + row.bytes, 0) + Math.max(0, selected.size - 1) * 2;
-  if (used > maxBytes) return null;
-  for (const row of passages.filter(row => !row.mandatory).sort((a, b) => b.score - a.score || a.index - b.index)) {
-    const added = row.bytes + (selected.size ? 2 : 0);
-    if (used + added <= maxBytes) { selected.add(row.index); used += added; }
-  }
-  const result = render();
-  // An empty excerpt must never turn unread knowledge into an eligible source.
-  return result.trim() ? result : null;
+  return compact.trim() && new TextEncoder().encode(compact).length <= maxBytes ? compact : null;
 }
