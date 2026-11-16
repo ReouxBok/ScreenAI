@@ -130,6 +130,51 @@ it("refuses a deleted member rather than silently completing a partial audit", a
   await expect(run({ cursor: first.nextCursor })).rejects.toThrow("MEMBERSHIP_CHANGED");
 });
 
+it("refuses a newly committed member below snapshotAt and allows restarting the traversal", async () => {
+  await fixture(); await fixture();
+  const first = await run({ limit: 1 });
+  const snapshot = decryptSavPayload(first.nextCursor!) as { snapshotAt: string };
+  await f.db.transaction(async tx => {
+    await tx.insert(savCases).values({ createdAt: new Date(Date.parse(snapshot.snapshotAt) - 1000), ticketId: String(++sequence), owner: "agent", phase: "queued", admissionTarget: "agent", contractRevision: SAV_CASE_CONTRACT_REVISION, payloadCiphertext: encryptSavPayload(emptyCaseBody()) });
+  });
+  await expect(run({ cursor: first.nextCursor })).rejects.toThrow("SAV_V2_INVENTORY_MEMBERSHIP_CHANGED");
+  const restarted = await run();
+  expect(restarted.attendus).toBe(3);
+  expect(restarted.rows).toHaveLength(3);
+  expect(restarted.nextCursor).toBeNull();
+});
+
+// PGlite serializes transactions; only native PostgreSQL can exercise the overlapping commit.
+it.skipIf(!process.env.SAV_TEST_POSTGRES_URL)("refuses a transaction started before snapshotAt but committed between pages", async () => {
+  await fixture(); await fixture();
+  let release!: () => void, inserted!: (value: string) => void;
+  const commit = new Promise<void>(resolve => { release = resolve; });
+  const ready = new Promise<string>(resolve => { inserted = resolve; });
+  const writer = f.db.transaction(async tx => {
+    const [row] = await tx.insert(savCases).values({ ticketId: String(++sequence), owner: "agent", phase: "queued", admissionTarget: "agent", contractRevision: SAV_CASE_CONTRACT_REVISION, payloadCiphertext: encryptSavPayload(emptyCaseBody()) }).returning({ id: savCases.id, createdAt: savCases.createdAt });
+    inserted(row!.createdAt.toISOString());
+    await commit;
+    return row!.id;
+  });
+  // Propagate setup failures instead of leaving the reader waiting on the barrier.
+  const createdAt = await Promise.race([ready, writer.then(() => { throw Error("WRITER_COMMITTED_BEFORE_PAGE"); })]);
+  try {
+    const first = await run({ limit: 1 });
+    expect(first.attendus).toBe(2);
+    expect(first.rows).toHaveLength(1);
+    expect(first.nextCursor).not.toBeNull();
+    const snapshot = decryptSavPayload(first.nextCursor!) as { snapshotAt: string };
+    expect(Date.parse(createdAt)).toBeLessThanOrEqual(Date.parse(snapshot.snapshotAt));
+    release();
+    const addedId = await writer;
+    await expect(run({ cursor: first.nextCursor })).rejects.toThrow("SAV_V2_INVENTORY_MEMBERSHIP_CHANGED");
+    const restarted = await run();
+    expect(restarted.attendus).toBe(3);
+    expect(restarted.rows.map(row => row.caseId)).toContain(addedId);
+    expect(restarted.nextCursor).toBeNull();
+  } finally { release(); await writer; }
+});
+
 it("keeps inventory available with explicit null costs for missing or unreadable receipts", async () => {
   const c = await fixture(), subject = randomUUID();
   await f.db.insert(savCaseCalls).values({ callKey: `${subject}:call1`, subjectKey: subject, caseId: c.caseId, caseVersion: 1, purpose: "decision", state: "reserved", token: randomUUID(), holder: "fixture", leaseUntil: new Date() });
