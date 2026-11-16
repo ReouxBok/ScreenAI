@@ -626,3 +626,24 @@ describe("SAV-92 (revue batch 3, B1) : une partie équipe dont la notice ne peut
     expect(await readCaseTeamPartWait(w.caseId)).toMatchObject({ passes: 2, handedToTeam: expect.any(String) });
   });
 });
+
+describe("propriétaire rendu à V2 (#271) : l'équipe a écrit en dernier, puis le client répond sur le dossier agent ouvert", () => {
+  it("le retour consommé par V2 (sans exécution V1) lève le blocage : une seule reprise, aucun double enregistrement", async () => {
+    const w = await waitingWithReturn();
+    await f.db.insert(auditLogs).values({ actorEmail: "system", action: "sav_v2_owner_handover", entityType: "sav_hubspot_ticket", entityId: w.ticketId,
+      technicalMetadata: { state: "team_replied_last", occurredAt: T0.getTime(), teamLastAt: new Date(T1.getTime() - 60_000).toISOString() } });
+    const point = vi.fn(async () => ({ status: "started" }));
+    // Team last, no newer customer mail yet: nothing resumes the case.
+    expect(await continueCaseAfterCommit(w.caseId, "sweep", entry({ continuation: point }))).toEqual({ status: "owner_handover_pending" });
+    expect(point).not.toHaveBeenCalled();
+    expect(await customerReturnGate(w.run.id, entry({ continuation: point }))).toEqual({ skipped: "v2_customer_return" });
+    expect(await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, w.reply.id))).toEqual([]);
+    expect(point).toHaveBeenCalledExactlyOnceWith({ caseId: w.caseId, trigger: "customer_return", env: ON });
+    // A replayed pass on the consumed mail neither records it again nor continues again.
+    expect(await customerReturnGate(w.run.id, entry({ continuation: point }))).not.toBeNull();
+    expect(point).toHaveBeenCalledTimes(1);
+    expect(await inboundCount(w.caseId)).toBe(2);
+    // The block stays lifted for the next sweeps.
+    expect(await continueCaseAfterCommit(w.caseId, "sweep", entry({ continuation: point }))).not.toEqual({ status: "owner_handover_pending" });
+  });
+});
