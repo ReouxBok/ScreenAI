@@ -245,6 +245,15 @@ describe("after closure: same incident reopens, a new subject is a new admission
     expect(after.body.cycle.endedBy).toBeUndefined();
     expect(after.body.openRequests.map(request => request.status)).toEqual(["open"]);
   });
+  it("a reply on the same incident after a confirmed J2 closure reopens the same case and starts its next cycle", async () => {
+    const w = await waiting(), c = (await readCase(w.caseId))!;
+    await updateCaseRecord({ caseId: c.caseId, expectedVersion: c.version, actor: { type: "agent" }, phase: "closed_no_reply",
+      body: { ...c.body, waiting: null, cycle: { number: 1, endedBy: "closed_no_reply" } } });
+    const reply = await mail(w.threadId, w.mailboxId, { receivedAt: T1 });
+    expect(await routeCustomerReturn(reply.id, ports({ readV1Target: async () => "same_ticket", readMailAdmission: async () => ADMITTED }).deps))
+      .toMatchObject({ route: { route: "reopen" }, written: true });
+    expect(await readCase(w.caseId)).toMatchObject({ phase: "queued", body: { cycle: { number: 2 }, waiting: null } });
+  });
   it("another ticket (a new subject), a thanks, an automatic reply or V1 not done yet: the closed case is not touched", async () => {
     const w = await resolved();
     const cases: Array<[Partial<CustomerReturnDeps>, unknown]> = [

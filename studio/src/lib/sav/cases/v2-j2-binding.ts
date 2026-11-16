@@ -72,15 +72,15 @@ export async function enqueueApprovedJ2(timer: Pick<J2Timer,"id"|"caseId">, case
   return result.ok ? (result.created ? "queued" : "already_queued") : result.code;
 }
 
-/** Authors only the fixed reminder, through the normal durable proposal, rule and queue. */
+/** Authors the deterministic reminder, through the normal durable proposal, rule and queue. */
 export async function produceAutoJ2(timer: Pick<J2Timer,"id"|"caseId">, caseVersion: number, deps: CaseReplyStoreDeps) {
   const blocked = await j2AutoGate(deps.env());
   if (blocked) return blocked;
   const config = readAccessAutoApprovalConfig(deps.env());
   if (config.mode !== "on") return "j2_auto_off";
-  const origin = await readJ2Origin(timer.caseId, j2TriggerEventId(timer.id), await deps.currentPolicyRevision(), new Date());
+  const origin = await readJ2Origin(timer.caseId, j2TriggerEventId(timer.id), await deps.currentPolicyRevision(), new Date(), deps.env());
   if (!origin) return "reminder_origin_unproven";
-  const text = await readJ2ReminderText(timer.caseId, j2TriggerEventId(timer.id), deps.env());
+  const text = await readJ2ReminderText(timer.caseId, j2TriggerEventId(timer.id), deps.env(), origin);
   if (!text) return "reminder_origin_unproven";
   const proposal: CaseReplyProposal = { caseId: timer.caseId, caseVersion, triggerEventId: j2TriggerEventId(timer.id), purpose: "reminder",
     inboundMessageId: origin.inboundMessageId, recipient: origin.recipient, subject: origin.subject, text };
@@ -91,7 +91,7 @@ export async function produceAutoJ2(timer: Pick<J2Timer,"id"|"caseId">, caseVers
     seen: { payloadHash: caseReplyPayloadHash(proposal), caseVersion, recipient: proposal.recipient }, expectedCaseVersion: caseVersion, deps,
     authorizer: accessAutoReplyAuthorizer({ env: deps.env(), readFacts: async () => {
       if (await j2AutoGate(deps.env())) return null;
-      if (!await readJ2Origin(timer.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), new Date())) return null;
+      if (!await readJ2Origin(timer.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), new Date(), deps.env())) return null;
       const snapshot = await readCase(timer.caseId);
       if (!snapshot) return null;
       const owner = await judgeCurrentTicketOwner(deps.readTicketOwner, snapshot.ticketId);

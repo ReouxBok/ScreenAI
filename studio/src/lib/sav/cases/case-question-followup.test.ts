@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { caseBodySchema, type CaseEvent } from "./case-types";
 import type { CaseDecisionProposal } from "./decision-contract";
 import { hasMultiQuestionWait, reconcileCaseQuestionAnswers } from "./case-question-followup";
-import { j2ReminderText, J2_REMINDER_TEXT } from "./j2-auto-reminder";
 import { caseReplyPayloadHash, caseEffectHash, caseReplyQuestions, type CaseReplyProposal } from "./case-effects";
 
 const sent = "2026-11-16T09:00:00.000Z", at = "2026-11-16T10:00:00.000Z";
@@ -21,12 +20,10 @@ describe("partial customer answers", () => {
     expect(next.facts.map(f => f.key)).toEqual(["configuration_q1"]);
     expect(hasMultiQuestionWait(next)).toBe(true);
     expect(reconcileCaseQuestionAnswers(next, decision(["configuration_q1"]), events)).toEqual(next);
-    expect(j2ReminderText(next, "effect", true)).not.toContain("Question 1 ?");
-    expect(j2ReminderText(next, "effect", true)).toContain("Question 2 ?\n- Question 3 ?");
+    // The J2 text is built from the sealed sent mail (j2-contextual.test.ts), not from the case's open questions.
     const one = reconcileCaseQuestionAnswers(body(), decision(["configuration_q1", "configuration_q2"]), events);
-    expect(j2ReminderText(one, "effect", true)).toContain("Question 3 ?");
-    expect(j2ReminderText(one, "effect", true)).not.toContain("Question 2 ?");
-    expect(j2ReminderText(one, "effect", false)).toBe(J2_REMINDER_TEXT);
+    expect(one.questions.map(q => Boolean(q.answeredBy))).toEqual([true, true, false]);
+    expect(hasMultiQuestionWait(one)).toBe(true);
     const complete = reconcileCaseQuestionAnswers(body(), decision(["configuration_q1", "configuration_q2", "configuration_q3"]), events);
     expect(complete.questions.every(question => question.answeredBy)).toBe(true);
     expect(hasMultiQuestionWait(complete)).toBe(false);
@@ -62,7 +59,6 @@ describe("partial customer answers", () => {
   it("retains legacy single-question data and reminder text exactly", () => {
     const legacy = body(); legacy.questions = legacy.questions.slice(0, 1);
     expect(reconcileCaseQuestionAnswers(legacy, decision(["configuration_q1"]), events)).toEqual(legacy);
-    expect(j2ReminderText(legacy, "effect", true)).toBe(J2_REMINDER_TEXT);
     const proposal = { caseId: "10000000-0000-4000-8000-000000000001", caseVersion: 1, triggerEventId: "inbound:initial", inboundMessageId: "message", purpose: "question", recipient: "test@example.invalid", subject: "Test", text: "Question ?", question: { id: "in:initial:q1", text: "Question ?", factKeys: [] } } satisfies CaseReplyProposal;
     expect(caseReplyQuestions(proposal)).toEqual([proposal.question]);
     expect(caseReplyPayloadHash(proposal)).toBe(caseEffectHash({ ...proposal }));

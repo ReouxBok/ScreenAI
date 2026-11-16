@@ -228,7 +228,7 @@ export async function readRequestQuotes(input: { runId: string | null; runVersio
  * against its own hashes; never the mail. A summary covering several requests is none of their
  * subjects, and two accepted analyses that disagree give none either: absent, with the reason.
  * SAV-92: in a mail of several requests, a request the summary does not describe alone takes its own verified quote, masked the same way. */
-export async function readRequestSubjects(input: { runId: string | null; runVersion: number; messageId: string; gmailMessageId: string; requestIds: string[] }): Promise<Map<string, CaseRequestSubject>> {
+export async function readRequestSubjects(input: { runId: string | null; runVersion: number; messageId: string; gmailMessageId: string; requestIds: string[]; summaryTitleOnly?: true }): Promise<Map<string, CaseRequestSubject>> {
   const subjects = new Map<string, CaseRequestSubject>();
   const all = (reason: CaseSubjectAbsence) => {
     for (const id of input.requestIds) subjects.set(caseRequestId(input.gmailMessageId, id), { status: "absent", reason });
@@ -259,7 +259,7 @@ export async function readRequestSubjects(input: { runId: string | null; runVers
       if (subject.success) subjects.set(key, subject.data); else absent("source_invalid");
       continue;
     }
-    const text = searchableSubject(summary);
+    const text = input.summaryTitleOnly ? maskSearchText(summary.title) : searchableSubject(summary);
     // Masks alone are nothing to search for.
     if (text.replace(/\[[^\]]*masqu[^\]]*\]/g, "").replace(/[^\p{L}\p{N}]+/gu, "").length < SAV_CASE_SUBJECT_LENGTH.min) { absent("redacted_empty"); continue; }
     const subject = available(text, entry, "ticketSummary");

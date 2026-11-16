@@ -885,7 +885,7 @@ describe("the receipt transaction, read as code", () => {
     const inside = body.slice(body.indexOf("transaction(async tx"));
     expect(body.indexOf("deps.currentPolicyRevision()")).toBeLessThan(body.indexOf("transaction(async tx"));
     expect(inside).not.toMatch(/deps\.|adapters|fetch\(|\.transaction\(/);
-    expect(inside).toMatch(/recordConfirmedCaseReply\([^)]*\{ tx \}\)/);
+    expect(inside).toMatch(/recordConfirmedCaseReply\([\s\S]*?, \{ tx, contextualJ2: env\(\)\.SAV_V2_J2_CONTEXTUAL === "on" \}\)/);
   });
 });
 

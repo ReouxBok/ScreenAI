@@ -8,7 +8,6 @@ import { caseDecisionDraft, caseReplyTriggerOf } from "./investigation-intent";
 import { selectCaseKnowledge } from "./investigation-knowledge";
 import { caseBodySchema, emptyCaseBody, type CaseEvent } from "./case-types";
 import { hasMultiQuestionWait, reconcileCaseQuestionAnswers } from "./case-question-followup";
-import { j2ReminderText } from "./j2-auto-reminder";
 import type { CaseDecisionProposal } from "./decision-contract";
 import type { CaseInvestigationStoredRecord } from "./investigation-record";
 
@@ -229,9 +228,6 @@ describe("B → C draft: the decision in pole C's own proposal shape (SAV-10), v
     const pending = answered.some(done => !done);
     expect(hasMultiQuestionWait(next)).toBe(pending);
     expect(next.waiting).toEqual(pending ? body.waiting : null);
-    if (pending) questions.forEach((question, index) => {
-      expect(j2ReminderText(next, "effect", true).includes(question.text)).toBe(!answered[index]);
-    });
     const complete = reconcileCaseQuestionAnswers(next, proposal(required.flat()), events);
     expect(complete.questions.every(question => question.answeredBy)).toBe(true);
     expect(complete.waiting).toBeNull();

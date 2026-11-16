@@ -129,7 +129,8 @@ export type CaseTicketStageTrigger =
   /** The receipt of a V2 reply is confirmed (`reply:<case>:<trigger>` confirmed by the executor), sent at `sentAt`. */
   | Readonly<{ kind: "reply_confirmed"; replyKey: string; sentAt: string }>
   /** The case cycle `cycle` ended `resolved` on an accepted `confirm_resolution` (evidence checked by the decision validator). */
-  | Readonly<{ kind: "resolution_recorded"; cycle: number }>;
+  | Readonly<{ kind: "resolution_recorded"; cycle: number }>
+  | Readonly<{ kind: "j2_confirmed"; replyKey: string; sentAt: string; cycle: number; caseVersion: number }>;
 export type CaseTicketStagePlanInput = Readonly<{
   config: CaseTicketStageConfig;
   caseId: string;
@@ -157,6 +158,12 @@ export function planCaseTicketStage(input: CaseTicketStagePlanInput): CaseTicket
     if (!Number.isFinite(Date.parse(trigger.sentAt))) return { plan: false, reason: "sent_at_invalid" };
     if (input.lastCustomerInboundAt && Date.parse(input.lastCustomerInboundAt) > Date.parse(trigger.sentAt)) return { plan: false, reason: "customer_replied_since" };
     return { plan: true, intent: { key: caseTicketStageKey(input.caseId, "waiting_customer", trigger.replyKey), target: "waiting_customer", stageId: config.waitingCustomer, ticketId: input.ticketId, caseId: input.caseId } };
+  }
+  if (trigger.kind === "j2_confirmed") {
+    if (current.phase !== "closed_no_reply" || current.cycle.endedBy !== "closed_no_reply" || current.cycle.number !== trigger.cycle) return { plan: false, reason: "j2_closure_stale" };
+    if (!Number.isFinite(Date.parse(trigger.sentAt))) return { plan: false, reason: "sent_at_invalid" };
+    if (input.lastCustomerInboundAt && Date.parse(input.lastCustomerInboundAt) > Date.parse(trigger.sentAt)) return { plan: false, reason: "customer_replied_since" };
+    return { plan: true, intent: { key: caseTicketStageKey(input.caseId, "closed", trigger.replyKey), target: "closed", stageId: config.closed, ticketId: input.ticketId, caseId: input.caseId } };
   }
   // Closing needs a PROVEN resolution: an administrative closure without reply (J2) or a handoff is not one.
   if (current.phase !== "resolved" || current.cycle.endedBy !== "resolved" || current.cycle.number !== trigger.cycle) return { plan: false, reason: "resolution_not_proven" };

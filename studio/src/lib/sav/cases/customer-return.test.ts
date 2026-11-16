@@ -85,6 +85,16 @@ describe("ticket stages: « attente client » after a confirmed reply, « fermé
     expect(() => caseTicketStageKey("not-a-case", "closed", "cycle-1")).toThrow("SAV_CASE_STAGE_KEY_INVALID");
   });
 
+  it("confirmed J2 closes administratively only on its own closed cycle and without a newer client mail", () => {
+    const c = { owner: "agent" as const, phase: "closed_no_reply" as const, sensitivity: "none" as const, cycle: { number: 2, endedBy: "closed_no_reply" as const } };
+    const trigger = { kind: "j2_confirmed" as const, replyKey: `reply:${CASE}:timer:syn-j2`, sentAt: "2026-11-03T10:00:00Z", cycle: 2, caseVersion: 10 };
+    expect(plan({ case: c, trigger })).toMatchObject({ plan: true, intent: { target: "closed", stageId: "syn-closed" } });
+    expect(plan({ case: { ...c, phase: "awaiting_customer" }, trigger })).toEqual({ plan: false, reason: "j2_closure_stale" });
+    expect(plan({ case: { ...c, cycle: { number: 3, endedBy: "closed_no_reply" } }, trigger }).plan).toBe(false);
+    expect(plan({ case: c, trigger, lastCustomerInboundAt: "2026-11-03T10:01:00Z" })).toEqual({ plan: false, reason: "customer_replied_since" });
+    expect(plan({ case: { ...c, teamPartPending: true }, trigger }).plan).toBe(false);
+  });
+
   const live: CaseTicketStageLive = { config: stagesOn, pause: { intake: "running", v2: "running" }, ownerNow: "v2", caseStillTarget: true, customerRepliedSince: false };
   it("the gate: confirmed is final, an engaged write is verified only whatever changed, only a planned one is judged", () => {
     expect(decideCaseTicketStage("confirmed", "closed", { ...live, ownerNow: "human" })).toEqual({ action: "done" });

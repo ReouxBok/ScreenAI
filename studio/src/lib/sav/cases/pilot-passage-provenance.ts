@@ -5,7 +5,7 @@
 // No production reader of the active versions and no real scope exist yet: both are injected ports; without them nothing is proven.
 import "server-only";
 import { isTerminalReply, terminalReplyInput } from "./case-terminal-reply";
-import { readJ2ReminderText, readJ2Origin } from "./j2-auto-reminder";
+import { j2ReminderText, readJ2ReminderText, readJ2Origin } from "./j2-auto-reminder";
 import { savKnowledgeFreshness } from "../request-retrieval";
 import { prepareCaseReplyText } from "./case-reply-outbound";
 import type { CaseReplyProposal } from "./case-effects";
@@ -32,12 +32,12 @@ export type PilotProvenanceReason = typeof SAV_PILOT_PROVENANCE_REASONS[number];
 export type PilotActiveSource = Readonly<{ active: boolean; title: string; content: string; verifiedAt: string | null }>;
 export type PilotProvenanceDeps = Readonly<{
   /** The approved scope datum (B `investigation-access-scope.ts`). */
-  env?: () => Record<string, string | undefined>;
   accessScope: () => Promise<unknown>;
   currentPolicyRevision: () => Promise<string | null>;
   readActiveSource: (ref: KnowledgeRef) => Promise<PilotActiveSource | null>;
   readTemporaryIncidents?: IncidentReader;
   now: () => Date;
+  env?: () => Record<string, string | undefined>;
 }>;
 export type PilotProvenanceSource = KnowledgeRef & Readonly<{ use: "answer"; title: string; content: string; verifiedAt: string; verification: "fresh" | "revalidation_due"; evaluatedAt: string }>;
 export type PilotProvenance =
@@ -56,10 +56,19 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
    * its trigger and purpose, the scope, every source and every incident are still proven, and the incident claims are read on the corrected text too. */
   options: Readonly<{ humanCorrection?: boolean; reminderInputKey?: string }> = {}): Promise<PilotProvenance> {
   if (proposal.purpose === "reminder") {
-    if (proposal.text !== await readJ2ReminderText(proposal.caseId, proposal.triggerEventId, process.env)) return unproven("reply_not_from_decision");
-    const origin = await readJ2Origin(proposal.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), deps.now());
-    const reminderInputKey = origin?.questions?.[0]?.id.replace(/:q1$/, "");
-    return origin ? readPilotReplyProvenance(origin, deps, reminderInputKey ? { reminderInputKey } : {}) : unproven("decision_not_latest");
+    const env = deps.env?.() ?? process.env;
+    if (env.SAV_V2_J2_CONTEXTUAL !== "on") {
+      // OFF: main's path exactly, including rejection before any origin read.
+      if (proposal.text !== await readJ2ReminderText(proposal.caseId, proposal.triggerEventId, env)) return unproven("reply_not_from_decision");
+      const origin = await readJ2Origin(proposal.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), deps.now());
+      const reminderInputKey = origin?.questions?.[0]?.id.replace(/:q1$/, "");
+      return origin ? readPilotReplyProvenance(origin, deps, reminderInputKey ? { reminderInputKey } : {}) : unproven("decision_not_latest");
+    }
+    const origin = await readJ2Origin(proposal.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), deps.now(), env);
+    if (!origin) return unproven("decision_not_latest");
+    if (proposal.text !== j2ReminderText(origin, env)) return unproven("reply_not_from_decision");
+    const reminderInputKey = origin.questions?.[0]?.id.replace(/:q1$/, "");
+    return readPilotReplyProvenance(origin, deps, reminderInputKey ? { reminderInputKey } : {});
   }
   const policyRevision = await deps.currentPolicyRevision();
   const events = await listCaseEvents(proposal.caseId), inputKey = options.reminderInputKey ?? terminalReplyInput(events, latestInvestigationInput(events), deps.env?.() ?? {});
