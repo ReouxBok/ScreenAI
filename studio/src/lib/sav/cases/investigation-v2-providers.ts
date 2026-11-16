@@ -1,5 +1,6 @@
 import { compactInvestigationContext, INVESTIGATION_CONTEXT_INSTRUCTION } from "./investigation-context-view";
 import { caseDecisionBodyBreakdown, caseGeminiDecisionBody, type CaseDecisionBodyBreakdown } from "./investigation-context-budget";
+import { caseDecisionGenerationConfig, caseDecisionPromptRevision, caseProviderJsonSchema, readCaseDecisionGeneration, type CaseDecisionGenerationConfig, type CaseDecisionGenerationProblem } from "./investigation-decision-generation";
 import { caseModelFinishReason, type CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
 import { readCaseV2TransportPolicy, assertCaseV2ReservedPolicy } from "./investigation-v2-spend";
 import "server-only";
@@ -118,9 +119,23 @@ export function caseGeminiEmbeddingTransport(input: Readonly<{ env: () => Env; n
 export const SAV_CASE_INVESTIGATION_PROMPT_REVISION = "sav-v2-investigation-prompt-2026-11-15.v5";
 /** Review P2-2: with SAV_V2_ATTACHMENT_MEDIA off (default) no attachments instruction is ever sent, so the prompt is the v4 one and is recorded as such. */
 export const SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS = "sav-v2-investigation-prompt-2026-11-14.v4";
-export const caseInvestigationPromptRevision = (attachmentsOn: boolean) => attachmentsOn ? SAV_CASE_INVESTIGATION_PROMPT_REVISION : SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS;
 const CLOSURE_JSON_SCHEMA = JSON.stringify(z.toJSONSchema(caseResolutionCheckSchema));
 const DECISION_JSON_SCHEMA = JSON.stringify(z.toJSONSchema(caseDecisionProposalSchema, { io: "input", unrepresentable: "any" }));
+/** SAV-92 idée 3: the provider copies of the SAME schemas (`caseProviderJsonSchema`), built on first use; the text schemas above are unchanged. */
+const providerSchemas = new Map<"decision" | "resolution_check", Record<string, unknown>>();
+export function caseDecisionProviderSchema(purpose: "decision" | "resolution_check") {
+  let schema = providerSchemas.get(purpose);
+  if (!schema) providerSchemas.set(purpose, schema = caseProviderJsonSchema(JSON.parse(purpose === "resolution_check" ? CLOSURE_JSON_SCHEMA : DECISION_JSON_SCHEMA)));
+  return schema;
+}
+/**
+ * The prompt revision a decision records: v5 with the attachments instruction, v4 without (review P2-2); then, only when a SAV-92
+ * generation flag is on, what was sent appended (`+so1`, `+think-<level>`). Both flags off: exactly main's revision.
+ */
+export function caseInvestigationPromptRevision(attachmentsOn: boolean, env: Env = {}) {
+  const base = attachmentsOn ? SAV_CASE_INVESTIGATION_PROMPT_REVISION : SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS;
+  return caseDecisionPromptRevision(base, readCaseDecisionGeneration(env, env[SAV_V2_MODEL_ENV] ?? ""));
+}
 /**
  * SAV-92: how the model must read `customerContext`. Sent only with a context, so a request without one keeps the exact v3 wording.
  * The context itself is a JSON value of the user part (never this system instruction): what a customer writes cannot become a rule here.
@@ -199,20 +214,30 @@ const generateResponse = z.object({
  */
 /** Prepare the EXACT existing prompt/body. No source, fact, instruction or reply rule is removed to fit. */
 export function prepareCaseGeminiDecisionRequest(original: CaseInvestigationModelRequest, env: Env):
-  | { ok: true; key: string; model: string; body: string; metadata: Pick<CaseModelTransportDiagnostic, "inputBytes" | "maxInputBytes" | "knowledgeCards">; compacted: boolean }
-  | { ok: false; diagnostic: CaseModelTransportDiagnostic; breakdown?: CaseDecisionBodyBreakdown } {
+  | { ok: true; key: string; model: string; body: string; metadata: Pick<CaseModelTransportDiagnostic, "inputBytes" | "maxInputBytes" | "knowledgeCards">; compacted: boolean; generation: CaseDecisionGenerationConfig }
+  | { ok: false; diagnostic: CaseModelTransportDiagnostic; breakdown?: CaseDecisionBodyBreakdown; problem?: CaseDecisionGenerationProblem } {
   const resolved = resolveCaseV2GeminiKey(env), model = env[SAV_V2_MODEL_ENV] ?? "";
   if (!resolved.ok) return { ok: false, diagnostic: { stage: "preflight", code: "key_unavailable", networkAttempted: false } };
   if (!MODEL_ID.test(model)) return { ok: false, diagnostic: { stage: "preflight", code: "model_invalid", networkAttempted: false } };
   let bounds: ReturnType<typeof readCaseV2TransportPolicy>;
   try { bounds = readCaseV2TransportPolicy(env); } catch { return { ok: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false } }; }
+  // SAV-92 idée 3: the generation flags. An unknown value, a thinking level on a non-Gemini-3 model or a schema the adapter does not know
+  // is a policy refusal before any reservation. The stored diagnostic keeps main's closed codes (`policy_invalid`); the precise reason
+  // (`problem`) goes BESIDE it, to the structured log. The factory refuses the same flags earlier, before any knowledge search.
+  // Off: `generation` is empty.
+  let generation: CaseDecisionGenerationConfig;
+  const read = readCaseDecisionGeneration(env, model);
+  if (!read.ok) return { ok: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false }, problem: read.problem };
+  try {
+    generation = caseDecisionGenerationConfig(read.generation, () => caseDecisionProviderSchema(original.purpose === "resolution_check" ? "resolution_check" : "decision"));
+  } catch { return { ok: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false }, problem: "v2_provider_schema_unsupported" }; }
   // SAV-92 (15/11): the customer's files are attached only within the token room the approved policy leaves above the text bound, so the
   // per-call reservation (computed from maxInputTokens) still covers the call; the text body and its bound are measured without them.
   const fitted = original.customerContext ? fitCaseCustomerAttachmentMedia(original.customerContext, { model, mediaTokens: bounds.maxInputTokens - bounds.maxInputBytes }) : null;
   const request: CaseInvestigationModelRequest = fitted ? { ...original, customerContext: fitted.context } : original;
   const build = (candidate: CaseInvestigationModelRequest) => {
     const prompt = caseInvestigationPrompt(candidate);
-    const serialize = (payload: unknown, decoding = "") => caseGeminiDecisionBody(prompt, payload, bounds.maxOutputTokens, decoding);
+    const serialize = (payload: unknown, decoding = "") => caseGeminiDecisionBody(prompt, payload, bounds.maxOutputTokens, decoding, generation);
     let body = serialize(prompt.payload), compacted = false;
     // Preserve the original wire format whenever it fits. Only exact, reversible
     // sharing is allowed; measure the ENTIRE candidate, including decoding rules.
@@ -239,8 +264,8 @@ export function prepareCaseGeminiDecisionRequest(original: CaseInvestigationMode
   const metadata = { inputBytes: Buffer.byteLength(body, "utf8"), maxInputBytes: bounds.maxInputBytes, knowledgeCards: request.knowledge.length };
   // K1: measured on the raw body when too large; returned BESIDE the diagnostic (logged, never stored: the record keeps main's schema).
   if (metadata.inputBytes > bounds.maxInputBytes)
-    return { ok: false, diagnostic: { stage: "preflight", code: "input_too_large", networkAttempted: false, ...metadata }, breakdown: caseDecisionBodyBreakdown(prompt, bounds.maxOutputTokens, compacted) };
-  return { ok: true, key: resolved.key, model, body: appendCaseAttachmentParts(body, caseAttachmentPartsOf(sent.customerContext, fitted?.media ?? [])), metadata, compacted };
+    return { ok: false, diagnostic: { stage: "preflight", code: "input_too_large", networkAttempted: false, ...metadata }, breakdown: caseDecisionBodyBreakdown(prompt, bounds.maxOutputTokens, compacted, generation) };
+  return { ok: true, key: resolved.key, model, body: appendCaseAttachmentParts(body, caseAttachmentPartsOf(sent.customerContext, fitted?.media ?? [])), metadata, compacted, generation };
 }
 
 /** Runs before money and dispatch; ledger-known/uncertain calls retain their precedence. */
@@ -250,6 +275,8 @@ export function caseGeminiDecisionPreflight(env: () => Env) {
     if (prepared.ok) return null;
     // K1: structured log of the breakdown (ids and byte counts only); the returned diagnostic is the one the record may store, unchanged.
     if (prepared.breakdown) console.warn("sav_v2_model_transport", { ...prepared.diagnostic, breakdown: prepared.breakdown });
+    // SAV-92 idée 3: the precise reason of a generation-flag refusal, logged only (closed code names, never a value from the env).
+    if (prepared.problem) console.warn("sav_v2_model_transport", { ...prepared.diagnostic, problem: prepared.problem });
     return prepared.diagnostic;
   };
 }
@@ -264,12 +291,15 @@ export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; net
       return { result: { status: "failed" as const, uncertain, diagnostic }, usage };
     };
     const env = input.env(), prepared = prepareCaseGeminiDecisionRequest(request, env);
-    if (!prepared.ok) return failed(prepared.diagnostic, false, { inputTokens: 0, outputTokens: 0 }, prepared.breakdown);
+    if (!prepared.ok) {
+      if (prepared.problem) console.warn("sav_v2_model_transport", { ...prepared.diagnostic, problem: prepared.problem });
+      return failed(prepared.diagnostic, false, { inputTokens: 0, outputTokens: 0 }, prepared.breakdown);
+    }
     const { key, model, body } = prepared;
     // K1: a stored failure keeps the breakdown of the body it concerns (measured only on failure; the policy was read just above).
     const metadata = prepared.metadata;
     const breakdown = (): CaseDecisionBodyBreakdown | undefined => {
-      try { return caseDecisionBodyBreakdown(caseInvestigationPrompt(request), readCaseV2TransportPolicy(env).maxOutputTokens, prepared.compacted); }
+      try { return caseDecisionBodyBreakdown(caseInvestigationPrompt(request), readCaseV2TransportPolicy(env).maxOutputTokens, prepared.compacted, prepared.generation); }
       catch { return undefined; } // never lose the failure itself to its measurement
     };
     let response: Response;

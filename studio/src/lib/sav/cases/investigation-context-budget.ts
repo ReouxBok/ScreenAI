@@ -8,6 +8,8 @@
  * breakdown still describes the raw body it was built from (`inputBytes` stays the bytes actually sent).
  */
 
+import type { CaseDecisionGenerationConfig } from "./investigation-decision-generation";
+
 export type CaseDecisionPromptParts = Readonly<{ instruction: string; schema: string; payload: Readonly<{ knowledge: readonly unknown[] }> & Record<string, unknown> }>;
 export type CaseDecisionBodyBreakdown = {
   fixedBytes: number; caseBytes: number; knowledgeBytes: number; rawBytes: number; compacted: boolean;
@@ -20,18 +22,22 @@ export type CaseDecisionBodyBreakdown = {
  */
 export const SAV_CASE_BREAKDOWN_MAX_CARDS = 200;
 
-/** The exact wire format of a decision request (unchanged since the transport was written). */
-export function caseGeminiDecisionBody(prompt: Pick<CaseDecisionPromptParts, "instruction" | "schema">, payload: unknown, maxOutputTokens: number, decoding = "") {
+/**
+ * The exact wire format of a decision request (unchanged since the transport was written). SAV-92: `generation` (the V2 flags, see
+ * `investigation-decision-generation.ts`) only APPENDS fields to `generationConfig`; empty or absent, the body is byte-identical to before.
+ */
+export function caseGeminiDecisionBody(prompt: Pick<CaseDecisionPromptParts, "instruction" | "schema">, payload: unknown, maxOutputTokens: number, decoding = "", generation: CaseDecisionGenerationConfig = {}) {
   return JSON.stringify({ systemInstruction: { parts: [{ text: `${prompt.instruction}\n\nSchéma JSON de la réponse :\n${prompt.schema}${decoding}` }] },
-    contents: [{ role: "user", parts: [{ text: JSON.stringify(payload) }] }], generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens } });
+    contents: [{ role: "user", parts: [{ text: JSON.stringify(payload) }] }], generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens, ...generation } });
 }
 
 const size = (text: string) => Buffer.byteLength(text, "utf8");
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$/;
 const idOf = (value: unknown) => typeof value === "string" && ID.test(value) ? value : "unknown";
 
-export function caseDecisionBodyBreakdown(prompt: CaseDecisionPromptParts, maxOutputTokens: number, compacted = false): CaseDecisionBodyBreakdown {
-  const measure = (payload: unknown) => size(caseGeminiDecisionBody(prompt, payload, maxOutputTokens));
+export function caseDecisionBodyBreakdown(prompt: CaseDecisionPromptParts, maxOutputTokens: number, compacted = false, generation: CaseDecisionGenerationConfig = {}): CaseDecisionBodyBreakdown {
+  // The provider schema (flag on) is part of `fixed`, like the schema text.
+  const measure = (payload: unknown) => size(caseGeminiDecisionBody(prompt, payload, maxOutputTokens, "", generation));
   const knowledge = prompt.payload.knowledge;
   const rawBytes = measure(prompt.payload), fixedBytes = measure({}), withoutCards = measure({ ...prompt.payload, knowledge: [] });
   const cards = knowledge.map((card, index) => {
