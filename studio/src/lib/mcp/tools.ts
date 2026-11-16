@@ -1,5 +1,6 @@
 import "server-only";
 import { z } from "zod";
+import { listV2Cases, v2InventoryInput } from "@/lib/sav/cases/v2-inventory";
 import type { SavClerkUser } from "@/lib/sav/intake/console-auth";
 import { listIntakeConsole } from "@/lib/sav/intake/console-store";
 import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
@@ -126,6 +127,13 @@ const getDiagnostics = { name: "get_diagnostics", title: "Diagnostic technique d
     const diagnostics = await readIntakeRunDiagnostics(input.threadId);
     return diagnostics ? done(diagnostics) : refused("SAV_INTAKE_DOSSIER_NOT_FOUND", "Aucun diagnostic pour ce dossier.");
   } };
+const listV2CasesTool = { name: "list_v2_cases", title: "Inventaire des dossiers V2", write: false,
+  description: "Inventaire V2 réservé aux administrateurs, sans contenu client. from/until : dates ISO inclusives de création du dossier, jusqu’à min(until, snapshotAt) ; state filtre uniquement l’affichage : processing, awaiting_customer, reply_sent, handed_to_team, failed, paused. 25 dossiers parcourus par défaut, 100 maximum. Réutiliser le curseur et les mêmes filtres : borne snapshotAt figée, insertions ultérieures exclues ; attendus reste le total du périmètre immuable. statesFilterApplied indique si le filtre d’état est appliqué ; filteredOut compte les dossiers masqués sur chaque page. Contrôlés = lignes listées + filteredOut cumulés ; continuer tant que nextCursor existe, même avec une page vide. Une suppression ou un commit tardif ajoutant un dossier antérieur à snapshotAt invalide le parcours (SAV_V2_INVENTORY_MEMBERSHIP_CHANGED) : relancer alors le parcours depuis le début, sans curseur. Valeurs relues par page. hubspot queued inclut les effets incertains, absent signifie aucun effet enregistré. Coûts en micro-USD ; usage inconnu conservé en réservé. Curseur keyset compact. replyDelaySeconds mesure le délai jusqu’à la confirmation de l’envoi. Historiques limités à 1000 entrées par dossier (dépassement explicite), registres à 1000 et 1 Mio chacun (coûts inconnus au-delà).",
+  input: v2InventoryInput,
+  async run(context: StudioMcpContext, input: z.infer<typeof v2InventoryInput>) {
+    if (context.staff.role !== "admin") return refused("SAV_V2_INVENTORY_FORBIDDEN", "Inventaire V2 réservé aux administrateurs.");
+    return done(await listV2Cases(input));
+  } };
 const getBudget = { name: "get_budget", title: "Budget IA de l’intake", write: false,
   description: "Plafond effectif, dépense confirmée, réservations et coûts incertains, glissant 30 jours et appels. Mêmes chiffres que la page Budget IA, réservée au propriétaire du budget. Lecture seule.",
   input: z.object({}).strict(),
@@ -139,4 +147,4 @@ const whoami = { name: "whoami", title: "Identité Studio", write: false,
   async run(context: StudioMcpContext) { return done({ email: context.staff.email, role: context.staff.role, name: context.staff.name }); } };
 
 /** Read-only tools of this lot. Write tools (SAV-27 to SAV-30) register with write: true. */
-export const studioMcpTools: StudioMcpTool[] = [whoami, listDossiers, getDossier, getDiagnostics, getBudget] as unknown as StudioMcpTool[];
+export const studioMcpTools: StudioMcpTool[] = [whoami, listDossiers, listV2CasesTool, getDossier, getDiagnostics, getBudget] as unknown as StudioMcpTool[];
