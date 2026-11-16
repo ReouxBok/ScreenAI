@@ -44,3 +44,28 @@ export function caseReplySummaryWithStage(text: string, stage: CaseReplySummaryS
   if (stage === "closed") return `${text} Ticket fermé.`;
   return text;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// SAV-92 (decision of Ugo, 16/11): the closure note. When V2 CLOSES a ticket (stage « Fermé », only after a PROVEN resolution: an accepted `confirm_resolution`
+// on the customer's own words and a second reading `soft_close`), ONE short note says so. Written by the ticket stage execution itself, only once its « closed »
+// stage is CONFIRMED in the ledger. Deterministic, from the families of the requests the proof resolved; never a quote, a card, a model or an id.
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+/** The note's `interactionId` (`caseNoteKey`: `note:<case>:closed-summary.cycle-<n>`): one note per closed cycle, whatever replays or passes. */
+export const CASE_CLOSURE_NOTE_PREFIX = "closed-summary.";
+export const caseClosureNoteInteractionId = (cycle: number) => `${CASE_CLOSURE_NOTE_PREFIX}cycle-${cycle}`;
+export const isCaseClosureNote = (interactionId: string) => interactionId.startsWith(CASE_CLOSURE_NOTE_PREFIX);
+
+const RESOLVED: Readonly<Record<string, string>> = {
+  access: "son problème d'accès est résolu", usage: "sa question d'utilisation est résolue", technical: "son problème technique est résolu",
+  integration: "son problème d'intégration est résolu", telephony: "son problème de téléphonie est résolu",
+};
+/** Sensitive, `other`, unknown or unrecorded families: the generic label, never the family's name. */
+const RESOLVED_GENERIC = "sa demande est résolue";
+
+/** The closure note: the customer's confirmation (what the proof is) and the ticket closed (what the confirmed stage did). Nothing else. */
+export function caseClosureNoteText(families: readonly string[]) {
+  const labels = [...new Set(families.map(family => RESOLVED[family] ?? RESOLVED_GENERIC))];
+  const what = !labels.length ? RESOLVED_GENERIC : labels.length === 1 ? labels[0]! : "ses demandes sont résolues";
+  return `Le client a confirmé que ${what}. Ticket fermé.`;
+}

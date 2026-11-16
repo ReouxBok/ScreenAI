@@ -56,6 +56,8 @@ export async function planCaseTicketStageNow(tx: ExecutionTx, input: Readonly<{ 
  */
 export async function enqueueCaseTicketStage(tx: ExecutionTx, input: Readonly<{
   snapshot: StageCase; trigger: CaseTicketStageTrigger; policy: Readonly<{ id: string; hash: string }>; env: () => Record<string, string | undefined>; threadId?: string;
+  /** SAV-92 (16/11): sealed with a « closed » stage only (its closure note's families); never part of the key, never read for « waiting ». */
+  closureFamilies?: readonly string[];
 }>): Promise<EnqueueTicketStageResult> {
   const { snapshot } = input;
   const planned = await planCaseTicketStageNow(tx, input);
@@ -64,7 +66,8 @@ export async function enqueueCaseTicketStage(tx: ExecutionTx, input: Readonly<{
   const threadId = input.threadId ?? snapshot.threadIds.at(-1);
   if (!threadId) return { ok: false, reason: "no_thread" };
   const key = planned.intent.key;
-  const payload: TicketStagePayload = { contract: TICKET_STAGE_CONTRACT, intent: planned.intent, trigger: input.trigger };
+  const payload: TicketStagePayload = { contract: TICKET_STAGE_CONTRACT, intent: planned.intent, trigger: input.trigger,
+    ...(planned.intent.target === "closed" && input.closureFamilies ? { closureFamilies: [...new Set(input.closureFamilies)].slice(0, 20) } : {}) };
   const [created] = await tx.insert(savCaseEffectExecutions).values({
     caseId: snapshot.caseId, replyKey: key, threadId, policyId: input.policy.id, policyHash: input.policy.hash, payloadCiphertext: encryptSavPayload(payload),
   }).onConflictDoNothing().returning({ id: savCaseEffectExecutions.id });
