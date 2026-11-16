@@ -164,7 +164,7 @@ describe("B → C draft: the decision in pole C's own proposal shape (SAV-10), v
     const action = { kind: "handoff", reason: "diagnosis_out_of_tools", requestIds: ["r1"], report: { need: "Diagnostic", expectedIntervention: "Vérifier", trialIds: [], hypotheses: [], missingInformation: [], knowledge: [], expected: null, observed: null } };
     expect(caseDecisionDraft("case-1", stored(action), EVENTS)?.reply).toBeNull();
     const handoff = caseDecisionDraft("case-1", stored(action, reply("Délai garanti https://evil.invalid")), EVENTS, undefined, env)!;
-    expect(handoff).toMatchObject({ reply: { purpose: "handoff", text: "Votre demande est transmise à un conseiller." }, shownSources: [], citations: [] });
+    expect(handoff).toMatchObject({ reply: { purpose: "handoff", text: "Un conseiller reprend votre demande." }, shownSources: [], citations: [] });
     expect(caseDecisionDraft("case-1", stored({ ...action, reason: "sensitive_request" }), EVENTS, undefined, env)?.reply).toBeNull();
     for (const family of ["finance", "cancellation", "identity", "rights", "subscription"]) {
       const sensitive = stored(action, { understanding: { requests: [{ id: "r1", family, status: "open", summary: "Sensible" }], newFacts: [] } });
