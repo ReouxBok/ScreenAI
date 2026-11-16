@@ -9,7 +9,7 @@ import { isSavAdmittedMedia, isSavPdfMedia, type SavAdmittedMedia } from "./atta
 import { SAV_ATTACHMENT_LIMITS, SAV_ATTACHMENT_PDF_LIMITS } from "./attachment-contract";
 
 export const SAV_AI_TRANSPORT_REVISION = "sav-gemini-transport-2026-10-22.v6";
-export type SavAiPhase = "understanding" | "composition" | "coherence" | "ticket_matching" | "repair" | "learning_comparison" | "attachment_reading" | "translation";
+export type SavAiPhase = "understanding" | "composition" | "coherence" | "ticket_matching" | "repair" | "learning_comparison" | "attachment_reading" | "translation" | "block_builder";
 export type SavAiFailureCategory = "authentication" | "billing" | "rate_limited" | "provider_unavailable" | "invalid_output" | "blocked_output" | "budget_exhausted" | "cancelled";
 export type SavAiTransportTrace = {
   transportRevision: string; correlationId: string; phase: SavAiPhase; model: string; promptRevision: string;
@@ -151,7 +151,7 @@ export async function requestSavGeminiJson(input: {
   catch (error) { return fail(error instanceof Error ? error.message : "SAV_AI_MEDIA_ADMISSION_REQUIRED"); }
   const { output, textBody, textBytes, body, mediaAllowance, visual } = wire;
   const requestBody = textBody;
-  const derivedStage = input.phase === "learning_comparison" ? "comparison" : input.phase === "translation" ? "translation" : null;
+  const derivedStage = input.phase === "block_builder" ? "block_builder" : input.phase === "learning_comparison" ? "comparison" : input.phase === "translation" ? "translation" : null;
   const reservationId = derivedStage ? input.derivedReservationId ?? (await reserveSavDerivedCall(derivedStage, input.model, output)).reservationId : null;
   // UTF-8 bytes conservatively reserve input capacity. Unknown failed usage is
   // never refunded. This is an admission bound, not a provider billing estimate.
@@ -177,7 +177,7 @@ export async function requestSavGeminiJson(input: {
     const timer = setTimeout(() => controller.abort(), attemptMs);
     let code = "SAV_AI_GENERATION_FAILED", retryAfter = 0;
     try {
-      if (derivedStage) savDerivedCostQuote(input.model, output);
+      if (derivedStage) savDerivedCostQuote(input.model, output, new Date(), derivedStage);
       const response = await (input.fetch ?? fetch)(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(input.model)}:generateContent`, {
         method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": input.apiKey }, body, signal: input.signal ? AbortSignal.any([controller.signal, input.signal]) : controller.signal,
       });
