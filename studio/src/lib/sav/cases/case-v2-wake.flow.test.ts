@@ -313,7 +313,7 @@ describe("the automatic access reply, from the real investigation to the ticket 
     expect(await replyRows(made.caseId)).toHaveLength(1);
   });
 
-  it("a question runs J2 from the VERIFIED sentAt; an answer plans none", async () => {
+  it("a question runs J2 from the VERIFIED sentAt; a procedure answer waits for feedback with one J2 too", async () => {
     const made = await queuedAnswer("gm-wake-q", ask);
     await wake();
     const timers = await listCaseTimers(made.caseId);
@@ -322,9 +322,10 @@ describe("the automatic access reply, from the real investigation to the ticket 
     expect(outbound).toHaveLength(1);
     expect(timers[0]).toMatchObject({ state: "scheduled", sentAt: expect.any(String) });
     expect(Math.abs(Date.parse(timers[0]!.sentAt) - Date.parse(outbound[0]!.occurredAt))).toBeLessThan(5_000);
+    // SAV-92: a proposed procedure also waits for the customer's feedback, so it plans exactly one J2.
     const answered = await queuedAnswer("gm-wake-a");
     await wake();
-    expect(await listCaseTimers(answered.caseId)).toEqual([]);
+    expect(await listCaseTimers(answered.caseId)).toEqual([expect.objectContaining({ state: "scheduled" })]);
   });
 
   it("the format grants nothing: every incompatible (basis, mention) pair is refused with NO row queued and NO mail", async () => {
