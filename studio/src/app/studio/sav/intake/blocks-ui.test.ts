@@ -26,3 +26,19 @@ it("an unreadable setting is shown as stopped for safety; a non-administrator is
   mocks.panel.mockRejectedValue(Error("SAV_BLOCK_SWITCH_UNAUTHORIZED"));
   await expect(BlocksPage()).rejects.toThrow("SAV_BLOCK_SWITCH_UNAUTHORIZED");
 });
+
+it("only an absent legacy auto setting invites an explicit setting", async () => {
+  for (const [blockId, mode, invalid, setting, inherited] of [
+    ["access", "auto", false, null, true],
+    ["access", "auto", false, { setAt: "2026-11-12T08:00:00.000Z", setBy: "admin@example.invalid", reason: "Synthétique" }, false],
+    ["collaborators", "off", false, null, false],
+    ["integrations", "off", false, null, false],
+    ["access", "off", true, null, false],
+  ] as const) {
+    mocks.panel.mockResolvedValue({ globalAutoReply: true, blocks: [{ blockId, mode, invalid, setting, paused: false, effective: mode, history: [] }] });
+    const html = renderToStaticMarkup(await BlocksPage());
+    expect(html.includes("Défaut hérité (auto)")).toBe(inherited);
+    expect(html.includes("Enregistrez un réglage explicite")).toBe(inherited);
+    expect(mocks.set).not.toHaveBeenCalled();
+  }
+});
