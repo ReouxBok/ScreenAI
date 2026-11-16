@@ -47,7 +47,8 @@ const KNOWLEDGE_ID = /^[A-Za-z0-9._-]{1,80}$/;
 // SAV-92 (Ugo 16/11; reviews Astra of 1289893 and 54694e4): the full links a customer gave, for the team's HubSpot note. A STRICT ALLOW-LIST: a link is shown
 // only on a host listed in `CUSTOMER_LINK_HOSTS` (or one of its subdomains), i.e. a page of the Limova app such as a conversation; any other link is masked
 // (the note says one was sent, never its text). A deny-list never holds (short tokens, shorteners, payment links...). Anything doubtful is dropped whole:
-//   - https only, no credentials (user:pass@), no port, an allowed host;
+//   - https only, no credentials (user:pass@), no port, an allowed host whose labels name no sign-in or account service (auth., sso., id., account.);
+//   - the path, decoded until stable (3 passes), is exactly /conversation|chat|thread|share/<id>; anything else is masked;
 //   - an AUTHENTICATION link (a path segment, a parameter name or the fragment evokes login, reset, magic, token...) is rejected whole: it may open the account;
 //   - the fragment is always removed;
 //   - a path segment shaped like a token (16+ characters mixing letters and digits, long hex, a provider token, a UUID) rejects the link; a UUID is allowed
@@ -69,6 +70,19 @@ const TOKEN_LIKE = (value: string) => /eyJ[A-Za-z0-9_-]{8,}|(?:sk-|ghp_|gho_|git
   || value.split(/[^A-Za-z0-9+/=_]+/).some(part => part.length >= 16 && /[A-Za-z]/.test(part) && /[0-9]/.test(part));
 // A Map, never an object literal: `constructor` or `__proto__` must not resolve to an inherited property (review Astra of 54694e4).
 const SAFE_PARAMS: ReadonlyMap<string, RegExp> = new Map([["lang", /^[a-z]{2}(?:-[A-Za-z]{2})?$/], ["page", /^[0-9]{1,4}$/], ["tab", /^[a-z][a-z-]{0,19}$/i], ["id", /^[0-9]{1,9}$/]]);
+/** Host labels that name an identity or account service even without an authentication word. */
+const AUTH_HOST_LABEL = /^(?:id|ids|idp|identity|account|accounts|compte|comptes|secure|connect|oidc|saml|mfa|2fa|admin)$/i;
+/** Percent-decoding until the text no longer changes, 3 passes at most; null when a pass fails. */
+function decodeStable(value: string): string | null {
+  let current = value;
+  for (let pass = 0; pass < 3; pass++) {
+    let next: string;
+    try { next = decodeURIComponent(current); } catch { return null; }
+    if (next === current) return current;
+    current = next;
+  }
+  return current;
+}
 type LinkVerdict = Readonly<{ ok: true; link: string }> | Readonly<{ ok: false }>;
 function judgeCustomerLink(raw: string): LinkVerdict {
   try { return judgeCustomerLinkUnsafe(raw); } catch { return { ok: false }; }
@@ -82,13 +96,17 @@ function judgeCustomerLinkUnsafe(raw: string): LinkVerdict {
   if (url.protocol !== "https:" || url.username || url.password || url.port) return no;
   const host = url.hostname.toLowerCase();
   if (!/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(host) || /^[0-9.]+$/.test(host) || !allowedHost(host)) return no;
-  let segments: string[], fragment: string;
-  try { segments = url.pathname.split("/").filter(Boolean).map(decodeURIComponent); fragment = decodeURIComponent(url.hash); } catch { return no; }
+  // Review Astra of e9f2f89: an authentication host (auth.limova.ai, sso., id., account.) is masked like an authentication path.
+  if (host.split(".").some(label => AUTH_WORD.test(label) || AUTH_HOST_LABEL.test(label))) return no;
+  // Decoded until stable (3 passes at most): `%256cogin` is `login`. A `%` left after that is masked, never guessed.
+  const path = decodeStable(url.pathname), fragment = decodeStable(url.hash);
+  if (path === null || fragment === null || path.includes("%")) return no;
+  const segments = path.split("/").filter(Boolean);
   if (segments.some(segment => AUTH_WORD.test(segment)) || AUTH_WORD.test(fragment) || [...url.searchParams.keys()].some(name => AUTH_WORD.test(name))) return no;
-  for (const [i, segment] of segments.entries()) {
-    if (UUID_SEGMENT.test(segment)) { if (i > 0 && CONVERSATION_SEGMENT.test(segments[i - 1]!)) continue; return no; }
-    if (TOKEN_LIKE(segment)) return no;
-  }
+  // Only the one useful shape of a Limova link: /conversation|chat|thread|share/<id>. Any other path is masked.
+  if (segments.length !== 2 || !CONVERSATION_SEGMENT.test(segments[0]!)) return no;
+  const id = segments[1]!;
+  if (!UUID_SEGMENT.test(id) && (!/^[A-Za-z0-9_-]{1,64}$/.test(id) || TOKEN_LIKE(id))) return no;
   url.hash = "";
   for (const name of [...new Set(url.searchParams.keys())]) {
     const values = url.searchParams.getAll(name), safe = SAFE_PARAMS.get(name.toLowerCase());

@@ -125,9 +125,9 @@ describe("customer links: conservative policy (review Astra of 1289893)", () => 
     expect(customerLinkOf(`https://app.limova.ai/sso/conversation/${uuid}`)).toBeNull();
   });
   it("parameters: only lang, page, tab and a short numeric id with a plain value; a secret-looking value is removed", () => {
-    expect(customerLinkOf("https://app.limova.ai/c/1?page=2&ref=abc&id=42&key=k&code=99&email=x%40y.invalid&utm_source=mail")).toBe("https://app.limova.ai/c/1?page=2&id=42");
-    expect(customerLinkOf(`https://app.limova.ai/c/1?tab=${SECRET}&id=${SECRET}&lang=fr`)).toBe("https://app.limova.ai/c/1?lang=fr");
-    expect(customerLinkOf("https://app.limova.ai/c/1?id=12345678901234")).toBe("https://app.limova.ai/c/1");
+    expect(customerLinkOf("https://app.limova.ai/conversation/1?page=2&ref=abc&id=42&key=k&code=99&email=x%40y.invalid&utm_source=mail")).toBe("https://app.limova.ai/conversation/1?page=2&id=42");
+    expect(customerLinkOf(`https://app.limova.ai/conversation/1?tab=${SECRET}&id=${SECRET}&lang=fr`)).toBe("https://app.limova.ai/conversation/1?lang=fr");
+    expect(customerLinkOf("https://app.limova.ai/conversation/1?id=12345678901234")).toBe("https://app.limova.ai/conversation/1");
   });
   it("rejects authentication words anywhere, token-shaped segments, http, credentials, ports, addresses and over-long links", () => {
     for (const link of ["https://app.limova.ai/signin", "https://app.limova.ai/account/verify-email", "https://app.limova.ai/x?invite=1",
@@ -149,22 +149,32 @@ describe("customer links: conservative policy (review Astra of 1289893)", () => 
       "Il nous a aussi envoyé un lien (masqué par sécurité, voir le mail)."]);
   });
 
+  it("reserves Astra of e9f2f89: path decoded until stable; authentication host labels; only /conversation|chat|thread|share/<id> on Limova", () => {
+    for (const link of ["https://limova.ai/%256cogin/a", "https://limova.ai/conversation/%2525256c", "https://auth.limova.ai/s/Ab3Cd4Ef5Gh6", "https://auth.limova.ai/conversation/c-1",
+      "https://sso.limova.ai/conversation/c-1", "https://id.limova.ai/conversation/c-1", "https://account.limova.ai/conversation/c-1", "https://app.limova.ai/s/Ab3Cd4Ef5Gh6",
+      "https://app.limova.ai/pay/x7Kq2", "https://app.limova.ai/settings", "https://app.limova.ai/conversation", "https://app.limova.ai/conversation/c-1/extra",
+      "https://app.limova.ai/x/conversation/c-1", "https://app.limova.ai/conversation/Ab3Cd4Ef5Gh6Ij7Kl8"])
+      expect({ link, kept: customerLinkOf(link) }).toEqual({ link, kept: null });
+    expect(customerLinkOf("https://app.limova.ai/%63onversation/c-1")).toBe("https://app.limova.ai/%63onversation/c-1");
+    expect(customerLinkOf("https://app.limova.ai/thread/t_42?lang=fr")).toBe("https://app.limova.ai/thread/t_42?lang=fr");
+  });
+
   it("inherited property names never break the synthesis (constructor, __proto__); a link that cannot be judged is masked and the note is still written", () => {
     expect(customerLinkOf("https://app.limova.ai/conversation/c-77?constructor=x&__proto__=x&toString=y&lang=fr")).toBe("https://app.limova.ai/conversation/c-77?lang=fr");
     expect(customerLinkOf("https://app.limova.ai/conversation/%E0%A4%A")).toBeNull();
     const { facts, text } = note("knowledge_missing", body(), { files: [], omitted: 0,
-      linkTexts: ["https://app.limova.ai/c/1?constructor=x https://app.limova.ai/c/2?__proto__=x https://app.limova.ai/conversation/%E0%A4%A"] });
+      linkTexts: ["https://app.limova.ai/conversation/1?constructor=x https://app.limova.ai/conversation/2?__proto__=x https://app.limova.ai/conversation/%E0%A4%A"] });
     expect(facts.summary).toBeDefined();
     expect(handoffNoteOf(facts, AT(9))?.text).toBe(text);
-    expect(text).toContain("Il nous a envoyé ces liens : https://app.limova.ai/c/1 ; https://app.limova.ai/c/2");
+    expect(text).toContain("Il nous a envoyé ces liens : https://app.limova.ai/conversation/1 ; https://app.limova.ai/conversation/2");
     expect(text).toContain("Il nous a aussi envoyé un lien (masqué par sécurité, voir le mail).");
   });
 
   it("at most five distinct links, rejected ones counted as masked, idempotent", () => {
     const text = ["http://plain.example.invalid/a", "https://u:p@creds.example.invalid/a",
-      ...Array.from({ length: 7 }, (_, i) => `https://app.limova.ai/c/${i}?ref=t${i}`), "https://app.limova.ai/c/0"].join(" et ");
+      ...Array.from({ length: 7 }, (_, i) => `https://app.limova.ai/conversation/${i}?ref=t${i}`), "https://app.limova.ai/conversation/0"].join(" et ");
     const scan = customerLinkScan([text]);
-    expect(scan).toEqual({ links: [0, 1, 2, 3, 4].map(i => `https://app.limova.ai/c/${i}`), masked: 2 });
+    expect(scan).toEqual({ links: [0, 1, 2, 3, 4].map(i => `https://app.limova.ai/conversation/${i}`), masked: 2 });
     expect(scan.links).toHaveLength(CASE_HANDOFF_SUMMARY_LIMITS.links);
     expect(customerLinksOf(scan.links)).toEqual(scan.links);
   });
