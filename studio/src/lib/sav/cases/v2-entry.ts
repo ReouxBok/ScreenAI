@@ -99,7 +99,7 @@ export async function firstBlockEvidence(env: Env, messageId: string, gmailMessa
   if (typeof text !== "string") return [];
   const original = await readOriginalRequestTicket(messageId, env);
   // B may carry a new sensitive request: selecting A must never hide that request.
-  if (original && savCaseSensitiveWording(original.current.currentText, message.subject)) return [];
+  if (original && (savCaseSensitiveWording(text, message.subject) || savCaseSensitiveWording(original.text, original.message.subject))) return [];
   const selected = selectCaseBlockRule(candidates, original?.text ?? text, original?.message.subject ?? message.subject);
   // Two blocks claiming one mail is a configuration to review: visible, with no customer text, and nobody admitted.
   if (selected.reason === "ambiguous_block") console.error("sav_v2_entry_block_ambiguous", { messageId, blockIds: selected.blockIds });

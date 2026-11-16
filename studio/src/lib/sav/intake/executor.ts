@@ -6,7 +6,7 @@ import { releaseNeverDispatchedIntakeScopes } from "./execution-store";
 import { intakeRunConfigurationBound } from "./human-binding";
 import { intakeExecutionConfigurationBound } from "./execution-continuity";
 import { createHash } from "node:crypto";
-import { and, eq, inArray, lte, or, sql } from "drizzle-orm";
+import { and, eq, inArray, lte, ne, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savIntakeExecutions, savIntakeExecutionBudget, savIntakeEffects, savIntakeRuns, savMessages, savThreads, savMailboxes, savSyncState } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
@@ -170,9 +170,10 @@ async function nextIntent(lease: ExecutionLease, effects: Effect[], options: Exe
             const key = emailMessageId === messageId ? `email:${messageId}` : `email:${messageId}:original:${emailMessageId}`, marker = intakeRuntimeHash(key);
             // A previous continuation may have confirmed A's email before its execution finished.
             // Its receipt is authoritative even when finishExecution has not saved hubspotEmailId yet.
-            const previous = emailMessageId !== messageId ? await requireDb().select().from(savIntakeEffects).where(or(
+            // The current business key is resumed from its stored intent above, never treated as a prior receipt.
+            const previous = emailMessageId !== messageId ? await requireDb().select().from(savIntakeEffects).where(and(ne(savIntakeEffects.businessKey, key), or(
                 eq(savIntakeEffects.businessKey, `email:${emailMessageId}`),
-                sql`${savIntakeEffects.businessKey} like ${`email:%:original:${emailMessageId}`}`)) : [];
+                sql`${savIntakeEffects.businessKey} like ${`email:%:original:${emailMessageId}`}`))) : [];
             if (previous.some(e => e.kind !== "email_create" || e.state !== "confirmed" || !ack(e)?.id || effectIntent(e).sourceMessageId !== emailMessageId))
                 return fault("RECONCILIATION_REQUIRED");
             const ids = new Set([s.message.hubspotEmailId, ...previous.map(e => ack(e)?.id)].filter(Boolean));

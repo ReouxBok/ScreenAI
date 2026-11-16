@@ -2422,7 +2422,7 @@ it.each([["truncated", "x".repeat(100_000)], ["unclosed_html", "<html><body>Sour
     expect(Object.values(p.objects.emails)).toHaveLength(0);
 });
 
-it("SAV-92 admission V2 reads A and refuses a new sensitive request in B", async () => {
+it.each(["registered@example.invalid. Je veux un remboursement.", "registered@example.invalid\nCordialement\nJe veux un remboursement.", "registered@example.invalid\n--\nCordialement\nJe veux un remboursement."])("SAV-92 admission V2 reads A and refuses a new sensitive request in full B: %s", async body => {
     const j = await originalRequestJourney("on", "Bonjour, je ne reçois pas le code de connexion à mon compte.");
     const {firstBlockEvidence} = await import("../cases/v2-entry");
     const rules = [{ruleId:"synthetic-access",revision:"r1",v1Kind:"support",family:"access",at:new Date().toISOString()}];
@@ -2430,7 +2430,8 @@ it("SAV-92 admission V2 reads A and refuses a new sensitive request in B", async
     const requests = [{requestId:"r1",kind:"support"}] as Parameters<typeof firstBlockEvidence>[3];
     expect(await firstBlockEvidence(env,j.reply.id,j.reply.gmailMessageId!,requests)).toMatchObject([{family:"access"}]);
     expect(await firstBlockEvidence({...env,SAV_INTAKE_ORIGINAL_REQUEST_TICKET:"off"},j.reply.id,j.reply.gmailMessageId!,requests)).toEqual([]);
-    await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"registered@example.invalid. Je veux un remboursement.",attachments:[]})}).where(eq(savMessages.id,j.reply.id));
+    await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:body,headers:{"message-id":"<reply@example.invalid>"},attachments:[]})}).where(eq(savMessages.id,j.reply.id));
+    expect(await (await import("./original-request-ticket")).readOriginalRequestTicket(j.reply.id, env)).not.toBeNull();
     expect(await firstBlockEvidence(env,j.reply.id,j.reply.gmailMessageId!,requests)).toEqual([]);
 });
 it.each(["missing","other_thread","other_sender","other_mailbox","uncertain"])("SAV-92 unverified continuation falls back: %s",async reason=>{
@@ -2492,4 +2493,28 @@ it.each(["confirmed","uncertain"] as const)("SAV-92 respects an earlier original
     expect(result).toMatchObject({state:state==="confirmed"?"confirmed":"waiting"});
     expect(p.calls.filter(c=>c.method==="POST"&&c.path==="/crm/v3/objects/emails")).toHaveLength(1); // B only
     expect(Object.values(p.objects.emails)).toHaveLength(2); // pre-existing A + B
+});
+
+
+it("SAV-92 resumes the stored original-email intent after interruption before its marker, without duplicates", async () => {
+    const j = await originalRequestJourney("on");
+    expect(await executeIntakePass(j.row.id, options, { beforeMarker: async effect => {
+        if (effect.kind === "email_create" && decryptSavPayload<EffectIntent>(effect.intentCiphertext).sourceMessageId === j.initialId)
+            throw Error("SYNTHETIC_BEFORE_ORIGINAL_EMAIL_MARKER");
+    } })).toMatchObject({ state: "waiting" });
+    const planned = (await getExecutionEffects(j.row.id)).find(e => e.kind === "email_create" && decryptSavPayload<EffectIntent>(e.intentCiphertext).sourceMessageId === j.initialId)!;
+    expect(planned).toMatchObject({ state: "planned", dispatchedAt: null, dispatchToken: null, ackCiphertext: null });
+    expect(Object.values(p.objects.emails)).toHaveLength(1); // B only; A never dispatched.
+    expect(await executeIntakePass(j.row.id, options)).toMatchObject({ state: "confirmed" });
+    const resumed = (await getExecutionEffects(j.row.id)).find(e => e.id === planned.id)!;
+    expect(resumed).toMatchObject({ state: "confirmed", intentCiphertext: planned.intentCiphertext, intentHash: planned.intentHash });
+    const ticket = Object.values(p.objects.tickets)[0];
+    expect(Object.values(p.objects.tickets)).toHaveLength(1);
+    expect(Object.values(p.objects.emails)).toHaveLength(2);
+    expect(Object.values(p.objects.notes)).toHaveLength(1);
+    for (const effect of (await getExecutionEffects(j.row.id)).filter(e => e.kind === "email_create"))
+        expect(p.links.get(`emails:${decryptSavPayload<EffectAck>(effect.ackCiphertext!).id}:tickets`)).toEqual([ticket.id]);
+    const writes = p.calls.filter(c => c.method !== "GET").length;
+    await executeIntakePass(j.row.id, options);
+    expect(p.calls.filter(c => c.method !== "GET")).toHaveLength(writes);
 });
