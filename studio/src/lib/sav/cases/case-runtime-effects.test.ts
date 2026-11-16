@@ -158,7 +158,7 @@ beforeEach(async () => {
     const policy: ExecutionPolicy = {
       revision: "sav-intake-execution-2026-10-21.v1", mailboxId, codeRevision: "a".repeat(40), enginePolicyHash: "b".repeat(64), resourcesHash: "c".repeat(64),
       createdAfter: new Date(Date.now() - 10_000).toISOString(), receivedAfter: new Date(Date.now() - 3_600_000).toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-      maxDossiers: 10, mutations: ["send_case_reply", "append_case_note"], admission: { kind: "automatic" },
+      maxDossiers: 10, mutations: ["send_case_reply", "append_case_note", "set_case_ticket_stage"], admission: { kind: "automatic" },
     };
     const grant = await approveIntakeExecutionPolicy(policy);
     policyId = grant.id; policyHash = grant.policyHash;
@@ -953,13 +953,47 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     expect(sends).toBe(1);
   });
 
-  it("stages on: the ticket sentence names only the stage really planned for this reply (waiting for the customer)", async () => {
+  it("stages on: mail leaves immediately; the note waits for confirmed HubSpot stage, then writes once", async () => {
+    noteOn(); stagesOn();
+    const s = await scenario("answer"), { id } = await admit(s);
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "waiting", reason: "SAV_CASE_EFFECT_RECOVERY_NOTE_PENDING" }]);
+    expect(sends).toBe(1);
+    expect(await outbound(s.caseId)).toHaveLength(1);
+    expect(await notesOf(id)).toEqual([]);
+    const [stage] = await stageRows(s.caseId);
+    const { createTicketStageDriver } = await import("./case-ticket-stage-store");
+    const { createCaseTicketStageAdapters } = await import("./case-ticket-stage-hubspot");
+    environment.SAV_V2_HUBSPOT_OWNER_ID = "2002";
+    let stageId = "1", patches = 0;
+    const hubspot = createCaseTicketStageAdapters({ env: () => environment, network: (async (_url, init) => {
+      if (init?.method === "PATCH") { stageId = JSON.parse(String(init.body)).properties.hs_pipeline_stage; patches++; }
+      return Response.json({ id: s.ticketId, properties: { hs_pipeline: "0", hs_pipeline_stage: stageId, hubspot_owner_id: "2002" } });
+    }) as typeof fetch });
+    await executeIntakePass(stage!.id, { ...options, adapters: { ...options.adapters, ...hubspot } }, {},
+      createTicketStageDriver({ env: () => environment, readTicketOwner: async () => "v2" }));
+    expect((await stageRows(s.caseId))[0]).toMatchObject({ state: "confirmed" });
+    expect(patches).toBe(1);
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
+    await pass();
+    expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: `${ACCESS_ANSWER} Ticket passé en attente du client.` }]);
+    expect(await notesOf(id)).toHaveLength(1);
+    expect(sends).toBe(1);
+  });
+
+  it.each(["refused", "uncertain", "pending", "waiting"] as const)("stage %s after one catch-up: one note without status, no resend", async state => {
     noteOn(); stagesOn();
     const s = await scenario("answer"), { id } = await admit(s);
     await pass();
-    expect((await notesOf(id))[0]!.text).toBe(`${ACCESS_ANSWER} Ticket passé en attente du client.`);
-    const rows = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, s.caseId));
-    expect(rows.some(row => row.replyKey.startsWith("case-stage:") && row.replyKey.includes(":waiting_customer:"))).toBe(true);
+    expect(await notesOf(id)).toEqual([]);
+    const [stage] = await stageRows(s.caseId);
+    await f.db.update(savCaseEffectExecutions).set({ state }).where(eq(savCaseEffectExecutions.id, stage!.id));
+    // An intervening hold / driver restart must not reset the persisted bound.
+    await setPause("v2", "fully_paused"); await pass(); await setPause("v2", null);
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
+    await pass();
+    expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: ACCESS_ANSWER }]);
+    expect(await notesOf(id)).toHaveLength(1);
+    expect(sends).toBe(1);
   });
 
   it("a question: « J'ai demandé au client les informations manquantes. »", async () => {
@@ -1028,14 +1062,20 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     expect(await stageRows(s.caseId)).toEqual([]);
   });
 
-  it("[P1] a customer mail AFTER the note was planned: the stage was already durably queued with the receipt, and the note says so", async () => {
+  it("[P1] a customer mail while the stage waits: the cancelled stage adds no status to the note", async () => {
     noteOn(); stagesOn();
     const s = await scenario("answer"), { id } = await admit(s);
-    aroundDispatch("note_create", { before: async () => { await customerMailAfterReply(s); } });
     await pass();
-    expect((await notesOf(id))[0]!.text).toBe(`${ACCESS_ANSWER} Ticket passé en attente du client.`);
-    expect(await stageRows(s.caseId)).toHaveLength(1);
+    await customerMailAfterReply(s);
+    const [stage] = await stageRows(s.caseId);
+    const { createTicketStageDriver } = await import("./case-ticket-stage-store");
+    environment.SAV_V2_HUBSPOT_OWNER_ID = "2002";
+    await executeIntakePass(stage!.id, options, {}, createTicketStageDriver({ env: () => environment, readTicketOwner: async () => "v2" }));
+    expect((await stageRows(s.caseId))[0]).toMatchObject({ state: "refused", reason: "SAV_TICKET_STAGE_CANCELLED_NEW_INPUT" });
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
+    expect((await notesOf(id))[0]!.text).toBe(ACCESS_ANSWER);
     expect(await execution(id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
   });
 
   it("[P1] the note cannot be created (CRM unreadable after the reply): the receipt and the stage are already recorded; a later pass writes ONE note, no resend", async () => {
@@ -1050,7 +1090,7 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     for (let n = 0; n < 3 && (await execution(id)).state !== "confirmed"; n++) { await expireHeldLease(id); await pass(); }
     expect(await execution(id)).toMatchObject({ state: "confirmed" });
     expect(hubspotNotes()).toHaveLength(1);
-    expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: `${ACCESS_ANSWER} Ticket passé en attente du client.` }]);
+    expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: ACCESS_ANSWER }]);
     expect(await outbound(s.caseId)).toHaveLength(1);
     expect(await stageRows(s.caseId)).toHaveLength(1);
     expect(sends).toBe(1);

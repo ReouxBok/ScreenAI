@@ -6,7 +6,7 @@ import "server-only";
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savCaseEffectExecutions, savCases, savIntakeEffects } from "@/db/schema";
+import { savCaseEffectExecutions, savCases, savIntakeEffectJournal, savIntakeEffects } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { readSavAgentPause, SAV_AGENT_PAUSE_CODES, savAgentPauseCode, type SavAgentPauseState } from "../intake/agent-pause";
 import { readIntakeExecutionAuthority } from "../intake/execution-policy";
@@ -317,15 +317,28 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     await localFenceAfterRead(lease);
   }
 
-  /**
-   * The stage DURABLY queued for this confirmed reply (read after the receipt committed it): the « waiting for the customer » execution of this reply key, unless it
-   * was cancelled. No row (rule said no, switch off, a customer mail crossed the reply before the receipt) or an unbuildable key: null, and the note names no stage.
-   */
-  async function durableReplyStage(proposal: CaseEffectPayload["proposal"]): Promise<CaseReplySummaryStage> {
+  /** Only a confirmed stage execution proves the HubSpot move. Persist ONE wait in the journal:
+   * the next catch-up pass writes without a status if the stage is still undecided, even across
+   * process restarts or unrelated holds. The reply receipt is committed before this wait. */
+  async function durableReplyStage(lease: ExecutionLease, proposal: CaseEffectPayload["proposal"]): Promise<CaseReplySummaryStage> {
     let key: string;
     try { key = caseTicketStageKey(proposal.caseId, "waiting_customer", caseReplyKey(proposal.caseId, proposal.triggerEventId)); } catch { return null; }
-    const [row] = await requireDb().select({ state: savCaseEffectExecutions.state }).from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.replyKey, key));
-    return row && row.state !== "refused" ? "waiting_customer" : null;
+    const waiting = await requireDb().transaction(async tx => {
+      if (!await ownedExecution(tx, lease)) return fault("LEASE_LOST");
+      const [row] = await tx.select({ state: savCaseEffectExecutions.state }).from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.replyKey, key));
+      if (!row || row.state === "refused") return { stage: null };
+      if (row.state === "confirmed") return { stage: "waiting_customer" as const };
+      const [waited] = await tx.select({ id: savIntakeEffectJournal.id }).from(savIntakeEffectJournal).where(and(
+        eq(savIntakeEffectJournal.executionId, lease.row.id), eq(savIntakeEffectJournal.kind, "reply_note_stage_wait"),
+      )).limit(1);
+      if (waited) return { stage: null };
+      await executionJournal(tx, lease.row.id, "reply_note_stage_wait", { stageKey: key });
+      return { wait: true };
+    });
+    // The receipt is already committed: reuse its pending-note reason so recovery does not
+    // consume the next pass merely recording that same receipt again.
+    if ("wait" in waiting) throw Error(CASE_RECOVERY_NOTE_PENDING);
+    return waiting.stage;
   }
   /** A summary note's ledger row that this pass may still write (none yet, or planned: no marker). An engaged or confirmed row is only verified / kept. */
   const newSummaryWrite = (effect: Effect | undefined) => !effect || effect.state === "planned";
@@ -387,12 +400,12 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
           const { policy } = await readIntakeExecutionAuthority(options.config);
           if (!policy.mutations.includes(SAV_CASE_EFFECT_PERMISSIONS.note)) return null;
           // Review (16/11): the receipt and the ticket stage are recorded FIRST (the same idempotent transaction the end of the pass commits again), so the note's
-          // ticket sentence names only a stage that is durably queued, never one a customer mail could still cancel before the receipt. The execution stays running.
+          // ticket sentence is resolved from the confirmed stage below. The execution stays running.
           await commitReceipt(lease, proposal, effects, deps, async () => {});
         }
         const [row] = await requireDb().select({ ticketId: savCases.ticketId }).from(savCases).where(eq(savCases.id, proposal.caseId));
         if (!row) return fault("CASE_MISSING");
-        const text = summary ? caseReplySummaryWithStage(note.text, await durableReplyStage(proposal)) : note.text;
+        const text = summary ? caseReplySummaryWithStage(note.text, await durableReplyStage(lease, proposal)) : note.text;
         return buildCaseNoteIntent({ caseId: proposal.caseId, interactionId: note.interactionId, ticketId: row.ticketId, sourceMessageId: proposal.inboundMessageId, text, at: note.at });
       }
       if (associated?.state === "confirmed") return null;

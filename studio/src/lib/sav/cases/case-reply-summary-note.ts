@@ -1,5 +1,5 @@
 // SAV-92 (decision of Ugo, 16/11): after each CONFIRMED V2 reply, ONE short internal HubSpot note saying what V2 did, in French, 2-3 sentences.
-// Deterministic, from closed facts only: the families of the case's requests, the reply's purpose and the ticket stage really planned for this reply.
+// Deterministic, from closed facts only: the families of the case's requests, the reply's purpose and the ticket stage confirmed for this reply.
 // Never the reply's text, a card or model name, an id or a technical detail. No model call. Pure: nothing is read or written here.
 import type { CaseReplyPurpose } from "./case-effects";
 
@@ -37,7 +37,7 @@ export function caseReplySummaryText(input: Readonly<{ families: readonly string
   return `Le client signale ${problemOf(input.families)}. ${actionOf(input.families, input.purpose)}`;
 }
 
-/** The ticket sentence, only for what is really planned with this reply; nothing otherwise (no neutral claim about a state nobody moves). */
+/** The ticket sentence, only for what is confirmed for this reply; nothing otherwise (no neutral claim about a state nobody moves). */
 export type CaseReplySummaryStage = "waiting_customer" | "closed" | null;
 export function caseReplySummaryWithStage(text: string, stage: CaseReplySummaryStage) {
   if (stage === "waiting_customer") return `${text} Ticket passé en attente du client.`;
