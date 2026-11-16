@@ -6,7 +6,7 @@ import {
   isSensitiveCaseFamily, SAV_CASE_ACCESS_URL, SAV_CASE_DECISION_CONTRACT_REVISION, SAV_CASE_TEAM_PART_MENTION,
   type CaseDecisionKnowledgeRef, type CaseDecisionRejection, type CaseDecisionRejectionCode, type CaseDecisionSignal,
   type CaseDecisionSourceRef, type CaseDecisionUnverifiedJudgment, type CaseDecisionValidation,
-  type CaseDecisionValidationContext, type CaseResolutionEvidence, type SavCaseSensitiveFamily,
+  type CaseDecisionProposal, type CaseDecisionValidationContext, type CaseResolutionEvidence, type SavCaseSensitiveFamily,
 } from "./decision-contract";
 import { caseAccessSourceProblem } from "./investigation-access-scope";
 
@@ -191,13 +191,14 @@ const stepOf = (step: string) => {
   return { verb: (words[0] ?? "").slice(0, 4), object: [...new Set(words.slice(1))].filter(word => !STEP_NOISE.has(word)) };
 };
 const overlap = (object: readonly string[], sentence: string) => object.length ? object.filter(word => sentence.includes(word)).length / object.length : 0;
-function repeatedSteps(reply: string, card: SavRetrievalCandidate, context: CaseDecisionValidationContext): number[] {
+function repeatedSteps(reply: string, card: SavRetrievalCandidate, context: CaseDecisionValidationContext, unusedSentStep?: number): number[] {
   const steps = strings(card.resolution?.steps).map(stepOf), lastMail = Math.max(-Infinity, ...context.sources.filter(row => row.direction === "customer_inbound").map(row => at(row.at)));
   const instructed = sentencesOf(normalize(reply)).filter(sentence => !/^(?:vous avez|merci|comme vous)\b/.test(sentence));
   const restated = steps.flatMap((step, index) => step.object.length >= 2 && step.verb && instructed.some(sentence => sentence.includes(step.verb) && overlap(step.object, sentence) >= 0.7) ? [index] : []);
   if (!restated.length) return [];
   const sent = context.trials.some(trial => trial.knowledge.knowledgeId === card.id && at(trial.askedAt) < lastMail);
-  if (sent && restated.length >= Math.ceil(steps.length / 2)) return restated;
+  const repeatedSent = restated.filter(index => index !== unusedSentStep);
+  if (sent && repeatedSent.length && restated.length >= Math.ceil(steps.length / 2)) return repeatedSent;
   const customer = context.sources.filter(row => row.direction === "customer_inbound").sort((a, b) => b.order - a.order);
   const done = new Map<number, boolean>();
   for (const row of customer) {
@@ -284,16 +285,112 @@ function accessLinks(text: string) {
  * pilot ledgers) are not re-run here: the correction keeps the decision's own citations and purpose, and its provenance is proven again at every look.
  */
 export type CaseReplyTextSafetyProblem = Readonly<{ code: "credential_request_pattern" | "access_link_missing" | "access_link_invalid"; detail?: string }>;
-export function caseReplyTextSafetyProblems(text: string, options: Readonly<{ accessOpen: boolean; answersOrAsks: boolean }>): CaseReplyTextSafetyProblem[] {
+export function caseReplyTextSafetyProblems(text: string, options: Readonly<{ accessOpen: boolean; answersOrAsks: boolean; loginProcedure?: boolean }>): CaseReplyTextSafetyProblem[] {
   const problems: CaseReplyTextSafetyProblem[] = [];
   if (requestsCredential(text)) problems.push({ code: "credential_request_pattern" });
   if (options.accessOpen && options.answersOrAsks) {
     const links = accessLinks(text);
-    if (!links.present) problems.push({ code: "access_link_missing" });
+    if (accessLinkMissing(text, options.loginProcedure)) problems.push({ code: "access_link_missing" });
     for (const link of links.invalid) problems.push({ code: "access_link_invalid", detail: link.slice(0, 200) });
   }
   return problems;
 }
+// Explicit opt-in only. Missing, false and unrecognised values keep the historical path.
+const smartValidator = () => process.env.SAV_V2_SMART_VALIDATOR === "true";
+
+/** A clarification cites both stored references in its reason. The source itself must explain the doubt;
+ * a model merely calling a fact incomplete is not evidence. One original question plus one reconfirmation,
+ * including duplicates in this proposal. Unknown history fails closed. No new wire/storage fields. */
+function legitimateReconfirmation(question: Extract<CaseDecisionProposal["nextAction"], { kind: "ask" }>["questions"][number], key: string,
+  context: CaseDecisionValidationContext, now: Date) {
+  const previous = context.questions.filter(row => row.factKeys.includes(key));
+  if (previous.length !== 1 || !question.reducesUncertainty.includes(previous[0]!.id)) return false;
+  const facts = context.facts.filter(fact => fact.key === key);
+  return facts.some(fact => {
+    const source = context.sources.find(row => sourceKey(row.ref) === sourceKey(fact.source) && row.direction === "customer_inbound");
+    const raw = source && context.customerTexts[sourceKey(source.ref)];
+    if (!source || !raw || !question.reducesUncertainty.includes(sourceKey(source.ref))
+      || !previous[0]!.answeredBy || sourceKey(previous[0]!.answeredBy) !== sourceKey(fact.source) || at(previous[0]!.askedAt) >= at(fact.at)) return false;
+    const reason = normalize(question.reducesUncertainty), own = ownCustomerWords(raw).replace(QUOTED, " ");
+    const incomplete = /\b(?:incomplet|imprecis|manque)\b/.test(reason) && /\b(?:je ne sais pas|pas sur|pas certain|peut-etre|environ|je crois)\b/.test(own);
+    const contradictory = /\bcontradic\w*\b/.test(reason) && /\b(?:je me suis trompe|contrairement|rectification|en fait)\b/.test(own);
+    const old = /\b(?:ancien|ancienne|obsolete)\b/.test(reason) && now.getTime() - at(fact.at) >= 30 * 24 * 60 * 60 * 1000;
+    return incomplete || contradictory || old;
+  });
+}
+
+/** The current ledger stores a card, not its sent steps. Consequently an alternative needs explicit,
+ * latest customer evidence: one exact failed card step and one exact, explicitly untried step, after
+ * the single recorded failure. Missing/ambiguous history cannot establish an unused branch. The
+ * reason cites the trial and source; expectedResult states a stop/relay condition. Max two trials per
+ * request across ALL cards, even with new facts. Exact version/steps only, never a guessed branch. */
+function unusedAlternative(action: Extract<CaseDecisionProposal["nextAction"], { kind: "answer" }>, context: CaseDecisionValidationContext, reply: string | undefined) {
+  if (action.requestIds.length !== 1 || action.steps.length !== 1) return false;
+  const trials = context.trials.filter(row => row.requestId === action.requestIds[0]);
+  const trial = trials[0], step = action.steps[0]!;
+  if (trials.length !== 1 || !trial || trial.outcome !== "failed" || !trial.resultAt
+    || trial.knowledge.knowledgeId !== step.knowledge.knowledgeId || trial.knowledge.contentVersionId !== step.knowledge.contentVersionId) return false;
+  const card = context.knowledge.find(row => row.id === step.knowledge.knowledgeId && row.contentVersionId === step.knowledge.contentVersionId);
+  const steps = strings(card?.resolution?.steps);
+  // The wire has no step id: exact text + exact card/version identifies the structured
+  // step. The entire reply must be that step, optionally followed by the fixed access
+  // URL. No free prose can smuggle an unlisted/rephrased instruction into the reply.
+  if (!steps.includes(step.text) || steps.filter(text => text === step.text).length !== 1 || !reply
+    || ![step.text, `${step.text}\n\n${SAV_CASE_ACCESS_URL}`].includes(reply)) return false;
+  // A later claim of "untried" cannot erase an earlier explicit report of having tried this step.
+  if (context.sources.some(row => row.direction === "customer_inbound" &&
+    ownCustomerWords(context.customerTexts[sourceKey(row.ref)] ?? "").replace(QUOTED, " ").split(/[.!?\n]/)
+      .some(sentence => /\bj'ai (?:deja )?essaye\b/.test(sentence) && squash(sentence).includes(squash(step.text))))) return false;
+  const latest = context.sources.filter(row => row.direction === "customer_inbound" || row.direction === "human_outbound").sort((a, b) => b.order - a.order)[0];
+  if (!latest || latest.direction !== "customer_inbound" || at(latest.at) <= at(trial.resultAt)) return false;
+  const raw = context.customerTexts[sourceKey(latest.ref)];
+  if (!raw) return false;
+  const own = ownCustomerWords(raw).replace(QUOTED, " ");
+  const untried = /je n'ai pas (?:encore )?essaye(?: de | d')?\s*:?\s*([^.!?\n]+)/g;
+  const unused = [...own.matchAll(untried)].map(match => squash(match[1]!));
+  const failed = [...own.matchAll(/j'ai (?:deja )?essaye(?: de | d')?\s*:?\s*([^.!?\n]+?)(?:[.!?]|, mais)?\s*(?:cela|ca) a echoue/g)].map(match => squash(match[1]!));
+  const reason = normalize(action.expectedResult);
+  return unused.includes(squash(step.text)) && !failed.includes(squash(step.text))
+    && steps.some(text => text !== step.text && failed.includes(squash(text)))
+    && action.expectedResult.includes(trial.id) && action.expectedResult.includes(sourceKey(latest.ref))
+    && /\balternative\b/.test(reason) && /\bsi\b/.test(reason) && /\b(?:echec|echoue)\b/.test(reason) && /\b(?:equipe|humain)\b/.test(reason);
+}
+
+// Broad roots are intentional: a doubt about login requires the URL. Its presence
+// anywhere in the reply satisfies this requirement, including another paragraph.
+const LOGIN_REFERENCE = /\b(?:re|de|ré|dé)?(?:connect\w*|connexion\w*|identif\w*|authent\w*|mot de passe|espace\w*|compte\w*|acced\w*|accéd\w*|acces|accès|log\w*|sign[ -]?in)\b/;
+// Every sentence must ask for information. Greetings and courtesy are framing,
+// never an exemption for a second instruction or an unknown statement.
+const INFORMATION_QUESTION = /^(?:(?:quel|quelle|quels|quelles)\b|depuis quand\b|pouvez-vous (?:preciser|indiquer|me dire|m'envoyer une capture)\b|avez-vous\b|est-ce que\b|sur (?:quel|quelle|quels|quelles) (?:appareil|navigateur)\b) .+$/;
+// An interrogative form can still prescribe an operation. Deny those verbs even
+// inside a longer information question. A past trial question is handled separately below.
+const CLARIFICATION_OPERATION = /\b(?:ouvrir|ouvert\w*|ouvre\w*|session\w*|espace\w*|aller|allez|alliez|rendre|rendez|retourner|retourne\w*|rejoindre|rejoigne\w*|reessay\w*|reessai\w*|essayer|essay\w*|tenter|tente\w*|cliquer|cliqu\w*|saisir|saisiss\w*|entrer|entrez|entriez|fermer|ferme\w*|vider|videz|supprimer|supprime\w*|installer|installe\w*|telecharger|telecharge\w*|actualiser|actualise\w*|rafraich\w*|recommencer|recommence\w*|effectuer|effectue\w*|faire|faites|fait|desactiver|desactive\w*|activer|active\w*|changer|change\w*|utiliser|veuillez)\b/;
+function isAccessClarification(text: string) {
+  const value = squash(text);
+  if (LOGIN_REFERENCE.test(value)) return false;
+  const parts = value.split("?");
+  if (parts.length < 2) return false;
+  // Only fixed courtesies may follow the final question mark.
+  const tail = parts.pop()!.trim();
+  if (tail && !/^(?:merci(?: beaucoup| d'avance)?|(?:bien )?cordialement)[.!]?$/.test(tail)) return false;
+  return parts.every(part => {
+    const question = part.trim().replace(/^(?:bonjour|bonsoir|salut)(?:\s*[,!.]\s*|\s+)/, "")
+      .replace(/,?\s*s'il vous plait$/, "").trim();
+    // A period, semicolon or newline cannot hide a free-standing instruction.
+    // Only the past-tense trial verb is informational. Remaining operations and
+    // every login reference still fail closed, even in a question about the past.
+    const information = question.replace(/^avez-vous (?:deja )?essaye\b/, "avez-vous");
+    return !/[.!;:\n]/.test(question) && !CLARIFICATION_OPERATION.test(information) && INFORMATION_QUESTION.test(question);
+  });
+}
+function accessLinkMissing(text: string, loginProcedure?: boolean) {
+  if (accessLinks(text).present) return false;
+  if (!smartValidator()) return true;
+  // Corrected text has no card context: unknown procedure is fail-closed.
+  return loginProcedure !== false || LOGIN_REFERENCE.test(normalize(text))
+    || /\b(?:adresse|e-?mail|code)\b/.test(normalize(text));
+}
+
 const IMPOSSIBILITY_WORDING = /\b(?:impossible|pas possible|ne permet pas|ne peut pas|n'est pas (?:disponible|prevue?|prise? en charge))\b/;
 const ACCOUNT_WORDING = /\b(?:nouve(?:au|l) (?:compte|abonnement)|souscri\w*|creer un (?:autre |second |nouveau )?compte)\b/;
 
@@ -523,6 +620,9 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
     unverified.add("resolution_semantics");
   }
 
+  const smart = smartValidator();
+  const alternative = smart && action.kind === "answer" && unusedAlternative(action, context, proposal.reply?.text);
+  const reconfirmed = new Set<string>();
   if (action.kind === "ask") {
     unverified.add("question_overlap_semantics");
     action.questions.forEach((question, index) => {
@@ -534,7 +634,11 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
         if (seek.kind === "credential") reject("credential_requested", `${seekPath}.kind`);
         if (!seek.factKey) return;
         const key = seek.factKey;
-        if (context.facts.some(fact => fact.key === key) || proposal.understanding.newFacts.some(fact => fact.key === key)) return reject("question_already_answered", `${seekPath}.factKey`, key);
+        if (context.facts.some(fact => fact.key === key) || proposal.understanding.newFacts.some(fact => fact.key === key)) {
+          if (!smart || reconfirmed.has(key) || proposal.understanding.newFacts.some(fact => fact.key === key)
+            || !legitimateReconfirmation(question, key, context, now)) return reject("question_already_answered", `${seekPath}.factKey`, key);
+          reconfirmed.add(key);
+        }
         const pending = context.questions.find(row => row.answeredBy === null && row.factKeys.includes(key)
           && !context.sources.some(source => source.direction === "customer_inbound" && at(source.at) > at(row.askedAt)));
         if (pending) reject("question_already_pending", `${seekPath}.factKey`, pending.id);
@@ -557,6 +661,9 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
       citeKnowledge(step.knowledge, `${path}.knowledge`);
       requireLink(step.knowledge, action.requestIds, `${path}.knowledge`);
       if (pilot) requireInScope(step.knowledge, `${path}.knowledge`, action.requestIds);
+      const attempts = context.trials.filter(trial => action.requestIds.includes(trial.requestId));
+      if (smart && (attempts.length >= 2 || (attempts.length > 0 && !alternative)))
+        reject("repeated_failed_procedure", `${path}.knowledge`, step.knowledge.knowledgeId);
       const failed = context.trials.filter(trial => trial.outcome === "failed" && action.requestIds.includes(trial.requestId) && trial.knowledge.knowledgeId === step.knowledge.knowledgeId);
       if (!failed.length) return;
       const since = Math.max(...failed.map(trial => at(trial.resultAt ?? trial.askedAt)));
@@ -567,7 +674,7 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
         if (factAt === undefined || factAt <= since) reject("new_fact_reference_invalid", `${path}.newFactIds`, factId);
         else newer += 1;
       }
-      if (!newer) reject("repeated_failed_procedure", `${path}.knowledge`, step.knowledge.knowledgeId);
+      if (!newer && !alternative) reject("repeated_failed_procedure", `${path}.knowledge`, step.knowledge.knowledgeId);
     });
   }
 
@@ -642,7 +749,7 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
   const exchanged = context.trials.length > 0 || context.questions.length > 0 || context.sources.some(row => row.direction === "agent_outbound")
     || context.sources.filter(row => row.direction === "customer_inbound").length > 1;
   const open = context.requests.filter(row => row.status === "open");
-  if (!composed && loginRef && outgoing && restates && aboutLogin && thread.complete && thread.scope === "login" && thread.noCode !== false && (confirmedAny || exchanged)) {
+  if (!composed && !alternative && !reconfirmed.size && loginRef && outgoing && restates && aboutLogin && thread.complete && thread.scope === "login" && thread.noCode !== false && (confirmedAny || exchanged)) {
     const spamCheck = loginSays.spamFolder && thread.spam !== true;
     const tell = { link: thread.link === false || (thread.link === null && !outgoing.pathGiven), address: thread.address === false || (thread.address === null && !outgoing.pathGiven),
       spam: spamCheck && (thread.spam === false || !outgoing.spamGiven) };
@@ -750,14 +857,23 @@ Il vous suffira ensuite de saisir ce code sur la page pour accéder à votre esp
     if (requestsCredential(reply.text)) reject("credential_request_pattern", "reply.text");
     // Pilot: an instruction the case already gave, or a step the customer states they did, is not given again. Our own composition reads the same ledgers and is not re-read.
     if (pilot && !composed && (action.kind === "ask" || action.kind === "answer")) for (const card of context.knowledge) {
-      const repeated = repeatedSteps(reply.text, card, context);
+      // Only the proven unused step is exempt from the sent-procedure check, never the whole card.
+      const unusedSentStep = alternative && action.kind === "answer" && action.steps[0]!.knowledge.knowledgeId === card.id
+        ? strings(card.resolution?.steps).indexOf(action.steps[0]!.text) : undefined;
+      const repeated = repeatedSteps(reply.text, card, context, unusedSentStep);
       if (repeated.length) reject("procedure_step_repeated", "reply.text", `${card.id}:${repeated.join(",")}`);
     }
     const accessOpen = [...status].some(([requestId, value]) => value === "open" && families.get(requestId) === "access");
+    // No context is not proof of a harmless clarification. Only fully recognised
+    // observational questions (both action and reply) may omit the destination.
+    const clarificationOnly = action.kind === "ask" && reply.citations.length === 0
+      && !context.accessScope?.sources.some(source => source.firstReply === "login_code_steps")
+      && isAccessClarification(reply.text) && action.questions.every(question => isAccessClarification(question.text));
     if (accessOpen && (action.kind === "ask" || action.kind === "answer")) {
-      const links = accessLinks(reply.text);
-      if (!links.present) reject("access_link_missing", "reply.text");
-      for (const link of links.invalid) reject("access_link_invalid", "reply.text", link);
+      // Same fail-closed primitive as the shared text control. An exemption must
+      // be positively proven; absence of citations or scope alone proves nothing.
+      if (accessLinkMissing(reply.text, !clarificationOnly)) reject("access_link_missing", "reply.text");
+      for (const link of accessLinks(reply.text).invalid) reject("access_link_invalid", "reply.text", link);
     }
     if (!reply.impossibilityClaims.length && IMPOSSIBILITY_WORDING.test(replyText)) signals.add("impossibility_wording_without_claim");
     if (reply.accountAdvice === "none" && ACCOUNT_WORDING.test(replyText)) signals.add("account_wording_without_advice");

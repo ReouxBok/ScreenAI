@@ -7,7 +7,7 @@ import {
   caseDecisionRejectionLabels, caseDecisionSignalLabels, caseDecisionUnverifiedLabels, SAV_CASE_DECISION_CONTRACT_REVISION,
   type CaseDecisionValidation, type CaseDecisionValidationContext,
 } from "./decision-contract";
-import { requestsCredential, validateCaseDecision } from "./decision-validator";
+import { caseReplyTextSafetyProblems, requestsCredential, validateCaseDecision } from "./decision-validator";
 
 // Synthetic fixtures only. Cases C01–C10 are paraphrased patterns from the private scoping, without any customer content.
 const now = new Date("2026-10-27T12:00:00Z");
@@ -686,5 +686,444 @@ describe("SAV-92 review P2-3: a reply covers every request still open", () => {
     // A team part opened handed off by the admission is not open: the answer on r1 covers the mail (the notice and the fixed sentence carry r2).
     accepted(proposal(answer("k1", [], ["r1"]), { understanding: { requests: [request("r1")], newFacts: [] } }),
       context({ requests: [{ id: "r1", family: "usage", status: "open" }, { id: "r2", family: "usage", status: "handed_off" }] }));
+  });
+});
+
+describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
+  afterEach(() => vi.unstubAllEnvs());
+  const mode = (on: boolean) => vi.stubEnv("SAV_V2_SMART_VALIDATOR", on ? "true" : "false");
+  const fact = { id: "f1", key: "observed_result", kind: "customer_statement" as const, source: email("m1"), at: "2026-10-20T09:00:00Z" };
+  const original = { id: "q-original", factKeys: ["observed_result"], askedAt: "2026-10-19T09:00:00Z", answeredBy: email("m1") };
+  function clarification(reason = "Fait incomplet selon email:m1, question précédente q-original.", raw = "Je crois que cela fonctionne environ une fois sur deux.") {
+    const action = ask([{ kind: "observed_result", factKey: "observed_result" }]);
+    action.questions[0]!.reducesUncertainty = reason;
+    return { decision: { ...proposal(action), nextAction: action }, ctx: context({ facts: [{ ...fact }], questions: [{ ...original }], customerTexts: { "email:m1": raw } }) };
+  }
+  it.each([true, false])("motivated incomplete confirmation, ON=%s", on => {
+    mode(on);
+    const { decision, ctx } = clarification();
+    expect(run(decision, ctx).outcome).toBe(on ? "accepted" : "needs_review");
+  });
+  it.each([
+    ["Contradiction selon email:m1, question précédente q-original.", "Rectification : en fait cela ne fonctionne plus."],
+    ["Fait ancien selon email:m1, question précédente q-original.", "Cela fonctionnait."],
+  ])("accepts evidenced reason only ON: %s", (reason, raw) => {
+    const { decision, ctx } = clarification(reason, raw);
+    ctx.facts[0]!.at = "2026-09-01T09:00:00Z";
+    ctx.questions[0]!.askedAt = "2026-08-30T09:00:00Z";
+    mode(false); expect(codes(run(decision, ctx))).toContain("question_already_answered");
+    mode(true); accepted(decision, ctx);
+  });
+  it.each(["Fait incomplet.", "Fait incomplet email:invented q-original.", "Fait incomplet email:m1 q-invented.", "Confirmer email:m1 q-original."])("refuses unsupported reason %s", reason => {
+    mode(true); const { decision, ctx } = clarification(reason);
+    expect(codes(run(decision, ctx))).toContain("question_already_answered");
+  });
+  it("refuses invented ambiguity and recent facts called old", () => {
+    mode(true);
+    for (const reason of ["Fait incomplet email:m1 q-original.", "Fait ancien email:m1 q-original."]) {
+      const { decision, ctx } = clarification(reason, "Cela fonctionne.");
+      expect(codes(run(decision, ctx))).toContain("question_already_answered");
+    }
+  });
+  it("refuses second reconfirmation even after an answer, and duplicates in one proposal", () => {
+    mode(true);
+    const { decision, ctx } = clarification();
+    ctx.questions.push({ ...original, id: "q-confirm", askedAt: "2026-10-21T09:00:00Z" });
+    expect(codes(run(decision, ctx))).toContain("question_already_answered");
+    ctx.questions.pop();
+    decision.nextAction.questions.push({ ...decision.nextAction.questions[0]! });
+    expect(codes(run(decision, ctx))).toContain("question_already_answered");
+  });
+  const oldStep = "Vider le cache navigateur", nextStep = "Ouvrir une fenêtre privée";
+  function alternative() {
+    const ctx = context({ knowledge: [card("k1", { steps: [oldStep, nextStep] })],
+      trials: [{ id: "t1", requestId: "r1", knowledge: ref("k1"), askedAt: "2026-10-18T09:00:00Z", outcome: "failed", resultAt: "2026-10-19T09:00:00Z" }],
+      customerTexts: { "email:m1": `J'ai essayé : ${oldStep}. Cela a échoué.\nJe n'ai pas encore essayé : ${nextStep}.` } });
+    const action = answer();
+    action.steps[0]!.text = nextStep;
+    action.expectedResult = "Alternative après t1 selon email:m1 : accès restauré ; si échec, transmettre à l'équipe.";
+    return { ctx, decision: { ...proposal(action), nextAction: action, reply: { text: nextStep, citations: [], impossibilityClaims: [], accountAdvice: "none" } } };
+  }
+  it.each([true, false])("allows an exact untried bounded alternative ON=%s", on => {
+    mode(on); const { decision, ctx } = alternative();
+    expect(run(decision, ctx).outcome).toBe(on ? "accepted" : "needs_review");
+  });
+  it("allows only the fixed URL addition to the exact unused step", () => {
+    mode(true);
+    const { decision, ctx } = alternative();
+    decision.reply.text += "\n\nhttps://new.limova.ai";
+    accepted(decision, ctx);
+  });
+  it("refuses an ambiguous duplicate structured step", () => {
+    mode(true);
+    const { decision, ctx } = alternative();
+    (ctx.knowledge[0]!.resolution!.steps as string[]).push(nextStep);
+    expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+  });
+  it("keeps the alternative under pilot repeated-step checks", () => {
+    mode(true); const { decision, ctx } = alternative();
+    ctx.accessScope = { schema: "sav-case-block-scope-2026-11-11.v1", blockId: "synthetic_usage", policyRevision: "synthetic", revision: "synthetic", family: "usage", sources: [{ ...ref("k1"), use: "answer" }] };
+    accepted(decision, ctx);
+  });
+  it.each(["no evidence", "no reason", "no stop", "wrong version", "pending", "already tried", "third attempt", "other card"])("refuses alternative: %s", failure => {
+    mode(true); const { decision, ctx } = alternative();
+    if (failure === "no evidence") ctx.customerTexts = {};
+    if (failure === "no reason") decision.nextAction.expectedResult = "Accès restauré.";
+    if (failure === "no stop") decision.nextAction.expectedResult = "Alternative après t1 selon email:m1 : accès restauré.";
+    if (failure === "wrong version") ctx.trials[0]!.knowledge.contentVersionId = "old-version";
+    if (failure === "pending") ctx.trials[0]!.outcome = "pending";
+    if (failure === "already tried") decision.nextAction.steps[0]!.text = oldStep;
+    if (failure === "third attempt") ctx.trials.push({ ...ctx.trials[0]!, id: "t2" });
+    if (failure === "other card") ctx.trials[0]!.knowledge = ref("k2");
+    expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+  });
+  it("refuses a failed step hidden in the reply and a later denial of an earlier trial", () => {
+    mode(true);
+    const { decision, ctx } = alternative();
+    decision.reply.text = nextStep + ". Puis " + oldStep;
+    expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+    decision.reply.text = nextStep;
+    ctx.sources.unshift({ ref: email("older"), direction: "customer_inbound", at: "2026-10-17T09:00:00Z", order: 0 });
+    ctx.customerTexts = { ...ctx.customerTexts, "email:older": `J'ai essayé : ${nextStep}. Cela a échoué.` };
+    expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+  });
+  it.each([
+    "Ouvrir une fenêtre privée. Videz le cache.",
+    "Ouvrir une fenêtre privée. Veuillez vider votre cache.",
+    "Ouvrir une fenêtre privée. VIDER LE CACHE DU NAVIGATEUR.",
+  ])("refuses a reworded failed step, with and without pilot scope: %s", text => {
+    mode(true);
+    for (const pilot of [false, true]) {
+      const { decision, ctx } = alternative();
+      if (pilot) ctx.accessScope = { schema: "sav-case-block-scope-2026-11-11.v1", blockId: "synthetic_usage", policyRevision: "synthetic", revision: "synthetic", family: "usage", sources: [{ ...ref("k1"), use: "answer" }] };
+      decision.reply.text = text;
+      expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+    }
+  });
+  it.each([
+    "Effacez le cache du navigateur.", // Astra's exact bypass + ten reformulations
+    "Supprimez les données en cache.",
+    "Nettoyez la mémoire temporaire du navigateur.",
+    "Purgez le cache.",
+    "Procédez à une suppression des fichiers temporaires.",
+    "Faites disparaître les données temporaires du navigateur.",
+    "Le cache doit être effacé avant de continuer.",
+    "Un nettoyage du navigateur est nécessaire.",
+    "Pensez à éliminer les fichiers mis en mémoire.",
+    "Recommencez le nettoyage déjà effectué.",
+    "Veuillez réinitialiser le stockage temporaire.",
+  ])("closed alternative refuses arbitrary extra instruction: %s", extra => {
+    for (const pilot of [false, true]) {
+      const { decision, ctx } = alternative();
+      if (pilot) ctx.accessScope = { schema: "sav-case-block-scope-2026-11-11.v1", blockId: "synthetic_usage", policyRevision: "synthetic", revision: "synthetic", family: "usage", sources: [{ ...ref("k1"), use: "answer" }] };
+      decision.reply.text = `${nextStep}. ${extra}`;
+      mode(true);
+      expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+      // OFF retains the original refusal: no new alternative exception.
+      mode(false);
+      expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+    }
+  });
+  it("binds the structured step itself, not just the reply", () => {
+    mode(true);
+    const { decision, ctx } = alternative();
+    decision.nextAction.steps[0]!.text = "Essayez une navigation privée.";
+    decision.reply.text = decision.nextAction.steps[0]!.text;
+    expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+  });
+  it("keeps sent-procedure protection when an alternative repeats another step", () => {
+    mode(true); const { decision, ctx } = alternative();
+    ctx.accessScope = { schema: "sav-case-block-scope-2026-11-11.v1", blockId: "synthetic_usage", policyRevision: "synthetic", revision: "synthetic", family: "usage", sources: [{ ...ref("k1"), use: "answer" }] };
+    decision.reply.text += ". Videz le cache du navigateur.";
+    expect(codes(run(decision, ctx))).toContain("procedure_step_repeated");
+  });
+  it("refuses even unrelated free instructions outside the structured unused step", () => {
+    mode(true); const { decision, ctx } = alternative();
+    decision.reply.text += ". Indiquez la taille du cache.";
+    expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+  });
+  it("never weakens sensitive handling or credential checks ON", () => {
+    mode(true); const { decision, ctx } = clarification();
+    ctx.sensitiveCategories = ["finance"];
+    expect(codes(run(decision, ctx))).toContain("sensitive_requires_human");
+    ctx.sensitiveCategories = [];
+    decision.nextAction.questions[0]!.text = "Envoyez votre mot de passe.";
+    expect(codes(run(decision, ctx))).toContain("credential_request_pattern");
+  });
+  it("new facts do not authorize an already failed step ON; legacy OFF is preserved", () => {
+    const { decision, ctx } = alternative();
+    decision.nextAction.steps[0]!.text = oldStep;
+    decision.nextAction.steps[0]!.newFactIds = ["f1"];
+    ctx.facts = [fact];
+    mode(false); accepted(decision, ctx);
+    mode(true); expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+  });
+  function accessQuestion(text = "Quel navigateur utilisez-vous ?") {
+    return { decision: { ...proposal(ask(), { understanding: { requests: [request("r1", "access")], newFacts: [] } }), reply: { text, citations: [], impossibilityClaims: [], accountAdvice: "none" } },
+      ctx: context({ requests: [{ id: "r1", family: "access", status: "open" }] }) };
+  }
+  it.each([true, false])("clarification needs no link ON=%s", on => {
+    mode(on); const { decision, ctx } = accessQuestion();
+    expect(run(decision, ctx).outcome).toBe(on ? "accepted" : "needs_review");
+  });
+  it.each([
+    "Essayez de vous connecter à votre espace.", // Astra + ten reformulations
+    "Tentez de vous reconnecter.",
+    "Il faudrait que vous vous connectiez.",
+    "Une fois connecté, poursuivez.",
+    "Vous vous connecterez ensuite.",
+    "Vous devriez vous identifier.",
+    "Identifiez votre compte.",
+    "En vous identifiant, vous continuerez.",
+    "Il vous faudra accéder à votre espace.",
+    "Essayez de vous loguer.",
+    "Effectuez un login.",
+  ])("Astra login and ten variants require URL in both paths: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    for (const on of [false, true]) {
+      mode(on);
+      expect(codes(run(decision, ctx))).toContain("access_link_missing");
+      expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true })).toContainEqual({ code: "access_link_missing" });
+      for (const separator of [" ", "\n\n"]) {
+        decision.reply.text = text + separator + "https://new.limova.ai";
+        accepted(decision, ctx);
+        expect(caseReplyTextSafetyProblems(decision.reply.text, { accessOpen: true, answersOrAsks: true })).toEqual([]);
+      }
+      decision.reply.text = text;
+    }
+  });
+  const noContextInstructions = [
+    "Pouvez-vous ouvrir votre session puis réessayer ?",
+    "Rendez-vous dans votre espace personnel puis réessayez.",
+    "Ouvrez votre session puis réessayez.",
+    "Pourriez-vous ouvrir votre espace personnel ?",
+    "Merci de retourner dans votre espace personnel.",
+    "Vous pouvez ouvrir une nouvelle session.",
+    "Veuillez rejoindre votre espace personnel puis recommencer.",
+  ];
+  it.each(noContextInstructions)("ask without context fails closed: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    for (const on of [false, true]) {
+      mode(on);
+      expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+      expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true })).toEqual([{ code: "access_link_missing" }]);
+      decision.reply.text = text + " https://new.limova.ai";
+      accepted(decision, ctx);
+      decision.reply.text = text;
+    }
+  });
+  it.each([
+    "Quel message d'erreur voyez-vous ?",
+    "Quel navigateur utilisez-vous ?",
+    "Quel appareil utilisez-vous ?",
+    "Quelle version du navigateur utilisez-vous ?",
+    "Quel résultat obtenez-vous après l'opération ?",
+  ])("only a complete clarification is exempt without context: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    mode(true); accepted(decision, ctx);
+    mode(false); expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+    mode(true);
+    for (const instruction of noContextInstructions) {
+      decision.reply.text = text + " " + instruction;
+      expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+      decision.reply.text = text;
+      decision.nextAction = ask(undefined, text + " " + instruction);
+      expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+      decision.nextAction = ask(undefined, text);
+    }
+  });
+  const informationQuestions = [
+    "Bonjour, quel navigateur utilisez-vous ?",
+    "Pouvez-vous préciser le message affiché ?",
+    "Depuis quand rencontrez-vous ce problème ?",
+    "Quelle version du système utilisez-vous ?",
+    "Quels messages voyez-vous à l’écran ?",
+    "Pouvez-vous indiquer votre navigateur ?",
+    "Pouvez-vous me dire ce qui s’affiche à l’écran ?",
+    "Pouvez-vous m’envoyer une capture de l’écran ?",
+    "Avez-vous un message d’erreur ?",
+    "Est-ce que le problème est permanent ?",
+    "Sur quel appareil constatez-vous ce problème ?",
+    "Sur quel navigateur rencontrez-vous ce problème ?",
+    "Bonsoir ! Quelle page voyez-vous ? Merci.",
+    "Bonjour, pouvez-vous préciser le résultat obtenu, s’il vous plaît ?",
+    "Quel appareil utilisez-vous ? Depuis quand observez-vous ce problème ?",
+  ];
+  const disguisedInstructions = [
+    "Pouvez-vous ouvrir votre session ?",
+    "Est-ce que vous pouvez vous connecter ?",
+    "Pouvez-vous aller dans votre espace ?",
+    "Pouvez-vous réessayer de vous connecter ?",
+    "Quel navigateur pouvez-vous ouvrir pour vous connecter ?",
+    "Avez-vous la possibilité d’ouvrir une session ?",
+    "Pouvez-vous me dire le résultat puis ouvrir votre session ?",
+    "Depuis quand rencontrez-vous ce problème, pouvez-vous vous reconnecter ?",
+    "Quel navigateur utilisez-vous ? Pouvez-vous aller dans votre espace personnel ?",
+    "Pouvez-vous m’envoyer une capture après avoir ouvert votre session ?",
+  ];
+  it.each(informationQuestions)("information question without link, ON only: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    mode(true); accepted(decision, ctx);
+    expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true, loginProcedure: false })).toEqual([]);
+    mode(false); expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+  });
+  const authenticationQuestions = [
+    "Est-ce que vous pouvez vous authentifier ?",
+    "Est-ce que cela permet de s’authentifier ?",
+    "Avez-vous un identifiant pour la connexion ?",
+    "Est-ce que le mot de passe permet le login ?",
+    "Avez-vous accès à votre espace ?",
+    "Est-ce que vous pouvez authentifier votre compte ?",
+    "Est-ce que vous pouvez vous réauthentifier ?",
+    "Pouvez-vous vous reconnecter à votre espace ?",
+    "Est-ce que vous pouvez vous ré-identifier ?",
+  ];
+  const pastTrialQuestions = [
+    "Avez-vous déjà essayé un autre navigateur ?",
+    "Avez-vous essayé un autre navigateur ?",
+    "Avez-vous déjà essayé une autre version du navigateur ?",
+    "Bonjour, avez-vous déjà essayé un autre appareil ?",
+    "Avez-vous déjà essayé une autre tablette, s’il vous plaît ?",
+    "Avez-vous déjà essayé un autre ordinateur ? Merci.",
+  ];
+  it.each(authenticationQuestions)("authentication questions fail closed ON and OFF: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    for (const on of [true, false]) {
+      mode(on);
+      expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+      expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true, loginProcedure: false }))
+        .toContainEqual({ code: "access_link_missing" });
+      decision.reply.text = text + " https://new.limova.ai";
+      accepted(decision, ctx);
+      decision.reply.text = text;
+    }
+  });
+  it.each(pastTrialQuestions)("past trial information is accepted only ON: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    mode(true); accepted(decision, ctx);
+    expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true, loginProcedure: false })).toEqual([]);
+    mode(false); expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+    const off = run(decision, ctx);
+    vi.stubEnv("SAV_V2_SMART_VALIDATOR", undefined); expect(run(decision, ctx)).toEqual(off);
+  });
+  it.each([
+    "Avez-vous déjà essayé de vous authentifier ?",
+    "Avez-vous déjà essayé de vider le cache ?",
+    "Avez-vous déjà essayé un autre navigateur, puis réessayez ?",
+    "Avez-vous déjà essayé un autre navigateur ? Est-ce que vous pouvez vous authentifier ?",
+    "Avez-vous déjà essayé votre identifiant ?",
+    "Avez-vous déjà essayé votre mot de passe ?",
+    "Avez-vous déjà essayé le login ?",
+    "Avez-vous déjà essayé la connexion ?",
+    "Avez-vous déjà essayé votre espace ?",
+    "Avez-vous déjà essayé votre compte ?",
+  ])("past trial exemption cannot hide operations or login: %s", text => {
+    mode(true); const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+  });
+  it.each(disguisedInstructions)("disguised connection instruction still requires a link: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    for (const on of [true, false]) {
+      mode(on); expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+    }
+  });
+  it.each([
+    "Quel navigateur utilisez-vous ? Ouvrez une fenêtre privée.",
+    "Quel navigateur utilisez-vous ? Pouvez-vous cliquer sur le bouton ?",
+    "Quel navigateur utilisez-vous ? Quel résultat obtenez-vous, puis réessayez ?",
+    "Quel navigateur utilisez-vous ? Texte libre.",
+    "Pouvez-vous préciser le message affiché",
+  ])("each sentence must remain an information question: %s", text => {
+    mode(true); const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+  });
+  it("checks every structured question as well as the complete reply", () => {
+    mode(true); const { decision, ctx } = accessQuestion(informationQuestions[0]);
+    decision.nextAction = { ...ask(), questions: [
+      ...ask(undefined, informationQuestions[0]).questions,
+      ...ask(undefined, disguisedInstructions[0]).questions,
+    ] };
+    expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+  });
+  it.each(["Procédure de connexion", "Procédure sans catégorie"])("requires URL for a cited Access procedure, including unknown category: %s", title => {
+    mode(true);
+    const { decision, ctx } = accessQuestion("Ouvrez une fenêtre privée.");
+    ctx.knowledge[0]!.title = title;
+    const cited = { ...decision, reply: { ...decision.reply, citations: [ref("k1")] } };
+    expect(codes(run(cited, ctx))).toContain("access_link_missing");
+    cited.reply.text += "\n\nhttps://new.limova.ai";
+    accepted(cited, ctx);
+  });
+  it.each([
+    "Veuillez vous connecter à votre espace",
+    "Pour vous connecter, saisissez votre e-mail",
+    "Vous pouvez vous reconnecter à votre espace.",
+    "Merci de vous connecter.",
+    "Identifiez-vous dans votre espace.",
+    "Veuillez vous identifier.",
+    "Accédez à votre compte.",
+    "Pour accéder à votre compte, utilisez votre e-mail.",
+    "Vous pouvez accéder à votre espace.",
+  ])("requires a link for a connection instruction: %s", text => {
+    mode(true); const { decision, ctx } = accessQuestion(text);
+    expect(codes(run(decision, ctx))).toContain("access_link_missing");
+    expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true })).toContainEqual({ code: "access_link_missing" });
+    decision.reply.text += " https://new.limova.ai";
+    accepted(decision, ctx);
+    decision.reply.text = text + "\n\nhttps://new.limova.ai";
+    accepted(decision, ctx);
+  });
+  it.each([
+    "Vous connecter reste impossible ?",
+    "Avez-vous réussi à vous connecter ?",
+    "La connexion à votre espace est-elle rétablie ?",
+    "Le bouton permet d’accéder à votre compte.",
+    "Vous avez essayé de vous identifier.",
+    "Vous vous connectez habituellement le matin ?",
+  ])("a doubtful mention of login also requires the link: %s", text => {
+    mode(true); const { decision, ctx } = accessQuestion(text);
+    expect(codes(run(decision, ctx))).toContain("access_link_missing");
+    expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true })).toEqual([{ code: "access_link_missing" }]);
+  });
+  it("accepts the link anywhere in the reply ON and OFF", () => {
+    const { decision, ctx } = accessQuestion("Connectez-vous à votre espace.\n\nAutre information : https://new.limova.ai");
+    mode(false); accepted(decision, ctx);
+    mode(true); accepted(decision, ctx);
+    decision.reply.text = "Connectez-vous sur https://new.limova.ai\n\nQuel navigateur utilisez-vous ?";
+    accepted(decision, ctx);
+  });
+  it.each([true, false])("forbidden links remain forbidden ON=%s", on => {
+    mode(on);
+    const { decision, ctx } = accessQuestion("Quel navigateur ? https://new.limova.ai\n\nhttps://evil.example.invalid");
+    expect(codes(run(decision, ctx))).toContain("access_link_invalid");
+  });
+  it("fails closed without procedure context for corrected replies, preserving destination checks", () => {
+    const options = { accessOpen: true, answersOrAsks: true };
+    mode(true);
+    expect(caseReplyTextSafetyProblems("Quel navigateur utilisez-vous ?", options)).toEqual([{ code: "access_link_missing" }]);
+    expect(caseReplyTextSafetyProblems("Quel navigateur utilisez-vous ?", { ...options, loginProcedure: false })).toEqual([]);
+    expect(caseReplyTextSafetyProblems("Connectez-vous.\n\nhttps://new.limova.ai", options)).toEqual([]);
+    expect(caseReplyTextSafetyProblems("Quel navigateur ? https://evil.example.invalid", options)).toEqual([{ code: "access_link_missing" }, { code: "access_link_invalid", detail: "https://evil.example.invalid" }]);
+    mode(false);
+    expect(caseReplyTextSafetyProblems("Quel navigateur utilisez-vous ?", options)).toEqual([{ code: "access_link_missing" }]);
+  });
+  it("still requires independent resolution evidence ON", () => {
+    mode(true);
+    const decision = proposal(confirm([{ requestId: "r1", source: email("m1"), trialId: null, quote: THANKS_TEXT }]));
+    expect(codes(run(decision))).toContain("resolution_evidence_invalid");
+  });
+  it("missing/unknown switch is identical to OFF", () => {
+    const { decision, ctx } = accessQuestion();
+    mode(false); const off = run(decision, ctx);
+    vi.stubEnv("SAV_V2_SMART_VALIDATOR", undefined); expect(run(decision, ctx)).toEqual(off);
+    vi.stubEnv("SAV_V2_SMART_VALIDATOR", "auto"); expect(run(decision, ctx)).toEqual(off);
   });
 });
