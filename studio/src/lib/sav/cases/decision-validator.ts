@@ -358,16 +358,16 @@ function unusedAlternative(action: Extract<CaseDecisionProposal["nextAction"], {
 
 // Broad roots are intentional: a doubt about login requires the URL. Its presence
 // anywhere in the reply satisfies this requirement, including another paragraph.
-const LOGIN_REFERENCE = /\b(?:(?:re|de)?connect\w*|connexion\w*|identif\w*|acced\w*|acces|log\w*|sign[ -]?in)\b/;
+const LOGIN_REFERENCE = /\b(?:(?:re|de)?connect\w*|connexion\w*|identif\w*|authent\w*|mot de passe|espace\w*|compte\w*|acced\w*|acces|log\w*|sign[ -]?in)\b/;
 // Every sentence must ask for information. Greetings and courtesy are framing,
 // never an exemption for a second instruction or an unknown statement.
 const INFORMATION_QUESTION = /^(?:(?:quel|quelle|quels|quelles)\b|depuis quand\b|pouvez-vous (?:preciser|indiquer|me dire|m'envoyer une capture)\b|avez-vous\b|est-ce que\b|sur (?:quel|quelle|quels|quelles) (?:appareil|navigateur)\b) .+$/;
 // An interrogative form can still prescribe an operation. Deny those verbs even
-// inside a longer information question (including past/conditional forms).
+// inside a longer information question. A past trial question is handled separately below.
 const CLARIFICATION_OPERATION = /\b(?:ouvrir|ouvert\w*|ouvre\w*|session\w*|espace\w*|aller|allez|alliez|rendre|rendez|retourner|retourne\w*|rejoindre|rejoigne\w*|reessay\w*|reessai\w*|essayer|essay\w*|tenter|tente\w*|cliquer|cliqu\w*|saisir|saisiss\w*|entrer|entrez|entriez|fermer|ferme\w*|vider|videz|supprimer|supprime\w*|installer|installe\w*|telecharger|telecharge\w*|actualiser|actualise\w*|rafraich\w*|recommencer|recommence\w*|effectuer|effectue\w*|faire|faites|fait|desactiver|desactive\w*|activer|active\w*|changer|change\w*|utiliser|veuillez)\b/;
 function isAccessClarification(text: string) {
   const value = squash(text);
-  if (LOGIN_REFERENCE.test(value) || CLARIFICATION_OPERATION.test(value)) return false;
+  if (LOGIN_REFERENCE.test(value)) return false;
   const parts = value.split("?");
   if (parts.length < 2) return false;
   // Only fixed courtesies may follow the final question mark.
@@ -377,7 +377,10 @@ function isAccessClarification(text: string) {
     const question = part.trim().replace(/^(?:bonjour|bonsoir|salut)(?:\s*[,!.]\s*|\s+)/, "")
       .replace(/,?\s*s'il vous plait$/, "").trim();
     // A period, semicolon or newline cannot hide a free-standing instruction.
-    return !/[.!;:\n]/.test(question) && INFORMATION_QUESTION.test(question);
+    // Only the past-tense trial verb is informational. Remaining operations and
+    // every login reference still fail closed, even in a question about the past.
+    const information = question.replace(/^avez-vous (?:deja )?essaye\b/, "avez-vous");
+    return !/[.!;:\n]/.test(question) && !CLARIFICATION_OPERATION.test(information) && INFORMATION_QUESTION.test(question);
   });
 }
 function accessLinkMissing(text: string, loginProcedure?: boolean) {

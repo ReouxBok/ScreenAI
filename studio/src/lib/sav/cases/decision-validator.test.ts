@@ -970,6 +970,60 @@ describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
     expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true, loginProcedure: false })).toEqual([]);
     mode(false); expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
   });
+  const authenticationQuestions = [
+    "Est-ce que vous pouvez vous authentifier ?",
+    "Est-ce que cela permet de s’authentifier ?",
+    "Avez-vous un identifiant pour la connexion ?",
+    "Est-ce que le mot de passe permet le login ?",
+    "Avez-vous accès à votre espace ?",
+    "Est-ce que vous pouvez authentifier votre compte ?",
+  ];
+  const pastTrialQuestions = [
+    "Avez-vous déjà essayé un autre navigateur ?",
+    "Avez-vous essayé un autre navigateur ?",
+    "Avez-vous déjà essayé une autre version du navigateur ?",
+    "Bonjour, avez-vous déjà essayé un autre appareil ?",
+    "Avez-vous déjà essayé une autre tablette, s’il vous plaît ?",
+    "Avez-vous déjà essayé un autre ordinateur ? Merci.",
+  ];
+  it.each(authenticationQuestions)("authentication questions fail closed ON and OFF: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    for (const on of [true, false]) {
+      mode(on);
+      expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+      expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true, loginProcedure: false }))
+        .toContainEqual({ code: "access_link_missing" });
+      decision.reply.text = text + " https://new.limova.ai";
+      accepted(decision, ctx);
+      decision.reply.text = text;
+    }
+  });
+  it.each(pastTrialQuestions)("past trial information is accepted only ON: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    mode(true); accepted(decision, ctx);
+    expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true, loginProcedure: false })).toEqual([]);
+    mode(false); expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+    const off = run(decision, ctx);
+    vi.stubEnv("SAV_V2_SMART_VALIDATOR", undefined); expect(run(decision, ctx)).toEqual(off);
+  });
+  it.each([
+    "Avez-vous déjà essayé de vous authentifier ?",
+    "Avez-vous déjà essayé de vider le cache ?",
+    "Avez-vous déjà essayé un autre navigateur, puis réessayez ?",
+    "Avez-vous déjà essayé un autre navigateur ? Est-ce que vous pouvez vous authentifier ?",
+    "Avez-vous déjà essayé votre identifiant ?",
+    "Avez-vous déjà essayé votre mot de passe ?",
+    "Avez-vous déjà essayé le login ?",
+    "Avez-vous déjà essayé la connexion ?",
+    "Avez-vous déjà essayé votre espace ?",
+    "Avez-vous déjà essayé votre compte ?",
+  ])("past trial exemption cannot hide operations or login: %s", text => {
+    mode(true); const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+  });
   it.each(disguisedInstructions)("disguised connection instruction still requires a link: %s", text => {
     const { decision, ctx } = accessQuestion(text);
     decision.nextAction = ask(undefined, text);
