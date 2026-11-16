@@ -45,7 +45,10 @@ export function createSavKnowledgeVectorIndex(options: { locale?: string; audien
   const project = (card: SavRetrievalCandidate, query: string): SavRetrievalCandidate => {
     if (!options.compact || !card.content || !card.resolution) return card;
     const excerpt = selectCaseKnowledgePassages(card.content, card.resolution, query, Math.max(0, 10_000 - new TextEncoder().encode(JSON.stringify(card.resolution)).length));
-    return excerpt === null ? { ...card, sourceTooLarge: true } : { ...card, content: excerpt, sourceTooLarge: false };
+    // A complete source read within the SQL envelope is still usable when it
+    // cannot fit the passage budget. Preserve it for the request-level preflight;
+    // sourceTooLarge describes the source read, never the prompt envelope.
+    return { ...card, content: excerpt ?? card.content, sourceTooLarge: false };
   };
   return {
     dimension: SAV_RETRIEVAL_EMBEDDING_DIMENSION,
