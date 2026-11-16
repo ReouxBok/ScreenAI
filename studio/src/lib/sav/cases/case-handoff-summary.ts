@@ -153,7 +153,10 @@ export function buildCaseHandoffSummary(input: Partial<Pick<CaseBody, "openReque
   const asked = [...body.questions].sort((a, b) => a.askedAt.localeCompare(b.askedAt));
   const exchanges = asked.slice(-L.questions).map(question => {
     const answered = Boolean(question.answeredBy);
-    const said = question.answeredBy ? byTime(body.facts.filter(fact => sameSource(fact.source, question.answeredBy!))).map(fact => fact.text).join(" ; ") : "";
+    const batch = body.questions.filter(other => other.askedInEffect === question.askedInEffect).length > 1;
+    const said = question.answeredBy ? byTime(body.facts.filter(fact => batch
+      ? fact.key !== null && question.factKeys.includes(fact.key) && Date.parse(fact.at) > Date.parse(question.askedAt)
+      : sameSource(fact.source, question.answeredBy!))).map(fact => fact.text).join(" ; ") : "";
     return { question: clean(question.text, L.questionChars), answered, answer: said ? clean(said, L.answerChars) : null };
   });
 

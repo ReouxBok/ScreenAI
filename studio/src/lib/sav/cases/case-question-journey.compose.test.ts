@@ -36,7 +36,9 @@ import { caseTicketOwnerPortFromTransport, type CaseOwnerReadTransport } from ".
 import { ticketOwnerPort, type AdmissionPolicyRecord, type V1AdmissionAdapterPolicy } from "./admission-runtime";
 import { caseReplyPayloadHash, type CaseReplyProposal } from "./case-effects";
 import { caseReplyFinalTextProblem, readCaseReplyDisclosure } from "./case-reply-outbound";
-import { decideCaseReply } from "./case-reply-store";
+import { decideCaseReply, submitCaseReplyProposal } from "./case-reply-store";
+import { readJ2Origin, readJ2ReminderText } from "./j2-auto-reminder";
+import { readPilotReplyProvenance } from "./pilot-passage-provenance";
 import type { CaseReplyAuthorizer } from "./case-reply-validation";
 import { proposeCaseReplyFromDraft, queueValidatedCaseReply, runCaseEffectsPass } from "./case-runtime-effects";
 import { type CaseTicketOwnerPort } from "./case-ticket-owner";
@@ -304,21 +306,33 @@ const sendRequests = () => p.calls.filter(call => call.path === "gmail/messages/
 const sentNow = () => sentBodies().slice(sentBase);
 
 /** The question, from the V1 mail to the approved and queued reply; nothing has left. */
-async function questionQueued() {
+async function questionQueued(count = 1, factKeys?: string[][]) {
   crm.requests.length = 0; sends = 0; sentBase = Object.keys(p.sent).length; requestsBase = p.calls.filter(call => call.path === "gmail/messages/send").length;
   const mail = await v1Mail();
   await personHandsBack(mail.caseId);
   const { deps, counts } = wiring();
-  modelAnswer = askTargeted as never;
+  modelAnswer = ((request: CaseInvestigationModelRequest) => {
+    const result = askTargeted(request);
+    if (count > 1) {
+      const texts = [QUESTION, "Quel navigateur utilisez-vous ?", "Quel appareil utilisez-vous ?", "Quelle version utilisez-vous ?", "Depuis quand cela arrive-t-il ?"].slice(0, count);
+      result.output.nextAction.questions = texts.map((text, index) => ({ ...result.output.nextAction.questions[0]!, text, ...(factKeys ? { seeks: factKeys[index]!.map(factKey => ({ kind: "configuration" as const, factKey })) } : {}) }));
+      result.output.reply.text = `Bonjour, depuis https://new.limova.ai, ${texts.join(" ")}`;
+    }
+    return result;
+  }) as never;
   expect(await runCaseInvestigationRuntime(mail.caseId, deps)).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 1 });
   expect(counts.model).toBe(1);
   const { draft, proposed } = await proposeFromB(mail.caseId);
   // B decided a REAL question: its purpose, its text and its one id come from the stored decision, none from this test.
-  expect(draft).toMatchObject({ triggerEventId: `inbound:${mail.gmail}`, reply: { purpose: "question", text: ASKED, question: { text: QUESTION, factKeys: [] } }, replyLimit: null });
+  expect(draft).toMatchObject({ triggerEventId: `inbound:${mail.gmail}`, reply: { purpose: "question" }, replyLimit: null });
+  if (count === 1) expect(draft.reply).toMatchObject({ text: ASKED, question: { text: QUESTION, factKeys: [] } });
+  else expect(draft.reply!.questions).toHaveLength(count);
   if (!proposed.ok) throw Error(`PROPOSE_REFUSED:${proposed.code}`);
   const stored = decryptSavPayload<CaseReplyProposal>((await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, proposed.validationId)))[0]!.proposalCiphertext);
-  expect(stored).toMatchObject({ purpose: "question", question: { id: draft.reply!.question!.id, text: QUESTION } });
-  expect(stored.text.startsWith(ASKED)).toBe(true);
+  expect(stored.purpose).toBe("question");
+  if (count === 1) expect(stored.question).toMatchObject({ id: draft.reply!.question!.id, text: QUESTION });
+  else expect(stored.questions).toEqual(draft.reply!.questions);
+  expect(stored.text.startsWith(draft.reply!.text)).toBe(true);
   expect(caseReplyFinalTextProblem(stored.text)).toBeNull(); // the AI mention is IN the stored text, before the hash
   expect(readCaseReplyDisclosure(stored.text)).toMatchObject({ mode: "manual_reviewed" });
   expect(caseReplyPayloadHash(stored)).toBe(proposed.payloadHash);
@@ -464,4 +478,95 @@ describe("C10 end of the question cycle: B's question → C's proposal, approval
     expect(sentNow()).toEqual([stored.text]);
     expect(crm.requests).toEqual(crm.requests.map(() => ownerGet(mail.ticketId)));
   });
+});
+
+
+it.each([2, 3, 5])("sends %i questions through the real B-to-C executor in one mail, with one J2 and all questions visible", async count => {
+  const { mail, queued, stored, draft } = await questionQueued(count);
+  expect((await pass()).supervised).toEqual([{ executionId: queued.executionId, state: "confirmed", reason: null }]);
+  expect(sends).toBe(1);
+  expect(sendRequests()).toBe(1);
+  expect(sentNow()).toEqual([stored.text]);
+  const done = await receipt(mail.caseId);
+  expect(done.outbound).toHaveLength(1);
+  expect(done.timers).toHaveLength(1);
+  expect(done.questions.map(({ id, text, factKeys }) => ({ id, text, factKeys }))).toEqual(draft.reply!.questions);
+  expect(done.questions.map(question => question.id)).toEqual(Array.from({ length: count }, (_, i) => `${draft.inputKey}:q${i + 1}`));
+  expect(new Set(done.questions.flatMap(question => question.factKeys)).size).toBe(count);
+  expect((await page(mail.ticketId)).view.openQuestions).toHaveLength(count);
+});
+
+
+it.each([1, 2])("J2 after a partial answer recalls only the %i still-open questions and retains its original decision provenance", async remaining => {
+  try {
+    const { mail, queued } = await questionQueued(3);
+    expect((await pass()).supervised).toEqual([{ executionId: queued.executionId, state: "confirmed", reason: null }]);
+    const initial = await receipt(mail.caseId), timer = initial.timers[0]!;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(Date.parse(timer.sentAt) + 1000));
+    const partial = await v1Mail({ ticketId: mail.ticketId, threadId: mail.threadId });
+    const answered = initial.questions.slice(0, 3 - remaining);
+    modelAnswer = ((request: CaseInvestigationModelRequest) => ({ status: "ok", output: {
+      caseVersion: request.snapshot.version,
+      understanding: { requests: askTargeted(request).output.understanding.requests,
+        newFacts: answered.map((question, index) => ({ id: `partial-${index}`, key: question.factKeys[0], statement: "Réponse synthétique", kind: "customer_statement", source: { type: "email", id: partial.gmail } })) },
+      nextAction: { kind: "observe_only" },
+    } })) as never;
+    expect(await runCaseInvestigationRuntime(mail.caseId, wiring().deps)).toMatchObject({ status: "recorded", outcome: "accepted" });
+    expect((await readCase(mail.caseId))!.body.questions.filter(question => !question.answeredBy)).toHaveLength(remaining);
+    vi.setSystemTime(new Date(Date.parse(timer.dueAt) + 60_000));
+    await j2Pass({ reminderEffect: async () => "none", budgetAvailable: async () => true }, new Date());
+    const trigger = `timer:${timer.id}`;
+    const origin = await readJ2Origin(mail.caseId, trigger, SYN_POLICY.revision, new Date());
+    expect(origin?.questions).toHaveLength(3);
+    vi.stubEnv("SAV_V2_J2_CONTEXTUAL", "on");
+    const text = await readJ2ReminderText(mail.caseId, trigger, { SAV_V2_J2_CONTEXTUAL: "on" });
+    expect(text).toBeTruthy();
+    for (const question of initial.questions) expect(text!.includes(question.text)).toBe(!answered.includes(question));
+    expect(await readPilotReplyProvenance({ caseId: mail.caseId, triggerEventId: trigger, purpose: "reminder", text: text! }, {
+      accessScope: async () => ({ schema: SAV_CASE_ACCESS_SCOPE_REVISION, policyRevision: SYN_POLICY.revision, revision: "syn-scope-r1", family: "access", sources: [{ knowledgeId: card.id, contentVersionId: card.contentVersionId, use: "answer" }] }),
+      currentPolicyRevision: admissionPolicyRevision, readActiveSource: async () => null, now: () => new Date(),
+    })).toMatchObject({ status: "proven" });
+    const current = (await readCase(mail.caseId))!;
+    const proposal: CaseReplyProposal = { caseId: mail.caseId, caseVersion: current.version, triggerEventId: trigger, purpose: "reminder", inboundMessageId: origin!.inboundMessageId, recipient: origin!.recipient, subject: origin!.subject, text: text! };
+    const proposed = await submitCaseReplyProposal(proposal, storeDeps());
+    expect(proposed).toMatchObject({ ok: true, created: true });
+    expect(await submitCaseReplyProposal(proposal, storeDeps())).toMatchObject({ ok: true, created: false });
+    expect(await listCaseTimers(mail.caseId)).toHaveLength(1);
+    expect(sendRequests()).toBe(1); // only the original question mail has been sent
+  } finally { vi.useRealTimers(); }
+});
+
+
+it("keeps the original J2 valid when browser and device arrive without the shared account_email", async () => {
+  const required = [["browser", "account_email"], ["device", "account_email"]];
+  const { mail, queued } = await questionQueued(2, required);
+  expect((await pass()).supervised).toEqual([{ executionId: queued.executionId, state: "confirmed", reason: null }]);
+  const initial = (await readCase(mail.caseId))!.body;
+  expect(initial.questions.map(question => question.factKeys)).toEqual(required);
+  const [timer] = await listCaseTimers(mail.caseId);
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    vi.setSystemTime(new Date(Date.parse(timer!.sentAt) + 60_000));
+    const partial = await v1Mail({ ticketId: mail.ticketId, threadId: mail.threadId });
+    modelAnswer = ((request: CaseInvestigationModelRequest) => ({ status: "ok", output: {
+      caseVersion: request.snapshot.version,
+      understanding: { requests: askTargeted(request).output.understanding.requests,
+        newFacts: ["browser", "device"].map((key, index) => ({ id: `partial-${index}`, key, statement: "Réponse synthétique", kind: "customer_statement", source: { type: "email", id: partial.gmail } })) },
+      nextAction: { kind: "observe_only" },
+    } })) as never;
+    expect(await runCaseInvestigationRuntime(mail.caseId, wiring().deps)).toMatchObject({ status: "recorded", outcome: "accepted" });
+    const current = (await readCase(mail.caseId))!;
+    expect(current.body.questions.map(question => Boolean(question.answeredBy))).toEqual([false, false]);
+    expect(current.body.waiting?.timerId).toBe(timer!.id);
+    expect(current.phase).toBe("awaiting_customer");
+    expect(await listCaseTimers(mail.caseId)).toMatchObject([{ id: timer!.id, state: "scheduled" }]);
+    vi.setSystemTime(new Date(Date.parse(timer!.dueAt) + 60_000));
+    await j2Pass({ reminderEffect: async () => "none", budgetAvailable: async () => true }, new Date());
+    const trigger = `timer:${timer!.id}`;
+    expect(await readJ2Origin(mail.caseId, trigger, SYN_POLICY.revision, new Date())).not.toBeNull();
+    const text = await readJ2ReminderText(mail.caseId, trigger, { SAV_V2_J2_CONTEXTUAL: "on" });
+    for (const question of initial.questions) expect(text).toContain(question.text);
+    expect(sendRequests()).toBe(1);
+  } finally { vi.useRealTimers(); }
 });

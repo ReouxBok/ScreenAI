@@ -353,7 +353,10 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
   if (problem) { reject("context_invalid", "context", problem); return needsReview(); }
   const parsed = caseDecisionProposalSchema.safeParse(input);
   if (!parsed.success) {
-    for (const issue of parsed.error.issues.slice(0, 10)) reject("proposal_schema_invalid", issue.path.join("."), issue.code);
+    for (const issue of parsed.error.issues.slice(0, 10)) {
+      const tooManyQuestions = issue.path.join(".") === "nextAction.questions" && issue.code === "too_big";
+      reject(tooManyQuestions ? "too_many_questions" : "proposal_schema_invalid", issue.path.join("."), tooManyQuestions ? "too_many_questions:max_5" : issue.code);
+    }
     return needsReview();
   }
   const proposal = parsed.data, action = proposal.nextAction;
