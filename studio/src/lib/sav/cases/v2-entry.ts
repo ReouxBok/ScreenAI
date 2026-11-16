@@ -209,12 +209,23 @@ async function v1CreatedTicket(executionId: string, ticketId: string) {
   return v1IntentHash(intent) === create.intentHash && intent.kind === "ticket_create" && intent.key === create.businessKey && decryptSavPayload<{ id?: string }>(create.ackCiphertext).id === ticketId;
 }
 
+/** 16/11: the EXISTING ticket V1 linked or reopened for this execution: it created no ticket, every effect it recorded is confirmed, and its
+ * `email_associate` (intact, hash checked) attached this mail to this very ticket. Uncertain, merely sent or another ticket is no proof. */
+async function v1ExistingTicket(executionId: string, ticketId: string) {
+  const effects = await requireDb().select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, executionId));
+  if (!effects.length || effects.some(effect => effect.kind === "ticket_create" || effect.state !== "confirmed")) return false;
+  const associations = effects.filter(effect => effect.kind === "email_associate");
+  if (associations.length !== 1) return false;
+  const intent = decryptSavPayload<{ kind?: string; key?: string; ticketId?: string }>(associations[0]!.intentCiphertext);
+  return v1IntentHash(intent) === associations[0]!.intentHash && intent.kind === "email_associate" && intent.key === associations[0]!.businessKey && intent.ticketId === ticketId;
+}
+
 /**
  * SAV-81: the relay's binder for a mail V1 already confirmed, in qualification mode only (the scope checks themselves answer `open` or `closed` otherwise).
  * The real test mail opened its thread and V1 created its ticket, but its subject did not match at the creation, so nothing was bound and the relay could
  * never attribute it. This binds it once an operator put that ticket under the V2 owner, with exactly the creation's conditions and V1's current proofs:
  * the execution confirmed on this ticket and run version, no newer run, no operator refusal, the current contract's decision of ONE support request that
- * CREATED this ticket for the unique primary contact, its `ticket_create` confirmed for this ticket, no other mail on the thread, the thread not paused, no
+ * CREATED this ticket (16/11: or linked/reopened this EXISTING ticket, `v1ExistingTicket`) for the unique primary contact, its `ticket_create` confirmed for this ticket, no other mail on the thread, the thread not paused, no
  * person's decision on the mail, not handled outside, and (before the write) no agent pause; then
  * the exact scope (sender, contact, first message, subject, window, hash, revision, one thread). The owner itself is read by the relay, between the read-only
  * check and the write. It writes no CRM owner. Unreadable is refused, never guessed.
@@ -229,8 +240,12 @@ export function qualificationRelayBinder(env: Env): NonNullable<CaseBoundaryDeps
         || source.runVersion !== input.runVersion || freshness.latestRunVersion !== input.runVersion || freshness.humanRefused) return false;
       if (decision.revision !== SAV_INTAKE_CONTRACT_REVISION || decision.messageId !== input.messageId || decision.latestInboundMessageId !== input.messageId
         || decision.classification !== "support" || decision.requests.length !== 1 || decision.requests[0]!.kind !== "support"
-        || disposition.kind !== "ticket" || disposition.target.operation !== "create" || disposition.target.contactId !== disposition.contactScope.primaryContactId) return false;
-      if (!await v1CreatedTicket(input.executionId, input.ticketId)) return false;
+        || disposition.kind !== "ticket" || disposition.target.contactId !== disposition.contactScope.primaryContactId) return false;
+      // 16/11 (Ugo): a tester who already has a ticket. V1 links or reopens it instead of creating one; the same binding, with V1's proof of THAT ticket.
+      const target = disposition.target;
+      if (target.operation === "create") { if (!await v1CreatedTicket(input.executionId, input.ticketId)) return false; }
+      else if (target.operation === "link" || target.operation === "reopen") { if (target.ticketId !== input.ticketId || !await v1ExistingTicket(input.executionId, input.ticketId)) return false; }
+      else return false;
       const db = requireDb();
       const [message] = await db.select({ id: savMessages.id, threadId: savMessages.threadId, receivedAt: savMessages.receivedAt, gmailMessageId: savMessages.gmailMessageId })
         .from(savMessages).where(eq(savMessages.id, input.messageId));

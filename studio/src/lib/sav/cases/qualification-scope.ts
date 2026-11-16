@@ -14,7 +14,7 @@ import { savCases, savMessages, savSyncState } from "@/db/schema";
  * missing, invalid, not yet open or expired scope in qualification mode: nothing is allowed, never a permissive fallback. The binding holds
  * the hash of the exact configuration: any change of contact, sender, subject or window under the same revision refuses, it never
  * reinterprets an older thread. No value lives in code: root sets the configuration. SAV-81: a mail V1 already confirmed on the ticket it
- * created can bind through the relay too, only with the same checks, V1's proofs and a fresh V2 owner reading (see `v2EntryRelayDeps`).
+ * created (16/11: or on the EXISTING ticket it linked or reopened, `v1ExistingTicket`) can bind through the relay too, only with the same checks, V1's proofs and a fresh V2 owner reading (see `v2EntryRelayDeps`).
  * Multi-thread (15/11): a real customer often writes a NEW mail outside the first thread, and V1 attaches it to the same ticket, so the case
  * gathers 2+ threads. The binding is unchanged (the exact initial subject still selects only the FIRST thread), but a case is allowed when the
  * bound thread is among its threads AND every other thread is a « tester thread »: at least one inbound message, EVERY inbound message from

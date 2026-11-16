@@ -488,3 +488,157 @@ describe("multi-thread (15/11): the real test shape, a tester's new mail in a NE
     expect(await savV2QualificationCaseAllowed(next, w.caseId)).toEqual({ allowed: false, reason: "qualification_foreign_thread" });
   });
 });
+
+describe("16/11: a tester who already has a ticket — V1 links or reopens it instead of creating one", () => {
+  /** V1's current decision that LINKED (open ticket) or REOPENED (closed ticket) an existing ticket of the unique primary contact: one support request. */
+  function existing(messageId: string, threadId: string, operation: "link" | "reopen", ticketId: string, contact = CONTACT): SavIntakeDecision {
+    const base = creation(messageId, threadId, contact);
+    if (base.disposition.kind !== "ticket") throw Error("FIXTURE");
+    return { ...base,
+      evidence: [...base.evidence, evidence("ticket", "crm_ticket", ticketId),
+        { ...evidence("ticket-contact", "crm_ticket", `syn-association-${ticketId}-${contact}`), source: "ticket_contact_association" as const, ticketId, contactId: contact, direction: "ticket_to_contact" as const }],
+      disposition: { ...base.disposition,
+        target: operation === "link" ? { operation, contactId: contact, ticketId, alreadyNew: false, ticketEvidenceId: "ticket", contactAssociationEvidenceId: "ticket-contact" }
+          : { operation, contactId: contact, ticketId, preserveOwnerId: null, ticketEvidenceId: "ticket", contactAssociationEvidenceId: "ticket-contact" },
+        sameIssueEvidenceIds: ["current", "ticket"], requiredPermissions: ["link_ticket", "associate_email", "append_ticket_note", "set_ticket_new"],
+        multiTicketNote: { openTicketIdsOnTargetContact: operation === "link" ? [ticketId] : [] },
+        note: { kind: "existing_return_summary", version: 2, previousState: operation === "link" ? "open" : "closed", warningPrefix: null, sourceMessageId: messageId, sourceEvidenceIds: ["current"],
+          renderedContentHash: "a".repeat(43), deduplication: "source_message_and_final_ticket" },
+        evidenceIds: ["current", "contact", "ticket", "ticket-contact"] },
+    } as SavIntakeDecision;
+  }
+  /** The real shape of this morning's tests: a first mail opening its thread, V1 confirmed on the tester's EXISTING ticket (no creation), every effect confirmed. */
+  async function v1Existing(operation: "link" | "reopen", options: { subject?: string; from?: string; decision?: (d: SavIntakeDecision) => SavIntakeDecision;
+    associateTicket?: string; associateState?: string; withCreate?: boolean } = {}): Promise<Mail> {
+    const threadId = randomUUID(), messageId = randomUUID(), ticketId = String(++seq), gmail = `gm-${messageId}`;
+    await f.db.insert(savThreads).values({ id: threadId, mailboxId, gmailThreadId: `thread-${threadId}`, subject: options.subject ?? SUBJECT, customerEmail: SENDER });
+    await f.db.insert(savMessages).values({ id: messageId, threadId, mailboxId, direction: "inbound", fromEmail: options.from ?? SENDER, toEmails: ["support@example.invalid"],
+      subject: options.subject ?? SUBJECT, bodyCiphertext: encryptSavPayload({ text: BODY, attachments: [], headers: {} }), receivedAt: new Date(windowStart - 60_000), gmailMessageId: gmail });
+    const [run] = await f.db.insert(savIntakeRuns).values({ threadId, messageId, version: 1, isCurrent: false, state: "observed", configHash: "syn", policyHash: "syn", payloadCiphertext: encryptSavPayload({}) }).returning();
+    const decision = (options.decision ?? (d => d))(existing(messageId, threadId, operation, ticketId));
+    const [execution] = await f.db.insert(savIntakeExecutions).values({ messageId, threadId, runId: run!.id, runVersion: 1, policyId, policyHash: "syn", state: "confirmed", ticketId,
+      payloadCiphertext: encryptSavPayload({ plan: { decision } }) }).returning();
+    const effect = async (kind: string, intent: Record<string, unknown>, stateValue = "confirmed") =>
+      f.db.insert(savIntakeEffects).values({ businessKey: String(intent.key), executionId: execution!.id, kind, permission: String(intent.permission), state: stateValue,
+        intentHash: v1IntentHash(intent), intentCiphertext: encryptSavPayload(intent), ackCiphertext: encryptSavPayload({ id: `${kind}-${messageId}` }), confirmedAt: new Date(), dispatchedAt: new Date() });
+    if (options.withCreate) await effect("ticket_create", { kind: "ticket_create", permission: "create_ticket", key: `create:${messageId}`, sourceMessageId: messageId, contactId: CONTACT });
+    await effect("note_create", { kind: "note_create", permission: "append_ticket_note", key: `note:${messageId}:${ticketId}`, ticketId });
+    await effect("note_associate", { kind: "note_associate", permission: "append_ticket_note", key: `note-association:${messageId}:${ticketId}`, ticketId });
+    await effect("email_create", { kind: "email_create", permission: "associate_email", key: `email:${messageId}`, ticketId });
+    await effect("email_associate", { kind: "email_associate", permission: "associate_email", key: `email-association:${messageId}:${ticketId}`, ticketId: options.associateTicket ?? ticketId }, options.associateState);
+    await effect("stage_new", { kind: "stage_new", permission: "set_ticket_new", key: `stage-new:${messageId}:${ticketId}`, ticketId, expectedOwnerId: null });
+    return { messageId, threadId, ticketId, executionId: execution!.id, gmail };
+  }
+  const humanTakeovers = async (caseId: string) => (await listCaseEvents(caseId)).filter(e => e.kind === "owner_changed" && (e.detail as { transition?: string }).transition === "human_takeover");
+  const retarget = (patch: Record<string, string>) => (d: SavIntakeDecision) => d.disposition.kind === "ticket"
+    ? { ...d, disposition: { ...d.disposition, target: { ...d.disposition.target, ...patch } } } as SavIntakeDecision : d;
+
+  it("fixtures: the synthetic link and reopen are valid current V1 decisions", () => {
+    for (const operation of ["link", "reopen"] as const) expect(savIntakeDecisionSchema.safeParse(existing(randomUUID(), randomUUID(), operation, "123")).success).toBe(true);
+  });
+  it.each(["link", "reopen"] as const)("%s, ticket already under the V2 owner: bound and taken by V2 at the first relay; no CRM write, no new ticket", async operation => {
+    const m = await v1Existing(operation), e = env(), effects = await intakeEffects(m.executionId);
+    owners.set(m.ticketId, V2_OWNER);
+    expect(await recordCaseAfterConfirmedIntake(m.messageId, deps(e))).toMatchObject({ created: true, owner: "agent", existingTicket: "existing_ticket_taken" });
+    const kase = (await readCaseByTicket(m.ticketId))!;
+    expect(kase).toMatchObject({ owner: "agent", phase: "queued" });
+    expect((await bindings()).map(row => JSON.parse(row.cursor!))).toEqual([expect.objectContaining({ threadId: m.threadId, messageId: m.messageId })]);
+    expect(await savV2QualificationCaseAllowed(e, kase.caseId)).toEqual({ allowed: true });
+    expect(await attributions(kase.caseId)).toEqual([expect.objectContaining({ detail: expect.objectContaining({ proof: expect.objectContaining({ kind: "hubspot_owner_read", ticketId: m.ticketId }) }) })]);
+    expect(await intakeEffects(m.executionId)).toBe(effects);
+    expect(requests.every(r => r.method === "GET")).toBe(true);
+  });
+  it("ticket WITHOUT owner (V1 leaves it empty on a link): not bound, not taken, reason `existing_ticket_owner_none`; once an operator puts the V2 owner, the sweep binds and attributes", async () => {
+    const m = await v1Existing("link"), e = env();
+    owners.set(m.ticketId, null);
+    expect(await recordCaseAfterConfirmedIntake(m.messageId, deps(e))).toMatchObject({ owner: "human", existingTicket: "existing_ticket_owner_none" });
+    expect(await bindings()).toEqual([]);
+    const waiting = (await readCaseByTicket(m.ticketId))!;
+    expect(waiting).toMatchObject({ owner: "human", phase: "handoff_pending", body: { handoff: { reason: "awaiting_v2_attribution" } } });
+    owners.set(m.ticketId, V2_OWNER);
+    expect((await sweep(e)).recovered).toBe(1);
+    expect(await readCaseByTicket(m.ticketId)).toMatchObject({ caseId: waiting.caseId, owner: "agent" });
+    expect(await bindings()).toHaveLength(1);
+  });
+  it.each([["a person", PERSON], ["the V1 team owner", TEAM]] as const)("ticket owned by %s: not bound, not taken; it stays the person's with the closed reason `existing_ticket_human_owner`, never read again", async (_name, owner) => {
+    const m = await v1Existing("reopen"), e = env();
+    owners.set(m.ticketId, owner);
+    expect(await recordCaseAfterConfirmedIntake(m.messageId, deps(e))).toMatchObject({ owner: "human", existingTicket: "existing_ticket_human_owner" });
+    const kase = (await readCaseByTicket(m.ticketId))!;
+    expect(kase.owner).toBe("human");
+    expect(kase.body.handoff?.humanSince).toBeTruthy();
+    expect((await humanTakeovers(kase.caseId)).map(event => (event.detail as { reason?: string }).reason)).toEqual(["existing_ticket_human_owner"]);
+    expect(await bindings()).toEqual([]);
+    // Even if V2's owner shows up later, a person's ticket is not taken back by the sweep or a replay.
+    owners.set(m.ticketId, V2_OWNER); requests.length = 0;
+    await sweep(e); await recordCaseAfterConfirmedIntake(m.messageId, deps(e));
+    expect(ownerReads(m.ticketId)).toEqual([]);
+    expect(await readCaseByTicket(m.ticketId)).toMatchObject({ owner: "human" });
+    expect(await humanTakeovers(kase.caseId)).toHaveLength(1);
+  });
+  it.each<[string, () => Record<string, string | undefined>, Parameters<typeof v1Existing>[1]]>([
+    ["another contact in the window", () => env({}, scope({ hubspotContactId: "100000082" })), {}],
+    ["another subject in the window", () => env({}, scope({ initialSubject: "Autre objet" })), {}],
+    ["another sender", () => env(), { from: "other@example.invalid" }],
+    ["V1's target ticket is not the execution's", () => env(), { decision: retarget({ ticketId: "999999998" }) }],
+    ["the ticket's contact is not the primary contact", () => env(), { decision: retarget({ contactId: "100000099" }) }],
+    ["the mail associated to another ticket", () => env(), { associateTicket: "999999997" }],
+    ["the association still uncertain", () => env(), { associateState: "uncertain" }],
+    ["a ticket_create in the same execution", () => env(), { withCreate: true }],
+  ])("refused before any owner read, nothing bound: %s", async (_name, make, options) => {
+    const m = await v1Existing("link", options);
+    owners.set(m.ticketId, V2_OWNER);
+    const result = await recordCaseAfterConfirmedIntake(m.messageId, deps(make())).catch(() => null);
+    if (result && "owner" in result) expect(result.owner).toBe("human");
+    expect(ownerReads(m.ticketId)).toEqual([]);
+    expect(await bindings()).toEqual([]);
+  });
+  it("a second thread on another existing ticket: refused, the first binding untouched", async () => {
+    const e = env(), first = await v1Existing("link"), second = await v1Existing("reopen");
+    owners.set(first.ticketId, V2_OWNER); owners.set(second.ticketId, V2_OWNER);
+    await recordCaseAfterConfirmedIntake(first.messageId, deps(e));
+    requests.length = 0;
+    expect(await recordCaseAfterConfirmedIntake(second.messageId, deps(e))).toMatchObject({ owner: "human" });
+    expect(ownerReads(second.ticketId)).toEqual([]);
+    expect((await bindings()).map(row => JSON.parse(row.cursor!).threadId)).toEqual([first.threadId]);
+  });
+  it("replay and racing relays and sweeps: one binding, one attribution, one inbound event", async () => {
+    const m = await v1Existing("link"), e = env();
+    owners.set(m.ticketId, V2_OWNER);
+    await Promise.all([recordCaseAfterConfirmedIntake(m.messageId, deps(e)), recordCaseAfterConfirmedIntake(m.messageId, deps(e)).catch(() => null), sweep(e)]);
+    await recordCaseAfterConfirmedIntake(m.messageId, deps(e)); await sweep(e);
+    const kase = (await readCaseByTicket(m.ticketId))!;
+    expect(kase.owner).toBe("agent");
+    expect(await bindings()).toHaveLength(1);
+    expect(await attributions(kase.caseId)).toHaveLength(1);
+    expect(await inbounds(kase.caseId)).toHaveLength(1);
+  });
+  it("the operator route (preview, then run) on an existing ticket under the V2 owner: bound, taken, continued once", async () => {
+    const m = await v1Existing("reopen"); owners.set(m.ticketId, V2_OWNER);
+    const e = { ...env(), SAV_V2_INVESTIGATION: "observe" };
+    // The relay first ran out of scope (subject prefixed), as this morning: the case exists and waits.
+    await recordCaseAfterConfirmedIntake(m.messageId, deps(env({}, scope({ initialSubject: PREFIXED }))));
+    vi.stubGlobal("fetch", network);
+    const ports = manualQualificationPorts(e);
+    const continuation = vi.fn(async (caseId: string) => ({ status: (await savV2QualificationCaseAllowed(e, caseId)).allowed ? "qualified_no_model_fixture" : "qualification_out_of_scope" }));
+    ports.continue = continuation;
+    const preview = await manualQualification({ operation: "preview", messageId: m.messageId }, e, ports);
+    expect(preview.status).toBe("ready"); if (preview.status !== "ready") throw Error("PREVIEW_NOT_READY");
+    expect(await manualQualification({ operation: "run", messageId: m.messageId, expected: preview.expected }, e, ports)).toMatchObject({ status: "attempted", outcome: "qualified_no_model_fixture" });
+    expect(continuation).toHaveBeenCalledTimes(1);
+    expect(await readCaseByTicket(m.ticketId)).toMatchObject({ owner: "agent" });
+  });
+  it("control: a creation relayed in scope carries no existing-ticket reason (creation path unchanged)", async () => {
+    const m = await v1Mail(); owners.set(m.ticketId, V2_OWNER);
+    const result = await recordCaseAfterConfirmedIntake(m.messageId, deps(env()));
+    expect(result).toMatchObject({ owner: "agent" });
+    expect(result).not.toHaveProperty("existingTicket");
+  });
+  it("open mode (no scope): an existing ticket is relayed exactly as before, no reason, no binding", async () => {
+    const m = await v1Existing("link"); owners.set(m.ticketId, null);
+    const result = await recordCaseAfterConfirmedIntake(m.messageId, deps({ ...BASE }));
+    expect(result).toMatchObject({ owner: "human" });
+    expect(result).not.toHaveProperty("existingTicket");
+    expect(await bindings()).toEqual([]);
+  });
+});
