@@ -54,7 +54,7 @@ const nextActionSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("ask"), questions: z.array(z.object({
     text: text(600), requestId: id, reducesUncertainty: text(300),
     seeks: z.array(z.object({ kind: caseQuestionSeekKindSchema, factKey: savFactKeySchema.optional() }).strict()).min(1).max(5),
-  }).strict()).min(1).max(4) }).strict(),
+  }).strict()).min(1).max(5) }).strict(),
   z.object({ kind: z.literal("answer"), requestIds: ids(6, 1), steps: z.array(z.object({
     text: text(1000), knowledge: caseDecisionKnowledgeRefSchema, newFactIds: ids(10).default([]),
   }).strict()).min(1).max(8), expectedResult: text(600) }).strict(),
@@ -176,6 +176,7 @@ export const SAV_CASE_ACCESS_URL = "https://new.limova.ai";
 export const caseDecisionRejectionLabels = {
   context_invalid: "Contexte de validation incohérent : la décision ne peut pas être vérifiée.",
   proposal_schema_invalid: "La décision proposée ne respecte pas le format attendu.",
+  too_many_questions: "Le mail proposé dépasse la limite de 5 questions : aucun envoi autorisé.",
   case_version_stale: "Le dossier a changé depuis la lecture : la décision porte sur une version périmée.",
   case_not_agent_owned: "Un humain ou une pause détient le dossier : l'agent peut seulement observer, sans répondre.",
   admission_missing: "Aucune admission du dossier pour l'agent n'est connue : l'agent peut seulement observer.",

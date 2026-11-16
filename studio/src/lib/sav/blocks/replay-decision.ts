@@ -313,7 +313,7 @@ export type SavReplayDecisionDetail = Readonly<{
   action: SavReplayDecisionAction;
   /** Why the case would go to the team: the decision's handoff reason, the second refusal, or the gate. */
   team: Readonly<{ reason: string; codes?: readonly string[] }> | null;
-  ask: Readonly<{ requestId: string; text: string }> | null;
+  ask: Readonly<{ requestId: string; text: string; questions?: ReadonlyArray<Readonly<{ requestId: string; text: string }>> }> | null;
   /** The exact text the customer would receive (help line, signature and AI mention included), or why there is none. */
   reply: Readonly<{ purpose: "answer" | "question"; mode: CaseReplyAiMode; draft: string; text: string }> | null;
   replyLimit: string | null;
@@ -423,12 +423,13 @@ export async function runSavReplayDecision(source: SavReplayCaseSource, options:
     const decision = validation.decision, next = decision.nextAction;
     action = next.kind;
     if (next.kind === "handoff") team = { reason: next.reason };
-    if (next.kind === "ask") ask = { requestId: next.questions[0]!.requestId, text: next.questions[0]!.text };
+    if (next.kind === "ask") ask = { requestId: next.questions[0]!.requestId, text: next.questions[0]!.text,
+      ...(next.questions.length > 1 ? { questions: next.questions.map(({ requestId, text }) => ({ requestId, text })) } : {}) };
     const mode: CaseReplyAiMode = options.blockMode === "automatic" ? "automated" : "manual_reviewed";
-    // As the reply passage does (`caseDecisionDraft`): an answer or ONE question is sent; a closure or a handoff waits for its own purpose.
+    // As the reply passage does (`caseDecisionDraft`): an answer or up to five questions are sent; a closure or a handoff waits for its own purpose.
     if (!decision.reply) replyLimit = "no_reply";
     else if (next.kind !== "answer" && next.kind !== "ask") replyLimit = "purpose_not_supported";
-    else if (next.kind === "ask" && next.questions.length !== 1) replyLimit = "several_questions";
+    else if (next.kind === "ask" && next.questions.length > 5) replyLimit = "too_many_questions";
     else {
       const purpose = next.kind === "answer" ? "answer" as const : "question" as const;
       // French by default: the replay does not resolve the customer's language (`resolveCaseReplyLanguage` reads a stored proof).
