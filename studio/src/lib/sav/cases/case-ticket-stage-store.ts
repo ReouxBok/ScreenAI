@@ -9,9 +9,9 @@
 // Nothing here is called by a route, a cron or an action. OFF until `SAV_V2_TICKET_STAGES=on` AND the execution policy grants `set_case_ticket_stage`.
 import "server-only";
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, isNull, like, lt, lte, notExists, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, like, lt, lte, notExists, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savCaseEffectExecutions, savIntakeEffectJournal, savIntakeEffects } from "@/db/schema";
+import { savCaseEvents, savCaseEffectExecutions, savIntakeEffectJournal, savIntakeEffects } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { readSavAgentPause, SAV_AGENT_PAUSE_CODES, savAgentPauseCode, type SavAgentPauseState } from "../intake/agent-pause";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "../intake/execution-policy";
@@ -88,6 +88,7 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
     const pause = { intake: level(await readSavAgentPause(tx, "intake")), v2: level(await readSavAgentPause(tx, "v2")) };
     const snapshot = await lockCaseForWrite(tx, caseId);
     const { intent } = payload;
+    if (payload.trigger.kind === "j2_confirmed" && deps.env().SAV_V2_J2_CONTEXTUAL !== "on") return fault("HOLD_J2_CONTEXTUAL_OFF");
     // What the execution was sealed for must still be what A's rule plans now (same ticket, same key, same stage): otherwise the case or the configuration moved.
     let still = false;
     try {
@@ -99,7 +100,13 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
       still = planned.plan && planned.intent.key === intent.key && planned.intent.stageId === intent.stageId && planned.intent.ticketId === intent.ticketId;
     } catch { still = false; }
     const lastInbound = await lastCustomerInboundAt(tx, caseId);
-    const repliedSince = payload.trigger.kind === "reply_confirmed" && lastInbound !== null && Date.parse(lastInbound) > Date.parse(payload.trigger.sentAt);
+    const repliedSince = (payload.trigger.kind === "reply_confirmed" || payload.trigger.kind === "j2_confirmed") && lastInbound !== null && Date.parse(lastInbound) > Date.parse(payload.trigger.sentAt);
+    if (payload.trigger.kind === "j2_confirmed") {
+      const [newInput] = await tx.select({ id: savCaseEvents.id }).from(savCaseEvents).where(and(
+        eq(savCaseEvents.caseId, caseId), eq(savCaseEvents.kind, "inbound_confirmed"), gt(savCaseEvents.caseVersion, payload.trigger.caseVersion),
+      )).limit(1);
+      if (repliedSince || newInput) return fault("CANCELLED_NEW_INPUT");
+    }
     const decision = decideCaseTicketStage("planned", intent.target, { config, pause, ownerNow, caseStillTarget: still, customerRepliedSince: repliedSince });
     if (decision.action === "hold") return fault(`HOLD_${decision.code.toUpperCase()}`);
     if (decision.action === "cancel") return fault(`CANCELLED_${decision.code.toUpperCase()}`);

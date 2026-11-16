@@ -23,11 +23,11 @@ vi.mock("../intake/model-dispatch", async importOriginal => {
   const real = await importOriginal<Record<string, unknown>>();
   return Object.fromEntries(Object.entries(real).map(([name, value]) => [name, typeof value === "function" ? () => { throw Error(`MODEL_DISPATCH_FORBIDDEN:${name}`); } : value]));
 });
-import { savCaseEffectExecutions, savMailboxes, savMessages, savSyncState, savThreads, staffUsers, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeProjections } from "@/db/schema";
+import { savIntakeEffects, savCaseEffectExecutions, savMailboxes, savMessages, savSyncState, savThreads, staffUsers, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeProjections } from "@/db/schema";
 import { canonicalKnowledgeSchema } from "@/lib/knowledge/contracts";
 import { readRuntimeTemporaryIncidents } from "@/lib/knowledge/temporary-incidents-runtime";
 import type { IncidentReader } from "./investigation-incidents-contract";
-import { encryptSavPayload } from "../crypto";
+import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { planSavIntake, savIntakeEvidenceContentHash } from "../intake/engine";
 import { createIntakeExecutorAdapters } from "../intake/execution-adapters";
@@ -682,7 +682,7 @@ it.each([[false, false], [true, false], [false, true], [true, true]])("J2 follow
     const [timer] = await listCaseTimers(mail.caseId);
     expect(timer).toBeDefined();
     vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date(Date.parse(timer!.dueAt) + 60_000));
-    const policy = { ...options.policy, expiresAt: new Date(Date.now() + 3600_000).toISOString() };
+    const policy = { ...options.policy, mutations: [...options.policy.mutations.filter(m => m !== "send_identity_template"), "set_case_ticket_stage" as const], expiresAt: new Date(Date.now() + 3600_000).toISOString() };
     grant = await approveIntakeExecutionPolicy(policy);
     Object.assign(environment, { SAV_V2_J2_AUTO: "on", SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: "30000000-0000-4000-8000-000000000042",
       SAV_INTAKE_EXECUTION_POLICY_ID: grant.id, SAV_INTAKE_EXECUTION_POLICY_SHA256: grant.policyHash });
@@ -691,6 +691,7 @@ it.each([[false, false], [true, false], [false, true], [true, true]])("J2 follow
     await f.db.insert(savSyncState).values({ key: "sav-block-switch.v1:access", status: "installed", cursor: encryptSavPayload({ revision: "sav-block-switch.v1", blockId: "access", mode: "auto", paused: false, setBy: "fixture@example.invalid", setAt: AT, reason: "synthetic" }) });
     await runDueJ2Pass({ now: new Date(), maxEvents: 10, currentPolicyRevision: POLICY.revision, ports: { reminderEffect: async () => "none", budgetAvailable: async () => true } });
     environment.SAV_V2_J2_CONTEXTUAL = contextual ? "on" : "off";
+    if (contextual) Object.assign(environment, { SAV_V2_TICKET_STAGES: "on", SAV_V2_STAGE_WAITING_CUSTOMER: "2", SAV_V2_STAGE_CLOSED: "4", SAV_V2_REPLY_NOTE: "on", SAV_V2_HUBSPOT_OWNER_ID: PILOT });
     const currentProvenance = { ...provenanceDeps, env: () => environment, now: () => new Date() };
     const deps = { ...storeDeps(), pilotProvenance: pilotProvenanceGate(currentProvenance) };
     const snapshot = (await readCase(mail.caseId))!;
@@ -700,7 +701,8 @@ it.each([[false, false], [true, false], [false, true], [true, true]])("J2 follow
       expect(sends).toBe(1);
       return;
     }
-    const origin = (await readJ2Origin(mail.caseId, `timer:${timer!.id}`, POLICY.revision, new Date()))!;
+    const origin = (await readJ2Origin(mail.caseId, `timer:${timer!.id}`, POLICY.revision, new Date(), environment))!;
+    if (contextual) expect(origin.j2Context).toMatchObject({ subject: "Connexion impossible" });
     const text = j2ReminderText(origin, environment);
     if (!contextual) expect(text).toBe(J2_REMINDER_TEXT);
     const reminder = { caseId: mail.caseId, triggerEventId: `timer:${timer!.id}`, purpose: "reminder" as const, text };
@@ -710,8 +712,31 @@ it.each([[false, false], [true, false], [false, true], [true, true]])("J2 follow
     expect(await produceAutoJ2(timer!, snapshot.version, deps)).toBe("approved");
     let id = "";
     expect(await enqueueApprovedJ2(timer!, snapshot.version, { id: grant.id, hash: grant.policyHash }, deps, value => { id = value; })).toBe("queued");
-    expect(await executeIntakePass(id, options, {}, createCaseEffectDriver({ ...deps }))).toMatchObject({ state: "confirmed" });
+    expect((await readCase(mail.caseId))!.phase).toBe("awaiting_customer");
+    expect(await executeIntakePass(id, options, {}, createCaseEffectDriver({ ...deps }))).toMatchObject({ state: contextual ? "waiting" : "confirmed" });
+    if (contextual) {
+      const rows = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, mail.caseId));
+      const stage = rows.find(row => row.replyKey.startsWith(`case-stage:${mail.caseId}:closed:`));
+      expect(stage).toBeDefined();
+      const { createTicketStageDriver } = await import("./case-ticket-stage-store");
+      const { createCaseTicketStageAdapters } = await import("./case-ticket-stage-hubspot");
+      let stageId = "2", patches = 0;
+      const hubspot = createCaseTicketStageAdapters({ env: () => environment, network: (async (_url, init) => {
+        if (init?.method === "PATCH") { stageId = JSON.parse(String(init.body)).properties.hs_pipeline_stage; patches++; }
+        return Response.json({ id: mail.ticketId, properties: { hs_pipeline: "0", hs_pipeline_stage: stageId, hubspot_owner_id: PILOT } });
+      }) as typeof fetch });
+      const stageResult = await executeIntakePass(stage!.id, { ...options, adapters: { ...options.adapters, ...hubspot } }, {},
+        createTicketStageDriver({ env: () => environment, readTicketOwner: async () => "v2" }));
+      expect(stageResult).toEqual({ state: "confirmed", executionId: stage!.id });
+      expect(stageId).toBe("4"); expect(patches).toBe(1);
+      expect(await executeIntakePass(id, options, {}, createCaseEffectDriver({ ...deps }))).toMatchObject({ state: "confirmed" });
+      const effects = await f.db.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, id));
+      const notes = effects.filter(effect => effect.kind === "note_create");
+      expect(notes).toHaveLength(1);
+      expect(decryptSavPayload<{ text: string }>(notes[0]!.intentCiphertext).text).toContain("J'ai relancé le client. Ticket fermé.");
+    }
     await executeIntakePass(id, options, {}, createCaseEffectDriver({ ...deps }));
+    expect((await readCase(mail.caseId))!.phase).toBe(contextual ? "closed_no_reply" : "awaiting_customer");
     expect(sends).toBe(2);
     expect(modelCalls).toBe(1); // original investigation only; reminder never calls a model
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();

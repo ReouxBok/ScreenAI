@@ -46,7 +46,7 @@ async function cas<T>(step: () => Promise<T>): Promise<T> {
  * version throws and rolls the caller's whole transaction back; a retry in another transaction would be a partial commit). Without it the behaviour is the historical one:
  * each step in its own transaction with a bounded compare-and-set retry. Returned refusals ("already recorded", owner, J2 refusal) are the caller's to judge.
  */
-export async function recordConfirmedCaseReply(input: ConfirmedReply, options: Readonly<{ tx?: CaseTx }> = {}): Promise<ConfirmedReplyOutcome> {
+export async function recordConfirmedCaseReply(input: ConfirmedReply, options: Readonly<{ tx?: CaseTx; contextualJ2?: boolean }> = {}): Promise<ConfirmedReplyOutcome> {
   const { proposal } = input, { tx } = options;
   const step = <T>(run: () => Promise<T>): Promise<T> => tx ? run() : cas(run);
   const sentAt = input.sentAt.toISOString();
@@ -61,9 +61,9 @@ export async function recordConfirmedCaseReply(input: ConfirmedReply, options: R
   let trials: ConfirmedReplyOutcome["trials"];
   if (proposal.purpose !== "question") {
     const procedures = proposal.purpose === "answer" ? proposal.procedures ?? [] : [];
-    if (!procedures.length) return { event, question: "not_applicable", j2: "not_applicable" };
+    if (!procedures.length && !(proposal.purpose === "answer" && options.contextualJ2)) return { event, question: "not_applicable", j2: "not_applicable" };
     // 2 (answer). The sealed procedures become pending trials, dated from the mail that really left. The id comes from the effect, so a replay finds the same trial and adds none.
-    trials = await step(async () => {
+    if (procedures.length) trials = await step(async () => {
       const current = await readCase(proposal.caseId, tx);
       if (!current) throw new Error("SAV_CASE_EFFECT_CASE_MISSING");
       // A person took the case after the send left: the mail stays in the journal, the agent records nothing more on the case.
@@ -78,8 +78,8 @@ export async function recordConfirmedCaseReply(input: ConfirmedReply, options: R
     if (typeof trials === "object") return { event, question: "not_applicable", j2: { refused: "owner_not_agent" }, trials };
   }
   if (proposal.purpose === "question" && !proposal.question) throw new Error("SAV_CASE_EFFECT_QUESTION_MISSING");
-  // A procedure also waits for customer feedback: use the existing question/timer tracking, never another outgoing message.
-  const question = proposal.question ?? { id: `procedure:${input.effectId}`, text: "Avez-vous pu essayer la procédure proposée ?", factKeys: [] };
+  // Answers use the existing question/timer tracking. The contextual label is internal only; the reminder reads the sealed outbound, never this label.
+  const question = proposal.question ?? { id: `procedure:${input.effectId}`, text: options.contextualJ2 ? "Suivi de la réponse envoyée." : "Avez-vous pu essayer la procédure proposée ?", factKeys: [] };
 
   // 2. The question is recorded on the case against the effect that sent it (the J2 timer needs it).
   const questionState = await step(async () => {

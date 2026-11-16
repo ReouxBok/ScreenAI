@@ -3,6 +3,7 @@
 // where the parent row lives, what is checked before every marker, what is recorded once the reply is confirmed — and never sends, marks,
 // acknowledges or verifies anything itself. Not wired to any route, cron or action: OFF until `SAV_CASE_EFFECTS=supervised` AND a person approved a payload.
 import "server-only";
+import { closeAfterConfirmedJ2 } from "./j2-confirmed-closure";
 import { j2AutoGate } from "./j2-auto-reminder";
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
@@ -102,13 +103,14 @@ async function commitReceipt(
       // The J2 counts from the mail's real send time (Gmail's own date, verified within a window of the marker); without it, from the marker.
       const verified = typeof ack.sentAt === "string" ? new Date(ack.sentAt) : null;
       const sentAt = verified && Number.isFinite(verified.getTime()) && verified.getTime() >= reply.dispatchedAt.getTime() - 60_000 && verified.getTime() <= reply.dispatchedAt.getTime() + 600_000 ? verified : reply.dispatchedAt;
-      const outcome = await recordConfirmedCaseReply({ proposal, effectId: reply.id, gmailMessageId: ack.id, gmailThreadId: ack.threadId, sentAt, currentPolicyRevision }, { tx });
+      const outcome = await recordConfirmedCaseReply({ proposal, effectId: reply.id, gmailMessageId: ack.id, gmailThreadId: ack.threadId, sentAt, currentPolicyRevision }, { tx, contextualJ2: env().SAV_V2_J2_CONTEXTUAL === "on" });
       if (typeof outcome.question === "object" || typeof outcome.trials === "object") throw new ReceiptOwnerChanged();
       if (typeof outcome.j2 === "object" && outcome.j2.refused !== "inbound_after_question") return fault(`RECEIPT_J2_${outcome.j2.refused.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`);
       if (owned.leaseUntil <= new Date()) return fault("LEASE_LOST");
       // « Waiting for the customer » (OFF unless `SAV_V2_TICKET_STAGES=on`): queued in THIS transaction, from the same locked case and the reply's own policy, so a confirmed reply
       // and its ticket state are born together and a replay or a recovery finds the same execution. Its own pass moves the ticket; nothing is sent from here.
-      await enqueueCaseTicketStage(tx, { snapshot: locked, trigger: { kind: "reply_confirmed", replyKey: key, sentAt: sentAt.toISOString() }, policy: { id: owned.row.policyId, hash: owned.row.policyHash }, env, threadId: owned.row.threadId });
+      const closure = await closeAfterConfirmedJ2(tx, proposal, key, sentAt, env());
+      if (closure || proposal.purpose !== "reminder" || env().SAV_V2_J2_CONTEXTUAL !== "on") await enqueueCaseTicketStage(tx, { snapshot: closure?.snapshot ?? locked, trigger: closure?.trigger ?? { kind: "reply_confirmed", replyKey: key, sentAt: sentAt.toISOString() }, policy: { id: owned.row.policyId, hash: owned.row.policyHash }, env, threadId: owned.row.threadId });
       await conclude(tx, reply);
       return reply;
     });
@@ -327,12 +329,19 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
    * process restarts or unrelated holds. The reply receipt is committed before this wait. */
   async function durableReplyStage(lease: ExecutionLease, proposal: CaseEffectPayload["proposal"]): Promise<CaseReplySummaryStage> {
     let key: string;
-    try { key = caseTicketStageKey(proposal.caseId, "waiting_customer", caseReplyKey(proposal.caseId, proposal.triggerEventId)); } catch { return null; }
+    const replyKey = caseReplyKey(proposal.caseId, proposal.triggerEventId);
+    let target: "closed" | "waiting_customer" = "waiting_customer";
+    if (proposal.purpose === "reminder" && deps.env().SAV_V2_J2_CONTEXTUAL === "on") {
+      const [closed] = await requireDb().select({ id: savCaseEffectExecutions.id }).from(savCaseEffectExecutions)
+        .where(eq(savCaseEffectExecutions.replyKey, caseTicketStageKey(proposal.caseId, "closed", replyKey)));
+      if (closed) target = "closed";
+    }
+    try { key = caseTicketStageKey(proposal.caseId, target, replyKey); } catch { return null; }
     const waiting = await requireDb().transaction(async tx => {
       if (!await ownedExecution(tx, lease)) return fault("LEASE_LOST");
       const [row] = await tx.select({ state: savCaseEffectExecutions.state }).from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.replyKey, key));
       if (!row || row.state === "refused") return { stage: null };
-      if (row.state === "confirmed") return { stage: "waiting_customer" as const };
+      if (row.state === "confirmed") return { stage: target };
       const [waited] = await tx.select({ id: savIntakeEffectJournal.id }).from(savIntakeEffectJournal).where(and(
         eq(savIntakeEffectJournal.executionId, lease.row.id), eq(savIntakeEffectJournal.kind, "reply_note_stage_wait"),
       )).limit(1);

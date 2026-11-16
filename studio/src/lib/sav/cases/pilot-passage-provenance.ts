@@ -58,7 +58,7 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
     const env = deps.env?.() ?? {};
     // Preserve the strict OFF path, including rejection before any origin read.
     if (env.SAV_V2_J2_CONTEXTUAL !== "on" && proposal.text !== J2_REMINDER_TEXT) return unproven("reply_not_from_decision");
-    const origin = await readJ2Origin(proposal.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), deps.now());
+    const origin = await readJ2Origin(proposal.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), deps.now(), env);
     if (!origin) return unproven("decision_not_latest");
     if (proposal.text !== j2ReminderText(origin, env)) return unproven("reply_not_from_decision");
     return readPilotReplyProvenance(origin, deps);
