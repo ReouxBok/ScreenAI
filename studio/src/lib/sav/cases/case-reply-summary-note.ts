@@ -7,6 +7,8 @@ import type { CaseReplyPurpose } from "./case-effects";
 export const CASE_REPLY_SUMMARY_PREFIX = "reply-summary.";
 export const caseReplySummaryInteractionId = (triggerEventId: string) => `${CASE_REPLY_SUMMARY_PREFIX}${triggerEventId}`;
 export const isCaseReplySummary = (interactionId: string) => interactionId.startsWith(CASE_REPLY_SUMMARY_PREFIX);
+/** The reply's summary note switch (OFF unless exactly `on`), read at queue time AND by the driver before any NEW write of a summary note. */
+export const caseReplyNoteEnabled = (env: Readonly<Record<string, string | undefined>>) => env.SAV_V2_REPLY_NOTE === "on";
 
 const PROBLEM: Readonly<Record<string, string>> = {
   access: "un problème d'accès", usage: "une question d'utilisation", technical: "un problème technique",

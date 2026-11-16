@@ -26,7 +26,7 @@ import { finalizeCaseReplyProposal, prepareCaseReplyText, readCaseReplyDisclosur
 import { getCaseReplyEffect, type CaseReplyView } from "./case-reply-registry";
 import { enqueueApprovedCaseReply, submitCaseReplyProposal, type CaseEffectNote, type CaseReplyStoreDeps, type EnqueueCaseReplyResult } from "./case-reply-store";
 import { savCaseReplyValidations } from "./case-reply-validation-table";
-import { caseReplySummaryInteractionId, caseReplySummaryText } from "./case-reply-summary-note";
+import { caseReplyNoteEnabled, caseReplySummaryInteractionId, caseReplySummaryText } from "./case-reply-summary-note";
 import { readCase } from "./case-store";
 import { decryptSavPayload } from "../crypto";
 import type { CaseDecisionReplyDraft } from "./investigation-intent";
@@ -143,11 +143,12 @@ export async function queueValidatedCaseReply(input: Readonly<{
   // SAV-92 (16/11): a queued reply carries its short summary note, written only after the reply is CONFIRMED (the driver plans it after the receipt),
   // and sealed only when `SAV_V2_REPLY_NOTE=on` AND the signed policy this execution is queued under grants `append_case_note`. Otherwise nothing changes.
   const note = await summaryNoteGranted(input.policy, input.deps) ? await caseReplySummaryNote(row.caseId, decryptSavPayload<CaseReplyProposal>(row.proposal), row.decidedAt) : null;
-  return enqueueApprovedCaseReply({ validationId: input.validationId, policy: input.policy, ...(note ? { note, derivedNote: true } : {}), deps: input.deps });
+  // `derivedNote` on THIS path whatever the switch says now: a replay (e.g. under `off`, after a note was sealed `on`) returns the existing execution as it is.
+  return enqueueApprovedCaseReply({ validationId: input.validationId, policy: input.policy, ...(note ? { note } : {}), derivedNote: true, deps: input.deps });
 }
 
-/** The reply's summary note switch (OFF unless exactly `on`). */
-export const caseReplyNoteEnabled = (env: Readonly<Record<string, string | undefined>>) => env.SAV_V2_REPLY_NOTE === "on";
+/** The reply's summary note switch (OFF unless exactly `on`), defined beside the note so the driver re-reads the same one. */
+export { caseReplyNoteEnabled };
 
 async function summaryNoteGranted(policy: Readonly<{ id: string; hash: string }>, deps: CaseReplyStoreDeps) {
   if (!caseReplyNoteEnabled(deps.env())) return false;
