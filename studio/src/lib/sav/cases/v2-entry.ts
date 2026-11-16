@@ -1,3 +1,4 @@
+import { readOriginalRequestTicket } from "../intake/original-request-ticket";
 // V2 entry (LOCAL, OFF unless SAV_V2_ENTRY=on and SAV_CASE_RECORDING=on). What joins V1's runtime to the V2 case, on the existing stores:
 //   customerReturnGate      before any claim, CRM read or model call of a run: a customer's answer on an open V2 case is consumed there and V1's run ends with it, in one transaction
 //   v2EntryRelayDeps        after V1's confirmed effect: the return route first, then the relay with its admission sources and the owner read
@@ -97,7 +98,10 @@ export async function firstBlockEvidence(env: Env, messageId: string, gmailMessa
   if (!message) return [];
   const text = decryptSavPayload<{text?: unknown}>(message.body)?.text;
   if (typeof text !== "string") return [];
-  const selected = selectCaseBlockRule(candidates, text, message.subject);
+  const original = await readOriginalRequestTicket(messageId, env);
+  // B may carry a new sensitive request: selecting A must never hide that request.
+  if (original && (savCaseSensitiveWording(text, message.subject) || savCaseSensitiveWording(original.text, original.message.subject))) return [];
+  const selected = selectCaseBlockRule(candidates, original?.text ?? text, original?.message.subject ?? message.subject);
   // Two blocks claiming one mail is a configuration to review: visible, with no customer text, and nobody admitted.
   if (selected.reason === "ambiguous_block") console.error("sav_v2_entry_block_ambiguous", { messageId, blockIds: selected.blockIds });
   if (selected.reason !== "admitted") return [];

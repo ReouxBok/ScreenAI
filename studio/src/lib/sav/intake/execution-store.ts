@@ -693,7 +693,15 @@ export async function finishExecution(lease: ExecutionLease, ticketId: string | 
                 ...lease.payload, effectsConfirmed: true
             }), updatedAt: new Date()
         }).where(eq(savIntakeExecutions.id, lease.row.id));
-        const email = effects.find(e => e.kind === "email_create" && e.state === "confirmed");
+        if (lease.payload.originalRequestTicket) {
+            for (const effect of effects.filter(e => e.kind === "email_create" && e.state === "confirmed" && e.ackCiphertext)) {
+                const intent = decryptSavPayload<EffectIntent>(effect.intentCiphertext);
+                const id = decryptSavPayload<EffectAck>(effect.ackCiphertext!).id;
+                if (id && intent.sourceMessageId === lease.payload.originalRequestTicket.messageId)
+                    await tx.update(savMessages).set({ hubspotEmailId: id }).where(eq(savMessages.id, intent.sourceMessageId));
+            }
+        }
+        const email = effects.find(e => e.kind === "email_create" && e.state === "confirmed" && decryptSavPayload<EffectIntent>(e.intentCiphertext).sourceMessageId === lease.row.messageId);
         const emailId = email?.ackCiphertext ? decryptSavPayload<EffectAck>(email.ackCiphertext).id : undefined;
         await tx.update(savMessages).set({
             analysisStatus: ticketId ? "intake_execution_confirmed" : "intake_execution_identity_wait", ...(emailId ? {

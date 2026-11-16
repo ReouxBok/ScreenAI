@@ -13,7 +13,7 @@ import { readAccessAutoApprovalConfig } from "./customer-return";
  * Outside configHash: a change neither redeploys nor breaks continuity. It can only RESTRICT: the global automatic reply
  * (`SAV_V2_AUTO_REPLY=access` + approver) and every check of A's rule still apply first, so the effective mode is the stricter of the two.
  *
- * No row = today's behaviour (`auto`, not paused). `off` or paused: the block's reply is never proposed, approved or queued; its case waits
+ * No row = off, not paused; only the frozen legacy Access exception keeps `auto` until explicitly configured. `off` or paused: the block's reply is never proposed, approved or queued; its case waits
  * visibly with a closed code (`block_off`, `block_paused`). `draft`: the reply is proposed for a person, never approved by the rule.
  * An unreadable row fails closed (`block_setting_invalid`, never sends), never as auto.
  */
@@ -22,7 +22,9 @@ type Reader = Pick<Parameters<Parameters<ReturnType<typeof requireDb>["transacti
 export const SAV_BLOCK_SWITCH_REVISION = "sav-block-switch.v1";
 export const SAV_BLOCK_MODES = ["off", "draft", "auto"] as const;
 export type SavBlockMode = typeof SAV_BLOCK_MODES[number];
-export const SAV_BLOCK_SWITCH_DEFAULT = Object.freeze({ mode: "auto" as SavBlockMode, paused: false });
+export const SAV_BLOCK_SWITCH_DEFAULT = Object.freeze({ mode: "off" as SavBlockMode, paused: false });
+// Temporary compatibility exception. Never add new blocks; remove Access after an explicit setting is saved.
+export const SAV_BLOCK_SWITCH_LEGACY_AUTO_BLOCKS: readonly string[] = Object.freeze([SAV_CASE_ACCESS_BLOCK_ID]);
 export const savBlockSwitchKey = (blockId: string) => `${SAV_BLOCK_SWITCH_REVISION}:${blockId}`;
 export const savBlockSwitchSchema = z.object({
   revision: z.literal(SAV_BLOCK_SWITCH_REVISION), blockId: z.string().regex(SAV_CASE_BLOCK_ID), mode: z.enum(SAV_BLOCK_MODES), paused: z.boolean(),
@@ -33,7 +35,7 @@ export type SavBlockSwitchState = Readonly<{ blockId: string; mode: SavBlockMode
 
 export async function readSavBlockSwitch(db: Reader, blockId: string): Promise<SavBlockSwitchState> {
   const [row] = await db.select({ cursor: savSyncState.cursor }).from(savSyncState).where(eq(savSyncState.key, savBlockSwitchKey(blockId)));
-  if (!row) return { blockId, ...SAV_BLOCK_SWITCH_DEFAULT, setting: null, invalid: false };
+  if (!row) return { blockId, ...SAV_BLOCK_SWITCH_DEFAULT, mode: SAV_BLOCK_SWITCH_LEGACY_AUTO_BLOCKS.includes(blockId) ? "auto" : "off", setting: null, invalid: false };
   try {
     const setting = savBlockSwitchSchema.parse(decryptSavPayload(row.cursor!));
     if (setting.blockId !== blockId) throw Error("SAV_BLOCK_SWITCH_KEY_MISMATCH");
