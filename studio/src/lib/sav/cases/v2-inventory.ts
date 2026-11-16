@@ -22,8 +22,8 @@ const handoffCodes = new Set<string>([...SAV_CASE_ADMISSION_TEAM_REASONS, "expli
   "evidence_inaccessible", "diagnosis_out_of_tools", "repeated_failure", "out_of_scope", "decision_refused", "validator_refusals", "awaiting_v2_attribution"]);
 const object = z.record(z.string(), z.unknown());
 
-type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
-async function queryBatch<T extends Record<string, unknown>>(tx: Pick<Tx, "execute">, statement: SQL) {
+export type V2ReadTx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
+async function queryBatch<T extends Record<string, unknown>>(tx: Pick<V2ReadTx, "execute">, statement: SQL) {
   const result = await tx.execute<T>(statement);
   return { rows: Array.isArray(result) ? result : (result as unknown as { rows: T[] }).rows };
 }
@@ -51,21 +51,27 @@ const stateSql = sql<typeof v2InventoryStates[number]>`case
  * Mutable states are display-only filters; every traversed case is listed or filtered out. Histories are bounded and fail explicitly on overflow.
  * No external call, write, lock or payload upgrade. */
 export async function listV2Cases(raw: Input) {
+  return requireDb().transaction(tx => readV2Cases(tx, raw), { isolationLevel: "repeatable read", accessMode: "read only" });
+}
+
+/** Internal batch reader; caller owns the read-only snapshot. */
+export async function readV2Cases(tx: V2ReadTx, raw: Input, untilExclusive = false) {
   const input = v2InventoryInput.parse(raw);
   if (input.from && input.until && Date.parse(input.from) > Date.parse(input.until)) throw Error("SAV_V2_INVENTORY_WINDOW_INVALID");
-  const filters = JSON.stringify([input.from ? new Date(input.from).toISOString() : null, input.until ? new Date(input.until).toISOString() : null, input.state ?? null]);
+  const filters = JSON.stringify([...(untilExclusive ? ["exclusive"] : []), input.from ? new Date(input.from).toISOString() : null, input.until ? new Date(input.until).toISOString() : null, input.state ?? null]);
   let cursor: z.infer<typeof cursorSchema> | null = null;
   if (input.cursor) {
     if (input.cursor.split(".").length !== 4 || input.cursor.split(".").slice(1).some(part => Buffer.from(part, "base64url").toString("base64url") !== part)) invalid();
     try { cursor = cursorSchema.parse(decryptSavPayload(input.cursor)); } catch { invalid(); }
     if (!cursor || cursor.filters !== filters || Date.parse(cursor.after.createdAt) > Date.parse(cursor.snapshotAt)) invalid();
   }
-  return requireDb().transaction(async tx => {
+  return (async () => {
     // Preserve PostgreSQL microseconds in the keyset (JS Date would truncate them).
     const snapshotAt = cursor?.snapshotAt ?? (await queryBatch<{ value: string }>(tx, sql`select clock_timestamp()::text as value`)).rows[0]!.value;
     const observedAt = new Date(snapshotAt).toISOString();
     const scope = and(
       input.from ? sql`${savCases.createdAt} >= ${input.from}::timestamptz` : undefined,
+      untilExclusive && input.until ? sql`${savCases.createdAt} < ${input.until}::timestamptz` : undefined,
       sql`${savCases.createdAt} <= least(${input.until ?? snapshotAt}::timestamptz, ${snapshotAt}::timestamptz)`,
     );
     const attendus = Number((await tx.select({ count: sql<number>`count(*)` }).from(savCases).where(scope))[0]!.count);
@@ -197,5 +203,5 @@ export async function listV2Cases(raw: Input) {
     }
     const last = page.slice(0, input.limit).at(-1);
     return { attendus, observedAt, statesFilterApplied: !!input.state, filteredOut, rows, nextCursor: page.length > input.limit && last ? encryptSavPayload({ v: 3, filters, after: { createdAt: last.createdAt, id: last.id }, snapshotAt, attendus }) : null };
-  }, { isolationLevel: "repeatable read", accessMode: "read only" });
+  })();
 }

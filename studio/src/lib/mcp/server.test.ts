@@ -80,7 +80,7 @@ it("SAV-24 refuses browsers: cross-origin requests and preflights", async () => 
   expect(preflight.status).toBe(403); expect(preflight.headers.get("access-control-allow-origin")).toBeNull();
 });
 it("SAV-24 lists read tools only while writes are off; with writes on, write tools carry write annotations", async () => {
-  const read = ["get_agent_pause", "get_budget", "get_diagnostics", "get_dossier", "list_dossiers", "list_v2_cases", "whoami"];
+  const read = ["get_agent_pause", "get_budget", "get_diagnostics", "get_dossier", "list_dossiers", "list_v2_cases", "v2_daily_report", "whoami"];
   const write = ["classify_invalid_source_other", "classify_other", "close_handled_outside", "continue_dossier", "reconcile_effect", "reconcile_identification", "reconcile_note",
     "record_choice", "release_hold", "request_reinvestigation", "set_agent_pause"];
   const list = async (flags: Record<string, string>) => ((await (await rpc("tools/list", {}, { env: flags })).json()) as { result: { tools: { name: string; annotations: { readOnlyHint: boolean; destructiveHint: boolean } }[] } }).result.tools;
@@ -192,4 +192,16 @@ it("SAV-92 V2 inventory checks admin before reading and validates input", async 
   current = ugo;
   expect((await callTool("list_v2_cases")).result?.structuredContent).toMatchObject({ outcome: "done", data: { attendus: 0, rows: [], nextCursor: null } });
   expect((await callTool("list_v2_cases", { limit: 101 })).result?.isError).toBe(true);
+});
+
+it("SAV-92 daily report is administrator-only and requires a bounded window", async () => {
+  const args = { from: "2026-11-15T00:00:00Z", until: "2026-11-16T00:00:00Z" };
+  for (const other of [reouven, contact]) {
+    current = other;
+    expect((await callTool("v2_daily_report", args)).result?.structuredContent).toMatchObject({ outcome: "refused", code: "SAV_V2_REPORT_FORBIDDEN" });
+  }
+  current = ugo;
+  expect((await callTool("v2_daily_report", args)).result?.structuredContent).toMatchObject({ outcome: "done", data: { coverage: { expected: 0, checked: 0, complete: true } } });
+  expect((await callTool("v2_daily_report")).result?.isError).toBe(true);
+  expect((await callTool("v2_daily_report", { ...args, until: "2026-11-23T00:00:00Z" })).result?.isError).toBe(true);
 });
