@@ -4,6 +4,7 @@ import { z } from "zod";
 import { requireDb } from "@/db";
 import { savCases, savMessages } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
+import { caseComponentOutcomes } from "./case-component-outcomes";
 import { SAV_CASE_ADMISSION_TEAM_REASONS } from "./case-types";
 
 export const v2InventoryStates = ["processing", "awaiting_customer", "reply_sent", "handed_to_team", "failed", "paused"] as const;
@@ -96,10 +97,18 @@ export async function listV2Cases(raw: Input) {
       join lateral (select * from sav.case_effect_executions where case_id=c.id order by created_at, id limit ${historyLimit + 1}) e on true
       where c.id=any(${idArray}::uuid[])`);
     const executionIds = `{${executionRows.rows.map(e => e.id).join(",")}}`;
+    // Latest component result only: one batch over the journal, never one scan per execution.
+    const componentRows = executionRows.rows.length ? await queryBatch<{ executionId: string; kind: string; payload: string }>(tx, sql`
+      select distinct on (execution_id, kind) execution_id as "executionId", kind, payload_ciphertext as payload
+      from sav.intake_effect_journal where execution_id=any(${executionIds}::uuid[])
+        and kind in ('case_component_note','case_component_status') order by execution_id, kind, created_at desc, id desc`) : null;
+    const componentJournal = new Map((componentRows?.rows ?? []).map(e => [`${e.executionId}:${e.kind}`, e.payload]));
     // Four public effect kinds, one aggregate per execution/kind, regardless of ledger length.
     const effectResult = executionRows.rows.length ? await queryBatch<{ executionId: string; kind: string; state: string; confirmedAt: string | null }>(tx, sql`
       select execution_id as "executionId", kind,
-        case when bool_and(state='confirmed' and confirmed_at is not null) then 'confirmed' else 'pending' end as state,
+        case when bool_and(state='confirmed' and confirmed_at is not null) then 'confirmed'
+          when bool_or(state in ('dispatched','acked','uncertain')) then 'uncertain'
+          when bool_or(state='failed') then 'failed' else 'pending' end as state,
         min(confirmed_at)::text as "confirmedAt"
       from sav.intake_effects where execution_id=any(${executionIds}::uuid[])
         and kind in ('reply_send','note_create','note_associate','ticket_stage') group by execution_id, kind`) : null;
@@ -150,6 +159,14 @@ export async function listV2Cases(raw: Input) {
       const entry = entries.rows.find(e => e.caseId === row.id);
       const message = entry ? messageRows.find(m => m.gmailId === entry.key.slice("inbound:".length) && row.threadIds.includes(m.threadId)) : undefined;
       const executions = executionsByCase.get(row.id) ?? [];
+      const componentExecutions = executions.map(e => {
+        const note = componentJournal.get(`${e.id}:case_component_note`), status = componentJournal.get(`${e.id}:case_component_status`);
+        return { ...e, noteExpected: object.safeParse(object.parse(decryptSavPayload(e.payload)).note).success,
+          noteOutcome: note ? object.parse(decryptSavPayload(note)) : null,
+          statusOutcome: status ? object.parse(decryptSavPayload(status)) : null };
+      });
+      const componentEffects = executions.flatMap(e => effectsByExecution.get(e.id) ?? []);
+      const outcomes = componentExecutions.map(e => ({ executionId: e.id, ...caseComponentOutcomes(e, componentExecutions, componentEffects) }));
       const active = executions.filter(e => !["refused", "cancelled"].includes(e.state) && !e.reason?.startsWith("SAV_CASE_EFFECT_CANCELLED_"));
       const effects = executions.flatMap(e => effectsByExecution.get(e.id) ?? []);
       const activeEffects = active.flatMap(e => effectsByExecution.get(e.id) ?? []);
@@ -190,7 +207,7 @@ export async function listV2Cases(raw: Input) {
       rows.push({ caseId: row.id, threadId: message?.threadId ?? row.threadIds[0] ?? null, messageId: message?.id ?? null, state: row.state, phase: row.phase,
         receivedAt: entered?.toISOString() ?? null, replyConfirmedAt: answered?.toISOString() ?? null,
         replyDelaySeconds: entered && answered && answered >= entered ? (answered.getTime() - entered.getTime()) / 1000 : null,
-        hubspot: { note, status }, handoffReason: typeof reason === "string" ? handoffCodes.has(reason) ? reason : "other_internal_reason" : null,
+        outcomes, hubspot: { note, status }, handoffReason: typeof reason === "string" ? handoffCodes.has(reason) ? reason : "other_internal_reason" : null,
         validatorRefusals: refusals.size,
         cost: { confirmedMicroUsd: complete ? confirmed : null, reservedMicroUsd: complete ? reserved : null, reason: complete ? null : !calls.length ? "no_recorded_call" : ledgerUnreadable ? "receipt_unreadable" : "receipt_missing" },
       });
