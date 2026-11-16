@@ -155,6 +155,18 @@ it("SAV-30 record_choice binds the run, version, source and candidates read; ref
   expect(await call("record_choice", { threadId, versionToken: token(), idempotencyKey: key(), kind: "refuse", reason: "Refus synthétique justifié." })).toMatchObject({ code: "SAV_MCP_ACTION_UNAVAILABLE" });
   expect(state.choice).toHaveBeenCalledTimes(3);
 });
+it("record_choice accepts a ticket-only selection when the contact was resolved by email (no contact candidate), and never a contact outside the candidates", async () => {
+  state.choice.mockResolvedValue({ eventId: "e3", status: "recorded" });
+  detail.current.candidateContactIds = []; detail.current.payload.plan.candidateContactIds = [];
+  const idem = key();
+  expect(await call("record_choice", { threadId, versionToken: token(), idempotencyKey: idem, kind: "select", ticketId: "201", reason: "Choix synthétique du ticket." })).toMatchObject({ outcome: "done" });
+  expect(state.choice).toHaveBeenCalledWith({ commandKey: idem, threadId, messageId, runId, version: 7, sourceHash, candidatesHash: intakeRuntimeHash([]),
+    kind: "select", ticketId: "201", reason: "Choix synthétique du ticket." });
+  // The resolved contact (decision target) is not a candidate: injecting it, or any other contact, stays refused.
+  for (const bad of [{ contactId: "101", ticketId: "201" }, { contactId: "101" }, { ticketId: "999" }]) expect(await call("record_choice", { threadId, versionToken: token(), idempotencyKey: key(), kind: "select", reason: "Choix synthétique du ticket.", ...bad })).toMatchObject({ code: "SAV_MCP_NOT_A_CANDIDATE" });
+  expect(await call("record_choice", { threadId, versionToken: token(), idempotencyKey: key(), kind: "select", reason: "Choix synthétique du ticket." })).toMatchObject({ code: "SAV_MCP_INVALID_INPUT" });
+  expect(state.choice).toHaveBeenCalledTimes(1);
+});
 it("SAV-29 reinvestigation, note and identification reconciliation go to the console functions, administrators only", async () => {
   state.reinvestigate.mockResolvedValue({ eventId: "e2", runId }); state.identification.mockResolvedValue({ confirmed: 1 }); state.note.mockResolvedValue({});
   const idem = key();
