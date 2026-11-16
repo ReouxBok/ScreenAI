@@ -30,7 +30,7 @@ export type RodageCase = {
   action: string; responseSummary: string; responseText: string | null; sensitiveMissed: boolean; citations: { knowledgeId: string; contentVersionId: string }[];
   refusals: string[]; afterwards: string[]; verdict: RodageVerdict | null;
 };
-export type RodageReport = { blockId: string; from: string; to: string; incomplete: boolean; cases: RodageCase[] };
+export type RodageReport = { blockId: string; from: string; to: string; incomplete: boolean; historyUncertain?: boolean; cases: RodageCase[] };
 const actionLabels = { answer: "répondre", ask: "demander", handoff: "passer à l’équipe", confirm_resolution: "confirmer la résolution", observe_only: "observer" };
 const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 type Journal = CaseInvestigationJournalEvent & { id: string; direction: string; occurredAt: Date };
@@ -81,7 +81,7 @@ export function rodageGoNoGo(report: RodageReport, thresholds = RODAGE_THRESHOLD
   }
   for (const [code, ids] of refusalCases) refusedByReason[code] = ids.size;
   const verdicts = { bon: good, "à corriger": drafts.filter(c => c.verdict?.verdict === "à corriger").length, "hors périmètre": drafts.filter(c => c.verdict?.verdict === "hors périmètre").length };
-  const result = report.incomplete || report.cases.some(c => c.refusals.includes("record_unreadable")) || sensitiveMissed > thresholds.maxSensitiveMissed || outOfBlock > thresholds.maxOutOfBlock ? "corriger puis recommencer"
+  const result = report.historyUncertain ? "historique incertain" : report.incomplete || report.cases.some(c => c.refusals.includes("record_unreadable")) || sensitiveMissed > thresholds.maxSensitiveMissed || outOfBlock > thresholds.maxOutOfBlock ? "corriger puis recommencer"
     : drafts.length < thresholds.minDrafts ? "pas assez de volume" : good / drafts.length >= thresholds.minGoodRatio ? "prêt pour auto" : "corriger puis recommencer";
   return { result, admitted: new Set(report.cases.filter(c => c.admitted).map(c => c.caseId)).size, drafts: drafts.length, good, goodRatio: drafts.length ? good / drafts.length : 0,
     sensitiveMissed, outOfBlock, refusedByReason, handoffs: new Set(report.cases.filter(c => c.action === actionLabels.handoff).map(c => c.caseId)).size, verdicts };
@@ -97,7 +97,7 @@ export async function readRodageReport(raw: unknown): Promise<RodageReport> {
   for (const row of rows.slice(0, 500)) {
     if (!row.admissionCiphertext) continue;
     // A later overwritten admission cannot certify the requested historical window.
-    if (row.admissionDecidedAt && row.admissionDecidedAt >= new Date(input.to)) { report.incomplete = true; continue; }
+    if (row.admissionDecidedAt && row.admissionDecidedAt >= new Date(input.to)) { report.incomplete = true; report.historyUncertain = true; continue; }
     const admission = decryptSavPayload<CaseAdmissionRecord>(row.admissionCiphertext);
     const events = await db.select().from(savCaseEvents).where(and(eq(savCaseEvents.caseId, row.id), gte(savCaseEvents.occurredAt, new Date(input.from)), lt(savCaseEvents.occurredAt, new Date(input.to))))
       .orderBy(asc(savCaseEvents.caseVersion)).limit(1001);
@@ -105,10 +105,17 @@ export async function readRodageReport(raw: unknown): Promise<RodageReport> {
     if (!events.length) continue;
     const journal = events.slice(0, 1000).map(e => ({ ...e, detail: decryptSavPayload<{ detail: Record<string, unknown> | null }>(e.payloadCiphertext).detail }));
     // Each distinct proposal is reviewed; resumptions carrying the same proposal do not inflate volume.
-    if (journal.some(e => e.kind === "admission_decided" && e.detail?.target === "agent" && e.caseVersion !== admission.version)) report.incomplete = true;
     const proposals = new Map<string, RodageCase>();
     const observations = journal.filter(e => e.kind === "observation_recorded" && (e.detail?.record as { kind?: unknown } | undefined)?.kind === SAV_CASE_INVESTIGATION_RECORD_KIND);
     for (const observation of observations) {
+      const key = (observation.detail?.record as { inputKey?: unknown } | undefined)?.inputKey;
+      const read = typeof key === "string" ? readCaseInvestigationProgress([observation], key) : { state: "none" as const };
+      // Admission events omit the old qualification: a replacement cannot be used
+      // retroactively, even if it happened inside this window or before a resumption.
+      const proposalVersion = read.state === "found"
+        ? read.record.progress.proposal?.proposedOn ?? read.record.decision?.caseVersion ?? observation.caseVersion
+        : observation.caseVersion;
+      if (admission.version > proposalVersion) report.historyUncertain = true;
       const view = journal.filter(e => e.kind !== "observation_recorded" || e.caseVersion <= observation.caseVersion);
       const item = projectRodageCase(row.id, admission, view, input.blockId);
       if (item?.draftId) proposals.set(item.draftId, item);
@@ -135,7 +142,7 @@ export async function saveRodageVerdict(raw: unknown, window: unknown) {
   const actor = await rodageAdministrator(), input = verdictInputSchema.parse(raw);
   const report = await readRodageReport(window);
   const item = report.cases.find(c => c.caseId === input.caseId && c.draftId === input.draftId);
-  if (report.blockId !== input.blockId || !item?.draftId || item.draftId !== input.draftId || report.incomplete) throw Error("SAV_RODAGE_DRAFT_STALE");
+  if (report.blockId !== input.blockId || !item?.draftId || item.draftId !== input.draftId || report.incomplete || report.historyUncertain) throw Error("SAV_RODAGE_DRAFT_STALE");
   const next: RodageVerdict = { ...input, revision: RODAGE_REVISION, actor: actor.email, at: new Date().toISOString() };
   await requireDb().transaction(async tx => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${rodageKey(input.blockId, input.caseId)}))`);
@@ -158,7 +165,7 @@ export function exportRodageMarkdown(report: RodageReport) {
     `Admis : ${stats.admitted} ; brouillons : ${stats.drafts} ; bons : ${stats.good} ; passages à l’équipe : ${stats.handoffs}`,
     `Sensible raté : ${stats.sensitiveMissed} ; hors bloc admis : ${stats.outOfBlock}`, `Refus : ${JSON.stringify(stats.refusedByReason)}`,
     `Verdicts : ${JSON.stringify(stats.verdicts)}`, `Lecture limitée : ${report.incomplete ? "oui" : "non"}`,
-    "Périmètre : provenance d’admission actuelle, événements dans la fenêtre. Les anciennes admissions remplacées ne sont pas reconstituées.",
+    `Historique incertain : ${report.historyUncertain ? "oui" : "non"}. Une admission remplacée après une proposition interdit GO : sa qualification historique n’est pas disponible.`,
     "Les résumés sont structurels ; les textes clients, réponses et raisons libres restent hors export. Aucune activation.",
     ...report.cases.map(c => `\n## Dossier ${z.uuid().parse(c.caseId)}\nDécision : ${Object.values(actionLabels).includes(c.action) ? c.action : "non disponible"}\nRéponse : ${c.draftId ? "brouillon proposé" : "aucun brouillon"}\nVerdict : ${c.verdict?.verdict ?? "non évalué"} ; catégorie : ${c.verdict?.category ?? "aucune"}\nFiches : ${c.citations.map(k => `${z.uuid().safeParse(k.knowledgeId).success ? k.knowledgeId : "identifiant non UUID"}@${z.uuid().safeParse(k.contentVersionId).success ? k.contentVersionId : "version non UUID"}`).join(", ") || "aucune"}\nSuite : ${c.afterwards.filter(s => ["le client a répondu", "un humain a répondu", "fermeture proposée", "fermeture observée"].includes(s)).join(", ") || "non observée dans la fenêtre"}`),
   ].join("\n\n");

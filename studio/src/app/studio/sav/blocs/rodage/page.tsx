@@ -19,7 +19,8 @@ export default async function RodagePage({ searchParams }: { searchParams: Promi
     <p>Critères : au moins {RODAGE_THRESHOLDS.minDrafts} brouillons, {RODAGE_THRESHOLDS.minGoodRatio * 100} % bons, aucun sensible raté et aucun hors bloc admis. Les brouillons sans verdict comptent dans le dénominateur.</p>
     <p>Admis : {stats.admitted} ; brouillons : {stats.drafts} ; bons : {stats.good} ({Math.round(stats.goodRatio * 100)} %) ; passages à l’équipe : {stats.handoffs} ; sensibles ratés : {stats.sensitiveMissed} ; hors bloc admis : {stats.outOfBlock}.</p>
     <p>Verdicts : {JSON.stringify(stats.verdicts)}. Refus par motif : {JSON.stringify(stats.refusedByReason)}.</p>
-    <p>Lecture : admission actuelle et événements dans la fenêtre. Une admission remplacée n’est pas reconstituée. Chaque proposition distincte est évaluée ; un nouveau brouillon exige un nouveau verdict. Les résumés de demande sont structurels, sans texte client.</p>
+    <p>Lecture : l’admission doit être applicable au moment de chaque proposition. Une qualification historique remplacée n’est pas reconstituable et interdit GO. Chaque proposition distincte est évaluée ; un nouveau brouillon exige un nouveau verdict. Les résumés de demande sont structurels, sans texte client.</p>
+    {report.historyUncertain && <p role="alert">Historique incertain : aucun GO possible. L’admission applicable à certaines propositions ne peut pas être établie.</p>}
     {report.incomplete && <p role="alert">Lecture tronquée : aucun GO possible. Réduire la fenêtre.</p>}
     <Link href="/studio/sav/intake/blocks">Consulter l’interrupteur du bloc</Link>
     {report.cases.map(c => <section key={`${c.caseId}:${c.draftId}`}><h2>Dossier {c.caseId}</h2><p>Proposition : {c.proposedAt ?? "aucune"}</p><p>{c.summary}</p>

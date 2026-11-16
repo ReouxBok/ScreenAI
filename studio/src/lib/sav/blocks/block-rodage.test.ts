@@ -143,5 +143,28 @@ it("never issues GO for a window whose admission was overwritten afterwards", as
   await seed();
   await fixture.db.update(savCases).set({ admissionDecidedAt: new Date("2026-11-17T08:00:00Z") }).where(eq(savCases.id, caseId));
   const r = await readRodageReport(window); expect(r.incomplete).toBe(true);
-  expect(rodageGoNoGo(r).result).toBe("corriger puis recommencer");
+  expect(rodageGoNoGo(r).result).toBe("historique incertain");
+});
+
+// Admission before the window, draft during it, then withdrawal to the team:
+// the old qualification is absent from admission_decided, so attribution is unknown.
+it.each([false, true])("vetoes GO after an in-window team readmission, even when the block disappears (%s)", async removeBlock => {
+  const caseId = removeBlock ? "10000000-0000-4000-8000-000000000003" : "10000000-0000-4000-8000-000000000002";
+  await fixture.db.update(savCases).set({ updatedAt: new Date("2026-11-15T00:00:00Z") });
+  const withdrawn = { ...admission(), target: "team" as const, version: 3, decidedAt: "2026-11-16T11:00:00.000Z" };
+  if (removeBlock) withdrawn.qualification.requests = [];
+  await fixture.db.insert(savCases).values({ id: caseId, ticketId: removeBlock ? "98920003" : "98920002", owner: "human", phase: "handoff_pending", sensitivity: "none", contractRevision: SAV_CASE_CONTRACT_REVISION, payloadCiphertext: encryptSavPayload(emptyCaseBody()), createdAt: new Date("2026-11-15T08:00:00Z"), updatedAt: new Date(withdrawn.decidedAt), admissionCiphertext: encryptSavPayload(withdrawn), admissionTarget: "team", admissionDecidedAt: new Date(withdrawn.decidedAt) });
+  const missed = progress(); missed.attempts = [{ call: 1, result: "validated", outcome: "needs_review", kinds: [], codes: ["sensitive_requires_human"] }];
+  const detail = { record: caseInvestigationObservationRecord("in:synthetic", missed, null) };
+  await fixture.db.insert(savCaseEvents).values({ caseId, kind: "observation_recorded", dedupeKey: "observation:initial", caseVersion: 2, direction: "internal", occurredAt: new Date("2026-11-16T10:00:00Z"), payloadCiphertext: encryptSavPayload({ detail }) });
+  await fixture.db.insert(savCaseEvents).values({ caseId, kind: "admission_decided", dedupeKey: "admission:withdrawn", caseVersion: 3, direction: "internal", occurredAt: new Date(withdrawn.decidedAt), payloadCiphertext: encryptSavPayload({ detail: { target: "team" } }) });
+  // A later resumption retains the proposal's original version, not today's admission.
+  await fixture.db.insert(savCaseEvents).values({ caseId, kind: "observation_recorded", dedupeKey: "observation:resumed", caseVersion: 4, direction: "internal", occurredAt: new Date("2026-11-16T12:00:00Z"), payloadCiphertext: encryptSavPayload({ detail }) });
+  const r = await readRodageReport(window);
+  expect(r.historyUncertain).toBe(true);
+  r.cases.push(...report().cases.map(good));
+  expect(rodageGoNoGo(r).result).toBe("historique incertain");
+  expect(exportRodageMarkdown(r)).toContain("Historique incertain : oui");
+  await expect(saveRodageVerdict({ blockId: "access", caseId, draftId: item().draftId, verdict: "bon", category: null, reason: "" }, window)).rejects.toThrow("SAV_RODAGE_DRAFT_STALE");
+  expect(state.writes).toEqual([]);
 });
