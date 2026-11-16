@@ -655,7 +655,7 @@ describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case not
     crmReading = () => goodCrm(made.ticketId);
     await f.db.insert(savMessages).values({ mailboxId, threadId: made.threadId, direction: "inbound", fromEmail: CUSTOMER, toEmails: ["support@example.invalid"], subject: "Connexion",
       gmailMessageId: randomUUID(), receivedAt: new Date(), createdAt: new Date(), analysisStatus: "intake_execution_confirmed",
-      bodyCiphertext: encryptSavPayload({ attachments: [], headers: {}, text: "Bonjour, voici la conversation : https://app.example.invalid/conversation/c-9?utm_source=abc&lang=fr et http://plain.example.invalid/x et https://app.example.invalid/login?magic=R7mQ2vX9pL4nW8zK\n\nLe lun. 16 nov. 2026, Support <support@example.invalid> a écrit :\n> https://help.example.invalid/article/1" }) });
+      bodyCiphertext: encryptSavPayload({ attachments: [], headers: {}, text: "Bonjour, voici la conversation : https://app.limova.ai/conversation/c-9?utm_source=abc&lang=fr et http://plain.example.invalid/x et https://app.limova.ai/login?magic=R7mQ2vX9pL4nW8zK\n\nLe lun. 16 nov. 2026, Support <support@example.invalid> a écrit :\n> https://help.example.invalid/article/1" }) });
     expect(await investigate(made.c.caseId, [handoff()])).toMatchObject({ status: "recorded", outcome: "accepted" });
     const [execution] = (await noticeRows()).filter(row => row.caseId === made.c.caseId);
     await granting(async () => {
@@ -663,7 +663,7 @@ describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case not
       const creates = hub.calls.filter(call => call.op === "dispatch" && call.kind === "note_create");
       expect(creates).toHaveLength(1);
       const text = (creates[0]!.intent as unknown as { text: string }).text;
-      expect(text).toContain("Il nous a envoyé ce lien : https://app.example.invalid/conversation/c-9?lang=fr");
+      expect(text).toContain("Il nous a envoyé ce lien : https://app.limova.ai/conversation/c-9?lang=fr");
       // The http link and the authentication link are masked, said once; the quoted history is not read.
       expect(text).toContain("Il nous a aussi envoyé 2 liens (masqués par sécurité, voir le mail).");
       expect(text).not.toMatch(/utm_source|abc|plain\.example|help\.example|login|magic|R7mQ2/);

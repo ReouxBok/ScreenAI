@@ -44,24 +44,36 @@ const sameSource = (a: SourceRef, b: SourceRef) => a.type === b.type && a.id ===
 const URL_IN_TEXT = /\bhttps?:\/\/([A-Za-z0-9.-]{1,120})(?::\d+)?(?:[/?#][^\s<>"']*)?/gi;
 const KNOWLEDGE_ID = /^[A-Za-z0-9._-]{1,80}$/;
 
-// SAV-92 (Ugo 16/11; review Astra of 1289893): the full links a customer gave (a conversation, a page in error), for the team's HubSpot note. No list of
-// allowed domains exists in the repository, so the policy is conservative; anything doubtful is dropped whole, never repaired:
-//   - https only, no credentials (user:pass@), no port, a named host (no IP address);
+// SAV-92 (Ugo 16/11; reviews Astra of 1289893 and 54694e4): the full links a customer gave, for the team's HubSpot note. A STRICT ALLOW-LIST: a link is shown
+// only on a host listed in `CUSTOMER_LINK_HOSTS` (or one of its subdomains), i.e. a page of the Limova app such as a conversation; any other link is masked
+// (the note says one was sent, never its text). A deny-list never holds (short tokens, shorteners, payment links...). Anything doubtful is dropped whole:
+//   - https only, no credentials (user:pass@), no port, an allowed host;
 //   - an AUTHENTICATION link (a path segment, a parameter name or the fragment evokes login, reset, magic, token...) is rejected whole: it may open the account;
 //   - the fragment is always removed;
 //   - a path segment shaped like a token (16+ characters mixing letters and digits, long hex, a provider token, a UUID) rejects the link; a UUID is allowed
 //     only right after conversation / chat / thread / share (a conversation id, what the team wants);
 //   - parameters: only a short safe list is kept (lang, page, tab, a short numeric id), and only with a short plain value; every other one is removed;
-//   - bounded in length (300) and in number (5). A rejected link is counted, so the note can say one was sent and masked.
+//   - bounded in length (300) and in number (5). A rejected link is counted, so the note can say one was sent and masked;
+//   - nothing here may throw: an error while judging a link masks that link, the synthesis (hence the note) is still written.
+/**
+ * The hosts whose links may appear in full in the team's note: the host itself and its subdomains (`app.limova.ai`). To allow another product's links, add
+ * its registrable domain here (lower case, no scheme, no path), after checking its links never carry a sign-in or a secret. Not configurable on purpose.
+ */
+export const CUSTOMER_LINK_HOSTS: readonly string[] = Object.freeze(["limova.ai"]);
+const allowedHost = (host: string) => CUSTOMER_LINK_HOSTS.some(allowed => host === allowed || host.endsWith(`.${allowed}`));
 const RAW_LINK = /\bhttps?:\/\/[^\s<>"'«»[\]{}|\\^`]+/gi;
 const AUTH_WORD = /login|log-in|log_in|signin|sign-in|sign_in|auth|callback|reset|password|passwd|magic|verify|verif|confirm|invite|invitation|token|otp|session|sso|activate|activation|unlock/i;
 const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CONVERSATION_SEGMENT = /^(?:conversations?|chats?|threads?|share|shared)$/i;
 const TOKEN_LIKE = (value: string) => /eyJ[A-Za-z0-9_-]{8,}|(?:sk-|ghp_|gho_|github_pat_|xox[abprs]-|xapp-|AKIA)[A-Za-z0-9_-]{6,}|[0-9a-f]{24,}/i.test(value)
   || value.split(/[^A-Za-z0-9+/=_]+/).some(part => part.length >= 16 && /[A-Za-z]/.test(part) && /[0-9]/.test(part));
-const SAFE_PARAMS: Record<string, RegExp> = { lang: /^[a-z]{2}(?:-[A-Za-z]{2})?$/, page: /^[0-9]{1,4}$/, tab: /^[a-z][a-z-]{0,19}$/i, id: /^[0-9]{1,9}$/ };
+// A Map, never an object literal: `constructor` or `__proto__` must not resolve to an inherited property (review Astra of 54694e4).
+const SAFE_PARAMS: ReadonlyMap<string, RegExp> = new Map([["lang", /^[a-z]{2}(?:-[A-Za-z]{2})?$/], ["page", /^[0-9]{1,4}$/], ["tab", /^[a-z][a-z-]{0,19}$/i], ["id", /^[0-9]{1,9}$/]]);
 type LinkVerdict = Readonly<{ ok: true; link: string }> | Readonly<{ ok: false }>;
 function judgeCustomerLink(raw: string): LinkVerdict {
+  try { return judgeCustomerLinkUnsafe(raw); } catch { return { ok: false }; }
+}
+function judgeCustomerLinkUnsafe(raw: string): LinkVerdict {
   const no = { ok: false } as const;
   const trimmed = raw.trim().replace(/[.,;:!?)»"'…]+$/u, "");
   if (!/^https:\/\//i.test(trimmed) || trimmed.length > 2_000) return no;
@@ -69,7 +81,7 @@ function judgeCustomerLink(raw: string): LinkVerdict {
   try { url = new globalThis.URL(trimmed); } catch { return no; }
   if (url.protocol !== "https:" || url.username || url.password || url.port) return no;
   const host = url.hostname.toLowerCase();
-  if (!/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(host) || /^[0-9.]+$/.test(host)) return no;
+  if (!/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(host) || /^[0-9.]+$/.test(host) || !allowedHost(host)) return no;
   let segments: string[], fragment: string;
   try { segments = url.pathname.split("/").filter(Boolean).map(decodeURIComponent); fragment = decodeURIComponent(url.hash); } catch { return no; }
   if (segments.some(segment => AUTH_WORD.test(segment)) || AUTH_WORD.test(fragment) || [...url.searchParams.keys()].some(name => AUTH_WORD.test(name))) return no;
@@ -79,7 +91,7 @@ function judgeCustomerLink(raw: string): LinkVerdict {
   }
   url.hash = "";
   for (const name of [...new Set(url.searchParams.keys())]) {
-    const values = url.searchParams.getAll(name), safe = SAFE_PARAMS[name.toLowerCase()];
+    const values = url.searchParams.getAll(name), safe = SAFE_PARAMS.get(name.toLowerCase());
     if (!safe || values.length !== 1 || !safe.test(values[0]!)) url.searchParams.delete(name);
   }
   const kept = url.toString();
@@ -94,9 +106,11 @@ export function customerLinkOf(raw: string): string | null {
 export function customerLinkScan(texts: readonly string[], max: number = CASE_HANDOFF_SUMMARY_LIMITS.links): { links: string[]; masked: number } {
   const links: string[] = [], masked = new Set<string>();
   for (const text of texts) {
-    for (const match of String(text ?? "").matchAll(RAW_LINK)) {
-      const verdict = judgeCustomerLink(match[0]);
-      if (!verdict.ok) masked.add(match[0].replace(/[.,;:!?)»"'…]+$/u, ""));
+    let found: string[];
+    try { found = [...String(text ?? "").matchAll(RAW_LINK)].map(match => match[0]); } catch { masked.add(`unreadable:${masked.size}`); continue; }
+    for (const raw of found) {
+      const verdict = judgeCustomerLink(raw);
+      if (!verdict.ok) masked.add(raw.replace(/[.,;:!?)»"'…]+$/u, ""));
       else if (!links.includes(verdict.link) && links.length < max) links.push(verdict.link);
     }
   }
