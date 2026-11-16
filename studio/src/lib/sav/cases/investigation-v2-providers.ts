@@ -1,5 +1,5 @@
-import { compactInvestigationContext, INVESTIGATION_CONTEXT_INSTRUCTION } from "./investigation-context-view";
-import { caseDecisionBodyBreakdown, caseGeminiDecisionBody, type CaseDecisionBodyBreakdown } from "./investigation-context-budget";
+import { casePromptCompactOn, compactCaseKnowledgeContent } from "./investigation-prompt-compact";
+import { caseDecisionBodyBreakdown, caseGeminiDecisionWire, type CaseDecisionBodyBreakdown } from "./investigation-context-budget";
 import { caseDecisionGenerationConfig, caseDecisionPromptRevision, caseProviderJsonSchema, readCaseDecisionGeneration, type CaseDecisionGenerationConfig, type CaseDecisionGenerationProblem } from "./investigation-decision-generation";
 import { caseModelFinishReason, type CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
 import { readCaseV2TransportPolicy, assertCaseV2ReservedPolicy } from "./investigation-v2-spend";
@@ -134,7 +134,7 @@ export function caseDecisionProviderSchema(purpose: "decision" | "resolution_che
  */
 export function caseInvestigationPromptRevision(attachmentsOn: boolean, env: Env = {}) {
   const base = attachmentsOn ? SAV_CASE_INVESTIGATION_PROMPT_REVISION : SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS;
-  return caseDecisionPromptRevision(base, readCaseDecisionGeneration(env, env[SAV_V2_MODEL_ENV] ?? ""));
+  return caseDecisionPromptRevision(base, readCaseDecisionGeneration(env, env[SAV_V2_MODEL_ENV] ?? "")) + (casePromptCompactOn(env) ? "+compact1" : "");
 }
 /**
  * SAV-92: how the model must read `customerContext`. Sent only with a context, so a request without one keeps the exact v3 wording.
@@ -164,7 +164,7 @@ export const SAV_CASE_REQUEST_BLOCKS_INSTRUCTION = "requestBlocks indique pour c
  * The decision prompt: the contract (the proposal's JSON schema, the one the validator applies), the case as stored (open requests, facts,
  * questions, trials), the cards retrieved for it and the previous rejections. Nothing is decided here; the validator judges the answer.
  */
-export function caseInvestigationPrompt(request: CaseInvestigationModelRequest) {
+export function caseInvestigationPrompt(request: CaseInvestigationModelRequest, options: { compact?: boolean; structuredOutput?: boolean } = {}) {
   const body = request.snapshot.body;
   const handedToTeam = body.openRequests.filter(row => row.status === "handed_off");
   // Review of batch 2 (finding 5): the customer's verbatim words of a request (`requestQuote` subject) leave the request rows and go inside the customer data
@@ -173,8 +173,8 @@ export function caseInvestigationPrompt(request: CaseInvestigationModelRequest) 
   const wordsKey = request.customerContext ? "customerContext.requestWords" : "customerRequestWords";
   const requestWords = body.openRequests.filter(row => row.status !== "resolved" && quoted(row)).map(row => ({ requestId: row.id, words: caseRequestSearchText(row) }));
   const asData = <T extends typeof body.openRequests[number]>(row: T) => quoted(row) ? { ...row, subject: { status: "available", wordsIn: wordsKey } } : row;
-  const cards = request.knowledge.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId, title: card.title,
-    content: card.content.slice(0, 6_000), resolution: card.resolution }));
+  const cards = request.knowledge.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId, title: card.title, ...(options.compact ? { source: card.source } : {}),
+    content: options.compact ? compactCaseKnowledgeContent(card.content, card.resolution) : card.content.slice(0, 6_000), resolution: card.resolution }));
   const instruction = [
     "Tu es l'agent SAV V2 de Limova. Tu proposes UNE décision pour ce dossier, en JSON strictement conforme au schéma fourni.",
     "Réponds en français, uniquement à partir des fiches fournies (citer knowledgeId et contentVersionId exacts) et des faits du dossier.",
@@ -200,7 +200,7 @@ export function caseInvestigationPrompt(request: CaseInvestigationModelRequest) 
     ...(handedToTeam.length ? { handedToTeam: handedToTeam.map(row => ({ id: row.id, ...(quoted(row) ? { wordsIn: wordsKey } : { subject: caseRequestSearchText(row) }) })) } : {}),
     ...(request.requestBlocks ? { requestBlocks: body.openRequests.filter(row => row.status === "open").map(row => ({ requestId: row.id, blockId: request.requestBlocks![row.id] ?? null,
       knowledge: (request.coverage ?? []).find(cover => cover.requestId === row.id)?.knowledge ?? [] })) } : {}) };
-  return { instruction, schema: request.purpose === "resolution_check" ? CLOSURE_JSON_SCHEMA : DECISION_JSON_SCHEMA, payload };
+  return { instruction, schema: options.compact && options.structuredOutput ? "" : request.purpose === "resolution_check" ? CLOSURE_JSON_SCHEMA : DECISION_JSON_SCHEMA, payload };
 }
 
 const generateResponse = z.object({
@@ -213,7 +213,7 @@ const generateResponse = z.object({
  * consumed nothing; 408, 429, 5xx, a timeout or a lost connection are uncertain (verified, never resent); an answer that is not JSON is a
  * failure whose usage is still reported.
  */
-/** Prepare the EXACT existing prompt/body. No source, fact, instruction or reply rule is removed to fit. */
+/** Prepare the prompt/body; legacy bytes unless the compact flag is explicitly on. */
 export function prepareCaseGeminiDecisionRequest(original: CaseInvestigationModelRequest, env: Env):
   | { ok: true; key: string; model: string; body: string; metadata: Pick<CaseModelTransportDiagnostic, "inputBytes" | "maxInputBytes" | "knowledgeCards">; compacted: boolean; generation: CaseDecisionGenerationConfig }
   | { ok: false; diagnostic: CaseModelTransportDiagnostic; breakdown?: CaseDecisionBodyBreakdown; problem?: CaseDecisionGenerationProblem } {
@@ -237,18 +237,8 @@ export function prepareCaseGeminiDecisionRequest(original: CaseInvestigationMode
   const fitted = original.customerContext ? fitCaseCustomerAttachmentMedia(original.customerContext, { model, mediaTokens: bounds.maxInputTokens - bounds.maxInputBytes }) : null;
   const request: CaseInvestigationModelRequest = fitted ? { ...original, customerContext: fitted.context } : original;
   const build = (candidate: CaseInvestigationModelRequest) => {
-    const prompt = caseInvestigationPrompt(candidate);
-    const serialize = (payload: unknown, decoding = "") => caseGeminiDecisionBody(prompt, payload, bounds.maxOutputTokens, decoding, generation);
-    let body = serialize(prompt.payload), compacted = false;
-    // Preserve the original wire format whenever it fits. Only exact, reversible
-    // sharing is allowed; measure the ENTIRE candidate, including decoding rules.
-    if (Buffer.byteLength(body, "utf8") > bounds.maxInputBytes) {
-      const compact = compactInvestigationContext(prompt.payload);
-      if (compact) {
-        const candidate = serialize(compact, `\n\n${INVESTIGATION_CONTEXT_INSTRUCTION}`);
-        if (Buffer.byteLength(candidate, "utf8") < Buffer.byteLength(body, "utf8")) { body = candidate; compacted = true; }
-      }
-    }
+    const prompt = caseInvestigationPrompt(candidate, { compact: casePromptCompactOn(env), structuredOutput: read.generation.structuredOutput });
+    const { body, compacted } = caseGeminiDecisionWire(prompt, bounds.maxOutputTokens, bounds.maxInputBytes, generation);
     return { prompt, body, compacted };
   };
   // SAV-92: the customer context gives way first, level by level (`reduceCaseCustomerContext`), never a card nor a rule. The last level is
