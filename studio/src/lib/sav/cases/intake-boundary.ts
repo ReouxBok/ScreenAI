@@ -1,4 +1,5 @@
 import "server-only";
+import { noOwnerHandoverGrace, ownerHandoverGraceOpen } from "./owner-handover";
 import { savV2QualificationMessageAllowed } from "./qualification-scope";
 import { and, asc, desc, eq, isNotNull, min, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -432,11 +433,11 @@ export async function sweepCaseRelays(options: { limit?: number; deps?: CaseBoun
   const noEvent = (caseId: unknown) => sql`not exists (select 1 from sav.case_events ev where ev.case_id = ${caseId} and ev.dedupe_key = 'inbound:' || ${savMessages.gmailMessageId})`;
   const confirmed = await db.select({ id: savIntakeExecutions.messageId }).from(savIntakeExecutions)
     .innerJoin(savMessages, eq(savMessages.id, savIntakeExecutions.messageId)).leftJoin(savCases, eq(savCases.ticketId, savIntakeExecutions.ticketId))
-    .where(and(eq(savIntakeExecutions.state, "confirmed"), isNotNull(savIntakeExecutions.ticketId), eq(savMessages.direction, "inbound"), isNotNull(savMessages.gmailMessageId),
+    .where(and(eq(savIntakeExecutions.state, "confirmed"), noOwnerHandoverGrace(savIntakeExecutions.ticketId), isNotNull(savIntakeExecutions.ticketId), eq(savMessages.direction, "inbound"), isNotNull(savMessages.gmailMessageId),
       sql`(${savCases.id} is null or ${noEvent(savCases.id)})`))
     .orderBy(asc(savIntakeExecutions.updatedAt), asc(savIntakeExecutions.id)).limit(limit);
   const acknowledgements = await db.select({ id: savMessages.id }).from(savMessages).innerJoin(savCases, sql`${savMessages.threadId} = any(${savCases.threadIds})`)
-    .where(and(eq(savMessages.direction, "inbound"), isNotNull(savMessages.gmailMessageId), noEvent(savCases.id),
+    .where(and(eq(savMessages.direction, "inbound"), isNotNull(savMessages.gmailMessageId), noOwnerHandoverGrace(savCases.ticketId), noEvent(savCases.id),
       sql`not exists (select 1 from sav.intake_executions e where e.message_id = ${savMessages.id} and e.ticket_id is not null)`,
       sql`exists (select 1 from sav.intake_runs r where r.message_id = ${savMessages.id} and r.state = 'observed')`,
       sql`${savMessages.receivedAt} >= (select min(ev.occurred_at) from sav.case_events ev where ev.case_id = ${savCases.id} and ev.kind = 'inbound_confirmed')`))
@@ -462,6 +463,7 @@ export async function sweepCaseRelays(options: { limit?: number; deps?: CaseBoun
     const waiting = await db.select({ ticketId: savCases.ticketId }).from(savCases)
       .where(and(eq(savCases.owner, "human"), eq(savCases.phase, "handoff_pending"), eq(savCases.admissionTarget, "agent"))).orderBy(sql`random()`).limit(limit);
     for (const { ticketId } of waiting) {
+      if (await ownerHandoverGraceOpen(ticketId)) continue;
       const current = await readCaseByTicket(ticketId);
       if (!current || !caseAwaitsV2Attribution(current)) continue;
       const messageId = (await listCaseEvents(current.caseId)).flatMap(event => {
