@@ -748,6 +748,18 @@ describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
     mode(on); const { decision, ctx } = alternative();
     expect(run(decision, ctx).outcome).toBe(on ? "accepted" : "needs_review");
   });
+  it("allows only the fixed URL addition to the exact unused step", () => {
+    mode(true);
+    const { decision, ctx } = alternative();
+    decision.reply.text += "\n\nhttps://new.limova.ai";
+    accepted(decision, ctx);
+  });
+  it("refuses an ambiguous duplicate structured step", () => {
+    mode(true);
+    const { decision, ctx } = alternative();
+    (ctx.knowledge[0]!.resolution!.steps as string[]).push(nextStep);
+    expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+  });
   it("keeps the alternative under pilot repeated-step checks", () => {
     mode(true); const { decision, ctx } = alternative();
     ctx.accessScope = { schema: "sav-case-block-scope-2026-11-11.v1", blockId: "synthetic_usage", policyRevision: "synthetic", revision: "synthetic", family: "usage", sources: [{ ...ref("k1"), use: "answer" }] };
@@ -788,16 +800,47 @@ describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
       expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
     }
   });
+  it.each([
+    "Effacez le cache du navigateur.", // Astra's exact bypass + ten reformulations
+    "Supprimez les données en cache.",
+    "Nettoyez la mémoire temporaire du navigateur.",
+    "Purgez le cache.",
+    "Procédez à une suppression des fichiers temporaires.",
+    "Faites disparaître les données temporaires du navigateur.",
+    "Le cache doit être effacé avant de continuer.",
+    "Un nettoyage du navigateur est nécessaire.",
+    "Pensez à éliminer les fichiers mis en mémoire.",
+    "Recommencez le nettoyage déjà effectué.",
+    "Veuillez réinitialiser le stockage temporaire.",
+  ])("closed alternative refuses arbitrary extra instruction: %s", extra => {
+    for (const pilot of [false, true]) {
+      const { decision, ctx } = alternative();
+      if (pilot) ctx.accessScope = { schema: "sav-case-block-scope-2026-11-11.v1", blockId: "synthetic_usage", policyRevision: "synthetic", revision: "synthetic", family: "usage", sources: [{ ...ref("k1"), use: "answer" }] };
+      decision.reply.text = `${nextStep}. ${extra}`;
+      mode(true);
+      expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+      // OFF retains the original refusal: no new alternative exception.
+      mode(false);
+      expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+    }
+  });
+  it("binds the structured step itself, not just the reply", () => {
+    mode(true);
+    const { decision, ctx } = alternative();
+    decision.nextAction.steps[0]!.text = "Essayez une navigation privée.";
+    decision.reply.text = decision.nextAction.steps[0]!.text;
+    expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+  });
   it("keeps sent-procedure protection when an alternative repeats another step", () => {
     mode(true); const { decision, ctx } = alternative();
     ctx.accessScope = { schema: "sav-case-block-scope-2026-11-11.v1", blockId: "synthetic_usage", policyRevision: "synthetic", revision: "synthetic", family: "usage", sources: [{ ...ref("k1"), use: "answer" }] };
     decision.reply.text += ". Videz le cache du navigateur.";
     expect(codes(run(decision, ctx))).toContain("procedure_step_repeated");
   });
-  it("an unrelated action mentioning the cache is not a repeated failed step", () => {
+  it("refuses even unrelated free instructions outside the structured unused step", () => {
     mode(true); const { decision, ctx } = alternative();
     decision.reply.text += ". Indiquez la taille du cache.";
-    accepted(decision, ctx);
+    expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
   });
   it("never weakens sensitive handling or credential checks ON", () => {
     mode(true); const { decision, ctx } = clarification();
@@ -824,6 +867,41 @@ describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
     expect(run(decision, ctx).outcome).toBe(on ? "accepted" : "needs_review");
   });
   it.each([
+    "Essayez de vous connecter à votre espace.", // Astra + ten reformulations
+    "Tentez de vous reconnecter.",
+    "Il faudrait que vous vous connectiez.",
+    "Une fois connecté, poursuivez.",
+    "Vous vous connecterez ensuite.",
+    "Vous devriez vous identifier.",
+    "Identifiez votre compte.",
+    "En vous identifiant, vous continuerez.",
+    "Il vous faudra accéder à votre espace.",
+    "Essayez de vous loguer.",
+    "Effectuez un login.",
+  ])("Astra login and ten variants require URL in both paths: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    for (const on of [false, true]) {
+      mode(on);
+      expect(codes(run(decision, ctx))).toContain("access_link_missing");
+      expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true })).toContainEqual({ code: "access_link_missing" });
+      for (const separator of [" ", "\n\n"]) {
+        decision.reply.text = text + separator + "https://new.limova.ai";
+        accepted(decision, ctx);
+        expect(caseReplyTextSafetyProblems(decision.reply.text, { accessOpen: true, answersOrAsks: true })).toEqual([]);
+      }
+      decision.reply.text = text;
+    }
+  });
+  it.each(["Procédure de connexion", "Procédure sans catégorie"])("requires URL for a cited Access procedure, including unknown category: %s", title => {
+    mode(true);
+    const { decision, ctx } = accessQuestion("Ouvrez une fenêtre privée.");
+    ctx.knowledge[0]!.title = title;
+    const cited = { ...decision, reply: { ...decision.reply, citations: [ref("k1")] } };
+    expect(codes(run(cited, ctx))).toContain("access_link_missing");
+    cited.reply.text += "\n\nhttps://new.limova.ai";
+    accepted(cited, ctx);
+  });
+  it.each([
     "Veuillez vous connecter à votre espace",
     "Pour vous connecter, saisissez votre e-mail",
     "Vous pouvez vous reconnecter à votre espace.",
@@ -833,14 +911,14 @@ describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
     "Accédez à votre compte.",
     "Pour accéder à votre compte, utilisez votre e-mail.",
     "Vous pouvez accéder à votre espace.",
-  ])("requires a local link for a connection instruction: %s", text => {
+  ])("requires a link for a connection instruction: %s", text => {
     mode(true); const { decision, ctx } = accessQuestion(text);
     expect(codes(run(decision, ctx))).toContain("access_link_missing");
     expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true })).toContainEqual({ code: "access_link_missing" });
     decision.reply.text += " https://new.limova.ai";
     accepted(decision, ctx);
     decision.reply.text = text + "\n\nhttps://new.limova.ai";
-    expect(codes(run(decision, ctx))).toContain("access_link_missing");
+    accepted(decision, ctx);
   });
   it.each([
     "Vous connecter reste impossible ?",
@@ -849,15 +927,15 @@ describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
     "Le bouton permet d’accéder à votre compte.",
     "Vous avez essayé de vous identifier.",
     "Vous vous connectez habituellement le matin ?",
-  ])("a simple mention of login needs no link: %s", text => {
+  ])("a doubtful mention of login also requires the link: %s", text => {
     mode(true); const { decision, ctx } = accessQuestion(text);
-    accepted(decision, ctx);
-    expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true })).toEqual([]);
+    expect(codes(run(decision, ctx))).toContain("access_link_missing");
+    expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true })).toEqual([{ code: "access_link_missing" }]);
   });
-  it("requires the link in the connection paragraph, not another section", () => {
+  it("accepts the link anywhere in the reply ON and OFF", () => {
     const { decision, ctx } = accessQuestion("Connectez-vous à votre espace.\n\nAutre information : https://new.limova.ai");
     mode(false); accepted(decision, ctx);
-    mode(true); expect(codes(run(decision, ctx))).toContain("access_link_missing");
+    mode(true); accepted(decision, ctx);
     decision.reply.text = "Connectez-vous sur https://new.limova.ai\n\nQuel navigateur utilisez-vous ?";
     accepted(decision, ctx);
   });
@@ -866,12 +944,13 @@ describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
     const { decision, ctx } = accessQuestion("Quel navigateur ? https://new.limova.ai\n\nhttps://evil.example.invalid");
     expect(codes(run(decision, ctx))).toContain("access_link_invalid");
   });
-  it("uses the same section rule for corrected replies, preserving destination checks", () => {
+  it("fails closed without procedure context for corrected replies, preserving destination checks", () => {
     const options = { accessOpen: true, answersOrAsks: true };
     mode(true);
-    expect(caseReplyTextSafetyProblems("Quel navigateur utilisez-vous ?", options)).toEqual([]);
-    expect(caseReplyTextSafetyProblems("Connectez-vous.\n\nhttps://new.limova.ai", options)).toEqual([{ code: "access_link_missing" }]);
-    expect(caseReplyTextSafetyProblems("Quel navigateur ? https://evil.example.invalid", options)).toEqual([{ code: "access_link_invalid", detail: "https://evil.example.invalid" }]);
+    expect(caseReplyTextSafetyProblems("Quel navigateur utilisez-vous ?", options)).toEqual([{ code: "access_link_missing" }]);
+    expect(caseReplyTextSafetyProblems("Quel navigateur utilisez-vous ?", { ...options, loginProcedure: false })).toEqual([]);
+    expect(caseReplyTextSafetyProblems("Connectez-vous.\n\nhttps://new.limova.ai", options)).toEqual([]);
+    expect(caseReplyTextSafetyProblems("Quel navigateur ? https://evil.example.invalid", options)).toEqual([{ code: "access_link_missing" }, { code: "access_link_invalid", detail: "https://evil.example.invalid" }]);
     mode(false);
     expect(caseReplyTextSafetyProblems("Quel navigateur utilisez-vous ?", options)).toEqual([{ code: "access_link_missing" }]);
   });

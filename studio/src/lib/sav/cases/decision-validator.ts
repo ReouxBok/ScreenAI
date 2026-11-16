@@ -285,12 +285,12 @@ function accessLinks(text: string) {
  * pilot ledgers) are not re-run here: the correction keeps the decision's own citations and purpose, and its provenance is proven again at every look.
  */
 export type CaseReplyTextSafetyProblem = Readonly<{ code: "credential_request_pattern" | "access_link_missing" | "access_link_invalid"; detail?: string }>;
-export function caseReplyTextSafetyProblems(text: string, options: Readonly<{ accessOpen: boolean; answersOrAsks: boolean }>): CaseReplyTextSafetyProblem[] {
+export function caseReplyTextSafetyProblems(text: string, options: Readonly<{ accessOpen: boolean; answersOrAsks: boolean; loginProcedure?: boolean }>): CaseReplyTextSafetyProblem[] {
   const problems: CaseReplyTextSafetyProblem[] = [];
   if (requestsCredential(text)) problems.push({ code: "credential_request_pattern" });
   if (options.accessOpen && options.answersOrAsks) {
     const links = accessLinks(text);
-    if (accessLinkMissing(text)) problems.push({ code: "access_link_missing" });
+    if (accessLinkMissing(text, options.loginProcedure)) problems.push({ code: "access_link_missing" });
     for (const link of links.invalid) problems.push({ code: "access_link_invalid", detail: link.slice(0, 200) });
   }
   return problems;
@@ -319,18 +319,6 @@ function legitimateReconfirmation(question: Extract<CaseDecisionProposal["nextAc
   });
 }
 
-/** A bounded lexical guard, not semantic equivalence: accents/case and verbal endings are
- * normalized, and at least half the step's objects must recur with its verb root. This also
- * catches a shortened instruction ("Videz le cache") without rejecting a mere shared object. */
-function rewordsStep(reply: string, text: string) {
-  const step = stepOf(text);
-  return !!step.verb && !!step.object.length && sentencesOf(normalize(reply)).some(sentence => {
-    const words: string[] = sentence.match(/[a-z0-9-]+/g) ?? [];
-    return words.some(word => word.startsWith(step.verb))
-      && step.object.filter(object => words.includes(object)).length / step.object.length >= 0.5;
-  });
-}
-
 /** The current ledger stores a card, not its sent steps. Consequently an alternative needs explicit,
  * latest customer evidence: one exact failed card step and one exact, explicitly untried step, after
  * the single recorded failure. Missing/ambiguous history cannot establish an unused branch. The
@@ -344,8 +332,11 @@ function unusedAlternative(action: Extract<CaseDecisionProposal["nextAction"], {
     || trial.knowledge.knowledgeId !== step.knowledge.knowledgeId || trial.knowledge.contentVersionId !== step.knowledge.contentVersionId) return false;
   const card = context.knowledge.find(row => row.id === step.knowledge.knowledgeId && row.contentVersionId === step.knowledge.contentVersionId);
   const steps = strings(card?.resolution?.steps);
-  if (!steps.includes(step.text) || !reply || !squash(reply).includes(squash(step.text))
-    || steps.some(text => text !== step.text && (squash(reply).includes(squash(text)) || rewordsStep(reply, text)))) return false;
+  // The wire has no step id: exact text + exact card/version identifies the structured
+  // step. The entire reply must be that step, optionally followed by the fixed access
+  // URL. No free prose can smuggle an unlisted/rephrased instruction into the reply.
+  if (!steps.includes(step.text) || steps.filter(text => text === step.text).length !== 1 || !reply
+    || ![step.text, `${step.text}\n\n${SAV_CASE_ACCESS_URL}`].includes(reply)) return false;
   // A later claim of "untried" cannot erase an earlier explicit report of having tried this step.
   if (context.sources.some(row => row.direction === "customer_inbound" &&
     ownCustomerWords(context.customerTexts[sourceKey(row.ref)] ?? "").replace(QUOTED, " ").split(/[.!?\n]/)
@@ -365,15 +356,15 @@ function unusedAlternative(action: Extract<CaseDecisionProposal["nextAction"], {
     && /\balternative\b/.test(reason) && /\bsi\b/.test(reason) && /\b(?:echec|echoue)\b/.test(reason) && /\b(?:equipe|humain)\b/.test(reason);
 }
 
-// Paragraphs are the sections available in the text contract. A link in another paragraph cannot
-// satisfy a connection instruction. Destination checks still run on the WHOLE reply, unchanged.
-function accessLinkMissing(text: string) {
-  if (!smartValidator()) return !accessLinks(text).present;
-  // Reflexive infinitives require an instruction/purpose prefix: "vous connecter" alone
-  // can describe the problem. Account access likewise needs an explicit action addressed to the customer.
-  const directedLogin = /\b(?:(?:re)?connectez-vous|identifiez-vous|(?:veuillez|merci de|pour|vous (?:pouvez|devez)|je vous invite a)\s+vous\s+(?:(?:re)?connecter|identifier)|accedez\s+a\s+votre\s+(?:compte|espace)|(?:veuillez|merci de|pour|vous (?:pouvez|devez)|je vous invite a)\s+acceder\s+a\s+votre\s+(?:compte|espace))\b/;
-  const instruction = /\b(?:log in|sign in|(?:ouvrez|rendez-vous|allez sur|cliquez|entrez|saisissez|renseignez|utilisez|voici)[^.!?\n]{0,160}(?:connexion|connecter|adresse|code|new\.limova\.ai)|(?:open|visit|enter|click|use)[^.!?\n]{0,160}(?:login|sign-in|sign in|email|code))\b/i;
-  return text.split(/\n\s*\n/).some(section => (directedLogin.test(normalize(section)) || instruction.test(normalize(section))) && !accessLinks(section).present);
+// Broad roots are intentional: a doubt about login requires the URL. Its presence
+// anywhere in the reply satisfies this requirement, including another paragraph.
+const LOGIN_REFERENCE = /\b(?:(?:re|de)?connect\w*|connexion\w*|identif\w*|acced\w*|acces|log\w*|sign[ -]?in)\b/;
+function accessLinkMissing(text: string, loginProcedure?: boolean) {
+  if (accessLinks(text).present) return false;
+  if (!smartValidator()) return true;
+  // Corrected text has no card context: unknown procedure is fail-closed.
+  return loginProcedure !== false || LOGIN_REFERENCE.test(normalize(text))
+    || /\b(?:adresse|e-?mail|code)\b/.test(normalize(text));
 }
 
 const IMPOSSIBILITY_WORDING = /\b(?:impossible|pas possible|ne permet pas|ne peut pas|n'est pas (?:disponible|prevue?|prise? en charge))\b/;
@@ -848,7 +839,12 @@ Il vous suffira ensuite de saisir ce code sur la page pour accéder à votre esp
     const accessOpen = [...status].some(([requestId, value]) => value === "open" && families.get(requestId) === "access");
     if (accessOpen && (action.kind === "ask" || action.kind === "answer")) {
       const links = accessLinks(reply.text);
-      if (accessLinkMissing(reply.text)) reject("access_link_missing", "reply.text");
+      // Access procedures/citations are conservatively treated as login: the
+      // contract has no closed non-login category that could prove an exemption.
+      // Only a clarification without a procedure/citation can use the text check.
+      const loginProcedure = smart && (action.kind === "answer" || reply.citations.length > 0
+        || context.accessScope?.sources.some(source => source.firstReply === "login_code_steps"));
+      if (accessLinkMissing(reply.text, Boolean(loginProcedure))) reject("access_link_missing", "reply.text");
       for (const link of links.invalid) reject("access_link_invalid", "reply.text", link);
     }
     if (!reply.impossibilityClaims.length && IMPOSSIBILITY_WORDING.test(replyText)) signals.add("impossibility_wording_without_claim");
