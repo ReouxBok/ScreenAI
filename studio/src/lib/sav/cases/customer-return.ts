@@ -1,3 +1,4 @@
+import { closingHandoffReplyEnabled, isTerminalReply } from "./case-terminal-reply";
 // V2 customer return (LOCAL, OFF): the PURE part of the joint between a new customer mail and the V2 case it may continue. No database, clock, network or model.
 //   route     which path a new inbound mail takes: continue the SAME case, reopen it (same incident still present), normal admission (new subject, no or
 //             ambiguous link), keep it closed (a thanks or an automatic reply), leave it to the person or the team who owns it, or wait (owner unread, pause)
@@ -220,20 +221,24 @@ export type AccessAutoApprovalFacts = Readonly<{
 export type AccessAutoApprovalOutcome = Readonly<{ allowed: true; basis: typeof ACCESS_AUTO_APPROVAL_BASIS }> | Readonly<{ allowed: false; reason: string }>;
 
 /** The rule that stands in for a person's approval, and only for this: an access-only, admitted agent case whose reply rests on B's accepted, sourced decision.
- * Anything else (another family, a mixed case, a handoff, an unverified source, an owner not V2) goes to a person, as today. It approves; it never revokes or declines. */
-export function decideAccessAutoApproval(input: Readonly<{ config: AccessAutoApprovalConfig; action: string; approverId: string; purpose: string; facts: AccessAutoApprovalFacts | null }>): AccessAutoApprovalOutcome {
+ * Terminal acknowledgements also require their dedicated switch. Anything else (another family, a mixed case, an unverified source, an owner not V2) goes to a person, as today. It approves; it never revokes or declines. */
+export function decideAccessAutoApproval(input: Readonly<{ config: AccessAutoApprovalConfig; action: string; approverId: string; purpose: string; env?: Readonly<Record<string, string | undefined>>; facts: AccessAutoApprovalFacts | null }>): AccessAutoApprovalOutcome {
   const { config, facts } = input;
   if (config.mode !== "on") return { allowed: false, reason: `auto_${config.why}` };
   if (input.action !== "approve") return { allowed: false, reason: "action_not_auto" };
   if (input.approverId.toLowerCase() !== config.approverId) return { allowed: false, reason: "approver_not_rule" };
-  if (!["answer", "question", "reminder"].includes(input.purpose)) return { allowed: false, reason: "purpose_not_auto" };
+  const terminal = closingHandoffReplyEnabled(input.env ?? {}) && isTerminalReply(input.purpose);
+  if (!["answer", "question", "reminder"].includes(input.purpose) && !terminal) return { allowed: false, reason: "purpose_not_auto" };
   if (!facts) return { allowed: false, reason: "facts_unread" };
   if (facts.case.owner !== "agent" || !facts.case.admitted) return { allowed: false, reason: "case_not_admitted" };
   if (facts.case.sensitivity !== "none") return { allowed: false, reason: "sensitive" };
   if (!facts.openFamilies.length || facts.openFamilies.some(family => family !== "access")) return { allowed: false, reason: "not_access_only" };
   if (input.purpose !== "reminder") {
     if (!facts.decision?.accepted) return { allowed: false, reason: "decision_not_accepted" };
-    if (!["answer", "ask"].includes(facts.decision.nextAction)) return { allowed: false, reason: "decision_not_reply" };
+    const matches = terminal
+      ? facts.decision.nextAction === (input.purpose === "closing" ? "confirm_resolution" : "handoff")
+      : ["answer", "ask"].includes(facts.decision.nextAction);
+    if (!matches) return { allowed: false, reason: "decision_not_reply" };
     if (!facts.decision.scopeCurrent) return { allowed: false, reason: "scope_not_current" };
     if (!facts.decision.shownSourcesVerified) return { allowed: false, reason: "sources_unverified" };
   }

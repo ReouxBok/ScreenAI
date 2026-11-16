@@ -1,4 +1,5 @@
 import "server-only";
+import { closingHandoffReplyEnabled, isTerminalReply, pendingHandoffReply, terminalReplyInput } from "./case-terminal-reply";
 import { and, eq } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savCaseReplyValidations } from "@/db/schema";
@@ -56,8 +57,8 @@ export type CaseReplyPassageReport =
 type AutoFacts = Readonly<{ facts: AccessAutoApprovalFacts | null; reasons: string[] }>;
 
 /** The recorded decision of the latest input as C's draft, under the access scope in force. Null: no decision, none accepted, or no reply. */
-async function latestDraft(caseId: string, provenance: PilotProvenanceDeps) {
-  const events = await listCaseEvents(caseId), inputKey = latestInvestigationInput(events);
+async function latestDraft(caseId: string, provenance: PilotProvenanceDeps, env: Record<string, string | undefined>) {
+  const events = await listCaseEvents(caseId), inputKey = terminalReplyInput(events, latestInvestigationInput(events), env);
   if (!inputKey) return { draft: null, reason: "no_input" } as const;
   const read = readCaseInvestigationProgress(events, inputKey);
   if (read.state !== "found") return { draft: null, reason: `decision_${read.state}` } as const;
@@ -67,7 +68,7 @@ async function latestDraft(caseId: string, provenance: PilotProvenanceDeps) {
   const blockIds = read.record.decision?.blockScopes ? read.record.decision.blockScopes.map(caseStampBlockId) : [blockId];
   const scope = await readCaseDecisionScopes(provenance.accessScope, await provenance.currentPolicyRevision(), read.record.decision);
   const draft = caseDecisionDraft(caseId, read.record, events, { accessScope: scope.ok ? caseAccessScopeStamp(scope.scope) : null,
-    ...(read.record.decision?.blockScopes ? { blockScopes: scope.ok && scope.blocks ? scope.blocks.map(caseAccessScopeStamp) : null } : {}) });
+    ...(read.record.decision?.blockScopes ? { blockScopes: scope.ok && scope.blocks ? scope.blocks.map(caseAccessScopeStamp) : null } : {}) }, env);
   if (!draft) return { draft: null, reason: "decision_not_accepted" } as const;
   const nextAction = read.record.decision?.validation.outcome === "accepted" ? read.record.decision.validation.decision.nextAction.kind : "none";
   return { draft, nextAction, events, blockId, blockIds, reason: draft.reply ? null : (draft.replyLimit ?? "no_reply") } as const;
@@ -90,15 +91,16 @@ async function autoFacts(caseId: string, deps: CaseReplyPassageDeps, decision: {
   const read = await readCase(caseId);
   if (!read) return { facts: null, reasons: ["case_missing"] };
   const snapshot = read, events = await listCaseEvents(caseId);
-  const admitted = caseAdmissionStatus(snapshot, await deps.store.currentPolicyRevision()).admitted;
+  const pending = decision?.draft.reply?.purpose === "handoff" && closingHandoffReplyEnabled(deps.store.env()) && pendingHandoffReply(snapshot, events, decision.draft.triggerEventId!);
+  const admitted = caseAdmissionStatus(pending ? { ...snapshot, owner: "agent" } : snapshot, await deps.store.currentPolicyRevision()).admitted;
   // An admission copied from an older mail never admits a reply to the new one (contract A-B).
   const current = caseAdmissionNamesLatestInput(snapshot, events);
   if (!current) reasons.push("admission_not_current_input");
   const owner = await judgeCurrentTicketOwner(deps.store.readTicketOwner, snapshot.ticketId);
   const ownerNow: AccessAutoApprovalFacts["ownerNow"] = owner.ok ? "v2" : owner.code === "owner_human" ? "human" : owner.code === "owner_none" ? "none" : "unknown";
   const facts: AccessAutoApprovalFacts = {
-    case: { owner: snapshot.owner, sensitivity: snapshot.sensitivity, admitted: admitted && current },
-    openFamilies: [...new Set(snapshot.body.openRequests.filter(row => row.status === "open").map(row => row.family))],
+    case: { owner: pending ? "agent" : snapshot.owner, sensitivity: snapshot.sensitivity, admitted: admitted && current },
+    openFamilies: [...new Set(snapshot.body.openRequests.filter(row => row.status === "open" || (decision?.draft.reply && isTerminalReply(decision.draft.reply.purpose))).map(row => row.family))],
     decision: decision ? { accepted: true, scopeCurrent: decision.draft.replyLimit !== "access_scope_unknown" && decision.draft.replyLimit !== "access_scope_changed",
       shownSourcesVerified: proven, nextAction: decision.nextAction } : null,
     ownerNow,
@@ -115,7 +117,7 @@ export function caseAccessAutoReplyAuthorizer(deps: Pick<CaseReplyPassageDeps, "
   const passageDeps = { ...deps, policy: null } satisfies CaseReplyPassageDeps;
   return async request => {
     // The block's switch first: off, paused or draft, the rule never approves (a person still may, through C's own path).
-    const current = await latestDraft(request.caseId, deps.provenance);
+    const current = await latestDraft(request.caseId, deps.provenance, deps.store.env());
     const { gate } = await blockReplyGate(current.draft ? current.blockIds : [SAV_CASE_ACCESS_BLOCK_ID]);
     if (gate.send !== "rule") return { allowed: false, reason: gate.code };
     const [row] = await requireDb().select().from(savCaseReplyValidations).where(and(eq(savCaseReplyValidations.caseId, request.caseId),
@@ -127,7 +129,7 @@ export function caseAccessAutoReplyAuthorizer(deps: Pick<CaseReplyPassageDeps, "
     try { proven = (await readPilotReplyProvenance(proposal, deps.provenance)).status === "proven"; } catch { proven = false; }
     if (!proven) return { allowed: false, reason: "provenance_unproven" };
     return accessAutoReplyAuthorizer({ env: deps.store.env(), readFacts: async () => {
-      const latest = await latestDraft(request.caseId, deps.provenance);
+      const latest = await latestDraft(request.caseId, deps.provenance, deps.store.env());
       if (!latest.draft || latest.draft.triggerEventId !== proposal.triggerEventId) return null;
       const { facts, reasons } = await autoFacts(request.caseId, passageDeps, { draft: latest.draft, nextAction: latest.nextAction }, proven);
       return reasons.length ? null : facts;
@@ -137,7 +139,7 @@ export function caseAccessAutoReplyAuthorizer(deps: Pick<CaseReplyPassageDeps, "
 
 /** Proposes, and only on every proof approves and queues, the reply of the latest recorded decision of a case. Callable alone and idempotent. */
 export async function passCaseInvestigationToReplyPlan(caseId: string, deps: CaseReplyPassageDeps): Promise<CaseReplyPassageReport> {
-  const latest = await latestDraft(caseId, deps.provenance);
+  const latest = await latestDraft(caseId, deps.provenance, deps.store.env());
   if (!latest.draft) return { status: "no_reply", caseId, reason: latest.reason };
   const { draft } = latest;
   // Keep the recorded decision and all call history. The entry persists this explicit operator task;
@@ -179,7 +181,7 @@ export async function passCaseInvestigationToReplyPlan(caseId: string, deps: Cas
       if (facts.case.owner !== "agent" || !facts.case.admitted) reasons.push("case_not_admitted");
       if (facts.case.sensitivity !== "none") reasons.push("sensitive");
       if (!facts.openFamilies.length || facts.openFamilies.some(family => family !== "access")) reasons.push("not_access_only");
-      if (!["answer", "ask"].includes(latest.nextAction)) reasons.push("decision_not_reply");
+      if (!["answer", "ask"].includes(latest.nextAction) && !(closingHandoffReplyEnabled(deps.store.env()) && isTerminalReply(draft.reply.purpose))) reasons.push("decision_not_reply");
       if (!facts.decision?.scopeCurrent) reasons.push("scope_not_current");
       if (facts.ownerNow !== "v2") reasons.push(facts.ownerNow === "unknown" ? "owner_unread" : "owner_not_v2");
     }

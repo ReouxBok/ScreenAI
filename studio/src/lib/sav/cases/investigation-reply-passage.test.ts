@@ -22,7 +22,7 @@ vi.mock("../intake/model-dispatch", async importOriginal => {
   const real = await importOriginal<Record<string, unknown>>();
   return Object.fromEntries(Object.entries(real).map(([name, value]) => [name, typeof value === "function" ? () => { throw Error(`MODEL_DISPATCH_FORBIDDEN:${name}`); } : value]));
 });
-import { encryptSavPayload } from "../crypto";
+import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { savIntakeEvidenceContentHash } from "../intake/engine";
 import { SAV_INTAKE_MODEL_REVISION } from "../intake/model-readers";
 import { intakeRuntimeHash } from "../intake/runtime-contract";
@@ -205,6 +205,26 @@ describe("passage to the send plan (B): C's store, A's rule, nothing short of ev
     expect(again).toEqual(first);
     expect(await sideEffects(mail.caseId)).toEqual({ effects: 0, validations: 1, timers: 0 });
   });
+  it("queues the non-sensitive handoff acknowledgement through the real provenance and auto rule, once", async () => {
+    const mail = await v1Mail({ ownerEffect: true });
+    const runtime = wiring().deps;
+    runtime.model.provider = async request => ({ status: "ok", output: { caseVersion: request.snapshot.version,
+      understanding: { requests: request.snapshot.body.openRequests.map(row => ({ id: row.id, family: "access", status: "open", summary: "Diagnostic nécessaire" })), newFacts: [] },
+      nextAction: { kind: "handoff", reason: "diagnosis_out_of_tools", requestIds: request.snapshot.body.openRequests.map(row => row.id), report: { need: "Diagnostic nécessaire", expected: null, observed: null, trialIds: [], hypotheses: [], missingInformation: [], expectedIntervention: "Vérifier le compte", knowledge: [] } } } });
+    expect(await runCaseInvestigationRuntime(mail.caseId, runtime)).toMatchObject({ status: "recorded", outcome: "accepted" });
+    const env = { ...AUTO, SAV_V2_CLOSING_HANDOFF_REPLY: "on" };
+    const terminalProvenance = { ...provenance, env: () => env };
+    const base = passage(env);
+    const deps = { ...base, provenance: terminalProvenance, store: { ...base.store, pilotProvenance: pilotProvenanceGate(terminalProvenance) } };
+    expect(await passCaseInvestigationToReplyPlan(mail.caseId, deps)).toMatchObject({ status: "queued", created: true });
+    expect(await passCaseInvestigationToReplyPlan(mail.caseId, deps)).toMatchObject({ status: "queued", created: false });
+    const rows = await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, mail.caseId));
+    expect(rows).toHaveLength(1);
+    const text = decryptSavPayload<{ text: string }>(rows[0]!.proposalCiphertext).text;
+    expect(text).toContain("Votre demande est transmise à un conseiller.");
+    expect(readCaseReplyDisclosure(text)?.mode).toBe("automated");
+  });
+
   it("queues a fully proven access reply in the automated mode exactly once", async () => {
     const mail = await answered();
     const report = await passCaseInvestigationToReplyPlan(mail.caseId, passage(AUTO));

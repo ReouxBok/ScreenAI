@@ -33,6 +33,7 @@ import { applyProvenResolution, applyProvenResolutions } from "./case-resolution
 import { HANDOFF_NOTICE_KEY_PREFIX, type HandoffCrmReading } from "./case-handoff-notice";
 import { accessAutoReplyAuthorizer, routeCustomerReturn } from "./customer-return-store";
 import { ACCESS_AUTO_APPROVAL_BASIS } from "./customer-return";
+import { pendingHandoffReply, provenClosingReply } from "./case-terminal-reply";
 import { caseDecisionDraft } from "./investigation-intent";
 import { readCaseInvestigationProgress } from "./investigation-record";
 import { selectCaseKnowledge } from "./investigation-knowledge";
@@ -169,7 +170,9 @@ const readFacts = async (request: { caseId: string }) => {
   const read = readCaseInvestigationProgress(events, inputKey);
   const decision = read.state === "found" ? read.record.decision : null;
   const kind = decision?.validation.outcome === "accepted" ? decision.validation.decision.nextAction.kind : "none";
-  return { case: { owner: snapshot.owner, sensitivity: snapshot.sensitivity, admitted: caseAdmissionStatus(snapshot, "policy-r1").admitted },
+  const pending = kind === "handoff" && pendingHandoffReply(snapshot, events, (await draftOf(snapshot.caseId)).triggerEventId!);
+  const eligible = pending ? { ...snapshot, owner: "agent" as const } : snapshot;
+  return { case: { owner: eligible.owner, sensitivity: snapshot.sensitivity, admitted: caseAdmissionStatus(eligible, "policy-r1").admitted },
     openFamilies: snapshot.body.openRequests.filter(row => row.status === "open").map(row => row.family),
     decision: { accepted: decision?.validation.outcome === "accepted", scopeCurrent: true, shownSourcesVerified: true, nextAction: kind }, ownerNow: await readOwner()(snapshot) };
 };
@@ -179,7 +182,7 @@ async function draftOf(caseId: string, pilot = false) {
   const inputKey = (events.filter(event => event.kind === "observation_recorded").at(-1)?.detail?.record as { inputKey: string }).inputKey;
   const read = readCaseInvestigationProgress(events, inputKey);
   if (read.state !== "found") throw Error("NO_RECORD");
-  return caseDecisionDraft(caseId, read.record, events, pilot ? { accessScope: null } : undefined)!;
+  return caseDecisionDraft(caseId, read.record, events, pilot ? { accessScope: null } : undefined, environment)!;
 }
 /** Proposal in the AUTOMATED format -> approval by the rule (A's authorizer, the persisted basis) -> queue. Returns each step so a test can stop anywhere. */
 async function autoReply(caseId: string, over: { format?: "human" | "automated"; authorizerOverride?: Parameters<typeof decideCaseReply>[0]["authorizer"]; approver?: string } = {}) {
@@ -271,6 +274,77 @@ beforeEach(async () => {
   await f.client.exec("DELETE FROM sav.sync_state WHERE key LIKE 'sav-v2-sweep.v1:%'");
 });
 afterEach(async () => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); await setPause("v2", null); await setPause("intake", null); });
+
+describe("closing and handoff customer acknowledgements", () => {
+  it("sends a confirmed closure once, alongside one closed stage/note and no new waiting stage or timer", async () => {
+    environment = { ...environment, SAV_V2_CLOSING_HANDOFF_REPLY: "on", SAV_V2_REPLY_NOTE: "on" };
+    const made = await queuedAnswer("gm-terminal-close");
+    await wake();
+    const trial = (await readCase(made.caseId))!.body.trials[0]!;
+    await laterMail(made, "gm-terminal-close-confirm", "Merci, ça remarche !");
+    expect(await investigate(made.caseId, [confirmResolution("gm-terminal-close-confirm", trial.id, "ça remarche"), resolvedVerdict])).toMatchObject({ closure: "soft_close" });
+    const snapshot = (await readCase(made.caseId))!, events = await listCaseEvents(made.caseId);
+    const trigger = "inbound:gm-terminal-close-confirm";
+    expect(provenClosingReply(snapshot, events, trigger)).toBe(true);
+    const another = { ...snapshot.body.openRequests[0]!, id: "unresolved-other-request", status: "open" as const };
+    expect(provenClosingReply({ ...snapshot, body: { ...snapshot.body, openRequests: [...snapshot.body.openRequests, another] } }, events, trigger)).toBe(false);
+    expect(provenClosingReply(snapshot, events.map(e => e.kind === "observation_recorded" ? { ...e, detail: { ...e.detail, applied: false } } : e), trigger)).toBe(false);
+    const queued = await autoReply(made.caseId);
+    expect(queued).toMatchObject({ queued: { ok: true, created: true } });
+    const before = sends;
+    await wake(); await wake(); await wake();
+    expect(sends).toBe(before + 1);
+    expect(mimeText(sentBodies.at(-1)!)).toContain("Merci pour votre confirmation");
+    expect(readCaseReplyDisclosure(mimeText(sentBodies.at(-1)!))?.mode).toBe("automated");
+    expect((await stageRows(made.caseId)).filter(row => row.replyKey.includes(":closed:"))).toHaveLength(1);
+    expect((await stageRows(made.caseId)).filter(row => row.replyKey.includes(":waiting_customer:"))).toHaveLength(1); // first answer only
+    expect((await readCase(made.caseId))!.phase).toBe("resolved");
+    expect((await listCaseTimers(made.caseId)).filter(row => row.state === "scheduled")).toHaveLength(0);
+    expect(Object.values(p.objects.notes!)).toHaveLength(2); // First answer summary, then the closure note.
+    expect(Object.values(p.objects.notes!).filter(row => (row.properties.hs_note_body ?? "").includes("Le client a confirm"))).toHaveLength(1);
+  });
+
+  it.each(["off", "human", "new_mail", "uncertain"] as const)("handoff reply respects %s at the executor and never sends twice", async reason => {
+    environment = { ...environment, SAV_V2_CLOSING_HANDOFF_REPLY: "on" };
+    kb.cards = [];
+    const made = await newCase(`gm-terminal-fence-${reason}`);
+    expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
+    expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true } });
+    if (reason === "off") environment.SAV_V2_CLOSING_HANDOFF_REPLY = "off";
+    if (reason === "human") {
+      const current = (await readCase(made.caseId))!;
+      await transitionCaseOwner({ caseId: made.caseId, expectedVersion: current.version, transition: "human_takeover", actor: { type: "human", staffUserId: RULE }, commandKey: "terminal-human-takeover", reason: "human_requested" });
+    }
+    if (reason === "new_mail") await laterMail(made, "gm-terminal-newer", "Une autre question");
+    if (reason === "uncertain") loseAck = true;
+    await wake(); await letReconcile(); await wake();
+    expect(sends).toBe(reason === "uncertain" ? 1 : 0);
+    if (reason === "off") {
+      environment.SAV_V2_CLOSING_HANDOFF_REPLY = "on";
+      await letReconcile(); await wake();
+      expect(sends).toBe(1);
+    }
+  });
+
+  it("sends one handoff acknowledgement on send_case_reply, preserves the human queue and creates no waiting stage", async () => {
+    environment = { ...environment, SAV_V2_CLOSING_HANDOFF_REPLY: "on", SAV_V2_REPLY_NOTE: "on" };
+    kb.cards = [];
+    const made = await newCase("gm-terminal-handoff");
+    expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
+    expect((await readCase(made.caseId))!.owner).toBe("human");
+    const snapshot = (await readCase(made.caseId))!, events = await listCaseEvents(made.caseId);
+    for (const family of ["finance", "cancellation", "identity", "rights", "subscription"] as const)
+      expect(pendingHandoffReply({ ...snapshot, body: { ...snapshot.body, openRequests: snapshot.body.openRequests.map(row => ({ ...row, family })) } }, events, "inbound:gm-terminal-handoff")).toBe(false);
+    expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true, created: true } });
+    await wake(); await wake();
+    expect(sends).toBe(1);
+    expect(mimeText(sentBodies[0]!)).toContain("Votre demande est transmise à un conseiller.");
+    expect((await stageRows(made.caseId))).toHaveLength(0);
+    expect((await readCase(made.caseId))!.phase).toBe("handoff_pending");
+    const effects = await f.db.select().from(savIntakeEffects).where(eq(savIntakeEffects.kind, "reply_send"));
+    expect(effects.filter(row => row.businessKey.includes(made.caseId) && row.state === "confirmed" && row.permission === "send_case_reply")).toHaveLength(1);
+  });
+});
 
 describe("the automatic access reply, from the real investigation to the ticket state", () => {
   it("B's accepted answer -> automated format -> A's rule -> queue -> wake: ONE mail, identical text / hash / MIME, the rule's basis counted on the single ledger, the ticket « waiting »", async () => {

@@ -58,8 +58,8 @@ export function prepareCaseReplyText(draft: string, language: CaseReplyLanguage 
   const body = caseReplyBody(draft);
   if (!body) throw new Error("SAV_REPLY_EMPTY");
   // ONE follow-up per reply (Ugo 11/11): a `question` reply IS its follow-up (the tracked question, which J2 follows), so the standard line is not stacked after it.
-  // Every other purpose keeps the standard line as its only generic follow-up; the code that composes a reply (decision-validator) never writes a second one.
-  return renderSavOutboundReply(purpose === "question" ? body : `${body}\n\n${caseReplyHelpLine(language)}`, language, mode);
+  // Closing/handoff acknowledgements need no new diagnostic question. Answers and reminders keep the standard line once.
+  return renderSavOutboundReply(purpose === "question" || purpose === "closing" || purpose === "handoff" ? body : `${body}\n\n${caseReplyHelpLine(language)}`, language, mode);
 }
 
 /**
