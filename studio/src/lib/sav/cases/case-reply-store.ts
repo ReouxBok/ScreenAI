@@ -268,6 +268,9 @@ export type EnqueueCaseReplyResult = Readonly<{ ok: true; executionId: string; c
  */
 export async function enqueueApprovedCaseReply(input: Readonly<{
   validationId: string; policy: Readonly<{ id: string; hash: string }>; note?: CaseEffectNote; deps: CaseReplyStoreDeps;
+  /** SAV-92 (16/11): the note is the reply's summary, derived from the case by the caller. An execution that already exists is returned as it is (sealed with
+   * or without a note, e.g. queued before the summary existed): the note never makes a replay refuse, and a sealed payload is never rewritten. */
+  derivedNote?: boolean;
 }>): Promise<EnqueueCaseReplyResult> {
   const { validationId, policy, note, deps } = input;
   if (!isSupervised(deps)) return refuse("effects_off");
@@ -294,7 +297,7 @@ export async function enqueueApprovedCaseReply(input: Readonly<{
     if (row.executionId) {
       const [execution] = await tx.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.id, row.executionId));
       const sealed = execution ? decryptSavPayload<CaseEffectPayload>(execution.payloadCiphertext) : null;
-      if (!execution || sha(sealed?.note ?? null) !== sha(note ?? null)) return refuse("trigger_already_planned");
+      if (!execution || (!input.derivedNote && sha(sealed?.note ?? null) !== sha(note ?? null))) return refuse("trigger_already_planned");
       return { ok: true, executionId: row.executionId, created: false };
     }
     const proposal = proposalOf(row);

@@ -14,6 +14,12 @@ const object = (v: unknown) => z.object({
 }).parse(v);
 const plain = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 export const renderIntakeNote = (text: string, marker: string) => `<p>${plain(text).replace(/\n/g, "<br>")}</p><p>[Studio intake: ${plain(marker)}]</p>`;
+/** SAV-92 (16/11): a note shown to the team with NO visible identifier (the V2 reply's summary note). Its marker is the historical hidden comment, which HubSpot
+ * may remove: the note is then proven only by its creation ACK (as before). With neither the ACK nor the hidden comment, nothing proves which note is ours (the
+ * summary is deterministic, two cases can share its text and instant): it stays uncertain, never attributed on its date and text. */
+export const renderIntakeNoteHidden = (text: string, marker: string) => `<p>${plain(text).replace(/\n/g, "<br>")}</p><!-- sav-intake:${marker} -->`;
+/** Only the V2 reply's summary note (`note:<case>:reply-summary.<trigger>`) is rendered without a visible marker; every other note keeps the visible one. */
+export const hiddenMarkerNoteKey = (key: string | undefined) => typeof key === "string" && /^note:[^:]+:reply-summary\./.test(key);
 const ownerHistorySchema = z.object({ propertiesWithHistory: z.object({ hubspot_owner_id: z.array(z.object({ value: z.string().nullable().optional(), timestamp: z.string() }).passthrough()).min(1) }).passthrough() }).passthrough();
 const sameProperties = (actual: Record<string, string | null>, expected: Record<string, string>) => Object.entries(expected).every(([k, v]) => k === "hs_timestamp" ? Date.parse(actual[k] ?? "") === Date.parse(v) : actual[k] === v);
 // HubSpot removes this exact historical comment and may append one LF. Do
@@ -343,7 +349,7 @@ export function createIntakeExecutorAdapters(options: {
             const row = await read(type, id(candidate), signal);
             const noteBody = intent.properties?.hs_note_body;
             const validNoteIntent = intent.kind !== "note_create" || typeof intent.text === "string" && Boolean(intent.marker?.match(/^[a-f0-9]{64}$/))
-                && (noteBody === renderIntakeNote(intent.text, intent.marker!) || noteBody === `<p>${plain(intent.text).replace(/\n/g, "<br>")}</p><!-- sav-intake:${intent.marker} -->`);
+                && (noteBody === renderIntakeNote(intent.text, intent.marker!) || noteBody === renderIntakeNoteHidden(intent.text, intent.marker!));
             // The owner a creation carried is proven apart (review F3): today's owner may be a person who took the ticket since.
             const createdOwner = type === "tickets" ? intent.properties?.hubspot_owner_id ?? null : null;
             const expected = createdOwner ? Object.fromEntries(Object.entries(intent.properties ?? {}).filter(([key]) => key !== "hubspot_owner_id")) : intent.properties ?? {};
