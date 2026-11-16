@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
+import { drizzle as pgliteDrizzle } from "drizzle-orm/pglite";
+import { drizzle as postgresDrizzle } from "drizzle-orm/postgres-js";
+import * as dbSchema from "@/db/schema";
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../../test/sav-db";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { savCases, savCaseEvents, savCaseCalls, savCaseEffectExecutions, savIntakeEffects, savIntakeExecutionPolicies, savMailboxes, savMessages, savThreads, savSyncState, staffUsers } from "@/db/schema";
-import { encryptSavPayload } from "../crypto";
+import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { emptyCaseBody, SAV_CASE_CONTRACT_REVISION } from "./case-types";
 import { listV2Cases, v2InventoryInput } from "./v2-inventory";
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, policyId: string, sequence = 10000;
@@ -33,15 +36,16 @@ beforeAll(async () => {
   mailboxId = (await f.db.insert(savMailboxes).values({ email: "support@example.invalid" }).returning())[0]!.id;
   policyId = (await f.db.insert(savIntakeExecutionPolicies).values({ revision: "fixture", state: "approved", administratorId: admin!.id, policyHash: "fixture", payloadCiphertext: encryptSavPayload({}) }).returning())[0]!.id;
 }, 60000);
-beforeEach(async () => { await f.client.exec("TRUNCATE sav.cases CASCADE"); });
+beforeEach(async () => { await f.client.exec("TRUNCATE sav.cases, sav.sync_state CASCADE"); });
 afterAll(async () => { state.db = null; await f?.client.close(); expect(network).not.toHaveBeenCalled(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
-it("keyset survives backdated inserts on both sides and state changes without gaps or duplicates", async () => {
+it("compact keyset excludes later inserts with backdated customer dates without gaps or duplicates", async () => {
   const originals = [];
   for (let n = 1; n <= 5; n++) originals.push(await fixture({ id: `40000000-0000-4000-8000-${String(n * 2).padStart(12, "0")}` }));
   const first = await run({ limit: 2, state: "processing" });
   await fixture({ id: "40000000-0000-4000-8000-000000000001", received: new Date("2026-11-15") });
   await fixture({ id: "40000000-0000-4000-8000-000000000007", received: new Date("2026-11-15") });
-  await f.db.update(savCases).set({ phase: "awaiting_customer", updatedAt: new Date() }).where(eq(savCases.id, originals[3]!.caseId));
+  expect(Buffer.byteLength(first.nextCursor!)).toBeLessThan(1024);
+  expect(decryptSavPayload(first.nextCursor!)).not.toHaveProperty("ids");
   const seen = first.rows.map(r => r.caseId); let cursor = first.nextCursor;
   while (cursor) { const next = await run({ limit: 2, state: "processing", cursor }); expect(next.attendus).toBe(5); seen.push(...next.rows.map(r => r.caseId)); cursor = next.nextCursor; }
   expect(seen).toEqual(originals.map(c => c.caseId)); expect(new Set(seen).size).toBe(5); expect((await run()).attendus).toBe(7);
@@ -123,4 +127,88 @@ it("keeps inventory available with explicit null costs for missing or unreadable
   expect((await run()).rows[0]!.cost).toEqual({ confirmedMicroUsd: null, reservedMicroUsd: null, reason: "receipt_missing" });
   await f.db.insert(savSyncState).values({ key: `sav-v2-spend.v1:model:${randomUUID()}`, cursor: "malformed fixture" });
   expect((await run()).rows[0]!.cost).toEqual({ confirmedMicroUsd: null, reservedMicroUsd: null, reason: "receipt_unreadable" });
+});
+
+it.each([["refused", true], ["reason", true], ["refused", false], ["reason", false]] as const)("ignores %s HubSpot parents (effect=%s), then reports a subsequent confirmation", async (state, withEffect) => {
+  const c = await fixture();
+  const parent = withEffect ? await effect(c, "ticket_stage", "planned") :
+    (await f.db.insert(savCaseEffectExecutions).values({ caseId: c.caseId, threadId: c.threadId, replyKey: `case-stage:${c.caseId}:cancelled`, policyId, policyHash: "fixture", payloadCiphertext: encryptSavPayload({}) }).returning())[0]!.id;
+  await f.db.update(savCaseEffectExecutions).set({ state: state === "reason" ? "pending" : state, reason: "SAV_CASE_EFFECT_CANCELLED_NEW_INPUT" }).where(eq(savCaseEffectExecutions.id, parent));
+  expect((await run()).rows[0]!.hubspot.status).toBe("absent");
+  await effect(c, "ticket_stage", "confirmed", at);
+  expect((await run()).rows[0]!.hubspot.status).toBe("confirmed");
+});
+it("uses at most 15 queries for 100 cases with histories and keeps cursor below 1 KiB", async () => {
+  const cases = [];
+  for (let n = 0; n < 101; n++) cases.push(await fixture());
+  for (const c of cases.slice(0, 100)) {
+    await effect(c, "ticket_stage", "planned");
+    const key = randomUUID();
+    await f.db.insert(savCaseCalls).values({ callKey: `${key}:call1`, subjectKey: key, caseId: c.caseId, caseVersion: 1, purpose: "decision", state: "reserved", token: randomUUID(), holder: "fixture", leaseUntil: new Date(at.getTime() + 60000) });
+  }
+  const statements: string[] = [];
+  const options = { schema: dbSchema, logger: { logQuery: (query: string) => statements.push(query) } };
+  state.db = process.env.SAV_TEST_POSTGRES_URL
+    ? postgresDrizzle((f.db as unknown as { $client: never }).$client, options)
+    : pgliteDrizzle(f.client as never, options);
+  try {
+    const page = await run({ limit: 100 });
+
+    console.info(`inventory 100 cases: ${statements.length} SQL queries; cursor: ${Buffer.byteLength(page.nextCursor!)} bytes`);
+    expect(statements.length).toBeLessThanOrEqual(15);
+    expect(statements.filter(query => /^\s*(select|with)\b/i.test(query))).toHaveLength(9);
+    expect(page.rows).toHaveLength(100);
+    expect(Buffer.byteLength(page.nextCursor!)).toBeLessThan(1024);
+  } finally { state.db = f.db; }
+});
+it("preserves microsecond keysets and bounds customer dates by snapshotAt", async () => {
+  const a = await fixture({ received: new Date("2099-01-01") });
+  const b = await fixture(), c = await fixture();
+  await f.client.query("update sav.cases set created_at='2026-11-01T00:00:00.000001Z' where id=$1", [b.caseId]);
+  await f.client.query("update sav.cases set created_at='2026-11-01T00:00:00.000002Z' where id=$1", [c.caseId]);
+  const first = await run({ limit: 1, until: "2099-01-02T00:00:00Z" });
+  const next = await run({ limit: 1, until: "2099-01-02T00:00:00Z", cursor: first.nextCursor });
+  expect(first.attendus).toBe(2); expect(first.rows[0]!.caseId).toBe(b.caseId); expect(next.rows[0]!.caseId).toBe(c.caseId);
+  expect(next.rows.some(row => row.caseId === a.caseId)).toBe(false);
+});
+it("fails explicitly instead of decrypting an unbounded observation history", async () => {
+  const c = await fixture();
+  await f.db.insert(savCaseEvents).values(Array.from({ length: 1001 }, (_, n) => ({ caseId: c.caseId, kind: "observation_recorded", direction: "internal", dedupeKey: `bound:${n}`, caseVersion: n+1, occurredAt: at, payloadCiphertext: "not decrypted" })));
+  await expect(run()).rejects.toThrow("HISTORY_LIMIT");
+});
+
+it.each(["count", "bytes"])("keeps costs unknown when spend registry %s exceeds its bound", async bound => {
+  const c = await fixture(), subject = randomUUID(), key = `${subject}:call1`;
+  await f.db.insert(savCaseCalls).values({ callKey: key, subjectKey: subject, caseId: c.caseId, caseVersion: 1, purpose: "decision", state: "reserved", token: randomUUID(), holder: "fixture", leaseUntil: new Date() });
+  const cursor = JSON.stringify({ open: { [key]: { amount: 12 } }, done: {}, ...(bound === "bytes" ? { padding: "x".repeat(1048576) } : {}) });
+  await f.db.insert(savSyncState).values(Array.from({ length: bound === "count" ? 1001 : 1 }, (_, n) => ({ key: `sav-v2-spend.v1:model:bound-${n}`, cursor })));
+  expect((await run()).rows[0]!.cost).toEqual({ confirmedMicroUsd: null, reservedMicroUsd: null, reason: "receipt_unreadable" });
+});
+
+it("reports filtered membership changes explicitly", async () => {
+  await fixture(); const c = await fixture();
+  const first = await run({ limit: 1, state: "processing" });
+  await f.db.update(savCases).set({ phase: "awaiting_customer" }).where(eq(savCases.id, c.caseId));
+  await expect(run({ cursor: first.nextCursor, state: "processing" })).rejects.toThrow("MEMBERSHIP_CHANGED");
+});
+
+it("accepts postgres-js array results as well as PGlite row envelopes", async () => {
+  const c = await fixture();
+  await effect(c, "ticket_stage", "confirmed", at);
+  const subject = randomUUID();
+  await f.db.insert(savCaseCalls).values({ callKey: `${subject}:call1`, subjectKey: subject, caseId: c.caseId, caseVersion: 1, purpose: "decision", state: "reserved", token: randomUUID(), holder: "fixture", leaseUntil: new Date() });
+  state.db = {
+    transaction: (callback: (tx: unknown) => Promise<unknown>) => f.db.transaction(tx => callback(new Proxy(tx, {
+      get(target, key, receiver) {
+        if (key === "execute") return async (statement: Parameters<typeof tx.execute>[0]) => {
+          const result = await tx.execute(statement);
+          return Array.isArray(result) ? result : (result as unknown as { rows: unknown[] }).rows;
+        };
+        const value = Reflect.get(target, key, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }))),
+  };
+  try { expect((await run()).rows[0]).toMatchObject({ caseId: c.caseId, hubspot: { status: "confirmed" }, cost: { reason: "receipt_missing" } }); }
+  finally { state.db = f.db; }
 });

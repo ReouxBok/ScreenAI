@@ -1,8 +1,8 @@
 import "server-only";
-import { and, asc, eq, gt, like, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { savCases, savCaseEvents, savCaseCalls, savCaseEffectExecutions, savIntakeEffects, savMessages, savSyncState } from "@/db/schema";
+import { savCases, savMessages } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { SAV_CASE_ADMISSION_TEAM_REASONS } from "./case-types";
 
@@ -12,15 +12,29 @@ export const v2InventoryInput = z.object({
   until: z.iso.datetime({ offset: true }).optional().describe("Jusqu’à : date inclusive du premier mail client V2."),
   state: z.enum(v2InventoryStates).optional().describe("processing : en cours ; awaiting_customer : en attente du client ; reply_sent : réponse envoyée ; handed_to_team : transféré à l’équipe ; failed : échec ; paused : en pause."),
   limit: z.number().int().min(1).max(100).default(25),
-  cursor: z.string().min(1).optional().describe("Curseur opaque durable ; conserver les mêmes filtres. Sa taille dépend du nombre de dossiers dans la fenêtre."),
+  cursor: z.string().min(1).max(1023).optional().describe("Curseur opaque durable ; conserver les mêmes filtres. Taille constante ; périmètre borné par snapshotAt."),
 }).strict();
 type Input = z.infer<typeof v2InventoryInput>;
-const cursorSchema = z.object({ v: z.literal(1), filters: z.string(), ids: z.array(z.uuid()), after: z.uuid(), observedAt: z.iso.datetime() }).strict();
+const timestamp = z.string().max(64).refine(value => Number.isFinite(Date.parse(value)));
+const cursorSchema = z.object({ v: z.literal(2), filters: z.string(), after: z.object({ createdAt: timestamp, id: z.uuid() }), snapshotAt: timestamp, attendus: z.number().int().nonnegative() }).strict();
 const invalid = (): never => { throw Error("SAV_V2_INVENTORY_CURSOR_INVALID"); };
 const handoffCodes = new Set<string>([...SAV_CASE_ADMISSION_TEAM_REASONS, "explicit_human_request", "sensitive_request", "knowledge_missing", "knowledge_conflict",
   "evidence_inaccessible", "diagnosis_out_of_tools", "repeated_failure", "out_of_scope", "decision_refused", "validator_refusals", "awaiting_v2_attribution"]);
 const object = z.record(z.string(), z.unknown());
-const spendDay = z.object({ open: z.record(z.string(), z.object({ amount: z.number().int().nonnegative() })), done: z.record(z.string(), z.number().int().nonnegative()), verifiedUsage: z.array(z.string()).optional() });
+
+type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
+async function queryBatch<T extends Record<string, unknown>>(tx: Pick<Tx, "execute">, statement: SQL) {
+  const result = await tx.execute<T>(statement);
+  return { rows: Array.isArray(result) ? result : (result as unknown as { rows: T[] }).rows };
+}
+function groupBy<T>(rows: T[], key: (row: T) => string) {
+  const groups = new Map<string, T[]>();
+  for (const row of rows) {
+    const id = key(row), group = groups.get(id);
+    if (group) group.push(row); else groups.set(id, [row]);
+  }
+  return groups;
+}
 
 // Dates belong to the FIRST customer event of the case, not to an unrelated older mail in its V1 thread.
 const receivedAt = sql<string | null>`(select min(e.occurred_at)::text from sav.case_events e where e.case_id = sav.cases.id and e.kind = 'inbound_confirmed' and e.direction = 'customer_inbound')`;
@@ -32,63 +46,126 @@ const stateSql = sql<typeof v2InventoryStates[number]>`case
   when ${savCases.phase} = 'resolved' and exists (select 1 from sav.case_effect_executions x join sav.intake_effects f on f.execution_id = x.id where x.case_id = sav.cases.id and f.kind = 'reply_send' and f.state = 'confirmed' and f.confirmed_at is not null) then 'reply_sent'
   else 'processing' end`;
 
-/** Read-only inventory. A sealed membership manifest makes cursors durable across processes and
- * freezes the state/date filter and total despite inserts (even backdated inserts) or case updates.
- * Keyset by immutable UUID, never offset or updated_at. The cursor grows with the window's membership;
- * use smaller date windows for very large inventories. Values are fresh per page, membership is not.
- * No payload upgrade, lock, migration, external call, or write. */
+/** Read-only, compact (created_at, id) keyset. The DB timestamp freezes the creation
+ * boundary; first-customer dates are bounded by min(until, snapshotAt). Mutable
+ * states/values are read afresh. Histories are bounded and fail explicitly on overflow.
+ * No external call, write, lock or payload upgrade. */
 export async function listV2Cases(raw: Input) {
   const input = v2InventoryInput.parse(raw);
   if (input.from && input.until && Date.parse(input.from) > Date.parse(input.until)) throw Error("SAV_V2_INVENTORY_WINDOW_INVALID");
   const filters = JSON.stringify([input.from ? new Date(input.from).toISOString() : null, input.until ? new Date(input.until).toISOString() : null, input.state ?? null]);
   let cursor: z.infer<typeof cursorSchema> | null = null;
   if (input.cursor) {
+    if (input.cursor.split(".").length !== 4 || input.cursor.split(".").slice(1).some(part => Buffer.from(part, "base64url").toString("base64url") !== part)) invalid();
     try { cursor = cursorSchema.parse(decryptSavPayload(input.cursor)); } catch { invalid(); }
-    if (!cursor || cursor.filters !== filters || !cursor.ids.includes(cursor.after) || new Set(cursor.ids).size !== cursor.ids.length) invalid();
+    if (!cursor || cursor.filters !== filters || Date.parse(cursor.after.createdAt) > Date.parse(cursor.snapshotAt)) invalid();
   }
   return requireDb().transaction(async tx => {
-    const observedAt = cursor?.observedAt ?? new Date().toISOString();
-    const members = cursor?.ids ?? (await tx.select({ id: savCases.id }).from(savCases).where(and(
+    // Preserve PostgreSQL microseconds in the keyset (JS Date would truncate them).
+    const snapshotAt = cursor?.snapshotAt ?? (await queryBatch<{ value: string }>(tx, sql`select clock_timestamp()::text as value`)).rows[0]!.value;
+    const observedAt = new Date(snapshotAt).toISOString();
+    const scope = and(
+      sql`${savCases.createdAt} <= ${snapshotAt}::timestamptz`,
       input.from ? sql`${receivedAt}::timestamptz >= ${input.from}::timestamptz` : undefined,
-      input.until ? sql`${receivedAt}::timestamptz <= ${input.until}::timestamptz` : undefined,
+      sql`((${!input.from && !input.until} and ${receivedAt} is null) or ${receivedAt}::timestamptz <= least(${input.until ?? snapshotAt}::timestamptz, ${snapshotAt}::timestamptz))`,
       input.state ? eq(stateSql, input.state) : undefined,
-    )).orderBy(asc(savCases.id))).map(row => row.id);
-    if (!members.length) return { attendus: 0, observedAt, rows: [], nextCursor: null };
-    const page = await tx.select({ id: savCases.id, threadIds: savCases.threadIds, phase: savCases.phase, state: stateSql, payload: savCases.payloadCiphertext, receivedAt })
-      .from(savCases).where(and(sql`${savCases.id} = any(${`{${members.join(",")}}`}::uuid[])`, cursor ? gt(savCases.id, cursor.after) : undefined)).orderBy(asc(savCases.id)).limit(input.limit + 1);
-    // A deletion must never make a partial audit look exhaustive.
-    const expected = members.filter(id => !cursor || id > cursor.after).slice(0, input.limit + 1);
-    if (JSON.stringify(page.map(row => row.id)) !== JSON.stringify(expected)) throw Error("SAV_V2_INVENTORY_MEMBERSHIP_CHANGED");
-    const ledgers: z.infer<typeof spendDay>[] = [];
-    let ledgerUnreadable = false;
-    // One accounting read per page, never the budget writer (which creates/locks day rows).
-    for (const ledger of await tx.select({ cursor: savSyncState.cursor }).from(savSyncState).where(like(savSyncState.key, "sav-v2-spend.v1:%"))) {
-      try { ledgers.push(spendDay.parse(JSON.parse(ledger.cursor ?? "null"))); } catch { ledgerUnreadable = true; }
-    }
+    );
+    const attendus = Number((await tx.select({ count: sql<number>`count(*)` }).from(savCases).where(scope))[0]!.count);
+    // Changes to filtered membership are reported, rather than silently claiming exhaustiveness.
+    if (cursor && attendus !== cursor.attendus) throw Error("SAV_V2_INVENTORY_MEMBERSHIP_CHANGED");
+    const page = await tx.select({ id: savCases.id, createdAt: sql<string>`${savCases.createdAt}::text`, threadIds: savCases.threadIds, phase: savCases.phase, state: stateSql, payload: savCases.payloadCiphertext, receivedAt })
+      .from(savCases).where(and(scope, cursor ? sql`(${savCases.createdAt}, ${savCases.id}) > (${cursor.after.createdAt}::timestamptz, ${cursor.after.id}::uuid)` : undefined))
+      .orderBy(asc(savCases.createdAt), asc(savCases.id)).limit(input.limit + 1);
+    if (!page.length) return { attendus, observedAt, rows: [], nextCursor: null };
+    const ids = page.slice(0, input.limit).map(row => row.id);
+    const idArray = `{${ids.join(",")}}`;
+    // One batch per table, with at most 1000 history records per case plus an overflow sentinel.
+    const historyLimit = 1000;
+    const eventBatch = await queryBatch<{ caseId: string; key: string | null; payload: string | null }>(tx, sql`
+      select c.id as "caseId", e.key, e.payload from sav.cases c join lateral (
+        (select dedupe_key as key, null::text as payload from sav.case_events where case_id=c.id
+          and kind='inbound_confirmed' and direction='customer_inbound' order by occurred_at, id limit 1)
+        union all
+        (select null::text as key, payload_ciphertext as payload from sav.case_events where case_id=c.id
+          and kind='observation_recorded' order by case_version, id limit ${historyLimit + 1})
+      ) e on true where c.id=any(${idArray}::uuid[])`);
+    const entries = { rows: eventBatch.rows.filter((e): e is typeof e & { key: string } => e.key !== null) };
+    const eventRows = { rows: eventBatch.rows.filter((e): e is typeof e & { payload: string } => e.payload !== null) };
+    const messageRows = entries.rows.length ? await tx.select({ id: savMessages.id, threadId: savMessages.threadId, gmailId: savMessages.gmailMessageId }).from(savMessages)
+      .where(and(inArray(savMessages.gmailMessageId, entries.rows.map(e => e.key.slice("inbound:".length))), eq(savMessages.direction, "inbound"))) : [];
+    const executionRows = await queryBatch<{ caseId: string; id: string; key: string; state: string; reason: string | null; payload: string }>(tx, sql`
+      select c.id as "caseId", e.id, e.reply_key as key, e.state, e.reason, e.payload_ciphertext as payload from sav.cases c
+      join lateral (select * from sav.case_effect_executions where case_id=c.id order by created_at, id limit ${historyLimit + 1}) e on true
+      where c.id=any(${idArray}::uuid[])`);
+    const executionIds = `{${executionRows.rows.map(e => e.id).join(",")}}`;
+    // Four public effect kinds, one aggregate per execution/kind, regardless of ledger length.
+    const effectResult = executionRows.rows.length ? await queryBatch<{ executionId: string; kind: string; state: string; confirmedAt: string | null }>(tx, sql`
+      select execution_id as "executionId", kind,
+        case when bool_and(state='confirmed' and confirmed_at is not null) then 'confirmed' else 'pending' end as state,
+        min(confirmed_at)::text as "confirmedAt"
+      from sav.intake_effects where execution_id=any(${executionIds}::uuid[])
+        and kind in ('reply_send','note_create','note_associate','ticket_stage') group by execution_id, kind`) : null;
+    const effectRows = (effectResult?.rows ?? []).map(e => ({ ...e, confirmedAt: e.confirmedAt ? new Date(e.confirmedAt) : null }));
+    const callRows = await queryBatch<{ caseId: string; key: string; state: string }>(tx, sql`
+      select c.id as "caseId", e.call_key as key, e.state from sav.cases c
+      join lateral (select call_key, state from sav.case_calls where case_id=c.id order by created_at, call_key limit ${historyLimit + 1}) e on true
+      where c.id=any(${idArray}::uuid[])`);
+    if (ids.some(id => [executionRows.rows, eventRows.rows, callRows.rows].some(rows => rows.filter(r => r.caseId === id).length > historyLimit)))
+      throw Error("SAV_V2_INVENTORY_HISTORY_LIMIT");
+    // SQL returns one aggregate per call, not day registries or day × call receipts.
+    // Size checks precede JSON parsing. Any truncated/corrupt registry keeps costs unknown.
+    const callKeys = callRows.rows.map(c => c.key);
+    const ledgerRows = callKeys.length ? await queryBatch<{ key: string; confirmed: string; reserved: string; coverage: number; unreadable: boolean }>(tx, sql`
+      with days as materialized (
+        select case when octet_length(cursor) <= 1048576 then
+          case when pg_input_is_valid(cursor, 'jsonb') then cursor::jsonb end end as body
+        from sav.sync_state where key like 'sav-v2-spend.v1:%' order by key limit 1001
+      ), keys as (select jsonb_array_elements_text(${JSON.stringify(callKeys)}::jsonb) as key),
+      metadata as (
+        select count(*) > 1000 or coalesce(bool_or(body is null or
+          jsonb_typeof(body->'open') is distinct from 'object' or jsonb_typeof(body->'done') is distinct from 'object' or
+          (body ? 'verifiedUsage' and jsonb_typeof(body->'verifiedUsage') is distinct from 'array')), false) as unreadable from days
+      ), receipts as (
+        select key, body->'open'->key->'amount' as held, body->'done'->key as done,
+          coalesce(body->'open' ? key, false) as has_open, coalesce(body->'done' ? key, false) as has_done,
+          coalesce(body->'verifiedUsage' ? key, false) as verified
+        from keys join days on body->'open' ? key or body->'done' ? key
+      ), checked as (
+        select *, (not has_open or (jsonb_typeof(held)='number' and held::text ~ '^[0-9]+$'))
+          and (not has_done or (jsonb_typeof(done)='number' and done::text ~ '^[0-9]+$')) as valid from receipts
+      ) select keys.key, metadata.unreadable or coalesce(bool_or(valid is distinct from true) filter (where checked.key is not null),false) as unreadable,
+        coalesce(sum(case when valid and has_done and verified then done::text::numeric else 0 end),0)::text as confirmed,
+        coalesce(sum(case when valid then (case when has_open then held::text::numeric else 0 end)
+          + (case when has_done and not verified then done::text::numeric else 0 end) else 0 end),0)::text as reserved,
+        coalesce(sum(has_open::int + has_done::int),0)::int as coverage
+      from keys cross join metadata left join checked on checked.key=keys.key group by keys.key, metadata.unreadable`) : null;
+    const receipts = new Map((ledgerRows?.rows ?? []).map(row => [row.key, row]));
+    const executionsByCase = groupBy(executionRows.rows, row => row.caseId);
+    const effectsByExecution = groupBy(effectRows, row => row.executionId);
+    const eventsByCase = groupBy(eventRows.rows, row => row.caseId);
+    const callsByCase = groupBy(callRows.rows, row => row.caseId);
     const rows = [];
     // Only public counters/codes are projected. Encrypted event/body content never leaves this function.
     for (const row of page.slice(0, input.limit)) {
-      const [entry] = await tx.select({ key: savCaseEvents.dedupeKey }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, row.id), eq(savCaseEvents.kind, "inbound_confirmed"), eq(savCaseEvents.direction, "customer_inbound")))
-        .orderBy(asc(savCaseEvents.occurredAt), asc(savCaseEvents.id)).limit(1);
-      const [message] = entry ? await tx.select({ id: savMessages.id, threadId: savMessages.threadId }).from(savMessages)
-        .where(and(eq(savMessages.gmailMessageId, entry.key.slice("inbound:".length)), eq(savMessages.direction, "inbound"), sql`exists (select 1 from sav.cases c where c.id = ${row.id} and ${savMessages.threadId} = any(c.thread_ids))`)).limit(1) : [];
-      const executions = await tx.select({ id: savCaseEffectExecutions.id, key: savCaseEffectExecutions.replyKey, state: savCaseEffectExecutions.state, payload: savCaseEffectExecutions.payloadCiphertext })
-        .from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, row.id));
-      const effects = await tx.select({ executionId: savCaseEffectExecutions.id, kind: savIntakeEffects.kind, state: savIntakeEffects.state, confirmedAt: savIntakeEffects.confirmedAt })
-        .from(savCaseEffectExecutions).innerJoin(savIntakeEffects, eq(savIntakeEffects.executionId, savCaseEffectExecutions.id)).where(eq(savCaseEffectExecutions.caseId, row.id));
+      const entry = entries.rows.find(e => e.caseId === row.id);
+      const message = entry ? messageRows.find(m => m.gmailId === entry.key.slice("inbound:".length) && row.threadIds.includes(m.threadId)) : undefined;
+      const executions = executionsByCase.get(row.id) ?? [];
+      const active = executions.filter(e => !["refused", "cancelled"].includes(e.state) && !e.reason?.startsWith("SAV_CASE_EFFECT_CANCELLED_"));
+      const effects = executions.flatMap(e => effectsByExecution.get(e.id) ?? []);
+      const activeEffects = active.flatMap(e => effectsByExecution.get(e.id) ?? []);
       // First confirmed V2 reply of this case, excluding unrelated V1/CRM effects.
       const reply = effects.filter(e => e.kind === "reply_send" && e.state === "confirmed" && e.confirmedAt).sort((a, b) => a.confirmedAt!.getTime() - b.confirmedAt!.getTime())[0];
-      const noteCreates = effects.filter(e => e.kind === "note_create");
-      const queuedNote = executions.some(e => e.state !== "refused" && !effects.some(f => f.executionId === e.id && f.kind === "note_create") && object.safeParse(object.parse(decryptSavPayload(e.payload)).note).success);
-      const note = queuedNote ? "queued" : !noteCreates.length ? effects.some(e => e.kind === "note_associate") ? "queued" : "absent" : noteCreates.every(e => e.state === "confirmed" && e.confirmedAt && effects.some(a => a.executionId === e.executionId && a.kind === "note_associate" && a.state === "confirmed" && a.confirmedAt)) ? "confirmed" : "queued";
-      const stages = effects.filter(e => e.kind === "ticket_stage");
-      const queuedStage = executions.some(e => e.state !== "refused" && e.key.startsWith("case-stage:") && !effects.some(f => f.executionId === e.id && f.kind === "ticket_stage"));
+      const noteCreates = activeEffects.filter(e => e.kind === "note_create");
+      const queuedNote = active.some(e => !effectsByExecution.get(e.id)?.some(f => f.kind === "note_create") && object.safeParse(object.parse(decryptSavPayload(e.payload)).note).success);
+      const note = queuedNote ? "queued" : !noteCreates.length ? activeEffects.some(e => e.kind === "note_associate") ? "queued" : "absent" : noteCreates.every(e => e.state === "confirmed" && e.confirmedAt && effectsByExecution.get(e.executionId)?.some(a => a.kind === "note_associate" && a.state === "confirmed" && a.confirmedAt)) ? "confirmed" : "queued";
+      const stages = activeEffects.filter(e => e.kind === "ticket_stage");
+      const queuedStage = active.some(e => e.key.startsWith("case-stage:") && !effectsByExecution.get(e.id)?.some(f => f.kind === "ticket_stage"));
       const status = queuedStage ? "queued" : !stages.length ? "absent" : stages.every(e => e.state === "confirmed" && e.confirmedAt) ? "confirmed" : "queued";
       const body = object.parse(decryptSavPayload(row.payload));
       const handoff = object.safeParse(body.handoff);
       const reason = handoff.success ? handoff.data.reason : null;
       const refusals = new Set<string>();
-      const events = await tx.select({ payload: savCaseEvents.payloadCiphertext }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, row.id), eq(savCaseEvents.kind, "observation_recorded")));
+      const events = eventsByCase.get(row.id) ?? [];
       for (const event of events) {
         const payload = object.parse(decryptSavPayload(event.payload));
         const detail = object.safeParse(payload.detail), record = object.safeParse(detail.success ? detail.data.record : null);
@@ -99,16 +176,16 @@ export async function listV2Cases(raw: Input) {
           if (attempt.result === "validated" && attempt.outcome === "needs_review") refusals.add(JSON.stringify([record.data.inputKey, attempt.call]));
         }
       }
-      const calls = await tx.select({ key: savCaseCalls.callKey, state: savCaseCalls.state }).from(savCaseCalls).where(eq(savCaseCalls.caseId, row.id));
+      const calls = callsByCase.get(row.id) ?? [];
       let confirmed = 0, reserved = 0;
-      const coverage = new Map<string, number>();
-      for (const day of ledgers) {
-        for (const call of calls) {
-          if (Object.hasOwn(day.open, call.key)) { reserved += day.open[call.key]!.amount; coverage.set(call.key, (coverage.get(call.key) ?? 0) + 1); }
-          if (Object.hasOwn(day.done, call.key)) { const amount = day.done[call.key]!; if (day.verifiedUsage?.includes(call.key)) confirmed += amount; else reserved += amount; coverage.set(call.key, (coverage.get(call.key) ?? 0) + 1); }
-        }
-      }
-      const complete = !ledgerUnreadable && calls.length > 0 && calls.every(call => call.state === "released" ? !coverage.has(call.key) : coverage.get(call.key) === 1);
+      let ledgerUnreadable = false;
+      const complete = calls.length > 0 && calls.every(call => {
+        const receipt = receipts.get(call.key);
+        if (!receipt || receipt.unreadable || !Number.isSafeInteger(Number(receipt.confirmed)) || !Number.isSafeInteger(Number(receipt.reserved))) ledgerUnreadable = true;
+        confirmed += Number(receipt?.confirmed ?? 0);
+        reserved += Number(receipt?.reserved ?? 0);
+        return !ledgerUnreadable && (call.state === "released" ? receipt?.coverage === 0 : receipt?.coverage === 1);
+      });
       const entered = row.receivedAt ? new Date(row.receivedAt) : null, answered = reply?.confirmedAt ?? null;
       rows.push({ caseId: row.id, threadId: message?.threadId ?? row.threadIds[0] ?? null, messageId: message?.id ?? null, state: row.state, phase: row.phase,
         receivedAt: entered?.toISOString() ?? null, replyConfirmedAt: answered?.toISOString() ?? null,
@@ -118,7 +195,7 @@ export async function listV2Cases(raw: Input) {
         cost: { confirmedMicroUsd: complete ? confirmed : null, reservedMicroUsd: complete ? reserved : null, reason: complete ? null : !calls.length ? "no_recorded_call" : ledgerUnreadable ? "receipt_unreadable" : "receipt_missing" },
       });
     }
-    const last = rows.at(-1);
-    return { attendus: members.length, observedAt, rows, nextCursor: page.length > input.limit && last ? encryptSavPayload({ v: 1, filters, ids: members, after: last.caseId, observedAt }) : null };
+    const last = page.slice(0, input.limit).at(-1);
+    return { attendus, observedAt, rows, nextCursor: page.length > input.limit && last ? encryptSavPayload({ v: 2, filters, after: { createdAt: last.createdAt, id: last.id }, snapshotAt, attendus }) : null };
   }, { isolationLevel: "repeatable read", accessMode: "read only" });
 }
