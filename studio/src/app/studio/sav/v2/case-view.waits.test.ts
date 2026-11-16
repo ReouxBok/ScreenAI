@@ -176,3 +176,13 @@ describe("SAV-92 (review batch 3, B1): a team part whose notice could not be que
     expect(handed.detail).toContain("remis le 2026-10-31T11:30:00.000Z");
   });
 });
+
+
+it("shows an unresolved continuation stop as an assigned human wait with its original age", () => {
+  const result = buildCasePilotView({ snapshot: base as unknown as CaseSnapshot, events: [], timers: [],
+    pause: { level: "running", setting: null, invalid: false }, now: new Date("2026-11-16T10:00:00Z"),
+    continuationStop: { code: "access_scope_changed", since: SINCE, lastAt: SINCE, failures: 1,
+      responsible: "sav_administrator", nextAction: "review_scope_and_decision" } });
+  expect(result.waits).toContainEqual({ label: "Arrêt V2 : access_scope_changed", needsPerson: true,
+    detail: expect.stringContaining(`Depuis ${SINCE}. Responsable : administrateur SAV`) });
+});

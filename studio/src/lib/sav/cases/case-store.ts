@@ -1,4 +1,5 @@
 import "server-only";
+import { readContinuationStop } from "./continuation-stop";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, count, desc, eq, gt, gte, like, lte, max, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -792,6 +793,7 @@ export async function readCaseDiagnostics(ticketId: string) {
     contractRevision: row.contractRevision, contractSupported: row.contractRevision === SAV_CASE_CONTRACT_REVISION || row.contractRevision in SAV_CASE_CONTRACT_UPGRADES,
     eventCount: events?.total ?? 0, lastEventKind: last?.kind ?? null, updatedAt: row.updatedAt.toISOString(),
     // SAV-18: held by its block's switch (off, paused, unreadable): a visible wait, never a silent skip.
+    continuationStop: await readContinuationStop(row.id, db),
     blockHold: hold ? { blockId: hold.blockId, reason: hold.reason, since: hold.since } : null,
     // SAV-92 (review batch 3, B1): a reply naming a team part whose notice could not be queued; bounded, then the whole mail goes to the team.
     teamPartWait: teamPart ? { code: teamPart.code, detail: teamPart.detail, passes: teamPart.passes, since: teamPart.since, lastAt: teamPart.lastAt, handedToTeam: teamPart.handedToTeam } : null,

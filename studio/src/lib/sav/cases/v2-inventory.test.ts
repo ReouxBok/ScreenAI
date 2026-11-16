@@ -10,6 +10,7 @@ vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATAB
 import { savCases, savCaseEvents, savCaseCalls, savCaseEffectExecutions, savIntakeEffects, savIntakeExecutionPolicies, savMailboxes, savMessages, savThreads, savSyncState, staffUsers } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { emptyCaseBody, SAV_CASE_CONTRACT_REVISION } from "./case-types";
+import { markContinuationStop } from "./continuation-stop";
 import { listV2Cases, v2InventoryInput } from "./v2-inventory";
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, policyId: string, sequence = 10000;
 const network = vi.fn(() => { throw Error("NETWORK_FORBIDDEN"); });
@@ -79,7 +80,7 @@ it("calculates delay from confirmed reply, never ack; note requires association"
 it("exposes closed fields and sanitized handoff codes without customer content", async () => {
   const c = await fixture({ owner: "human", phase: "human_owned", handoff: "private@example.invalid" }); const page = await run();
   expect(page.rows[0]).toMatchObject({ ...c, state: "handed_to_team", handoffReason: "other_internal_reason", validatorRefusals: 0, cost: { confirmedMicroUsd: null, reservedMicroUsd: null, reason: "no_recorded_call" } });
-  expect(Object.keys(page.rows[0]!).sort()).toEqual(["caseId", "threadId", "messageId", "state", "phase", "receivedAt", "replyConfirmedAt", "replyDelaySeconds", "hubspot", "handoffReason", "validatorRefusals", "cost"].sort());
+  expect(Object.keys(page.rows[0]!).sort()).toEqual(["caseId", "threadId", "messageId", "state", "phase", "receivedAt", "replyConfirmedAt", "replyDelaySeconds", "hubspot", "handoffReason", "validatorRefusals", "cost", "continuationStop"].sort());
   expect(JSON.stringify(page)).not.toMatch(/PRIVATE|private@|subject|recipient|customerEmail|body|Ciphertext/);
 });
 it("deduplicates cumulative validator refusals per input and call", async () => {
@@ -288,4 +289,13 @@ it("accepts postgres-js array results as well as PGlite row envelopes", async ()
   };
   try { expect((await run()).rows[0]).toMatchObject({ caseId: c.caseId, hubspot: { status: "confirmed" }, cost: { reason: "receipt_missing" } }); }
   finally { state.db = f.db; }
+});
+
+it("lists durable stops with their responsible and age, including under the failed filter", async () => {
+  const c = await fixture();
+  await markContinuationStop(c.caseId, "sweep", "access_scope_changed");
+  const result = await run({ state: "failed" });
+  expect(result.rows).toHaveLength(1);
+  expect(result.rows[0]).toMatchObject({ caseId: c.caseId, state: "failed", continuationStop: { code: "access_scope_changed", responsible: "sav_administrator", nextAction: "review_scope_and_decision" } });
+  expect(result.rows[0]!.continuationStop!.since).toMatch(/^\d{4}-/);
 });

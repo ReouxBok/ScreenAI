@@ -1,3 +1,4 @@
+import type { ContinuationStop } from "@/lib/sav/cases/continuation-stop";
 import { describeCaseModelTransportDiagnostic } from "@/lib/sav/cases/investigation-transport-diagnostic";
 import { caseAwaitsV2Attribution, caseRequestSubject, currentCaseFacts, SAV_CASE_ADMISSION_REASON_LABELS, type CaseAdmissionReason, type CaseEvent, type CaseSnapshot, type CaseTimer, type KnowledgeRef } from "@/lib/sav/cases/case-types";
 import { caseDecisionProposalSchema, caseDecisionRejectionLabels, caseDecisionSignalLabels, caseDecisionUnverifiedLabels, type CaseDecisionProposal } from "@/lib/sav/cases/decision-contract";
@@ -226,7 +227,7 @@ export type CasePilotBlockHold = Readonly<{ blockId: string; reason: string; sin
 /** SAV-92 (review batch 3, B1): a reply naming a team part whose notice could not be queued (`team_part_handoff_unavailable`). */
 export type CasePilotTeamPartWait = Readonly<{ code: string; detail: string; passes: number; since: string; handedToTeam: string | null }> | null;
 export function buildCasePilotView(input: { snapshot: CaseSnapshot; events: readonly CaseEvent[]; timers: readonly CaseTimer[]; pause: SavAgentPauseState; now: Date; blockHold?: CasePilotBlockHold;
-  teamPartWait?: CasePilotTeamPartWait }) {
+  continuationStop?: ContinuationStop | null; teamPartWait?: CasePilotTeamPartWait }) {
   const { snapshot, events, timers, pause, now } = input, body = snapshot.body;
   const firstInbound = [...events].sort((a, b) => a.caseVersion - b.caseVersion).find(event => event.kind === "inbound_confirmed") ?? null;
 
@@ -257,6 +258,8 @@ export function buildCasePilotView(input: { snapshot: CaseSnapshot; events: read
   const waits: CasePilotWait[] = [];
   if (pause.invalid) waits.push({ label: "Réglage de pause V2 illisible : traité comme une pause complète.", needsPerson: true });
   else if (pause.level !== "running") waits.push({ label: pauseLabels[pause.level], detail: pause.setting ? `Depuis ${pause.setting.setAt} par ${pause.setting.setBy}` : undefined, needsPerson: false });
+  if (input.continuationStop) waits.push({ label: `Arrêt V2 : ${input.continuationStop.code}`,
+    detail: `Depuis ${input.continuationStop.since || "date inconnue"}. Responsable : ${input.continuationStop.responsible === "ticket_owner" ? "responsable du ticket ; reprise après réattribution explicite à V2" : "administrateur SAV ; vérifier les droits et le périmètre de la décision conservée, puis organiser la reprise"}.`, needsPerson: true });
   if (input.blockHold) waits.push({ label: caseBlockHoldLabels[input.blockHold.reason] ?? caseBlockHoldLabels.block_setting_invalid,
     detail: `Bloc ${input.blockHold.blockId}, motif ${input.blockHold.reason}${input.blockHold.since ? `, depuis ${input.blockHold.since}` : ""}.`, needsPerson: input.blockHold.reason === "block_setting_invalid" });
   if (input.teamPartWait) waits.push(input.teamPartWait.handedToTeam

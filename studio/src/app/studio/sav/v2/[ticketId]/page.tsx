@@ -1,3 +1,4 @@
+import { readContinuationStop } from "@/lib/sav/cases/continuation-stop";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { requireDb } from "@/db";
@@ -42,7 +43,7 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
   const admin = staff.role === "admin" || staff.role === "owner";
   const { returnTo, replies: repliesCursor, reply: replyId } = await searchParams, back = safeStudioHref(returnTo);
   // Pole C's registry is read only here, after the access check and once the case is known (its list decrypts each stored proposal).
-  const [events, timers, pause, diagnostics, replies, qualification, blockHold, teamPartWait] = await Promise.all([listCaseEvents(snapshot.caseId), listCaseTimers(snapshot.caseId),
+  const [events, timers, pause, diagnostics, replies, qualification, blockHold, teamPartWait, continuationStop] = await Promise.all([listCaseEvents(snapshot.caseId), listCaseTimers(snapshot.caseId),
     readSavAgentPause(requireDb(), "v2"), admin ? readCaseDiagnostics(ticketId) : null,
     readCaseReplies(caseReplyReaders, { caseId: snapshot.caseId, cursor: repliesCursor }),
     // Pole A6, after the staff check, for the case read above; the caller is built from that check's result only.
@@ -50,12 +51,12 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
     // SAV-18: held by its block's switch, shown as a wait; an unreadable marker is not invented (the administrators' diagnostics read it again).
     readCaseBlockHold(snapshot.caseId).catch(() => null),
     // SAV-92 (review batch 3, B1): a team part whose notice could not be queued, shown as a wait, bounded.
-    readCaseTeamPartWait(snapshot.caseId).catch(() => null)]);
+    readCaseTeamPartWait(snapshot.caseId).catch(() => null), readContinuationStop(snapshot.caseId)]);
   // Without a choice in the link, the latest reply of the first page is the one shown: its id comes from the list just read for this case, never from a guess.
   const reply = await readCaseReply(caseReplyReaders, { caseId: snapshot.caseId, id: replyId ?? (!repliesCursor && replies.state === "ok" ? replies.items[0]?.id : undefined) });
   // Pole C9, only for the reply the page already read for this case (its id comes from that read, not from the URL), after the staff check.
   const operational = reply.state === "ok" ? await readOperationalState(operationalReader, staff, snapshot.caseId, reply.reply.id) : null;
-  const view = buildCasePilotView({ snapshot, events, timers, pause, now: new Date(), blockHold, teamPartWait }), effects = readCaseEffectsMode(process.env);
+  const view = buildCasePilotView({ snapshot, events, timers, pause, now: new Date(), blockHold, teamPartWait, continuationStop }), effects = readCaseEffectsMode(process.env);
   // The mails and the sheets, after the staff check and once the case and its journal are known.
   // The viewer comes from that check's result only, as for poles A6 and C9.
   const viewer = caseViewerOf(staff);

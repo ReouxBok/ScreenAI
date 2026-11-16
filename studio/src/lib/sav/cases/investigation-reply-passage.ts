@@ -45,6 +45,7 @@ export type CaseReplyPassageDeps = Readonly<{
 
 export type CaseReplyPassageReport =
   | Readonly<{ status: "no_reply"; caseId: string; reason: string }>
+  | Readonly<{ status: "human_task_required"; caseId: string; reason: "access_scope_changed" | "access_scope_unknown" }>
   /** Per-block switch (12/11): the decision's block is off, paused or its switch unreadable. Nothing proposed, approved or queued; a visible wait with its code. */
   | Readonly<{ status: "block_held"; caseId: string; blockId: string; reason: "block_off" | "block_paused" | "block_setting_invalid"; detail: string }>
   | Readonly<{ status: "proposal_refused"; caseId: string; code: string; detail?: string }>
@@ -139,6 +140,10 @@ export async function passCaseInvestigationToReplyPlan(caseId: string, deps: Cas
   const latest = await latestDraft(caseId, deps.provenance);
   if (!latest.draft) return { status: "no_reply", caseId, reason: latest.reason };
   const { draft } = latest;
+  // Keep the recorded decision and all call history. The entry persists this explicit operator task;
+  // restoration of the original scope allows the ordinary idempotent passage to resume.
+  if (draft.replyLimit === "access_scope_changed" || draft.replyLimit === "access_scope_unknown")
+    return { status: "human_task_required", caseId, reason: draft.replyLimit };
   if (!draft.reply) return { status: "no_reply", caseId, reason: latest.reason ?? "no_reply" };
   // SAV-92 (review of batch 2, finding 1): a reply telling the customer part of the mail went to the team is proposed only once that part's notice is durably
   // queued (same execution ledger, never cancelled by a later mail). Otherwise nothing is proposed: the case waits visibly, no promise without the handoff.

@@ -1,4 +1,5 @@
 import "server-only";
+import { publicContinuationStop } from "./continuation-stop";
 import { and, asc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
@@ -41,6 +42,7 @@ const receivedAt = sql<string | null>`(select min(e.occurred_at)::text from sav.
 const stateSql = sql<typeof v2InventoryStates[number]>`case
   when ${savCases.owner} = 'system_hold' then 'paused'
   when ${savCases.owner} = 'human' then 'handed_to_team'
+  when exists (select 1 from public.audit_logs a where a.entity_id = sav.cases.id::text and a.entity_type = 'sav_v2_case' and a.action = 'sav_v2_continuation_failed') then 'failed'
   when ${savCases.phase} in ('blocked_technical', 'blocked_reconcile', 'needs_review') then 'failed'
   when ${savCases.phase} = 'awaiting_customer' then 'awaiting_customer'
   when ${savCases.phase} = 'resolved' and exists (select 1 from sav.case_effect_executions x join sav.intake_effects f on f.execution_id = x.id where x.case_id = sav.cases.id and f.kind = 'reply_send' and f.state = 'confirmed' and f.confirmed_at is not null) then 'reply_sent'
@@ -71,7 +73,8 @@ export async function listV2Cases(raw: Input) {
     const attendus = Number((await tx.select({ count: sql<number>`count(*)` }).from(savCases).where(scope))[0]!.count);
     // Deletions still invalidate the traversal rather than silently claiming exhaustiveness.
     if (cursor && attendus !== cursor.attendus) throw Error("SAV_V2_INVENTORY_MEMBERSHIP_CHANGED");
-    const page = await tx.select({ id: savCases.id, createdAt: sql<string>`${savCases.createdAt}::text`, threadIds: savCases.threadIds, phase: savCases.phase, state: stateSql, payload: savCases.payloadCiphertext, receivedAt })
+    const page = await tx.select({ id: savCases.id, createdAt: sql<string>`${savCases.createdAt}::text`, threadIds: savCases.threadIds, phase: savCases.phase, state: stateSql,
+      continuationStop: sql<unknown>`(select a.technical_metadata from public.audit_logs a where a.entity_id = sav.cases.id::text and a.entity_type = 'sav_v2_case' and a.action = 'sav_v2_continuation_failed' order by a.created_at desc, a.id desc limit 1)`, payload: savCases.payloadCiphertext, receivedAt })
       .from(savCases).where(and(scope, cursor ? sql`(${savCases.createdAt}, ${savCases.id}) > (${cursor.after.createdAt}::timestamptz, ${cursor.after.id}::uuid)` : undefined))
       .orderBy(asc(savCases.createdAt), asc(savCases.id)).limit(input.limit + 1);
     if (!page.length) return { attendus, observedAt, statesFilterApplied: !!input.state, filteredOut: 0, rows: [], nextCursor: null };
@@ -191,6 +194,7 @@ export async function listV2Cases(raw: Input) {
         receivedAt: entered?.toISOString() ?? null, replyConfirmedAt: answered?.toISOString() ?? null,
         replyDelaySeconds: entered && answered && answered >= entered ? (answered.getTime() - entered.getTime()) / 1000 : null,
         hubspot: { note, status }, handoffReason: typeof reason === "string" ? handoffCodes.has(reason) ? reason : "other_internal_reason" : null,
+        continuationStop: publicContinuationStop(row.continuationStop),
         validatorRefusals: refusals.size,
         cost: { confirmedMicroUsd: complete ? confirmed : null, reservedMicroUsd: complete ? reserved : null, reason: complete ? null : !calls.length ? "no_recorded_call" : ledgerUnreadable ? "receipt_unreadable" : "receipt_missing" },
       });
