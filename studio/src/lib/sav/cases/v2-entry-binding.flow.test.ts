@@ -937,3 +937,88 @@ describe("immediate send: the queued reply leaves at once within the caller's bu
     expect(() => caseV2EffectsWithTestPorts({})).toThrow("SAV_V2_TEST_PORTS_FORBIDDEN");
   });
 });
+
+import { savCases } from "@/db/schema";
+import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
+import { requestOwnerHandover, runOwnerHandover } from "./owner-handover";
+import { sweepCaseContinuations } from "./v2-entry";
+/*
+ * Owner hand-over (#271) on the real chain: real database, the HubSpot webhook entry (`requestOwnerHandover`), the hand-over wake (`runOwnerHandover`), the V1 gate,
+ * the durable sweep, the REAL continuation loader (no mocked point) and the effects pass. Doubles: the network (owner reads, Gemini), the CRM history read of the
+ * wake (team wrote last) and the workflow starter. Synthetic values only.
+ */
+describe("owner hand-over (#271) end to end: the team wrote last, the owner goes to a person and back to V2, then the customer replies", () => {
+  it("nothing is queued while the team wrote last; the customer's reply is answered by exactly ONE reply effect and ONE send, whatever the sweeps and continuations replay", async () => {
+    const PERSON = "90000777";
+    // This scenario owns the sweep's queued cohort: earlier cases of this file leave it, and the lap starts fresh.
+    await f.db.update(savCases).set({ phase: "awaiting_customer" }).where(eq(savCases.phase, "queued"));
+    await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-v2-sweep.v1:continuation"));
+    const env = { ...await executionEnv(), SAV_V2_ENTRY: "on" };
+    // The hand-over is ON only with the latency wakes (VERCEL_ENV=production); the continuation runs without it, so no workflow is ever started here.
+    const handoverEnv = { ...env, VERCEL_ENV: "production", SAV_V2_OWNER_HANDOVER: "on" };
+    const crm = { owner: V2_OWNER }, net = network(crm);
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
+    const modelCalls = () => net.calls.filter(call => call.url.endsWith(":generateContent")).length;
+
+    // 1. A dossier owned by V2.
+    const made = await v1Mail({ ownerEffect: true });
+    expect(await readCase(made.caseId)).toMatchObject({ owner: "agent" });
+    const passes = async () => ({ sweep: await sweepCaseContinuations({ env, limit: 20 }), continuation: await continueCaseAfterCommit(made.caseId, "sweep", { env }) });
+
+    // 2. The team writes last on the thread.
+    const teamAt = new Date();
+    await f.db.insert(savMessages).values({ threadId: made.threadId, mailboxId, direction: "outbound", gmailMessageId: `gm-team-${randomUUID()}`, fromEmail: "support@example.invalid", toEmails: [SENDER],
+      subject: "Re: Synthétique", bodyCiphertext: encryptSavPayload({ text: "Réponse de l'équipe.", headers: {} }), receivedAt: teamAt });
+    afterSettle();
+
+    // 3. The owner goes to a person: no reply.
+    crm.owner = PERSON;
+    await passes();
+    expect(await effectRows(made.caseId)).toEqual([]);
+    expect(modelCalls()).toBe(0);
+    // ... and back to V2 through the webhook path.
+    crm.owner = V2_OWNER;
+    let token = "";
+    const occurredAt = Date.now();
+    expect(await requestOwnerHandover({ subscriptionType: "ticket.propertyChange", propertyName: "hubspot_owner_id", propertyValue: V2_OWNER, changeSource: "CRM_UI",
+      portalId: Number(SAV_HUBSPOT_SUPPORT.portalId), objectId: made.ticketId, occurredAt, eventId: 1 }, { env: handoverEnv, start: async (_ticketId, started) => { token = started; } }))
+      .toMatchObject({ status: "scheduled" });
+    expect(token).not.toBe("");
+    // During the 5-minute grace nothing resumes the case.
+    expect((await passes()).continuation).toEqual({ status: "owner_handover_pending" });
+    // The wake: the CRM history says the team wrote last, so the older customer mail is not answered.
+    expect(await runOwnerHandover(made.ticketId, token, { env: handoverEnv, now: new Date(occurredAt + 305_000),
+      readTicket: async () => ({ owner: V2_OWNER, pipeline: "0", lastEmailAt: teamAt.getTime(), lastDirection: "team" }) })).toEqual({ status: "team_replied_last" });
+    for (let i = 0; i < 2; i++) expect((await passes()).continuation).toEqual({ status: "owner_handover_pending" });
+    expect(await effectRows(made.caseId)).toEqual([]);
+    expect(await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, made.caseId))).toEqual([]);
+    expect(modelCalls()).toBe(0);
+
+    // 4. The customer replies: V1's run on the new mail meets the V2 gate.
+    const replyId = randomUUID(), replyGmail = `gm-${replyId}`;
+    await f.db.insert(savMessages).values({ id: replyId, threadId: made.threadId, mailboxId, direction: "inbound", gmailMessageId: replyGmail, fromEmail: SENDER, toEmails: ["support@example.invalid"],
+      subject: "Re: Synthétique", bodyCiphertext: encryptSavPayload({ text: "Toujours pas de code.", headers: { "message-id": `<${replyGmail}@example.invalid>` } }), receivedAt: new Date() });
+    const [run] = await f.db.insert(savIntakeRuns).values({ threadId: made.threadId, messageId: replyId, version: 2, isCurrent: true, state: "pending", attempts: 0, configHash: `runtime-${replyId}`, policyHash: "fixture",
+      payloadCiphertext: encryptSavPayload({ revision: "syn", effects: "not_connected" }) }).returning();
+    expect(await customerReturnGate(run!.id, { env, network: net.net as unknown as typeof fetch })).toEqual({ skipped: "v2_customer_return" });
+
+    // 5. The sweep and the continuation, twice, after the settle window; then the effects pass, twice.
+    afterSettle();
+    const outcomes = [];
+    for (let i = 0; i < 2; i++) outcomes.push(await passes());
+    expect(outcomes.map(row => row.continuation.status)).not.toContain("owner_handover_pending");
+    const rows = await effectRows(made.caseId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.replyKey).toContain(replyGmail);
+    expect(modelCalls()).toBe(1);
+    const provider = executionProvider(); provider.setGmail(replyGmail, `thread-${made.threadId}`); provider.seedTicket({ id: made.ticketId, ownerId: V2_OWNER, stage: "new" });
+    let sends = 0;
+    const deps = createCaseV2WakeDeps({ env: () => env, policy: { id: policyId, hash: policyHash }, readPolicyRecord, since: new Date(Date.now() - 600_000), deadlineMs: Date.now() + 60_000,
+      network: provider.network as typeof fetch,
+      gmail: { request: async (mailbox, path, init) => { if (path.replace(/^\//, "") === "messages/send") sends++; return provider.gmail(mailbox, path, init); }, permissions: async () => {} } });
+    const replies = { ...deps.replies, context: { runtime: {} as never, policy: executionPolicy } };
+    await runCaseEffectsPass(replies); await runCaseEffectsPass(replies);
+    expect(sends).toBe(1);
+    expect(await effectRows(made.caseId)).toEqual([expect.objectContaining({ state: "confirmed" })]);
+  });
+});
