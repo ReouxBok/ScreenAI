@@ -17,11 +17,12 @@ import { savV2QualificationCaseAllowed } from "./qualification-scope";
 import { HANDOFF_NOTICE_KEY_PREFIX } from "./case-handoff-notice";
 import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, buildReplySendIntent, type CaseNoteCreateIntent } from "./case-effect-intents";
 import { recordConfirmedCaseReply } from "./case-effect-outcomes";
-import { enqueueCaseTicketStage } from "./case-ticket-stage-queue";
+import { enqueueCaseTicketStage, planCaseTicketStageNow } from "./case-ticket-stage-queue";
 import { TICKET_STAGE_KEY_PREFIX } from "./case-ticket-stage";
-import { lockCaseForWrite } from "./case-store";
+import { lockCaseForWrite, readCase, type CaseTx } from "./case-store";
+import { caseReplySummaryWithStage, isCaseReplySummary, type CaseReplySummaryStage } from "./case-reply-summary-note";
 import {
-  caseNoteAssociationKey, caseNoteKey, caseRecipientCheck, caseReplyKey, checkCaseReplyApproval, decideCaseEffect, readCaseEffectsMode,
+  caseNoteAssociationKey, caseNoteKey, caseRecipientCheck, caseReplyKey, checkCaseReplyApproval, decideCaseEffect, readCaseEffectsMode, SAV_CASE_EFFECT_PERMISSIONS,
   type CaseApprovalCheck, type CaseEffectLive, type CaseReplyApproval,
 } from "./case-effects";
 import { readCaseReplyFacts } from "./case-reply-facts";
@@ -312,6 +313,21 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     await localFenceAfterRead(lease);
   }
 
+  /** The stage A's rule plans for this confirmed reply, on the facts read now (the receipt queues it with the same rule and the same send time); null when none. */
+  async function plannedReplyStage(proposal: CaseEffectPayload["proposal"], reply: Effect): Promise<CaseReplySummaryStage> {
+    const ack = ackOf(reply), dispatched = reply.dispatchedAt;
+    if (!dispatched) return null;
+    const verified = typeof ack?.sentAt === "string" ? new Date(ack.sentAt) : null;
+    const sentAt = verified && Number.isFinite(verified.getTime()) && verified.getTime() >= dispatched.getTime() - 60_000 && verified.getTime() <= dispatched.getTime() + 600_000 ? verified : dispatched;
+    return requireDb().transaction(async tx => {
+      const snapshot = await readCase(proposal.caseId, tx as unknown as CaseTx);
+      if (!snapshot) return null;
+      const planned = await planCaseTicketStageNow(tx, { snapshot, env: deps.env,
+        trigger: { kind: "reply_confirmed", replyKey: caseReplyKey(proposal.caseId, proposal.triggerEventId), sentAt: sentAt.toISOString() } });
+      return planned?.plan ? planned.intent.target : null;
+    });
+  }
+
   const driver: PassDriver = {
     async claim(executionId) {
       return requireDb().transaction(async (tx): Promise<{ lease: ExecutionLease } | { blocked: "occupied" }> => {
@@ -333,7 +349,7 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
       });
     },
     async adopt() { /* a case effect is never re-planned against a newer run */ },
-    async nextIntent(lease, effects) {
+    async nextIntent(lease, effects, options) {
       const payload = payloads.get(lease)!;
       const { proposal, context, note } = payload;
       const reply = effects.find(effect => effect.businessKey === caseReplyKey(proposal.caseId, proposal.triggerEventId));
@@ -358,9 +374,17 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
       if (!created || created.state !== "confirmed") {
         phases.set(lease, "note_create");
         if (created) return effectIntent(created);
+        // SAV-92 (16/11): the reply's summary note is planned only when the signed policy grants `append_case_note` (as the handoff note): without it the
+        // execution ends as before, with no note. Its ticket sentence names only the stage A's rule plans for THIS reply, on the facts read now.
+        const summary = isCaseReplySummary(note.interactionId);
+        if (summary) {
+          const { policy } = await readIntakeExecutionAuthority(options.config);
+          if (!policy.mutations.includes(SAV_CASE_EFFECT_PERMISSIONS.note)) return null;
+        }
         const [row] = await requireDb().select({ ticketId: savCases.ticketId }).from(savCases).where(eq(savCases.id, proposal.caseId));
         if (!row) return fault("CASE_MISSING");
-        return buildCaseNoteIntent({ caseId: proposal.caseId, interactionId: note.interactionId, ticketId: row.ticketId, sourceMessageId: proposal.inboundMessageId, text: note.text, at: note.at });
+        const text = summary ? caseReplySummaryWithStage(note.text, await plannedReplyStage(proposal, reply)) : note.text;
+        return buildCaseNoteIntent({ caseId: proposal.caseId, interactionId: note.interactionId, ticketId: row.ticketId, sourceMessageId: proposal.inboundMessageId, text, at: note.at });
       }
       if (associated?.state === "confirmed") return null;
       phases.set(lease, "note_associate");

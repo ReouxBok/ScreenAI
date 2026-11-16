@@ -926,3 +926,79 @@ describe("one executor, no transport of its own", () => {
     }
   });
 });
+
+// SAV-92 (decision of Ugo, 16/11): after each CONFIRMED reply, ONE short summary note on the ticket, deterministic, never the reply's text.
+describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_note)", () => {
+  const noteOn = () => { environment = { ...environment, SAV_V2_REPLY_NOTE: "on" }; };
+  const stagesOn = () => { environment = { ...environment, SAV_V2_TICKET_STAGES: "on", SAV_V2_STAGE_WAITING_CUSTOMER: "2", SAV_V2_STAGE_CLOSED: "4" }; };
+  const notesOf = async (id: string) => (await effectsOf(id)).filter(effect => effect.kind === "note_create")
+    .map(effect => ({ state: effect.state, key: effect.businessKey, ...decryptSavPayload<{ text: string; properties: { hs_note_body: string } }>(effect.intentCiphertext) }));
+  const ACCESS_ANSWER = "Le client signale un problème d'accès. J'ai répondu avec la procédure de connexion.";
+
+  it("Accès, stages off: the exact two sentences, never the reply's text; ONE note per reply key, replays and later passes add nothing", async () => {
+    noteOn();
+    const s = await scenario("answer"), { id, validationId } = await admit(s);
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
+    const notes = await notesOf(id);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatchObject({ state: "confirmed", key: `note:${s.caseId}:reply-summary.inbound:${s.gmailMessageId}`, text: ACCESS_ANSWER });
+    // The HubSpot body is the existing rendering (HTML-escaped, with its marker): the same sentences, nothing else of the case.
+    expect(notes[0]!.properties.hs_note_body).toContain(ACCESS_ANSWER.replaceAll("'", "&#39;"));
+    expect(notes[0]!.properties.hs_note_body).not.toMatch(/SYNTHETIC|Signature|inbound:|gm-/i);
+    expect((await effectsOf(id)).filter(effect => effect.kind === "note_associate")).toMatchObject([{ state: "confirmed" }]);
+    // Replays: the same validation queued again is the same execution; more passes write nothing.
+    expect(await queueValidatedCaseReply({ validationId, policy: policyArg(), deps: storeDeps() })).toEqual({ ok: true, executionId: id, created: false });
+    for (let n = 0; n < 2; n++) expect(await pass()).toMatchObject({ supervised: [] });
+    expect(await notesOf(id)).toHaveLength(1);
+    expect(sends).toBe(1);
+  });
+
+  it("stages on: the ticket sentence names only the stage really planned for this reply (waiting for the customer)", async () => {
+    noteOn(); stagesOn();
+    const s = await scenario("answer"), { id } = await admit(s);
+    await pass();
+    expect((await notesOf(id))[0]!.text).toBe(`${ACCESS_ANSWER} Ticket passé en attente du client.`);
+    const rows = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, s.caseId));
+    expect(rows.some(row => row.replyKey.startsWith("case-stage:") && row.replyKey.includes(":waiting_customer:"))).toBe(true);
+  });
+
+  it("a question: « J'ai demandé au client les informations manquantes. »", async () => {
+    noteOn();
+    const s = await scenario("question"), { id } = await admit(s);
+    await pass();
+    expect((await notesOf(id))[0]!.text).toBe("Le client signale un problème d'accès. J'ai demandé au client les informations manquantes.");
+  });
+
+  it("no confirmed reply, no note: a person owns the ticket before the send", async () => {
+    noteOn();
+    const s = await scenario("answer"), { id } = await admit(s);
+    await pass({ readTicketOwner: async () => "human" as const });
+    expect(sends).toBe(0);
+    expect(await notesOf(id)).toEqual([]);
+    expect(await pass()).toMatchObject({ supervised: [] });
+    expect(await notesOf(id)).toEqual([]);
+  });
+
+  it("a pause between the confirmed reply and its note: no note while paused; once lifted, ONE note", async () => {
+    noteOn();
+    const s = await scenario("answer"), id = await lostAck(s);
+    await letReconcile();
+    expect((await pass()).recovery).toMatchObject([{ executionId: id, state: "waiting", reason: "SAV_CASE_EFFECT_RECOVERY_NOTE_PENDING" }]);
+    await setPause("v2", "fully_paused");
+    await pass(); await pass();
+    expect(await notesOf(id)).toEqual([]);
+    await setPause("v2", null);
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
+    expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: ACCESS_ANSWER }]);
+    await pass();
+    expect(await notesOf(id)).toHaveLength(1);
+    expect(sends).toBe(1);
+  });
+
+  it("switch off: no note is sealed, the execution is exactly as before", async () => {
+    const s = await scenario("answer"), { id } = await admit(s);
+    await pass();
+    expect(await notesOf(id)).toEqual([]);
+    expect(await effectsOf(id)).toMatchObject([{ state: "confirmed" }]);
+  });
+});

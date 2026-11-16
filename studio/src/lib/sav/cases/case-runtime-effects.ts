@@ -20,12 +20,15 @@ import { HANDOFF_NOTICE_KEY_PREFIX } from "./case-handoff-notice";
 import { TICKET_STAGE_KEY_PREFIX } from "./case-ticket-stage";
 import { createCaseEffectDriver, ownerBeforeClaim, type CaseEffectDriverDeps } from "./case-effect-driver";
 import { caseEffectSchemaInstalled, recoverCaseEffects, type CaseEffectRecoveryResult } from "./case-effect-recovery";
-import { caseReplyPayloadHash, readCaseEffectsMode, type CaseReplyProposal } from "./case-effects";
+import { caseReplyPayloadHash, readCaseEffectsMode, SAV_CASE_EFFECT_PERMISSIONS, type CaseReplyProposal } from "./case-effects";
 import { CASE_VERIFICATION_READ_LIMIT, classifyEffectVerification } from "./case-effect-verification";
 import { finalizeCaseReplyProposal, prepareCaseReplyText, readCaseReplyDisclosure, type CaseReplyLanguage } from "./case-reply-outbound";
 import { getCaseReplyEffect, type CaseReplyView } from "./case-reply-registry";
 import { enqueueApprovedCaseReply, submitCaseReplyProposal, type CaseEffectNote, type CaseReplyStoreDeps, type EnqueueCaseReplyResult } from "./case-reply-store";
 import { savCaseReplyValidations } from "./case-reply-validation-table";
+import { caseReplySummaryInteractionId, caseReplySummaryText } from "./case-reply-summary-note";
+import { readCase } from "./case-store";
+import { decryptSavPayload } from "../crypto";
 import type { CaseDecisionReplyDraft } from "./investigation-intent";
 
 export const CASE_RUNTIME_EFFECTS_CONTRACT = "sav-v2-runtime-effects.v1";
@@ -132,10 +135,40 @@ export async function queueValidatedCaseReply(input: Readonly<{
   validationId: string; policy: Readonly<{ id: string; hash: string }>; note?: CaseEffectNote; deps: CaseReplyStoreDeps;
 }>): Promise<QueueValidatedCaseReplyResult> {
   const t = savCaseReplyValidations;
-  const [row] = await requireDb().select({ state: t.state, decidedBy: t.decidedBy, decidedAt: t.decidedAt, basis: t.authorizationBasis }).from(t).where(eq(t.id, input.validationId));
+  const [row] = await requireDb().select({ state: t.state, decidedBy: t.decidedBy, decidedAt: t.decidedAt, basis: t.authorizationBasis, caseId: t.caseId, proposal: t.proposalCiphertext })
+    .from(t).where(eq(t.id, input.validationId));
   if (!row) return { ok: false, code: "unknown" };
   if (row.state !== "approved" || !row.decidedBy || !row.decidedAt || !row.basis?.trim()) return { ok: false, code: "not_validated", detail: row.state };
-  return enqueueApprovedCaseReply({ validationId: input.validationId, policy: input.policy, ...(input.note ? { note: input.note } : {}), deps: input.deps });
+  if (input.note) return enqueueApprovedCaseReply({ validationId: input.validationId, policy: input.policy, note: input.note, deps: input.deps });
+  // SAV-92 (16/11): a queued reply carries its short summary note, written only after the reply is CONFIRMED (the driver plans it after the receipt),
+  // and sealed only when `SAV_V2_REPLY_NOTE=on` AND the signed policy this execution is queued under grants `append_case_note`. Otherwise nothing changes.
+  const note = await summaryNoteGranted(input.policy, input.deps) ? await caseReplySummaryNote(row.caseId, decryptSavPayload<CaseReplyProposal>(row.proposal), row.decidedAt) : null;
+  return enqueueApprovedCaseReply({ validationId: input.validationId, policy: input.policy, ...(note ? { note, derivedNote: true } : {}), deps: input.deps });
+}
+
+/** The reply's summary note switch (OFF unless exactly `on`). */
+export const caseReplyNoteEnabled = (env: Readonly<Record<string, string | undefined>>) => env.SAV_V2_REPLY_NOTE === "on";
+
+async function summaryNoteGranted(policy: Readonly<{ id: string; hash: string }>, deps: CaseReplyStoreDeps) {
+  if (!caseReplyNoteEnabled(deps.env())) return false;
+  try {
+    const config = intakeExecutionConfig(deps.env());
+    if (!config || config.policyId !== policy.id || config.policyHash !== policy.hash) return false;
+    return (await readIntakeExecutionAuthority(config)).policy.mutations.includes(SAV_CASE_EFFECT_PERMISSIONS.note);
+  } catch { return false; }
+}
+
+/** The reply's summary note as sealed at queue time: families of the case's requests (the open ones, else all) and the reply's purpose. Null when unbuildable. */
+async function caseReplySummaryNote(caseId: string, proposal: CaseReplyProposal, decidedAt: Date): Promise<CaseEffectNote | null> {
+  const interactionId = caseReplySummaryInteractionId(proposal.triggerEventId);
+  if (!/^[A-Za-z0-9._@<>=+:-]{1,200}$/.test(interactionId)) return null;
+  const snapshot = await readCase(caseId);
+  if (!snapshot) return null;
+  const open = snapshot.body.openRequests.filter(request => request.status === "open");
+  // The case's understood requests first (open ones, else all), else the families its admission qualified; an unknown family gets the generic label.
+  const families = open.length || snapshot.body.openRequests.length ? (open.length ? open : snapshot.body.openRequests).map(request => request.family)
+    : (snapshot.admission?.qualification.requests ?? []).map(request => request.family);
+  return { interactionId, text: caseReplySummaryText({ families, purpose: proposal.purpose }), at: decidedAt.toISOString() };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------

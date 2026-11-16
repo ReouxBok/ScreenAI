@@ -34,6 +34,22 @@ export async function lastCustomerInboundAt(tx: ExecutionTx, caseId: string): Pr
   return row?.at ? new Date(row.at).toISOString() : null;
 }
 
+/** A's rule on the facts read in the caller's transaction, exactly as the queue applies it (also read by the reply's summary note, SAV-92 16/11, so the
+ * note names only a stage this very rule plans). Null: the key could not be built. Writes nothing. */
+export async function planCaseTicketStageNow(tx: ExecutionTx, input: Readonly<{ snapshot: StageCase; trigger: CaseTicketStageTrigger; env: () => Record<string, string | undefined> }>) {
+  const { snapshot } = input;
+  // Read outside the catch, as before: an unreadable configuration fails the caller's transaction, it is never taken for « no stage ».
+  const config = readCaseTicketStageConfig(input.env());
+  try {
+    return planCaseTicketStage({
+      config, caseId: snapshot.caseId, ticketId: snapshot.ticketId,
+      case: { owner: snapshot.owner, phase: snapshot.phase, sensitivity: snapshot.sensitivity, cycle: snapshot.body.cycle,
+        ...(await caseTeamPartPending(tx, snapshot) ? { teamPartPending: true } : {}) },
+      trigger: input.trigger, lastCustomerInboundAt: await lastCustomerInboundAt(tx, snapshot.caseId),
+    });
+  } catch { return null; }
+}
+
 /**
  * Plans with A's rule, then queues. Inside the caller's transaction, the case already locked by the caller. Idempotent: the unique key makes a second call, a concurrent call or
  * a replay the same execution; a cancelled execution stays cancelled (its key is never reused). Never throws for a rule that says no: the reason is returned.
@@ -41,16 +57,9 @@ export async function lastCustomerInboundAt(tx: ExecutionTx, caseId: string): Pr
 export async function enqueueCaseTicketStage(tx: ExecutionTx, input: Readonly<{
   snapshot: StageCase; trigger: CaseTicketStageTrigger; policy: Readonly<{ id: string; hash: string }>; env: () => Record<string, string | undefined>; threadId?: string;
 }>): Promise<EnqueueTicketStageResult> {
-  const config = readCaseTicketStageConfig(input.env());
   const { snapshot } = input;
-  let planned: ReturnType<typeof planCaseTicketStage>;
-  try {
-    planned = planCaseTicketStage({
-      config, caseId: snapshot.caseId, ticketId: snapshot.ticketId, case: { owner: snapshot.owner, phase: snapshot.phase, sensitivity: snapshot.sensitivity, cycle: snapshot.body.cycle,
-        ...(await caseTeamPartPending(tx, snapshot) ? { teamPartPending: true } : {}) },
-      trigger: input.trigger, lastCustomerInboundAt: await lastCustomerInboundAt(tx, snapshot.caseId),
-    });
-  } catch { return { ok: false, reason: "key_invalid" }; }
+  const planned = await planCaseTicketStageNow(tx, input);
+  if (!planned) return { ok: false, reason: "key_invalid" };
   if (!planned.plan) return { ok: false, reason: planned.reason };
   const threadId = input.threadId ?? snapshot.threadIds.at(-1);
   if (!threadId) return { ok: false, reason: "no_thread" };
