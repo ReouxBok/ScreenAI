@@ -498,7 +498,42 @@ function isFollowedPageUrl(tabId, url) {
   return isLimovaUrl(url) || (tabId === sessionState.lockedTabId && isAssistedUrl(url));
 }
 
+// Tabs opened by another tab. A link with target="_blank" (an Instagram post,
+// a search result) opens one and Charly follows it: that click succeeded and
+// must not be reported as a cancelled or unverified action.
+const openedChildTabs = new Map();
+const OPENED_CHILD_TAB_MAX_AGE_MS = 60_000;
+
+function recordOpenedChildTab(tab) {
+  if (!tab?.id || !Number.isInteger(tab.openerTabId)) return;
+  const now = Date.now();
+  for (const [tabId, entry] of openedChildTabs) {
+    if (now - entry.openedAt > OPENED_CHILD_TAB_MAX_AGE_MS) openedChildTabs.delete(tabId);
+  }
+  openedChildTabs.set(tab.id, { openerTabId: tab.openerTabId, openedAt: now });
+}
+
+function childTabOpenedSince(openerTabId, since) {
+  let latest = null;
+  for (const [tabId, entry] of openedChildTabs) {
+    if (entry.openerTabId === openerTabId && entry.openedAt >= since && (!latest || entry.openedAt > latest.openedAt)) {
+      latest = { tabId, openedAt: entry.openedAt };
+    }
+  }
+  return latest?.tabId ?? null;
+}
+
+// The operation is only stale because Charly followed the tab the click
+// opened; the session itself is unchanged.
+function followedTabOpenedByClick(operation, since) {
+  if (operation.generation !== sessionGeneration || operation.signal?.aborted) return null;
+  if (operation.voiceGeneration !== undefined && operation.voiceGeneration !== voiceSessionGeneration) return null;
+  const openedTabId = childTabOpenedSince(operation.tabId, since);
+  return openedTabId && openedTabId === sessionState.lockedTabId ? openedTabId : null;
+}
+
 chrome.tabs.onCreated.addListener((tab) => {
+  recordOpenedChildTab(tab);
   trackExternalPopup(tab).catch(error => Logger.warn('popup', 'External popup tracking failed', error));
 });
 
@@ -4855,7 +4890,20 @@ function classifyActionRisk(element, { explicitRequest = false, userMessage = ''
     && clickableControl
     && consequential
     && element?.actionKind !== 'message_send';
+  // Charly works on any site, so a plain link to another domain (a search
+  // result, the Instagram post Limova just published) is ordinary navigation.
+  // It still needs an explicit request matching this link, and never covers
+  // forms, submit buttons, message sending or consequential labels.
+  const explicitExternalNavigation = explicitRequest
+    && element?.type === 'clickable'
+    && element.external === true
+    && !element.inForm
+    && !element.disabled
+    && element.buttonType !== 'submit'
+    && element.actionKind !== 'message_send'
+    && !consequential;
   if (lowRiskNavigation) return { level: 'low', label, reason: 'internal_navigation' };
+  if (explicitExternalNavigation) return { level: 'low', label, reason: 'explicit_external_navigation' };
   if (preparatoryConnection) return { level: 'low', label, reason: 'connection_setup' };
   if (explicitMessageSend) return { level: 'low', label, reason: 'explicit_message_send' };
   if (explicitSafeControl) return { level: 'low', label, reason: 'explicit_visible_control' };
@@ -5093,6 +5141,39 @@ async function executeElementAction(action) {
     return payload;
     }
   }
+  // The click opened a new tab and Charly moved there: report the click as
+  // executed instead of a cancelled command. The followed tab is analysed by
+  // the usual tab-change flow.
+  const reportClickOpenedFollowedTab = () => {
+    const openedTabId = followedTabOpenedByClick(operation, actionStartedAt);
+    if (!openedTabId) return cancelledOperation();
+    const payload = {
+      type: 'ACTION_RESULT',
+      ok: true,
+      label: activeAction.label,
+      effectObserved: true,
+      effectEvidence: { newTabOpened: true, followed: true }
+    };
+    broadcastToSidebar(payload);
+    analytics.track('action_executed', {
+      result: 'executed',
+      interaction_mode: result?.interactionMode || '',
+      risk: activeAction.risk || ''
+    });
+    Logger.event('action', 'ACTION_EXECUTED', {
+      elementId: activeAction.elementId,
+      requestedElementId: action.elementId,
+      ok: true,
+      effectObserved: true,
+      effectEvidence: payload.effectEvidence,
+      verificationRequired: false,
+      interactionMode: result?.interactionMode || null,
+      userTurnId: activeAction.userTurnId || null,
+      contextVersion: activeAction.contextVersion,
+      ...safeElementDiagnostic(activeAction.targetDescriptor)
+    }, activeAction.operationId);
+    return payload;
+  };
   let contextBeforeClick = lastPageContext;
   let tabBeforeClick = await chrome.tabs.get(operation.tabId).catch(() => null);
   if (!isCurrentOperation(operation)) return cancelledOperation();
@@ -5106,7 +5187,7 @@ async function executeElementAction(action) {
   } catch (_) {
     result = { ok: false, error: 'La page Limova ne répond plus.' };
   }
-  if (!isCurrentOperation(operation)) return cancelledOperation();
+  if (!isCurrentOperation(operation)) return result?.ok === true ? reportClickOpenedFollowedTab() : cancelledOperation();
   if (result?.ok !== true) {
     const recovery = await refreshAndRetryElementCommand({
       requestedId: activeAction.elementId,
@@ -5142,7 +5223,7 @@ async function executeElementAction(action) {
     // settle. The former 350 ms window incorrectly marked valid Limova clicks
     // as failed on components that update after a debounce.
     await new Promise(resolve => setTimeout(resolve, 700));
-    if (!isCurrentOperation(operation)) return cancelledOperation();
+    if (!isCurrentOperation(operation)) return reportClickOpenedFollowedTab();
     const [refreshedContext, technical] = await Promise.all([
       getPageContext(operation.tabId, operation).catch(() => ''),
       getPageTechnicalDiagnostics(operation.tabId, actionStartedAt)
@@ -5161,13 +5242,17 @@ async function executeElementAction(action) {
       const routeChanged = privacySafeUrl(tabBeforeClick?.url || '') !== privacySafeUrl(tabAfterClick?.url || '');
       const domChanged = Boolean(refreshedContext) && comparable(contextBeforeClick) !== comparable(refreshedContext);
       const popupObserved = Boolean(externalPopupFlow || externalPopupTabs.size);
+      // A link with target="_blank" leaves the clicked page unchanged while
+      // Charly is not following the new tab (for example sidebar closed).
+      const newTabOpened = Boolean(childTabOpenedSince(operation.tabId, actionStartedAt));
       const networkObserved = technical.network.length > 0;
       const networkFailed = technical.network.some(entry => entry.status === 0 || entry.status >= 400);
-      payload.effectObserved = routeChanged || domChanged || popupObserved || networkObserved;
+      payload.effectObserved = routeChanged || domChanged || popupObserved || newTabOpened || networkObserved;
       payload.effectEvidence = {
         routeChanged,
         domChanged,
         popupObserved,
+        newTabOpened,
         networkObserved,
         networkFailed,
         consoleErrorCount: technical.console.filter(entry => entry.level === 'error').length
@@ -5177,7 +5262,7 @@ async function executeElementAction(action) {
         payload.verificationRequired = true;
         payload.error = 'Le clic a été déclenché, mais aucun effet visible n’a encore été confirmé. Charly doit relire la page avant de continuer.';
         payload.visualCapture = await capturePageAnalysis(operation.tabId, activeAction.operationId);
-      } else if (networkFailed && !routeChanged && !domChanged && !popupObserved) {
+      } else if (networkFailed && !routeChanged && !domChanged && !popupObserved && !newTabOpened) {
         payload.status = 'unexpected';
         payload.verificationRequired = true;
         payload.error = 'Le clic a déclenché une requête en erreur. Charly doit vérifier l’état affiché avant de continuer.';

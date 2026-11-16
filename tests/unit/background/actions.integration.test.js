@@ -146,6 +146,71 @@ describe('controlled page actions', () => {
     }
   });
 
+  async function showOnlyExternalLink() {
+    document.body.innerHTML = '<a href="https://www.instagram.com/p/abc" target="_blank">Voir la publication Instagram</a>';
+    await background.getPageContext(17);
+    background.lockTab(17);
+    chromeMock.tabs.sendMessage.mockClear();
+    sidebarMessages.length = 0;
+  }
+
+  it('opens a link to another site when the user explicitly asks for it', async () => {
+    await showOnlyExternalLink();
+    const result = await background.proposeOrExecuteAction(1, 'Ouvre la publication Instagram');
+    expect(result.ok).toBe(true);
+    expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(17, expect.objectContaining({
+      type: 'EXECUTE_ELEMENT_ACTION', id: 1
+    }));
+  });
+
+  it('keeps a link to another site blocked when the user did not ask for it', async () => {
+    await showOnlyExternalLink();
+    const result = await background.proposeOrExecuteAction(1, 'Que contient cette page ?');
+    expect(result).toMatchObject({ ok: false, status: 'blocked' });
+    expect(chromeMock.tabs.sendMessage).not.toHaveBeenCalledWith(17, expect.objectContaining({
+      type: 'EXECUTE_ELEMENT_ACTION'
+    }));
+  });
+
+  it.each([
+    ['while the click is dispatched', 0],
+    ['while the click effect settles', 100]
+  ])('reports a link that opened a followed new tab as executed (%s)', async (_label, followDelayMs) => {
+    await showOnlyExternalLink();
+    chromeMock.tabs.sendMessage.mockImplementation(async (_tabId, message) => {
+      if (message.type !== 'EXECUTE_ELEMENT_ACTION') return { ok: true };
+      const follow = () => {
+        chromeMock._listeners.tabs.onCreated.forEach(listener => listener({ id: 18, openerTabId: 17, windowId: 1 }));
+        background.lockTab(18);
+      };
+      if (followDelayMs) setTimeout(follow, followDelayMs);
+      else follow();
+      return { ok: true, clickDispatched: true };
+    });
+    try {
+      const result = await background.proposeOrExecuteAction(1, 'Ouvre la publication Instagram');
+      expect(result).toMatchObject({ ok: true, effectObserved: true, effectEvidence: { newTabOpened: true } });
+      expect(result.cancelled).toBeUndefined();
+      expect(sidebarMessages).toContainEqual(expect.objectContaining({ type: 'ACTION_RESULT', ok: true }));
+    } finally {
+      background.lockTab(17);
+    }
+  });
+
+  it('still cancels a click when Charly moves to a tab the click did not open', async () => {
+    await showOnlyExternalLink();
+    chromeMock.tabs.sendMessage.mockImplementation(async (_tabId, message) => {
+      if (message.type === 'EXECUTE_ELEMENT_ACTION') background.lockTab(19);
+      return { ok: true, clickDispatched: true };
+    });
+    try {
+      const result = await background.proposeOrExecuteAction(1, 'Ouvre la publication Instagram');
+      expect(result).toMatchObject({ ok: false, cancelled: true });
+    } finally {
+      background.lockTab(17);
+    }
+  });
+
   it('executes a safe action marker without showing a confirmation card', async () => {
     const result = await background.proposeOrExecuteAction(1, 'Que contient cette page ?');
     expect(result.ok).toBe(true);

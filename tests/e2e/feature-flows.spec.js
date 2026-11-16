@@ -925,6 +925,39 @@ test.describe('Packaged extension — complete user flows', () => {
     await expect(sidebar.locator('.message.system .message-content').last()).toContainText('Ouvrir mon profil');
   });
 
+  for (const opensNewTab of [false, true]) {
+    test(`an explicitly requested link to another site opens it${opensNewTab ? ' in a new tab' : ''} without a sensitive-action error`, async ({ context, extensionId }) => {
+      await context.route('https://outside.example/**', route => route.fulfill({
+        status: 200,
+        contentType: 'text/html',
+        body: '<!doctype html><title>Publication</title><h1>Publication Instagram</h1>'
+      }));
+      const { limova, sidebar } = await openExtensionHarness(context, extensionId, {
+        geminiReply: ({ body }) => {
+          const prompt = body.systemInstruction.parts[0].text;
+          const linkId = prompt.match(/\[(\d+)\] clickable\(a\) "Voir la publication Instagram"/)?.[1];
+          return `J’ouvre la publication. {{ACTION:${linkId}}}`;
+        }
+      });
+      await limova.evaluate(newTab => {
+        const link = document.createElement('a');
+        link.href = 'https://outside.example/p/abc';
+        link.textContent = 'Voir la publication Instagram';
+        if (newTab) link.target = '_blank';
+        document.querySelector('main').prepend(link);
+      }, opensNewTab);
+      await grantAIConsent(sidebar);
+      const newPage = opensNewTab ? context.waitForEvent('page') : null;
+      await sidebar.locator('#userInput').fill('Ouvre la publication Instagram');
+      await sidebar.locator('#sendBtn').click();
+
+      const opened = opensNewTab ? await newPage : limova;
+      await expect(opened).toHaveURL('https://outside.example/p/abc');
+      await expect(sidebar.locator('.message.system .message-content').last()).toContainText('Voir la publication Instagram');
+      await expect(sidebar.locator('.message.error')).toHaveCount(0);
+    });
+  }
+
   test('assistant markdown cannot inject executable HTML or unsafe links', async ({ context, extensionId }) => {
     const malicious = '<img src=x onerror="document.body.dataset.xss=\'yes\'"> [Piège](javascript:alert(1)) **Texte sûr**';
     const { sidebar } = await openExtensionHarness(context, extensionId, { geminiReply: malicious });

@@ -256,6 +256,27 @@ describe('background privacy boundaries', () => {
     })).toMatchObject({ level: 'low', reason: 'visible_control' });
   });
 
+  it('opens a plain link to another site only when the user explicitly asks for it', () => {
+    const instagramPost = { type: 'clickable', text: 'https://www.instagram.com/p/abc', external: true, inForm: false };
+    const searchResult = { type: 'clickable', text: 'Limova — Assistants IA pour les entreprises', external: true, inForm: false };
+    for (const element of [instagramPost, searchResult]) {
+      expect(background.classifyActionRisk(element)).toMatchObject({ level: 'sensitive', reason: 'external_action' });
+      expect(background.classifyActionRisk(element, { explicitRequest: true }))
+        .toMatchObject({ level: 'low', reason: 'explicit_external_navigation' });
+    }
+    for (const element of [
+      { type: 'clickable', text: 'Continuer vers le paiement', external: true, inForm: true },
+      { type: 'clickable', text: 'Valider', external: true, buttonType: 'submit' },
+      { type: 'clickable', text: 'Payer maintenant', external: true, inForm: false },
+      { type: 'clickable', text: 'Autoriser l’accès', external: true, inForm: false },
+      { type: 'clickable', text: 'Supprimer le compte', external: true, inForm: false },
+      { type: 'clickable', text: 'Voir la page', external: true, inForm: false, disabled: true },
+      { type: 'clickable', text: 'Envoyer le message', external: true, inForm: false, actionKind: 'message_send' }
+    ]) {
+      expect(background.classifyActionRisk(element, { explicitRequest: true }).level).toBe('sensitive');
+    }
+  });
+
   it('allows only the preparatory connection step outside forms', () => {
     for (const text of ['Connecter Google Drive', 'Reconnecter HubSpot', 'Configurer cette intégration']) {
       expect(background.classifyActionRisk({
