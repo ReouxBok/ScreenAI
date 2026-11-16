@@ -1,3 +1,4 @@
+import { selectCaseKnowledgePassages } from "./cases/investigation-prompt-compact";
 import "server-only";
 import { sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -33,9 +34,22 @@ const validVectors = (queries: readonly string[], vectors: readonly (readonly nu
  * vector + lexical search given query vectors obtained elsewhere. Same SQL, filters, language, revision and limits as
  * the V1 backend below, which is now a wrapper over it. V2 passes vectors it paid through its own budget gate.
  */
-export function createSavKnowledgeVectorIndex(options: { locale?: string; audience?: "support" | "lead"; now?: Date } = {}) {
+export function createSavKnowledgeVectorIndex(options: { locale?: string; audience?: "support" | "lead"; now?: Date; compact?: boolean } = {}) {
   const locale = options.locale ?? "fr-FR", audience = options.audience ?? "support", now = options.now ?? new Date();
   const db = requireDb();
+  // V2 opt-in only. V1 retains the exact legacy SQL and mapping. Oversized raw
+  // sources remain refused above this local read envelope; never cut mid-passage.
+  const contentSql = options.compact
+    ? sql`CASE WHEN octet_length(version.body_markdown) <= 512000 THEN version.body_markdown ELSE '' END`
+    : sql`CASE WHEN octet_length(version.body_markdown) <= ${SAV_RETRIEVAL_LIMITS.sourceBytes} THEN version.body_markdown ELSE '' END`;
+  const project = (card: SavRetrievalCandidate, query: string): SavRetrievalCandidate => {
+    if (!options.compact || !card.content || !card.resolution) return card;
+    const excerpt = selectCaseKnowledgePassages(card.content, card.resolution, query, Math.max(0, 10_000 - new TextEncoder().encode(JSON.stringify(card.resolution)).length));
+    // A complete source read within the SQL envelope is still usable when it
+    // cannot fit the passage budget. Preserve it for the request-level preflight;
+    // sourceTooLarge describes the source read, never the prompt envelope.
+    return { ...card, content: excerpt ?? card.content, sourceTooLarge: false };
+  };
   return {
     dimension: SAV_RETRIEVAL_EMBEDDING_DIMENSION,
     async readRevision() {
@@ -64,7 +78,7 @@ export function createSavKnowledgeVectorIndex(options: { locale?: string; audien
         const response = await db.execute(sql`
           WITH scored AS (
             SELECT item.id, version.id AS "contentVersionId", activation.title AS title, item.slug AS source,
-              CASE WHEN octet_length(version.body_markdown) <= ${SAV_RETRIEVAL_LIMITS.sourceBytes} THEN version.body_markdown ELSE '' END AS content,
+              ${contentSql} AS content,
               ${verification} AS "verifiedAt", item.locale,
               CASE WHEN octet_length(${resolution}::text) <= ${SAV_RETRIEVAL_LIMITS.sourceBytes} THEN ${resolution} ELSE NULL END AS resolution,
               (octet_length(version.body_markdown) > ${SAV_RETRIEVAL_LIMITS.sourceBytes} OR octet_length(COALESCE(${resolution}::text, '')) > ${SAV_RETRIEVAL_LIMITS.sourceBytes}) AS "sourceTooLarge",
@@ -95,14 +109,14 @@ export function createSavKnowledgeVectorIndex(options: { locale?: string; audien
           )
           SELECT * FROM semantic UNION SELECT * FROM lexical LIMIT ${limit}
         `);
-        return rowsOf(response).map((row): SavRetrievalCandidate => ({
+        return rowsOf(response).map((row): SavRetrievalCandidate => project({
           id: String(row.id), contentVersionId: String(row.contentVersionId), title: String(row.title), source: String(row.source), content: String(row.content),
           verifiedAt: row.verifiedAt ? new Date(String(row.verifiedAt)).toISOString() : null,
           semanticScore: row.semanticScore !== null && row.semanticScore !== undefined && Number.isFinite(Number(row.semanticScore)) ? Number(row.semanticScore) : null,
           resolution: row.resolution && typeof row.resolution === "object" ? row.resolution as SavRetrievalCandidate["resolution"] : null,
           sourceTooLarge: row.sourceTooLarge === true,
           availability: { active: true, published: true, indexed: true, archived: false, aiEnabled: true, locale: String(row.locale), audience: String(row.audience) },
-        }));
+        }, queries.join(" ")));
       }));
     },
     /**
@@ -117,7 +131,7 @@ export function createSavKnowledgeVectorIndex(options: { locale?: string; audien
       const pairs = sql.join(wanted.map(ref => sql`(${ref.knowledgeId}::uuid, ${ref.contentVersionId}::uuid)`), sql`, `);
       const response = await db.execute(sql`
         SELECT item.id, version.id AS "contentVersionId", activation.title AS title, item.slug AS source,
-          CASE WHEN octet_length(version.body_markdown) <= ${SAV_RETRIEVAL_LIMITS.sourceBytes} THEN version.body_markdown ELSE '' END AS content,
+          ${contentSql} AS content,
           ${VERIFICATION} AS "verifiedAt", item.locale,
           CASE WHEN octet_length(${RESOLUTION}::text) <= ${SAV_RETRIEVAL_LIMITS.sourceBytes} THEN ${RESOLUTION} ELSE NULL END AS resolution,
           (octet_length(version.body_markdown) > ${SAV_RETRIEVAL_LIMITS.sourceBytes} OR octet_length(COALESCE(${RESOLUTION}::text, '')) > ${SAV_RETRIEVAL_LIMITS.sourceBytes}) AS "sourceTooLarge",
@@ -139,13 +153,13 @@ export function createSavKnowledgeVectorIndex(options: { locale?: string; audien
           AND ${VERIFICATION} <= ${now.toISOString()}::timestamptz
           AND item.verified_at <= ${now.toISOString()}::timestamptz
       `);
-      return rowsOf(response).map((row): SavRetrievalCandidate => ({
+      return rowsOf(response).map((row): SavRetrievalCandidate => project({
         id: String(row.id), contentVersionId: String(row.contentVersionId), title: String(row.title), source: String(row.source), content: String(row.content),
         verifiedAt: row.verifiedAt ? new Date(String(row.verifiedAt)).toISOString() : null, semanticScore: null,
         resolution: row.resolution && typeof row.resolution === "object" ? row.resolution as SavRetrievalCandidate["resolution"] : null,
         sourceTooLarge: row.sourceTooLarge === true,
         availability: { active: true, published: true, indexed: true, archived: false, aiEnabled: true, locale: String(row.locale), audience: String(row.audience) },
-      }));
+      }, String(row.title)));
     },
   };
 }

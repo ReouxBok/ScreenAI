@@ -30,3 +30,15 @@ export function compactCaseKnowledgeContent(content: string, resolution: unknown
     return kept.some(paragraph => paragraph.trim()) ? match[1] + kept.join("\n\n") : "";
   }).join("");
 }
+
+/**
+ * Without authored dependency metadata, any prose can qualify the procedure,
+ * including a Description paragraph. Treat the deduplicated card as one passage:
+ * a heading or query score cannot prove that omitted prose is dispensable.
+ * Refuse selection when it does not fit; callers retain the complete card for
+ * the existing request-level preflight rather than sending a partial procedure.
+ */
+export function selectCaseKnowledgePassages(content: string, resolution: unknown, _query: string, maxBytes: number): string | null {
+  const compact = compactCaseKnowledgeContent(content, resolution);
+  return compact.trim() && new TextEncoder().encode(compact).length <= maxBytes ? compact : null;
+}
