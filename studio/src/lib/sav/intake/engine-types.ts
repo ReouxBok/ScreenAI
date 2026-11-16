@@ -89,6 +89,8 @@ export type EnginePolicy = {
   manualSupportOverride?: PrivateResource;
   /** Set by the stored-message automation gate, never read from model output. */
   automatedReply?: { messageId: string; sourceHash: string; signals: string[] };
+  /** SAV-92: set only by the runtime noise filter in "on" mode, never from model output or configuration alone. */
+  noiseFilter?: { messageId: string; sourceHash: string; reason: string; signals: string[]; resource: PrivateResource };
 };
 export type IntakeAdapters = {
   analyseMessage(input: { message: IntakeMessage; conversation: readonly IntakeMessage[]; identificationContinuation?: EngineInput["identificationContinuation"] }, signal: AbortSignal): Promise<MessageAnalysis>;

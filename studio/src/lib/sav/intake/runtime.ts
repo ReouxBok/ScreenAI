@@ -16,6 +16,8 @@ import type { IntakeReadTrace } from "./hubspot-readers";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { planSavIntake } from "./engine";
 import { intakeAutomationAdapters } from "./automated-message";
+import { SAV_INTAKE_NOISE_RESOURCE, savIntakeNoiseLogLine } from "./noise-filter";
+import { evaluateIntakeNoise } from "./noise-filter-runtime";
 import { intakeCrmEvidenceFingerprint, recordIntakeCrmReads } from "./crm-evidence-fingerprint";
 import { intakeResumeHoldReason, intakeResumeProof, newIntakeResumeObservation, observeIntakeReads } from "./resume-progress";
 import { probeIntakeResumeForRun } from "./resume-progress-store";
@@ -102,6 +104,35 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       else delete payload.readRecovery;
       await saveSavIntakeResult(lease, config, payload, state);
       return { runId, state };
+    }
+    // SAV-92 noise filter. Off (absent): nothing computed, nothing read. Observe: verdict stored on the run and logged
+    // (message id and codes only), zero change to the analysis. On: a "noise" verdict goes to Autre without any model call.
+    if (config.noiseFilter && !lease.recoveringRead) {
+      const verdict = await evaluateIntakeNoise(lease, config.mailboxId);
+      // Only a strong rule yields "noise"; weak rules are stored and logged for measurement, never routed.
+      const routed = config.noiseFilter === "on" && verdict.verdict === "noise" && verdict.strength === "strong";
+      payload.noise = { ...verdict, mode: config.noiseFilter, messageId: lease.run.messageId, routed };
+      if (!routed) console.info(savIntakeNoiseLogLine(config.noiseFilter, lease.run.messageId, verdict, false));
+      if (routed) {
+        traces.push({ phase: "noise_filter", reason: verdict.reason, signals: verdict.signals, modelCalled: false });
+        await live();
+        payload.plan = await planSavIntake(lease.input, intakeAutomationAdapters(lease.input.message.id),
+          { ...config.policy, noiseFilter: { messageId: lease.run.messageId, sourceHash: lease.sourceHash, reason: verdict.reason!, signals: verdict.signals, resource: { ...SAV_INTAKE_NOISE_RESOURCE } } },
+          { timeoutMs: 10_000 }, () => new Date());
+        assertSavIntakeObservation(payload.plan);
+        if (payload.plan.progress.kind === "qualified_other") {
+          payload.reason = "SAV_INTAKE_NOISE_FILTERED";
+          console.info(savIntakeNoiseLogLine(config.noiseFilter, lease.run.messageId, verdict, true));
+          delete payload.readRecovery;
+          await saveSavIntakeResult(lease, config, payload, "observed");
+          return { runId, state: "observed" as const };
+        }
+        // The engine refused (a person's choice, an override, an incomplete history): never a vague wait,
+        // the mail continues on the normal path exactly as without the filter.
+        delete payload.plan; payload.noise = { ...payload.noise!, routed: false };
+        console.info(savIntakeNoiseLogLine(config.noiseFilter, lease.run.messageId, verdict, false));
+        traces.push({ phase: "noise_filter", refused: true, modelCalled: false });
+      }
     }
     const other = observeSavOther({ mailboxId: config.mailboxId, fromEmail: lease.input.message.fromEmail,
       subject: lease.provenance.get(lease.run.messageId)!.subject, gmailMessageId: "stored", body: lease.body,
