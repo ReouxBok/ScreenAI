@@ -1,3 +1,4 @@
+import type { ContinuationStop } from "@/lib/sav/cases/continuation-stop";
 import type { CasePhase } from "@/lib/sav/cases/case-types";
 // Unified operator line: one V1 intake row + the V2 case of its EXACT confirmed ticket.
 // Pure, no I/O. Never joins by contact or sender; never treats a created ticket as resolved;
@@ -8,7 +9,7 @@ export type UnifiedTicket =
   | { state: "confirmed" | "uncertain"; ticketId: string };
 export type UnifiedCase =
   | { state: "absent" } | { state: "unavailable" }
-  | { state: "found"; ticketId: string; owner: "agent" | "human" | "system_hold"; phase: string; updatedAt: string; reply?: UnifiedReply };
+  | { state: "found"; ticketId: string; owner: "agent" | "human" | "system_hold"; phase: string; updatedAt: string; reply?: UnifiedReply; continuationStop?: ContinuationStop | null };
 /** Latest reply of the exact case, from pole C's registry list (one list read per case, never one read per reply).
  * Only a confirmed Gmail receipt is "sent"; a started send without receipt is "uncertain", never "not sent". */
 export type UnifiedReply =
@@ -74,7 +75,10 @@ export function unifiedConsoleLine(row: UnifiedV1Row, ticket: UnifiedTicket, kas
     : ticket.state === "confirmed" && kase.state === "absent" ? "Pas de dossier V2 pour ce ticket" : "—";
   const v2Href = exact ? `/studio/sav/v2/${encodeURIComponent(exact.ticketId)}` : null;
   const reply = exact ? replyLabel(exact.reply) : null;
-  const line = (bucket: UnifiedBucket, stage: string, next: string): UnifiedLine => ({ bucket, stage, ticket: ticketLine, owner, next, reply, v2Href, paused });
+  const line = (bucket: UnifiedBucket, stage: string, next: string): UnifiedLine => ({ bucket,
+    stage: exact?.continuationStop && !stage.includes(exact.continuationStop.code)
+      ? `${stage} · arrêt V2 : ${exact.continuationStop.code}, depuis ${exact.continuationStop.since || "date inconnue"}` : stage,
+    ticket: ticketLine, owner, next, reply, v2Href, paused });
   if (ticket.state === "uncertain" || ticket.state === "unavailable" || V1_VERIFY.has(row.status) || (ticket.state === "confirmed" && kase.state === "unavailable"))
     return line("to_verify", "Résultat à vérifier", "Vérifier le résultat existant avant toute nouvelle action ; ne rien renvoyer.");
   // V1 human protections come first: a pause, a hold or a pending team decision is never shown as agent follow-up.
@@ -84,9 +88,16 @@ export function unifiedConsoleLine(row: UnifiedV1Row, ticket: UnifiedTicket, kas
   if (exact) {
     const known = (PHASES as Record<string, { bucket: UnifiedBucket; stage: string; next: string }>)[exact.phase];
     if (!known) return line("to_verify", "Phase V2 non reconnue par cette version", "Ouvrir le dossier V2 ; ne rien déduire.");
-    // I-C3/I-C4: an uncertain send, or a reply registry that is unwired or unreadable, outranks every phase and owner
-    // (a resolved or team case must not hide a send without receipt; unknown replies are never "no action").
+    // I-C3/I-C4: an uncertain send outranks every phase and owner. An unresolved stop stays actionable
+    // even before a reply exists; otherwise an unreadable registry is never interpreted as no action.
     if (exact.reply && "uncertainCount" in exact.reply && exact.reply.uncertainCount > 0) return line("to_verify", "Envoi d’une réponse incertain", "Attendre la vérification du reçu ; ne rien renvoyer.");
+    if (exact.continuationStop) {
+      const stop = exact.continuationStop;
+      const next = stop.nextAction === "return_ticket_to_v2" ? "Le responsable du ticket garde la main ; reprise automatique après réattribution explicite à V2."
+        : stop.nextAction === "review_scope_and_decision" ? "Administrateur SAV : vérifier le périmètre en vigueur et la décision conservée ; restaurer son périmètre ou organiser la reprise humaine."
+        : "Administrateur SAV : vérifier l’autorisation et la cause avant toute reprise.";
+      return line("to_verify", `Arrêt V2 : ${stop.code} · depuis ${stop.since || "date inconnue"}`, next);
+    }
     if (exact.reply?.state === "unavailable" || exact.reply?.state === "absent") return line("to_verify", "Réponses du dossier V2 non vérifiables", "Lire les réponses dans le dossier V2 avant toute conclusion ; ne rien renvoyer.");
     if (exact.owner === "human" && known.bucket !== "completed") return line("team", "Pris en charge par l’équipe", "Laisser l’équipe répondre ; l’agent n’intervient pas.");
     if (exact.owner === "system_hold" && known.bucket !== "completed") return line("to_verify", "Dossier V2 en suspens", "Lire la cause de la suspension dans le dossier V2.");

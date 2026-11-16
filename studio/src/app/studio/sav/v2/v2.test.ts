@@ -7,8 +7,9 @@ import { SAV_CASE_AWAITING_V2_ATTRIBUTION, SAV_CASE_CONTRACT_REVISION, type Case
 
 // Supervised V2 pilot pages: synthetic cases only, every network and write forbidden.
 const mocks = vi.hoisted(() => ({ staff: vi.fn(), byTicket: vi.fn(), events: vi.fn(), timers: vi.fn(), diagnostics: vi.fn(), list: vi.fn(), pause: vi.fn(), recording: vi.fn(), write: vi.fn(),
+  db: null as null | { select: ReturnType<typeof vi.fn> },
   readers: null as null | { get: ReturnType<typeof vi.fn>; list: ReturnType<typeof vi.fn> }, dossier: null as null | { mails: ReturnType<typeof vi.fn>; cards: ReturnType<typeof vi.fn>; handoffNotice?: ReturnType<typeof vi.fn> } }));
-vi.mock("@/db", () => ({ requireDb: () => ({}), getDb: () => ({}) }));
+vi.mock("@/db", () => ({ requireDb: () => mocks.db ?? ({}), getDb: () => mocks.db ?? ({}) }));
 vi.mock("@/lib/sav/intake/console-auth", () => ({ requireIntakeConsoleStaff: mocks.staff }));
 vi.mock("@/lib/sav/intake/agent-pause", () => ({ readSavAgentPause: mocks.pause }));
 vi.mock("@/lib/sav/cases/case-store", () => ({ readCaseByTicket: mocks.byTicket, listCaseEvents: mocks.events, listCaseTimers: mocks.timers, readCaseDiagnostics: mocks.diagnostics, listCasesPage: mocks.list,
@@ -58,6 +59,7 @@ const replyDetail = (over: Record<string, unknown> = {}) => ({ ...replyItem(1, {
   recipient: "client@example.test", decidedBy: null, revokedBy: null, authorizationBasis: null, proposal: { subject: "Re: accès", text: "Bonjour, pouvez-vous vérifier vos indésirables ?", question: { id: "q1", text: "Avez-vous vérifié les indésirables ?" } }, ...over });
 
 beforeEach(() => {
+  mocks.db = null;
   vi.clearAllMocks(); mocks.readers = null; mocks.dossier = null; vi.unstubAllEnvs(); vi.stubGlobal("fetch", () => { throw Error("NETWORK_FORBIDDEN"); });
   mocks.staff.mockResolvedValue({ id: "20000000-0000-4000-8000-000000000003", email: "operateur@example.test", role: "member" }); mocks.recording.mockReturnValue(true);
   mocks.byTicket.mockResolvedValue(snapshot()); mocks.events.mockResolvedValue([event({}), record(proposal(4), 4)]); mocks.timers.mockResolvedValue([timer]); mocks.pause.mockResolvedValue(running);
@@ -178,6 +180,33 @@ describe("case view: real states, nothing invented", () => {
 
 describe("case page: read-only, no fake approval, true states, role-gated diagnostics", () => {
   const render = async (returnTo?: string) => renderToStaticMarkup(await CasePage({ params: Promise.resolve({ ticketId: "123" }), searchParams: Promise.resolve(returnTo ? { returnTo } : {}) }));
+  it("an unavailable stop reader preserves the dossier and registry, with an explicit unknown diagnostic", async () => {
+    // Keep the historical DB double without select: the additional read must not break the page.
+    const html = await render();
+    expect(html).toContain("Arrêts V2 : lecture indisponible");
+    expect(html).toContain("L’absence d’arrêt ne peut pas être confirmée");
+    expect(html).toContain(reply.text);
+    expect(html).toContain("Demande d’accès synthétique");
+    expect(html).not.toContain("Arrêt V2 : access_scope_changed");
+    expect(mocks.write).not.toHaveBeenCalled();
+  });
+  it.each([false, true])("a successfully read durable stop (present=%s) keeps its age and responsible; absence keeps the previous view", async present => {
+    const where = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce(present ? [{ meta: {
+      code: "access_scope_changed", since: "2026-11-16T09:00:00.000Z", lastAt: "2026-11-16T10:00:00.000Z", failures: 2,
+      responsible: "sav_administrator", nextAction: "review_scope_and_decision",
+    } }] : []);
+    mocks.db = { select: vi.fn(() => ({ from: () => ({ where }) })) };
+    const html = await render();
+    expect(where).toHaveBeenCalledTimes(3); // block hold, team-part wait, continuation stop
+    expect(html).not.toContain("Arrêts V2 : lecture indisponible");
+    expect(html).toContain(reply.text);
+    if (present) {
+      expect(html).toContain("Arrêt V2 : access_scope_changed");
+      expect(html).toContain("Depuis 2026-11-16T09:00:00.000Z");
+      expect(html).toContain("administrateur SAV");
+    } else expect(html).not.toContain("Arrêt V2 :");
+    expect(mocks.write).not.toHaveBeenCalled();
+  });
   it("member: request, evidence, wait, proposal and the missing approval/effects stated, no form or button, no write", async () => {
     const html = await render();
     for (const text of ["Demande d’accès synthétique", "Lire le mail original dans la console", `href="/studio/sav/intake/${threadId}"`, "Dit par le client", "Avez-vous vérifié les indésirables ?",

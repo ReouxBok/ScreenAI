@@ -324,6 +324,28 @@ describe("déclencheur réel après commit et reprise durable (CONTRAT-A-B)", ()
     await continueCaseAfterCommit(w.caseId, "sweep", entry({ continuation: async () => ({ status: "started" }) }));
     expect(await failureMark(w.caseId)).toBeUndefined();
   });
+  it("owner stop is durable, no_reply cannot hide it, and explicit owner return resumes normally", async () => {
+    const w = await waitingWithReturn();
+    const before = await readCase(w.caseId);
+    await continueCaseAfterCommit(w.caseId, "sweep", entry({ continuation: async () => ({ status: "skipped", reason: "ticket_owner_human" }) }));
+    const mark = (await failureMark(w.caseId))!.technicalMetadata;
+    expect(mark).toMatchObject({ code: "ticket_owner_human", responsible: "ticket_owner", nextAction: "return_ticket_to_v2", failures: 1 });
+    await continueCaseAfterCommit(w.caseId, "sweep", entry({ continuation: async () => ({ status: "no_reply", reason: "no_reply" }) }));
+    expect((await failureMark(w.caseId))!.technicalMetadata).toEqual(mark);
+    expect(await readCase(w.caseId)).toEqual(before);
+    expect((await readCaseDiagnostics(w.ticketId))?.continuationStop).toMatchObject({ code: "ticket_owner_human", since: mark.since });
+    await continueCaseAfterCommit(w.caseId, "sweep", entry({ continuation: async () => ({ status: "queued" }) }));
+    expect(await failureMark(w.caseId)).toBeUndefined();
+  });
+  it("a scope task retains its first date across retries and no_reply preserves an unexpected failure", async () => {
+    const w = await waitingWithReturn();
+    await continueCaseAfterCommit(w.caseId, "sweep", entry({ continuation: async () => { throw Error("SAV_SYN_FAILURE"); } }));
+    const first = (await failureMark(w.caseId))!.technicalMetadata;
+    await continueCaseAfterCommit(w.caseId, "sweep", entry({ continuation: async () => ({ status: "no_reply" }) }));
+    expect((await failureMark(w.caseId))!.technicalMetadata).toEqual(first);
+    await continueCaseAfterCommit(w.caseId, "sweep", entry({ continuation: async () => ({ status: "human_task_required", reason: "access_scope_changed" }) }));
+    expect((await failureMark(w.caseId))!.technicalMetadata).toMatchObject({ since: first.since, responsible: "sav_administrator", nextAction: "review_scope_and_decision", code: "access_scope_changed" });
+  });
   it("crash entre le commit et le réveil : la reprise retrouve le dossier depuis la base ; une pause l'arrête ; un dossier d'équipe n'est jamais repris", async () => {
     const w = await waitingWithReturn();
     await customerReturnGate(w.run.id, entry({ continuation: async () => { throw Error("SAV_SYN_CRASH"); } }));
@@ -515,6 +537,8 @@ describe("qualification scope (15/11) : la reprise n'est plus affamée par des d
     expect(woken.filter(id => outside.includes(id))).toEqual([]);
     expect(outcome).toMatchObject({ outOfScope: expect.any(Number) });
     expect((outcome as { outOfScope: number }).outOfScope).toBeGreaterThanOrEqual(4);
+    const durable = await f.db.select().from(auditLogs).where(eq(auditLogs.action, "sav_v2_continuation_failed"));
+    expect(durable.some(mark => String(mark.technicalMetadata.code).startsWith("qualification_"))).toBe(true);
   });
   it("50 exclus puis un admis : la qualification réelle atteint le 51e au deuxième passage", async () => {
     const { scope, env } = scoped(), tester = await queuedCase(60_000);
@@ -533,6 +557,7 @@ describe("qualification scope (15/11) : la reprise n'est plus affamée par des d
     const w = await queuedCase(50_000);
     expect(await continueCaseAfterCommit(w.caseId, "sweep", entry({ env, continuation: async () => ({ status: "started" }) }))).toEqual({ status: "qualification_out_of_scope" });
     expect(infos).toHaveBeenCalledWith("sav_v2_continuation_skipped", { caseId: w.caseId, reason: "qualification_thread_unbound" });
+    expect((await failureMark(w.caseId))?.technicalMetadata).toMatchObject({ code: "qualification_thread_unbound", responsible: "sav_administrator", nextAction: "review_scope_and_decision" });
     expect(await continueCaseAfterCommit(w.caseId, "sweep", { env: ON })).toEqual({ status: "investigation_off" });
     expect(infos).toHaveBeenCalledWith("sav_v2_continuation_skipped", { caseId: w.caseId, reason: "investigation_off" });
     const logged = JSON.stringify(infos.mock.calls.filter((call: unknown[]) => call[0] === "sav_v2_continuation_skipped"));

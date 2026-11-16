@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { savCaseEffectExecutions, savCaseReplyValidations, savCaseTimers, savIntakeEffects, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeRuns, savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
+import { savCaseCalls, savCaseEffectExecutions, savCaseReplyValidations, savCaseTimers, savIntakeEffects, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeRuns, savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
 // B7 T8: pole A's journal read, passed through as is, except once when a test arms a failure (sav.case_events is append-only:
@@ -28,7 +28,7 @@ import { SAV_INTAKE_MODEL_REVISION } from "../intake/model-readers";
 import { intakeRuntimeHash } from "../intake/runtime-contract";
 import { intakeSemanticInputHash, SAV_INTAKE_SEMANTIC_RECORD_REVISION } from "../intake/semantic-records";
 import type { SavRetrievalCandidate } from "../request-retrieval";
-import { readCase, recordCustomerReturn } from "./case-store";
+import { listCaseEvents, readCase, recordCustomerReturn } from "./case-store";
 import { readCaseReplyDisclosure } from "./case-reply-outbound";
 import { decideCaseReply } from "./case-reply-store";
 import { caseInvestigationReturnAwareQualify, type CaseReturnRulePort } from "./investigation-return-qualify";
@@ -222,8 +222,25 @@ describe("passage to the send plan (B): C's store, A's rule, nothing short of ev
     expect(await passCaseInvestigationToReplyPlan(mail.caseId, passage(AUTO, "human"))).toMatchObject({ status: "proposal_refused" });
     // Without the approved scope the recorded decision has no reply at all (its scope cannot be checked): nothing is proposed.
     const gone = { ...passage(AUTO), provenance: { ...provenance, accessScope: async () => null } };
-    expect(await passCaseInvestigationToReplyPlan(mail.caseId, gone)).toEqual({ status: "no_reply", caseId: mail.caseId, reason: "access_scope_unknown" });
+    expect(await passCaseInvestigationToReplyPlan(mail.caseId, gone)).toEqual({ status: "human_task_required", caseId: mail.caseId, reason: "access_scope_unknown" });
     expect((await sideEffects(mail.caseId)).effects).toBe(0);
+  });
+  it("scope changed then restored: explicit human task, unchanged history, then ordinary reply without a new investigation", async () => {
+    const mail = await answered();
+    const before = await listCaseEvents(mail.caseId);
+    const snapshotBefore = await readCase(mail.caseId);
+    const callsBefore = await f.db.select().from(savCaseCalls).where(eq(savCaseCalls.caseId, mail.caseId));
+    const changed = { ...passage(AUTO), provenance: { ...provenance, accessScope: async () => ({ schema: SAV_CASE_ACCESS_SCOPE_REVISION, policyRevision: "policy-r1", revision: "changed-scope", family: "access", sources: [{ knowledgeId: card.id, contentVersionId: card.contentVersionId, use: "answer" }] }) } };
+    expect(await passCaseInvestigationToReplyPlan(mail.caseId, changed)).toMatchObject({ status: "human_task_required", reason: "access_scope_changed" });
+    expect(await listCaseEvents(mail.caseId)).toEqual(before);
+    const unknown = { ...passage(AUTO), provenance: { ...provenance, accessScope: async () => null } };
+    expect(await passCaseInvestigationToReplyPlan(mail.caseId, unknown)).toMatchObject({ status: "human_task_required", reason: "access_scope_unknown" });
+    expect(await listCaseEvents(mail.caseId)).toEqual(before);
+    expect((await sideEffects(mail.caseId)).effects).toBe(0);
+    expect(await passCaseInvestigationToReplyPlan(mail.caseId, passage(AUTO))).toMatchObject({ status: "queued" });
+    expect(await listCaseEvents(mail.caseId)).toEqual(before);
+    expect(await readCase(mail.caseId)).toEqual(snapshotBefore);
+    expect(await f.db.select().from(savCaseCalls).where(eq(savCaseCalls.caseId, mail.caseId))).toEqual(callsBefore);
   });
   it("the B authorizer refuses an absent, falsified or other approver, and an unknown payload; C refuses no authorizer", async () => {
     const mail = await answered();
