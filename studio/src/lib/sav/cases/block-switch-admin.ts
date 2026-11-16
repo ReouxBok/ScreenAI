@@ -5,7 +5,7 @@ import { requireDb } from "@/db";
 import { auditLogs, savSyncState } from "@/db/schema";
 import { encryptSavPayload } from "../crypto";
 import { executionAdministrator } from "../intake/execution-policy";
-import { SAV_CASE_BLOCK_REGISTRY } from "./case-block-registry";
+import { savCaseBlockRegistry } from "./case-block-registry";
 import { readSavBlockSwitch, savBlockEffectiveMode, savBlockSwitchKey, SAV_BLOCK_MODES, SAV_BLOCK_SWITCH_REVISION, type SavBlockEffectiveMode, type SavBlockMode,
   type SavBlockSwitch, type SavBlockSwitchState } from "./block-switch";
 
@@ -14,8 +14,8 @@ const AUDIT = { action: "sav_block_switch_set", entityType: "sav_block_switch" }
 export async function savBlockSwitchAdministrator() {
   return executionAdministrator().catch(() => { throw Error("SAV_BLOCK_SWITCH_UNAUTHORIZED"); });
 }
-/** Only the blocks the code knows (`SAV_CASE_BLOCK_REGISTRY`): a switch for an unknown block would protect nothing. */
-export const savBlockSwitchBlockIds = () => SAV_CASE_BLOCK_REGISTRY.map(block => block.blockId);
+/** Only the blocks the code knows (`savCaseBlockRegistry`, the same the entry reads): a switch for an unknown block would protect nothing. */
+export const savBlockSwitchBlockIds = (env: Readonly<Record<string, string | undefined>> = process.env) => savCaseBlockRegistry(env).map(block => block.blockId);
 const inputSchema = z.object({ blockId: z.string().refine(id => savBlockSwitchBlockIds().includes(id), "SAV_BLOCK_UNKNOWN"), mode: z.enum(SAV_BLOCK_MODES), paused: z.boolean(),
   reason: z.string().trim().min(3).max(500) }).strict();
 const label = (state: Pick<SavBlockSwitchState, "mode" | "paused" | "invalid">) => state.invalid ? "invalid" : `${state.mode}${state.paused ? "+paused" : ""}`;
@@ -45,7 +45,7 @@ export type SavBlockSwitchPanel = {
 export async function readSavBlockSwitchPanel(env: Readonly<Record<string, string | undefined>> = process.env): Promise<SavBlockSwitchPanel> {
   await savBlockSwitchAdministrator();
   const db = requireDb();
-  const blocks = await Promise.all(savBlockSwitchBlockIds().map(async blockId => {
+  const blocks = await Promise.all(savBlockSwitchBlockIds(env).map(async blockId => {
     const state = await readSavBlockSwitch(db, blockId);
     const rows = await db.select().from(auditLogs).where(and(eq(auditLogs.action, AUDIT.action), eq(auditLogs.entityType, AUDIT.entityType), eq(auditLogs.entityId, blockId)))
       .orderBy(desc(auditLogs.createdAt), desc(auditLogs.id)).limit(10);

@@ -74,6 +74,24 @@ it("requires a reason, a known mode and a registered block; no extra field", asy
   expect(await audit()).toHaveLength(0);
 });
 
+it("SAV-92 followups: without its switch the panel and the change know Access only, as before", async () => {
+  expect((await readSavBlockSwitchPanel({})).blocks.map(block => block.blockId)).toEqual(["access"]);
+  await expect(setSavBlockSwitch({ blockId: "followups", mode: "draft", paused: false, reason: "Rodage synthétique" })).rejects.toThrow();
+  expect(await audit()).toHaveLength(0);
+});
+
+it("SAV-92 followups: with SAV_V2_FOLLOWUPS_BLOCK=on it is listed off, can be set to draft, and is never auto", async () => {
+  vi.stubEnv("SAV_V2_FOLLOWUPS_BLOCK", "on");
+  const on = { SAV_V2_FOLLOWUPS_BLOCK: "on", SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: "30000000-0000-4000-8000-000000000042" };
+  const panel = await readSavBlockSwitchPanel(on);
+  expect(panel.blocks.map(block => [block.blockId, block.mode, block.effective])).toEqual([["access", "auto", "auto"], ["followups", "off", "off"]]);
+  await setSavBlockSwitch({ blockId: "followups", mode: "draft", paused: false, reason: "Rodage synthétique en brouillon" });
+  expect(await readSavBlockSwitch(f.db, "followups")).toMatchObject({ mode: "draft", paused: false, invalid: false });
+  expect((await readSavBlockSwitchPanel(on)).blocks.find(block => block.blockId === "followups")).toMatchObject({ mode: "draft", effective: "draft" });
+  await setSavBlockSwitch({ blockId: "followups", mode: "auto", paused: false, reason: "Essai synthétique en automatique" });
+  expect((await readSavBlockSwitchPanel(on)).blocks.find(block => block.blockId === "followups")).toMatchObject({ mode: "auto", effective: "draft" });
+});
+
 it("stores the switch encrypted, audits actor, previous and next state and reason, and lists the history in the panel", async () => {
   await setSavBlockSwitch({ blockId: "access", mode: "draft", paused: false, reason: "Qualification en brouillon" });
   expect(await readSavBlockSwitch(f.db, "access")).toMatchObject({ mode: "draft", paused: false, invalid: false, setting: { setBy: admin.email, reason: "Qualification en brouillon" } });
