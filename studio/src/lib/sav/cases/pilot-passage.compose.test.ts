@@ -49,7 +49,10 @@ import { decideCaseReply, enqueueApprovedCaseReply, submitCaseReplyProposal } fr
 import { CASE_REPLY_STUDIO_APPROVAL_BASIS, CASE_REPLY_STUDIO_CORRECTION_BASIS, type CaseReplyAuthorizer } from "./case-reply-validation";
 import { finalizeCaseReplyProposal } from "./case-reply-outbound";
 import { encodeCaseReplyReviewToken, reviewCaseReply } from "./case-reply-review";
-import { listCaseEvents, readCase, readCaseByTicket } from "./case-store";
+import { produceAutoJ2, enqueueApprovedJ2 } from "./v2-j2-binding";
+import { J2_REMINDER_TEXT } from "./j2-auto-reminder";
+import { runDueJ2Pass } from "./timer-store";
+import { listCaseEvents, listCaseTimers, readCase, readCaseByTicket } from "./case-store";
 import type { CaseAdmissionQualification, CaseSnapshot, KnowledgeRef } from "./case-types";
 import { recordCaseAfterConfirmedIntake, sweepCaseRelays, type CaseBoundaryDeps } from "./intake-boundary";
 import { caseCallLedgerAdapter, type CaseCallLedgerPort } from "./investigation-call-ledger";
@@ -669,4 +672,41 @@ describe("SYN export for UX", () => {
     expect(existsSync(FIXTURE)).toBe(true);
     expect(readFileSync(FIXTURE, "utf8")).toBe(text);
   });
+});
+
+
+it.each([false, true])("J2 follows real decision provenance and refuses a retired source=%s", async retired => {
+  try {
+    const mail = await queued();
+    expect(await executeIntakePass(mail.replyExecutionId, options, {}, driver())).toMatchObject({ state: "confirmed" });
+    const [timer] = await listCaseTimers(mail.caseId);
+    expect(timer).toBeDefined();
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date(Date.parse(timer!.dueAt) + 60_000));
+    const policy = { ...options.policy, expiresAt: new Date(Date.now() + 3600_000).toISOString() };
+    grant = await approveIntakeExecutionPolicy(policy);
+    Object.assign(environment, { SAV_V2_J2_AUTO: "on", SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: "30000000-0000-4000-8000-000000000042",
+      SAV_INTAKE_EXECUTION_POLICY_ID: grant.id, SAV_INTAKE_EXECUTION_POLICY_SHA256: grant.policyHash });
+    options = { ...options, policy, config: intakeExecutionConfig(environment)! };
+    await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-block-switch.v1:access"));
+    await f.db.insert(savSyncState).values({ key: "sav-block-switch.v1:access", status: "installed", cursor: encryptSavPayload({ revision: "sav-block-switch.v1", blockId: "access", mode: "auto", paused: false, setBy: "fixture@example.invalid", setAt: AT, reason: "synthetic" }) });
+    await runDueJ2Pass({ now: new Date(), maxEvents: 10, currentPolicyRevision: POLICY.revision, ports: { reminderEffect: async () => "none", budgetAvailable: async () => true } });
+    const currentProvenance = { ...provenanceDeps, now: () => new Date() };
+    const deps = { ...storeDeps(), pilotProvenance: pilotProvenanceGate(currentProvenance) };
+    const snapshot = (await readCase(mail.caseId))!;
+    if (retired) {
+      activeSource = { ...(activeSource as PilotActiveSource), active: false };
+      expect(await produceAutoJ2(timer!, snapshot.version, deps)).toBe("provenance_unproven");
+      expect(sends).toBe(1);
+      return;
+    }
+    expect(await readPilotReplyProvenance({ caseId: mail.caseId, triggerEventId: `timer:${timer!.id}`, purpose: "reminder", text: J2_REMINDER_TEXT }, currentProvenance)).toMatchObject({ status: "proven" });
+    expect(await produceAutoJ2(timer!, snapshot.version, deps)).toBe("approved");
+    let id = "";
+    expect(await enqueueApprovedJ2(timer!, snapshot.version, { id: grant.id, hash: grant.policyHash }, deps, value => { id = value; })).toBe("queued");
+    expect(await executeIntakePass(id, options, {}, createCaseEffectDriver({ ...deps }))).toMatchObject({ state: "confirmed" });
+    await executeIntakePass(id, options, {}, createCaseEffectDriver({ ...deps }));
+    expect(sends).toBe(2);
+    expect(modelCalls).toBe(1); // original investigation only; reminder never calls a model
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  } finally { vi.useRealTimers(); }
 });

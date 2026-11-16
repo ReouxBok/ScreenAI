@@ -58,11 +58,12 @@ export async function recordConfirmedCaseReply(input: ConfirmedReply, options: R
       ...(proposal.purpose === "answer" && proposal.procedures?.length === 1 ? { trialRecipient: trialRecipientBinding(proposal.caseId, proposal.recipient) } : {}) },
   }, tx));
   const event = appended.appended ? "appended" : "already_recorded";
+  let trials: ConfirmedReplyOutcome["trials"];
   if (proposal.purpose !== "question") {
     const procedures = proposal.purpose === "answer" ? proposal.procedures ?? [] : [];
     if (!procedures.length) return { event, question: "not_applicable", j2: "not_applicable" };
     // 2 (answer). The sealed procedures become pending trials, dated from the mail that really left. The id comes from the effect, so a replay finds the same trial and adds none.
-    const trials = await step(async () => {
+    trials = await step(async () => {
       const current = await readCase(proposal.caseId, tx);
       if (!current) throw new Error("SAV_CASE_EFFECT_CASE_MISSING");
       // A person took the case after the send left: the mail stays in the journal, the agent records nothing more on the case.
@@ -74,10 +75,11 @@ export async function recordConfirmedCaseReply(input: ConfirmedReply, options: R
       await updateCaseRecord({ caseId: current.caseId, expectedVersion: current.version, actor: { type: "agent" }, body: { ...current.body, trials: [...current.body.trials, ...opened] } }, tx);
       return "recorded" as const;
     });
-    return { event, question: "not_applicable", j2: "not_applicable", trials };
+    if (typeof trials === "object") return { event, question: "not_applicable", j2: { refused: "owner_not_agent" }, trials };
   }
-  if (!proposal.question) throw new Error("SAV_CASE_EFFECT_QUESTION_MISSING");
-  const question = proposal.question;
+  if (proposal.purpose === "question" && !proposal.question) throw new Error("SAV_CASE_EFFECT_QUESTION_MISSING");
+  // A procedure also waits for customer feedback: use the existing question/timer tracking, never another outgoing message.
+  const question = proposal.question ?? { id: `procedure:${input.effectId}`, text: "Avez-vous pu essayer la procédure proposée ?", factKeys: [] };
 
   // 2. The question is recorded on the case against the effect that sent it (the J2 timer needs it).
   const questionState = await step(async () => {
@@ -105,5 +107,5 @@ export async function recordConfirmedCaseReply(input: ConfirmedReply, options: R
     }, tx);
   });
   const j2 = scheduled.scheduled ? "scheduled" as const : scheduled.reason === "already_exists" ? "already_scheduled" as const : { refused: scheduled.reason };
-  return { event, question: questionState, j2 };
+  return { event, question: questionState, j2, ...(trials ? { trials } : {}) };
 }

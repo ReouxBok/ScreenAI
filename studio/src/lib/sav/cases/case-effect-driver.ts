@@ -3,6 +3,7 @@
 // where the parent row lives, what is checked before every marker, what is recorded once the reply is confirmed — and never sends, marks,
 // acknowledges or verifies anything itself. Not wired to any route, cron or action: OFF until `SAV_CASE_EFFECTS=supervised` AND a person approved a payload.
 import "server-only";
+import { j2AutoGate } from "./j2-auto-reminder";
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -184,6 +185,10 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
   async function eligibility(tx: ExecutionTx, lease: ExecutionLease, phase: Phase, policyRevision: string | null, pauses: readonly [SavAgentPauseState, SavAgentPauseState]) {
     const payload = payloads.get(lease)!;
     const { proposal } = payload;
+    if (phase === "reply" && proposal.purpose === "reminder") {
+      const blocked = await j2AutoGate(deps.env(), tx);
+      if (blocked) return fault(`HOLD_${blocked.toUpperCase()}`);
+    }
     const facts = await readCaseReplyFacts(tx, proposal, policyRevision, { lockCase: true });
     // SAV-80, under the case lock, at every look before a NEW plan, marker or send: outside the qualification scope or after it expired the
     // effect is cancelled; an unreadable scope or binding holds it. A verification of an engaged effect never comes here: it stays possible.

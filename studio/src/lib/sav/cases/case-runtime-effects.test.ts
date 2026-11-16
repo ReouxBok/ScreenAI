@@ -33,6 +33,9 @@ import {
   describeCaseReplyForReview, listCaseEffectsNeedingPerson, proposeCaseReplyFromDraft, queueValidatedCaseReply, resolveCaseReplyLanguage, runCaseEffectsPass,
   type CaseReplyDraftInput,
 } from "./case-runtime-effects";
+import { produceAutoJ2, enqueueApprovedJ2 } from "./v2-j2-binding";
+import { J2_REMINDER_TEXT } from "./j2-auto-reminder";
+import { appendCaseEvent, updateCaseRecord } from "./case-store";
 import { nextJ2Slot } from "./j2-calendar";
 import * as timerStore from "./timer-store";
 import * as caseStore from "./case-store";
@@ -1154,5 +1157,89 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     environment = { ...environment, SAV_V2_REPLY_NOTE: "off" };
     expect(await queueValidatedCaseReply({ validationId, policy: policyArg(), deps: storeDeps() })).toEqual({ ok: true, executionId: id, created: false });
     expect(s.caseId).toBeTruthy();
+  });
+});
+
+
+// SAV-92: real timer -> authored proposal -> dedicated Access rule -> queue -> real executor,
+// with synthetic Gmail/HubSpot adapters only. Provenance is a port here (tested separately).
+describe("automatic J2 production and sending", () => {
+  const RULE = "30000000-0000-4000-8000-000000000042";
+  async function waiting(procedure = false) {
+    environment = { ...environment, SAV_V2_J2_AUTO: "on", SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: RULE };
+    await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-block-switch.v1:access"));
+    await f.db.insert(savSyncState).values({ key: "sav-block-switch.v1:access", status: "installed", cursor: encryptSavPayload({
+      revision: "sav-block-switch.v1", blockId: "access", mode: "auto", paused: false, setBy: "fixture@example.invalid", setAt: AT, reason: "synthetic" }) });
+    const s = await scenario(procedure ? "answer" : "question");
+    const opened = (await readCase(s.caseId))!;
+    const withRequest = await updateCaseRecord({ caseId: s.caseId, expectedVersion: opened.version, actor: { type: "agent" },
+      body: { ...opened.body, openRequests: [{ id: "r1", summary: "Synthetic access request", family: "access", status: "open", openedAt: AT }] } });
+    s.draft = { ...s.draft, decidedOn: withRequest.version };
+    if (procedure) s.draft = { ...s.draft, reply: { purpose: "answer", text: "Synthetic procedure.", procedures: [{ requestId: "r1", procedure: { knowledgeId: randomUUID(), contentVersionId: randomUUID() } }] } };
+    const proposed = await propose(s); await approve(proposed.validationId);
+    const first = await queueValidatedCaseReply({ validationId: proposed.validationId, policy: policyArg(), deps: storeDeps() });
+    if (!first.ok) throw Error(first.code);
+    expect(await run(first.executionId)).toMatchObject({ state: "confirmed" });
+    const [timer] = await listCaseTimers(s.caseId);
+    expect(timer).toBeDefined();
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date(Date.parse(timer!.dueAt) + 60_000));
+    // A fresh synthetic signed authority at J2 (the original short grant has expired).
+    const policy = { ...options.policy, expiresAt: new Date(Date.now() + 3600_000).toISOString(), maxDossiers: 100 };
+    const grant = await approveIntakeExecutionPolicy(policy);
+    environment.SAV_INTAKE_EXECUTION_POLICY_ID = grant.id; environment.SAV_INTAKE_EXECUTION_POLICY_SHA256 = grant.policyHash;
+    options = { ...options, policy, config: { ...options.config, policyId: grant.id, policyHash: grant.policyHash } };
+    const fired = await timerStore.runDueJ2Pass({ now: new Date(), maxEvents: 100, currentPolicyRevision: POLICY,
+      ports: { reminderEffect: async () => "none", budgetAvailable: async () => true } });
+    expect(fired.outcomes.some(row => row.timerId === timer!.id && row.fired)).toBe(true);
+    return { s, timer: timer!, policy: { id: grant.id, hash: grant.policyHash } };
+  }
+  afterEach(() => vi.useRealTimers());
+  async function queued(w: Awaited<ReturnType<typeof waiting>>) {
+    const snapshot = (await readCase(w.s.caseId))!;
+    expect(await Promise.all([produceAutoJ2(w.timer, snapshot.version, storeDeps()), produceAutoJ2(w.timer, snapshot.version, storeDeps())])).toEqual(["approved", "approved"]);
+    let id = "";
+    expect(await enqueueApprovedJ2(w.timer, snapshot.version, w.policy, storeDeps(), value => { id = value; })).toBe("queued");
+    return id;
+  }
+  it.each([false, true])("authors and sends one reminder, replay included; procedure=%s", async procedure => {
+    const w = await waiting(procedure);
+    environment.SAV_V2_REPLY_NOTE = "on";
+    const id = await queued(w);
+    expect(await enqueueApprovedJ2(w.timer, (await readCase(w.s.caseId))!.version, w.policy, storeDeps())).toBe("already_queued");
+    const parent = await execution(id);
+    const payload = decryptSavPayload<{proposal: CaseReplyProposal}>(parent.payloadCiphertext);
+    expect(payload.proposal).toMatchObject({ purpose: "reminder", text: J2_REMINDER_TEXT });
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    await run(id);
+    expect(sends).toBe(2); // initial reply + ONE J2
+    expect((await effectsOf(id)).map(e => e.kind).sort()).toEqual(["note_associate", "note_create", "reply_send"]);
+    expect((await listCaseTimers(w.s.caseId))).toHaveLength(1); // a reminder cannot create another wait
+    expect(await produceAutoJ2(w.timer, (await readCase(w.s.caseId))!.version, storeDeps())).toBe("reminder_origin_unproven");
+  });
+  it.each(["client", "human", "human_late", "owner", "closed", "pause", "off", "global_off", "block_absent", "sensitive", "crm_owner"])("does not author after %s", async reason => {
+    const w = await waiting();
+    if (reason === "client") await newCustomerMail(w.s);
+    if (reason === "human" || reason === "human_late") await appendCaseEvent({ caseId: w.s.caseId, kind: "outbound_observed", direction: "human_outbound", dedupeKey: `outbound:${randomUUID()}`, sourceRef: {type:"email",id:"synthetic-human"}, occurredAt: reason === "human_late" ? AT : new Date().toISOString() });
+    if (reason === "owner") await takeover(w.s.caseId);
+    if (reason === "closed") await updateCaseRecord({ caseId: w.s.caseId, expectedVersion: (await readCase(w.s.caseId))!.version, actor: {type:"agent"}, phase: "closed_no_reply" });
+    if (reason === "pause") await setPause("v2", "actions_paused");
+    if (reason === "off") delete environment.SAV_V2_J2_AUTO;
+    if (reason === "global_off") delete environment.SAV_V2_AUTO_REPLY;
+    if (reason === "block_absent") await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-block-switch.v1:access"));
+    if (reason === "sensitive") await openCaseEvent({ ticketId: w.s.ticketId, threadId: w.s.thread.id,
+      kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(`finance-${randomUUID()}`), sourceRef: {type:"email",id:"synthetic-finance"}, occurredAt: new Date().toISOString(),
+      admission: { ...ADMITTED, qualification: { ...ADMITTED.qualification, requests: [{ ...ADMITTED.qualification.requests[0]!, family: "finance" }] } } });
+    expect(await produceAutoJ2(w.timer, (await readCase(w.s.caseId))!.version, reason === "crm_owner" ? { ...storeDeps(), readTicketOwner: async () => "human" as const } : storeDeps())).not.toBe("approved");
+    expect((await f.db.select().from(savCaseReplyValidations)).filter(r => r.replyKey === `reply:${w.s.caseId}:timer:${w.timer.id}`)).toHaveLength(0);
+    expect(sends).toBe(1);
+  });
+  it.each(["human", "off", "slot", "pause"])("blocks a queued reminder at the final send fence: %s", async reason => {
+    const w = await waiting(); const id = await queued(w);
+    if (reason === "human") await appendCaseEvent({ caseId: w.s.caseId, kind: "outbound_observed", direction: "human_outbound", dedupeKey: `outbound:${randomUUID()}`, sourceRef: {type:"email",id:"synthetic-human"}, occurredAt: new Date().toISOString() });
+    if (reason === "off") delete environment.SAV_V2_J2_AUTO;
+    if (reason === "pause") await setPause("intake", "actions_paused");
+    if (reason === "slot") vi.setSystemTime(new Date("2026-11-21T12:00:00Z"));
+    await run(id);
+    expect(sends).toBe(1);
   });
 });

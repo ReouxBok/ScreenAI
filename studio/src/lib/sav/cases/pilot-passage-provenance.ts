@@ -4,6 +4,7 @@
 // as `answer` at that exact version AND read as active at that version now. No proof, no validation: anything unread or unknown is a reason, never a default. Nothing is written.
 // No production reader of the active versions and no real scope exist yet: both are injected ports; without them nothing is proven.
 import "server-only";
+import { J2_REMINDER_TEXT, readJ2Origin } from "./j2-auto-reminder";
 import { savKnowledgeFreshness } from "../request-retrieval";
 import { prepareCaseReplyText } from "./case-reply-outbound";
 import type { CaseReplyProposal } from "./case-effects";
@@ -52,6 +53,11 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
   /** SAV-92: a text an administrator corrected in the Studio (persisted correction basis only). It skips the text comparison, nothing else: the latest decision,
    * its trigger and purpose, the scope, every source and every incident are still proven, and the incident claims are read on the corrected text too. */
   options: Readonly<{ humanCorrection?: boolean }> = {}): Promise<PilotProvenance> {
+  if (proposal.purpose === "reminder") {
+    if (proposal.text !== J2_REMINDER_TEXT) return unproven("reply_not_from_decision");
+    const origin = await readJ2Origin(proposal.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), deps.now());
+    return origin ? readPilotReplyProvenance(origin, deps) : unproven("decision_not_latest");
+  }
   const policyRevision = await deps.currentPolicyRevision();
   const events = await listCaseEvents(proposal.caseId), inputKey = latestInvestigationInput(events);
   const read = inputKey ? readCaseInvestigationProgress(events, inputKey) : null;
