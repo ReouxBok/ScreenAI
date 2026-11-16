@@ -156,11 +156,27 @@ describe("B → C draft: the decision in pole C's own proposal shape (SAV-10), v
     expect(caseDecisionDraft("case-1", stored(handoff, reply("Nous transmettons à l'équipe.")), EVENTS)).toMatchObject({ reply: null, replyLimit: "purpose_not_supported" });
   });
 
-  it("an answer becomes C's `answer` reply; one question becomes C's `question` with its fact keys; several questions are not sent", () => {
+  it("an answer becomes C's `answer` reply; one question becomes C's `question` with its fact keys; up to five questions share one mail; six are refused", () => {
     expect(caseDecisionDraft("case-1", stored(answer, reply("Bonjour, voici la marche.")), EVENTS)).toMatchObject({ reply: { purpose: "answer", text: "Bonjour, voici la marche." }, citations: [ref] });
     expect(caseDecisionDraft("case-1", stored(ask(["Quelle version utilisez-vous ?"]), reply("Bonjour, quelle version ?")), EVENTS)!.reply).toEqual({ purpose: "question", text: "Bonjour, quelle version ?",
       question: { id: "in:evt-1:q1", text: "Quelle version utilisez-vous ?", factKeys: ["configuration.version"] } });
-    expect(caseDecisionDraft("case-1", stored(ask(["Quelle version ?", "Quel écran ?"]), reply("Bonjour, deux questions.")), EVENTS)).toMatchObject({ reply: null, replyLimit: "several_questions" });
+    for (const count of [2, 3, 5]) {
+      const texts = ["Quelle version ?", "Quel écran ?", "Quel navigateur ?", "Depuis quand ?", "Quel appareil ?"].slice(0, count);
+      const action = ask(texts);
+      action.questions.forEach((question, index) => { question.seeks = [{ kind: "configuration", factKey: `configuration_q${index + 1}` }]; });
+      const draft = caseDecisionDraft("case-1", stored(action, reply("Bonjour, plusieurs questions.")), EVENTS)!;
+      expect(draft.replyLimit).toBeNull();
+      expect(draft.reply).toEqual({ purpose: "question", text: "Bonjour, plusieurs questions.", questions: texts.map((text, i) => ({ id: `in:evt-1:q${i + 1}`, text, factKeys: [`configuration_q${i + 1}`] })) });
+    }
+    const overlapping = caseDecisionDraft("case-1", stored(ask(["Quel écran ?", "Quel navigateur ?"]), reply("Deux questions.")), EVENTS)!.reply!.questions!;
+    expect(overlapping.every(question => question.factKeys.length === 1)).toBe(true);
+    expect(overlapping[0]!.factKeys).not.toEqual(overlapping[1]!.factKeys);
+    const unkeyed = ask(["Q1 ?", "Q2 ?"]);
+    unkeyed.questions.forEach(question => { question.seeks = [{ kind: "observed_result" }]; });
+    const fallback = caseDecisionDraft("case-1", stored(unkeyed, reply("Deux questions.")), EVENTS)!.reply!;
+    expect(fallback.questions?.map(question => question.factKeys[0])).toEqual([expect.stringMatching(/^question_[a-f0-9]{24}$/), expect.stringMatching(/^question_[a-f0-9]{24}$/)]);
+    expect(fallback.questions?.[0]!.factKeys).not.toEqual(fallback.questions?.[1]!.factKeys);
+    expect(caseDecisionDraft("case-1", stored(ask(["Q1 ?", "Q2 ?", "Q3 ?", "Q4 ?", "Q5 ?", "Q6 ?"]), reply("Six questions.")), EVENTS)).toMatchObject({ reply: null, replyLimit: "too_many_questions" });
   });
 
   it("the trigger is the stored mail answered (C's canonical `inbound:<Gmail id>`), never the input key; no stored mail, no reply", () => {

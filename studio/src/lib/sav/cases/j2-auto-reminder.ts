@@ -5,16 +5,31 @@ import { savCaseEffectExecutions, savIntakeEffects } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { readSavBlockSwitch, savBlockReplyGate } from "./block-switch";
+import type { CaseBody } from "./case-types";
 import { SAV_CASE_ACCESS_BLOCK_ID } from "./case-types";
 import type { CaseReplyProposal } from "./case-effects";
 import type { CaseEffectPayload } from "./case-reply-store";
 import { prepareCaseReplyText } from "./case-reply-outbound";
 import { readAccessAutoApprovalConfig } from "./customer-return";
-import { listCaseTimers } from "./case-store";
+import { listCaseTimers, readCase } from "./case-store";
 import { revalidateJ2Timer } from "./timer-store";
 
 // No copied question, procedure, link or claim of resolution; no model call.
 export const J2_REMINDER_TEXT = prepareCaseReplyText("Bonjour,\n\nNous revenons vers vous au sujet de notre précédent message. Avez-vous pu consulter notre demande ou essayer la procédure proposée ? Vous pouvez nous répondre dans ce fil pour poursuivre votre accompagnement.", "fr", "automated", "reminder");
+
+/** The inherited fixed reminder remains byte-for-byte stable, including for legacy single questions. */
+export function j2ReminderText(body: Pick<CaseBody, "questions">, effectId: string, contextual: boolean): string {
+  const batch = body.questions.filter(question => question.askedInEffect === effectId);
+  const open = batch.filter(question => !question.answeredBy);
+  if (!contextual || batch.length <= 1 || !open.length) return J2_REMINDER_TEXT;
+  return prepareCaseReplyText(`Bonjour,\n\nNous revenons vers vous au sujet des informations encore attendues :\n${open.map(question => `- ${question.text}`).join("\n")}\n\nVous pouvez nous répondre dans ce fil pour poursuivre votre accompagnement.`, "fr", "automated", "reminder");
+}
+
+export async function readJ2ReminderText(caseId: string, triggerEventId: string, env: Record<string, string | undefined>): Promise<string | null> {
+  const timer = (await listCaseTimers(caseId)).find(timer => `timer:${timer.id}` === triggerEventId);
+  const current = await readCase(caseId);
+  return timer && current ? j2ReminderText(current.body, timer.questionEffectId, env.SAV_V2_J2_CONTEXTUAL === "on") : null;
+}
 
 export async function j2AutoGate(env: Record<string, string | undefined>, db: Parameters<typeof readSavBlockSwitch>[0] & Parameters<typeof readSavAgentPause>[0] = requireDb()): Promise<string | null> {
   if (env.SAV_V2_J2_AUTO !== "on" || readAccessAutoApprovalConfig(env).mode !== "on") return "j2_auto_off";

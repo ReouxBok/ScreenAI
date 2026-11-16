@@ -91,3 +91,32 @@ describe("handoff synthesis (stored case only, masked, bounded)", () => {
     expect(sanitizeNoticeText("• x")).toBe("• x");
   });
 });
+
+
+it("associates each answer in a multi-question mail with its own fact keys in the handoff report", () => {
+  const current = body({ facts: [
+    { id: "f1", key: "browser", text: "Firefox", source: email("partial"), at: AT(5), kind: "customer_statement" },
+    { id: "f2", key: "device", text: "Ordinateur", source: email("partial"), at: AT(5), kind: "customer_statement" },
+  ], questions: [
+    { id: "q1", text: "Quel navigateur ?", factKeys: ["browser"], askedAt: AT(2), askedInEffect: "batch", answeredBy: email("partial") },
+    { id: "q2", text: "Quel appareil ?", factKeys: ["device"], askedAt: AT(2), askedInEffect: "batch", answeredBy: email("partial") },
+    { id: "q3", text: "Quelle version ?", factKeys: ["version"], askedAt: AT(2), askedInEffect: "batch" },
+  ] });
+  expect(buildCaseHandoffSummary(current).exchanges).toEqual([
+    { question: "Quel navigateur ?", answered: true, answer: "Firefox" },
+    { question: "Quel appareil ?", answered: true, answer: "Ordinateur" },
+    { question: "Quelle version ?", answered: false, answer: null },
+  ]);
+});
+
+
+it("retains both parts of a question answered across successive customer mails", () => {
+  const current = body({ facts: [
+    { id: "f1", key: "browser", text: "Firefox", source: email("partial-1"), at: AT(5), kind: "customer_statement" },
+    { id: "f2", key: "device", text: "Ordinateur", source: email("partial-2"), at: AT(6), kind: "customer_statement" },
+  ], questions: [
+    { id: "q1", text: "Quel navigateur et appareil ?", factKeys: ["browser", "device"], askedAt: AT(2), askedInEffect: "batch", answeredBy: email("partial-2") },
+    { id: "q2", text: "Quelle version ?", factKeys: ["version"], askedAt: AT(2), askedInEffect: "batch" },
+  ] });
+  expect(buildCaseHandoffSummary(current).exchanges[0]).toEqual({ question: "Quel navigateur et appareil ?", answered: true, answer: "Firefox ; Ordinateur" });
+});
