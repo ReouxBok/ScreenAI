@@ -31,7 +31,7 @@ export type CaseReplyListItem = Readonly<{
 
 export type CaseReplyView = CaseReplyListItem & Readonly<{
   recipient: string; decidedBy: string | null; revokedBy: string | null; authorizationBasis: string | null;
-  proposal: Readonly<{ subject: string; text: string; question: Readonly<{ id: string; text: string }> | null }>;
+  proposal: Readonly<{ subject: string; text: string; question: Readonly<{ id: string; text: string }> | null; questions?: ReadonlyArray<Readonly<{ id: string; text: string }>> }>;
 }>;
 
 export type CaseReplyReadDeps = Readonly<{ env: () => Record<string, string | undefined> }>;
@@ -83,7 +83,8 @@ export async function getCaseReplyEffect(input: Readonly<{ validationId: string;
   const [built] = await build([row], deps);
   return {
     ...built!.item, recipient: row.recipient, decidedBy: row.decidedBy, revokedBy: row.revokedBy, authorizationBasis: row.authorizationBasis,
-    proposal: { subject: built!.proposal.subject, text: built!.proposal.text, question: built!.proposal.question ? { id: built!.proposal.question.id, text: built!.proposal.question.text } : null },
+    proposal: { subject: built!.proposal.subject, text: built!.proposal.text, question: built!.proposal.question ? { id: built!.proposal.question.id, text: built!.proposal.question.text } : null,
+      ...(built!.proposal.questions ? { questions: built!.proposal.questions.map(({ id, text }) => ({ id, text })) } : {}) },
   };
 }
 

@@ -89,7 +89,10 @@ beforeAll(async () => {
   policyId = policy!.id;
 }, 60_000);
 afterAll(async () => { state.db = null; await f.client.close(); });
-beforeEach(() => {
+beforeEach(async () => {
+  // Each sweep scenario owns its queued cohort and starts a fresh lap. Previous tests' cases stay available for diagnostics.
+  await f.db.update(savCases).set({ phase: "awaiting_customer" }).where(eq(savCases.phase, "queued"));
+  await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-v2-sweep.v1:continuation"));
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "v2-entry-fixture-key-only-32-characters-x");
   vi.stubEnv("SAV_CASE_RECORDING", "on"); vi.stubEnv("SAV_V2_HUBSPOT_OWNER_ID", V2_OWNER);
   calls = []; ownerAnswer = V2_OWNER; network.mockClear(); vi.stubGlobal("fetch", network);
@@ -536,6 +539,18 @@ describe("qualification scope (15/11) : la reprise n'est plus affamée par des d
     expect((outcome as { outOfScope: number }).outOfScope).toBeGreaterThanOrEqual(4);
     const durable = await f.db.select().from(auditLogs).where(eq(auditLogs.action, "sav_v2_continuation_failed"));
     expect(durable.some(mark => String(mark.technicalMetadata.code).startsWith("qualification_"))).toBe(true);
+  });
+  it("50 exclus puis un admis : la qualification réelle atteint le 51e au deuxième passage", async () => {
+    const { scope, env } = scoped(), tester = await queuedCase(60_000);
+    await bind(scope, tester.threadId);
+    const [template] = await f.db.select().from(savCases).where(eq(savCases.id, tester.caseId));
+    await f.db.update(savCases).set({ phase: "awaiting_customer" }).where(eq(savCases.id, tester.caseId));
+    const ids = Array.from({ length: 51 }, (_, i) => `00000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`);
+    await f.db.insert(savCases).values(ids.map((id, i) => ({ ...template!, id, ticketId: String(910_000 + i), threadIds: i === 50 ? [tester.threadId] : [] })));
+    const continuation = vi.fn(async () => ({ status: "started" }));
+    expect(await sweepCaseContinuations({ env, continuation })).toEqual({ tried: 0, failed: {}, outOfScope: 50 });
+    expect(await sweepCaseContinuations({ env, continuation })).toEqual({ tried: 1, failed: {}, outOfScope: 49 });
+    expect(continuation).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ caseId: ids[50], trigger: "sweep" }));
   });
   it("un dossier hors périmètre : `sav_v2_continuation_skipped` avec seulement l'id du dossier et un code fermé ; `investigation_off` aussi", async () => {
     const { env } = scoped();

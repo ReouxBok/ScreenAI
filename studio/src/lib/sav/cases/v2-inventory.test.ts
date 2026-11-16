@@ -80,7 +80,7 @@ it("calculates delay from confirmed reply, never ack; note requires association"
 it("exposes closed fields and sanitized handoff codes without customer content", async () => {
   const c = await fixture({ owner: "human", phase: "human_owned", handoff: "private@example.invalid" }); const page = await run();
   expect(page.rows[0]).toMatchObject({ ...c, state: "handed_to_team", handoffReason: "other_internal_reason", validatorRefusals: 0, cost: { confirmedMicroUsd: null, reservedMicroUsd: null, reason: "no_recorded_call" } });
-  expect(Object.keys(page.rows[0]!).sort()).toEqual(["caseId", "threadId", "messageId", "state", "phase", "receivedAt", "replyConfirmedAt", "replyDelaySeconds", "hubspot", "handoffReason", "validatorRefusals", "cost", "continuationStop"].sort());
+  expect(Object.keys(page.rows[0]!).sort()).toEqual(["caseId", "threadId", "messageId", "state", "phase", "receivedAt", "replyConfirmedAt", "replyDelaySeconds", "hubspot", "handoffReason", "validatorRefusals", "cost", "continuationStop", "questions"].sort());
   expect(JSON.stringify(page)).not.toMatch(/PRIVATE|private@|subject|recipient|customerEmail|body|Ciphertext/);
 });
 it("deduplicates cumulative validator refusals per input and call", async () => {
@@ -298,4 +298,13 @@ it("lists durable stops with their responsible and age, including under the fail
   expect(result.rows).toHaveLength(1);
   expect(result.rows[0]).toMatchObject({ caseId: c.caseId, state: "failed", continuationStop: { code: "access_scope_changed", responsible: "sav_administrator", nextAction: "review_scope_and_decision" } });
   expect(result.rows[0]!.continuationStop!.since).toMatch(/^\d{4}-/);
+});
+
+it("projects separate question counts for MCP inventory without leaking their contents", async () => {
+  const c = await fixture();
+  const body = { ...emptyCaseBody(), questions: [1, 2, 3].map(i => ({ id: `q${i}`, text: "PRIVATE_QUESTION", factKeys: [], askedAt: at.toISOString(), askedInEffect: "mail", ...(i === 1 ? { answeredBy: { type: "email", id: "private-answer" } } : {}) })) };
+  await f.db.update(savCases).set({ payloadCiphertext: encryptSavPayload(body) }).where(eq(savCases.id, c.caseId));
+  const page = await run();
+  expect(page.rows.find(row => row.caseId === c.caseId)?.questions).toEqual({ asked: 3, answered: 1, open: 2 });
+  expect(JSON.stringify(page)).not.toContain("PRIVATE_QUESTION");
 });

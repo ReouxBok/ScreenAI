@@ -13,10 +13,11 @@ vi.mock("../hubspot", () => { throw Error("HUBSPOT_IMPORTED"); });
 vi.mock("../hubspot-transport", () => { throw Error("HUBSPOT_IMPORTED"); });
 import type { CaseAdmissionInput } from "./admission-policy";
 import { classifyCaseExit } from "./case-outcomes";
-import { appendCaseEvent, claimCaseForDecision, listCaseEvents, listCaseTimers, openCaseEvent, readCase } from "./case-store";
+import { appendCaseEvent, claimCaseForDecision, listCaseEvents, listCaseTimers, openCaseEvent, readCase, updateCaseRecord } from "./case-store";
 import { caseDedupeKey, caseRequestId, type CaseAdmissionQualification, type CaseSnapshot } from "./case-types";
 import { readCaseInvestigationProgress } from "./investigation-record";
 import { runCaseInvestigation, type CaseInvestigationModelRequest, type CaseInvestigationModelResult } from "./investigation-runner";
+import { scheduleJ2ForConfirmedQuestion } from "./timer-store";
 import { caseInvestigationStorePorts } from "./investigation-store-ports";
 
 /*
@@ -269,4 +270,24 @@ describe("B5 OBS1 (night 01/11): a qualification that cannot run before the clai
     expect(team.calls).toEqual([]);
     expect(await readCase(c.caseId)).toMatchObject({ owner: "human" });
   });
+});
+
+it("persists a partial answer through the real investigation ports and retains the one original J2", async () => {
+  const ticketId = String(++ticketSeq), threadId = randomUUID(), gmail = `batch-${ticketId}`, response = `${gmail}-partial`;
+  const initial = await mail(ticketId, threadId, gmail, byRule(gmail));
+  const sent = new Date(Date.now() + 1000), timerId = randomUUID();
+  const asked = await updateCaseRecord({ caseId: initial.caseId, expectedVersion: initial.version, actor: { type: "agent" }, body: { ...initial.body,
+    questions: [1, 2, 3].map(i => ({ id: `in:batch:q${i}`, text: `Question ${i} ?`, factKeys: [`configuration_q${i}`], askedAt: sent.toISOString(), askedInEffect: "batch-effect" })) } });
+  expect(await scheduleJ2ForConfirmedQuestion({ caseId: asked.caseId, expectedVersion: asked.version, currentPolicyRevision: "policy-r1", questionEffectId: "batch-effect", timerId, sentAt: sent })).toMatchObject({ scheduled: true });
+  await openCaseEvent({ ticketId, threadId, admission: byRule(response), kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(response), sourceRef: { type: "email", id: response }, occurredAt: new Date(sent.getTime() + 1000).toISOString(), opens: [{ id: caseRequestId(response, "r1"), summary: "Réponse partielle synthétique" }] });
+  expect(await listCaseTimers(asked.caseId)).toMatchObject([{ state: "scheduled", id: timerId }]);
+  const result = await investigate(asked.caseId, [request => ({ status: "ok", output: { caseVersion: request.snapshot.version,
+    understanding: { requests: ask(request.snapshot).understanding.requests, newFacts: [{ id: "partial-fact", key: "configuration_q1", statement: "Réponse synthétique", kind: "customer_statement", source: { type: "email", id: response } }] }, nextAction: { kind: "observe_only" } } })]);
+  expect(result.report).toMatchObject({ status: "recorded", outcome: "accepted" });
+  const current = (await readCase(asked.caseId))!;
+  expect(current.body.questions.map(question => Boolean(question.answeredBy))).toEqual([true, false, false]);
+  expect(current.body.facts).toMatchObject([{ key: "configuration_q1", source: { type: "email", id: response } }]);
+  expect(current.phase).toBe("awaiting_customer");
+  expect(current.body.waiting?.timerId).toBe(timerId);
+  expect(await listCaseTimers(current.caseId)).toMatchObject([{ state: "scheduled", id: timerId, sentAt: sent.toISOString() }]);
 });

@@ -1,3 +1,4 @@
+import { hasMultiQuestionWait } from "./case-question-followup";
 import "server-only";
 import { readContinuationStop } from "./continuation-stop";
 import { createHash, randomUUID } from "node:crypto";
@@ -153,7 +154,7 @@ async function appendLocked(tx: CaseTx, row: CaseRow, input: ValidEvent, threadI
     .where(and(eq(savCases.id, row.id), eq(savCases.version, row.version))).returning();
   if (!next) throw new CaseVersionStaleError(row.version);
   const cancel = timerCancelReason(input, next);
-  if (cancel) await cancelScheduledTimers(tx, row.id, cancel);
+  if (cancel) await cancelScheduledTimers(tx, row.id, cancel, cancel === "customer_inbound" && hasMultiQuestionWait(toSnapshot(row).body) ? toSnapshot(row).body.waiting?.timerId : undefined);
   return { appended: true, row: next };
 }
 
@@ -976,7 +977,7 @@ export async function recordCustomerReturn(input: CustomerReturnWrite): Promise<
     const reopened = input.route === "reopen"
       ? before.body.openRequests.filter(request => request.status === "resolved" && !caseSensitivityForFamily(request.family)).map(request => request.id) : [];
     const body = parseBody({
-      ...before.body, waiting: null, trials: await trialsOnCustomerReturn(tx, before, input),
+      ...before.body, waiting: hasMultiQuestionWait(before.body) ? before.body.waiting : null, trials: await trialsOnCustomerReturn(tx, before, input),
       ...(input.route === "reopen" ? { cycle: { number: before.body.cycle.number + 1 },
         openRequests: before.body.openRequests.map(request => reopened.includes(request.id) ? { ...request, status: "open" as const } : request) } : {}),
     });
