@@ -126,7 +126,11 @@ async function recordCaseComponentOutcome(tx: ExecutionTx, executionId: string, 
   const [last] = await tx.select({ payload: savIntakeEffectJournal.payloadCiphertext }).from(savIntakeEffectJournal)
     .where(and(eq(savIntakeEffectJournal.executionId, executionId), eq(savIntakeEffectJournal.kind, kind)))
     .orderBy(desc(savIntakeEffectJournal.createdAt), desc(savIntakeEffectJournal.id)).limit(1);
-  if (!last || JSON.stringify(decryptSavPayload(last.payload)) !== JSON.stringify(outcome)) await executionJournal(tx, executionId, kind, outcome);
+  const previous = last ? decryptSavPayload<Record<string, string>>(last.payload) : null;
+  // Once queued, the linked execution and its ledger own the status outcome. A later
+  // configuration refusal must not hide an already confirmed (or engaged) effect.
+  if (component === "status" && previous?.executionId && !outcome.executionId) return;
+  if (!previous || JSON.stringify(previous) !== JSON.stringify(outcome)) await executionJournal(tx, executionId, kind, outcome);
 }
 
 /** The reason a verification-only pass leaves on an execution whose reply is confirmed and recorded while its note still waits for a supervised pass. */
