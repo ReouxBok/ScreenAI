@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { auditLogs, staffUsers } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, detail: vi.fn(), complete: vi.fn(), invalid: vi.fn(), manualBinding: vi.fn(), manual: vi.fn(), release: vi.fn(),
-  choice: vi.fn(), reinvestigate: vi.fn(), identification: vi.fn(), note: vi.fn(), panel: vi.fn(), operator: vi.fn(), seen: [] as unknown[], gate: null as null | (() => Promise<void>) }));
+  choice: vi.fn(), reinvestigate: vi.fn(), identification: vi.fn(), note: vi.fn(), effect: vi.fn(), panel: vi.fn(), operator: vi.fn(), seen: [] as unknown[], gate: null as null | (() => Promise<void>) }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => { throw Error("NO_SESSION_ON_MCP"); }, clerkClient: async () => { throw Error("NO_REAL_CLERK"); } }));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
@@ -22,6 +22,7 @@ vi.mock("@/lib/sav/intake/human-hold-release", () => ({ releaseIntakeHumanHold: 
 vi.mock("@/lib/sav/intake/human-commands", () => ({ recordIntakeHumanCommand: as(state.choice) }));
 vi.mock("@/lib/sav/intake/operator-recovery", () => ({ requestIntakeReinvestigation: as(state.reinvestigate), reconcileThreadIdentification: as(state.identification) }));
 vi.mock("@/lib/sav/intake/note-recovery", () => ({ reconcileIntakeNoteForClosure: as(state.note) }));
+vi.mock("@/lib/sav/intake/effect-reconciliation", () => ({ reconcileIntakeUncertainEffect: as(state.effect) }));
 vi.mock("@/lib/sav/intake-ux/operator-commands", () => ({ readOperatorPanel: as(state.panel), recordOperatorCommand: as(state.operator) }));
 vi.mock("@/lib/sav/intake/agent-pause", async (original) => {
   const actual = await original<typeof import("@/lib/sav/intake/agent-pause")>();
@@ -72,7 +73,7 @@ beforeEach(async () => {
     { clerkId: "user_reouven", email: "reouven@limova.ai", name: "Reouven", role: "owner" }, { clerkId: "user_contact", email: "contact@limova.ai", name: "Contact", role: "member" }]);
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "synthetic-mcp-writes-encryption-key");
   current = ugo; detail = base(); state.seen = []; state.gate = null; resetStudioMcpRateLimit();
-  for (const fn of [state.complete, state.invalid, state.manualBinding, state.manual, state.release, state.choice, state.reinvestigate, state.identification, state.note, state.panel, state.operator]) fn.mockReset();
+  for (const fn of [state.complete, state.invalid, state.manualBinding, state.manual, state.release, state.choice, state.reinvestigate, state.identification, state.note, state.effect, state.panel, state.operator]) fn.mockReset();
   state.detail.mockImplementation(async () => structuredClone(detail));
   state.complete.mockResolvedValue({ batchId: "b", requested: 1, marked: 1, alreadyCompleted: 0, skipped: {} });
   vi.spyOn(console, "info").mockImplementation(() => undefined);
@@ -183,6 +184,25 @@ it("SAV-29 reinvestigation, note and identification reconciliation go to the con
   current = contact;
   for (const [name, extra] of [["request_reinvestigation", { idempotencyKey: key(), reason: "Nouvelle analyse synthétique." }], ["reconcile_identification", {}]] as const)
     expect(await call(name, { threadId, versionToken: token(), ...extra })).toMatchObject({ code: "SAV_MCP_ACTION_UNAVAILABLE" });
+});
+it("SAV-92 reconcile_effect passes only the dossier's own message and version, never a caller id", async () => {
+  // The strict input schema rejects any caller id at the protocol level: the server function is never reached.
+  expect(await call("reconcile_effect", { threadId, versionToken: token(), objectId: "999" })).toMatchObject({ outcome: "error", isError: true });
+  expect(state.effect).not.toHaveBeenCalled();
+  state.effect.mockResolvedValueOnce({ reconciled: true, kind: "note_associate", objectId: "301" });
+  expect(await call("reconcile_effect", { threadId, versionToken: token() })).toMatchObject({ outcome: "done", data: { kind: "note_associate" } });
+  expect(state.effect).toHaveBeenCalledWith({ threadId, messageId }, { threadId, messageId, runId, version: 7, sourceHash, epoch: 4 });
+  expect(state.seen.at(-1)).toBe("user_ugo");
+  state.effect.mockResolvedValueOnce({ reconciled: false, alreadyConfirmed: true });
+  expect(await call("reconcile_effect", { threadId, versionToken: token() })).toMatchObject({ outcome: "already_done" });
+  state.effect.mockRejectedValueOnce(Error("SAV_INTAKE_EFFECT_RECONCILIATION_NOT_PROVEN"));
+  expect(await call("reconcile_effect", { threadId, versionToken: token() })).toMatchObject({ outcome: "refused", code: "SAV_INTAKE_EFFECT_RECONCILIATION_NOT_PROVEN" });
+  detail.progress = { runId, state: "uncertain", effects: [{ id: "n", kind: "note_create", state: "confirmed", confirmedAt: at, ack: { id: "301" } },
+    { id: "a", kind: "note_associate", state: "uncertain", confirmedAt: null, ack: null }] };
+  const actions = (await call("get_dossier", { threadId }) as { data: { availableActions: { tool: string; available: boolean }[] } }).data.availableActions;
+  expect(actions.find(a => a.tool === "reconcile_effect")?.available).toBe(true);
+  expect(await call("reconcile_effect", { threadId, versionToken: "x" })).toMatchObject({ code: "SAV_MCP_VERSION_TOKEN_INVALID" });
+  expect(state.effect).toHaveBeenCalledTimes(3);
 });
 it("continue_dossier follows the operator panel's allowances and binding", async () => {
   state.panel.mockResolvedValue({ allowResume: false, allowReanalysis: true, allowInformation: true, unavailableReason: "Protégé (synthétique).", information: { id: "10000000-0000-4000-8000-000000000050" } });
@@ -435,7 +455,7 @@ it("REVIEW-AE running remains UI-only and cannot be activated through the MCP", 
   const after = await readSavAgentPause(f.db);
   expect({ applied: result.outcome === "done", level: after.level }).toEqual({ applied: false, level: "fully_paused" });
 });
-it.each(["close_handled_outside", "classify_invalid_source_other", "classify_other", "release_hold", "request_reinvestigation", "continue_dossier", "reconcile_note", "reconcile_identification"])("REVIEW-AE member cannot invoke restricted %s", async name => {
+it.each(["close_handled_outside", "classify_invalid_source_other", "classify_other", "release_hold", "request_reinvestigation", "continue_dossier", "reconcile_note", "reconcile_effect", "reconcile_identification"])("REVIEW-AE member cannot invoke restricted %s", async name => {
   current = contact; detail.humanHeld = name === "release_hold";
   state.panel.mockResolvedValue({ allowResume: true, allowReanalysis: true, allowInformation: true, information: null });
   const args: Record<string, unknown> = { threadId, versionToken: token(), idempotencyKey: key(), reason: "Synthetic explicit reviewer reason" };
@@ -443,10 +463,10 @@ it.each(["close_handled_outside", "classify_invalid_source_other", "classify_oth
   if (name === "classify_invalid_source_other") { args.attest = true; delete args.reason; }
   if (name === "classify_other") args.attest = true;
   if (name === "continue_dossier") args.kind = "resume";
-  if (["reconcile_note", "reconcile_identification"].includes(name)) { delete args.idempotencyKey; delete args.reason; }
+  if (["reconcile_note", "reconcile_effect", "reconcile_identification"].includes(name)) { delete args.idempotencyKey; delete args.reason; }
   expect(await call(name, args)).toMatchObject({ outcome: "refused", code: "SAV_MCP_ACTION_UNAVAILABLE" });
-  for (const fn of [state.complete, state.invalid, state.manual, state.release, state.reinvestigate, state.operator, state.note, state.identification]) expect(fn).not.toHaveBeenCalled();
-  if (["reconcile_note", "reconcile_identification"].includes(name)) expect((await writes()).every(row => row.technicalMetadata.outcome === "refused")).toBe(true);
+  for (const fn of [state.complete, state.invalid, state.manual, state.release, state.reinvestigate, state.operator, state.note, state.effect, state.identification]) expect(fn).not.toHaveBeenCalled();
+  if (["reconcile_note", "reconcile_effect", "reconcile_identification"].includes(name)) expect((await writes()).every(row => row.technicalMetadata.outcome === "refused")).toBe(true);
   else expect(await writes()).toHaveLength(0);
 });
 it("REVIEW-AE read-only reconciliation keeps the member permission on a fresh request", async () => {
