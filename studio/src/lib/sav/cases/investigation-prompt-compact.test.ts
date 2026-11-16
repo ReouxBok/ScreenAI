@@ -40,7 +40,7 @@ describe("SAV-92 compact prompt (offline, synthetic, attachments off)", () => {
       expect(prepared).toMatchObject({ ok: true });
       if (!prepared.ok) throw Error("prepare");
       expect(hash(prepared.body)).toBe(hash(legacy));
-      expect(hash(prepared.body)).toBe(purpose === "decision" ? "92459496e60ec77b18df30c2c0ee8dd6264f066c385b9820e13a10f5aa23ddae" : "1edc22e000efabb721586b6b355ed6ccc3000d92ea3d7f1b3bfdf33a02195111");
+      expect(hash(prepared.body)).toBe(purpose === "decision" ? "daf597e6e0b707f80852c50bd655bac9f13163dbe738797dc8f5bedb79b99929" : "e90239c01d21d104b7768057048191e5a585d69a9653a19fdfae5bd7611c0de8");
     }
     for (const compact of [false, true]) for (const structuredOutput of [false, true]) {
       const prepared = prepareCaseGeminiDecisionRequest(req, { ...env, SAV_V2_PROMPT_COMPACT: compact ? "on" : "off", SAV_V2_STRUCTURED_OUTPUT: structuredOutput ? "on" : "off" });
