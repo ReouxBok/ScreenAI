@@ -359,6 +359,10 @@ function unusedAlternative(action: Extract<CaseDecisionProposal["nextAction"], {
 // Broad roots are intentional: a doubt about login requires the URL. Its presence
 // anywhere in the reply satisfies this requirement, including another paragraph.
 const LOGIN_REFERENCE = /\b(?:(?:re|de)?connect\w*|connexion\w*|identif\w*|acced\w*|acces|log\w*|sign[ -]?in)\b/;
+// A closed observational grammar proves the no-procedure exemption. Match the
+// whole text: an unknown wording or an appended instruction is never permission.
+const ACCESS_CLARIFICATION = /^(?:quel message(?: d'erreur)? (?:voyez-vous|s'affiche(?: a l'ecran)?)|quel (?:navigateur|appareil|systeme d'exploitation) utilisez-vous|quelle version du navigateur utilisez-vous|quel resultat obtenez-vous(?: apres l'operation)?)\s*\?$/;
+const isAccessClarification = (text: string) => ACCESS_CLARIFICATION.test(squash(text));
 function accessLinkMissing(text: string, loginProcedure?: boolean) {
   if (accessLinks(text).present) return false;
   if (!smartValidator()) return true;
@@ -837,15 +841,16 @@ Il vous suffira ensuite de saisir ce code sur la page pour accéder à votre esp
       if (repeated.length) reject("procedure_step_repeated", "reply.text", `${card.id}:${repeated.join(",")}`);
     }
     const accessOpen = [...status].some(([requestId, value]) => value === "open" && families.get(requestId) === "access");
+    // No context is not proof of a harmless clarification. Only fully recognised
+    // observational questions (both action and reply) may omit the destination.
+    const clarificationOnly = action.kind === "ask" && reply.citations.length === 0
+      && !context.accessScope?.sources.some(source => source.firstReply === "login_code_steps")
+      && isAccessClarification(reply.text) && action.questions.every(question => isAccessClarification(question.text));
     if (accessOpen && (action.kind === "ask" || action.kind === "answer")) {
-      const links = accessLinks(reply.text);
-      // Access procedures/citations are conservatively treated as login: the
-      // contract has no closed non-login category that could prove an exemption.
-      // Only a clarification without a procedure/citation can use the text check.
-      const loginProcedure = smart && (action.kind === "answer" || reply.citations.length > 0
-        || context.accessScope?.sources.some(source => source.firstReply === "login_code_steps"));
-      if (accessLinkMissing(reply.text, Boolean(loginProcedure))) reject("access_link_missing", "reply.text");
-      for (const link of links.invalid) reject("access_link_invalid", "reply.text", link);
+      // Same fail-closed primitive as the shared text control. An exemption must
+      // be positively proven; absence of citations or scope alone proves nothing.
+      if (accessLinkMissing(reply.text, !clarificationOnly)) reject("access_link_missing", "reply.text");
+      for (const link of accessLinks(reply.text).invalid) reject("access_link_invalid", "reply.text", link);
     }
     if (!reply.impossibilityClaims.length && IMPOSSIBILITY_WORDING.test(replyText)) signals.add("impossibility_wording_without_claim");
     if (reply.accountAdvice === "none" && ACCOUNT_WORDING.test(replyText)) signals.add("account_wording_without_advice");

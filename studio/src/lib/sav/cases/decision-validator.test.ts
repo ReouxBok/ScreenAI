@@ -892,6 +892,48 @@ describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
       decision.reply.text = text;
     }
   });
+  const noContextInstructions = [
+    "Pouvez-vous ouvrir votre session puis réessayer ?",
+    "Rendez-vous dans votre espace personnel puis réessayez.",
+    "Ouvrez votre session puis réessayez.",
+    "Pourriez-vous ouvrir votre espace personnel ?",
+    "Merci de retourner dans votre espace personnel.",
+    "Vous pouvez ouvrir une nouvelle session.",
+    "Veuillez rejoindre votre espace personnel puis recommencer.",
+  ];
+  it.each(noContextInstructions)("ask without context fails closed: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    for (const on of [false, true]) {
+      mode(on);
+      expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+      expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true })).toEqual([{ code: "access_link_missing" }]);
+      decision.reply.text = text + " https://new.limova.ai";
+      accepted(decision, ctx);
+      decision.reply.text = text;
+    }
+  });
+  it.each([
+    "Quel message d'erreur voyez-vous ?",
+    "Quel navigateur utilisez-vous ?",
+    "Quel appareil utilisez-vous ?",
+    "Quelle version du navigateur utilisez-vous ?",
+    "Quel résultat obtenez-vous après l'opération ?",
+  ])("only a complete clarification is exempt without context: %s", text => {
+    const { decision, ctx } = accessQuestion(text);
+    decision.nextAction = ask(undefined, text);
+    mode(true); accepted(decision, ctx);
+    mode(false); expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+    mode(true);
+    for (const instruction of noContextInstructions) {
+      decision.reply.text = text + " " + instruction;
+      expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+      decision.reply.text = text;
+      decision.nextAction = ask(undefined, text + " " + instruction);
+      expect(codes(run(decision, ctx))).toEqual(["access_link_missing"]);
+      decision.nextAction = ask(undefined, text);
+    }
+  });
   it.each(["Procédure de connexion", "Procédure sans catégorie"])("requires URL for a cited Access procedure, including unknown category: %s", title => {
     mode(true);
     const { decision, ctx } = accessQuestion("Ouvrez une fenêtre privée.");
