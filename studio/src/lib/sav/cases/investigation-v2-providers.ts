@@ -1,4 +1,4 @@
-import { casePromptCompactOn, compactCaseKnowledgeContent } from "./investigation-prompt-compact";
+import { casePromptCompactOn, compactCaseKnowledgeContent, selectCaseKnowledgePassages } from "./investigation-prompt-compact";
 import { caseDecisionBodyBreakdown, caseGeminiDecisionWire, type CaseDecisionBodyBreakdown } from "./investigation-context-budget";
 import { caseDecisionGenerationConfig, caseDecisionPromptRevision, caseProviderJsonSchema, readCaseDecisionGeneration, type CaseDecisionGenerationConfig, type CaseDecisionGenerationProblem } from "./investigation-decision-generation";
 import { caseModelFinishReason, type CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
@@ -78,8 +78,8 @@ export function caseV2ProviderConfigProblems(env: Env): string[] {
 }
 
 /** The SAV vector index V2 already has (`createSavKnowledgeVectorIndex`), as the budgeted search's port; built at each call with the clock now. */
-export function caseKnowledgeVectorSearch(options: Readonly<{ locale: string; audience: "support" | "lead"; now: () => Date }>): CaseKnowledgeVectorSearch {
-  const index = () => createSavKnowledgeVectorIndex({ locale: options.locale, audience: options.audience, now: options.now() });
+export function caseKnowledgeVectorSearch(options: Readonly<{ locale: string; audience: "support" | "lead"; now: () => Date; env?: () => Env }>): CaseKnowledgeVectorSearch {
+  const index = () => createSavKnowledgeVectorIndex({ locale: options.locale, audience: options.audience, now: options.now(), compact: casePromptCompactOn(options.env?.() ?? {}) });
   return {
     dimension: SAV_RETRIEVAL_EMBEDDING_DIMENSION,
     readRevision: () => index().readRevision(),
@@ -134,7 +134,7 @@ export function caseDecisionProviderSchema(purpose: "decision" | "resolution_che
  */
 export function caseInvestigationPromptRevision(attachmentsOn: boolean, env: Env = {}) {
   const base = attachmentsOn ? SAV_CASE_INVESTIGATION_PROMPT_REVISION : SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS;
-  return caseDecisionPromptRevision(base, readCaseDecisionGeneration(env, env[SAV_V2_MODEL_ENV] ?? "")) + (casePromptCompactOn(env) ? "+compact1" : "");
+  return caseDecisionPromptRevision(base, readCaseDecisionGeneration(env, env[SAV_V2_MODEL_ENV] ?? "")) + (casePromptCompactOn(env) ? "+compact2" : "");
 }
 /**
  * SAV-92: how the model must read `customerContext`. Sent only with a context, so a request without one keeps the exact v3 wording.
@@ -164,7 +164,7 @@ export const SAV_CASE_REQUEST_BLOCKS_INSTRUCTION = "requestBlocks indique pour c
  * The decision prompt: the contract (the proposal's JSON schema, the one the validator applies), the case as stored (open requests, facts,
  * questions, trials), the cards retrieved for it and the previous rejections. Nothing is decided here; the validator judges the answer.
  */
-export function caseInvestigationPrompt(request: CaseInvestigationModelRequest, options: { compact?: boolean; structuredOutput?: boolean } = {}) {
+export function caseInvestigationPrompt(request: CaseInvestigationModelRequest, options: { compact?: boolean; structuredOutput?: boolean; knowledgeBytes?: number } = {}) {
   const body = request.snapshot.body;
   const handedToTeam = body.openRequests.filter(row => row.status === "handed_off");
   // Review of batch 2 (finding 5): the customer's verbatim words of a request (`requestQuote` subject) leave the request rows and go inside the customer data
@@ -173,8 +173,9 @@ export function caseInvestigationPrompt(request: CaseInvestigationModelRequest, 
   const wordsKey = request.customerContext ? "customerContext.requestWords" : "customerRequestWords";
   const requestWords = body.openRequests.filter(row => row.status !== "resolved" && quoted(row)).map(row => ({ requestId: row.id, words: caseRequestSearchText(row) }));
   const asData = <T extends typeof body.openRequests[number]>(row: T) => quoted(row) ? { ...row, subject: { status: "available", wordsIn: wordsKey } } : row;
+  const passageQuery = options.compact ? [request.customerContext?.latestMessage?.text, ...body.openRequests.filter(row => row.status === "open").map(caseRequestSearchText)].filter(Boolean).join(" ") : "";
   const cards = request.knowledge.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId, title: card.title, ...(options.compact ? { source: card.source } : {}),
-    content: options.compact ? compactCaseKnowledgeContent(card.content, card.resolution) : card.content.slice(0, 6_000), resolution: card.resolution }));
+    content: options.compact ? (selectCaseKnowledgePassages(card.content, card.resolution, passageQuery, options.knowledgeBytes ?? 6_000) ?? compactCaseKnowledgeContent(card.content, card.resolution)) : card.content.slice(0, 6_000), resolution: card.resolution }));
   const instruction = [
     "Tu es l'agent SAV V2 de Limova. Tu proposes UNE décision pour ce dossier, en JSON strictement conforme au schéma fourni.",
     "Réponds en français, uniquement à partir des fiches fournies (citer knowledgeId et contentVersionId exacts) et des faits du dossier.",
@@ -235,15 +236,24 @@ export function prepareCaseGeminiDecisionRequest(original: CaseInvestigationMode
   // per-call reservation (computed from maxInputTokens) still covers the call; the text body and its bound are measured without them.
   const fitted = original.customerContext ? fitCaseCustomerAttachmentMedia(original.customerContext, { model, mediaTokens: bounds.maxInputTokens - bounds.maxInputBytes }) : null;
   const request: CaseInvestigationModelRequest = fitted ? { ...original, customerContext: fitted.context } : original;
-  const build = (candidate: CaseInvestigationModelRequest) => {
-    const prompt = caseInvestigationPrompt(candidate, { compact: casePromptCompactOn(env), structuredOutput: read.generation.structuredOutput });
+  const build = (candidate: CaseInvestigationModelRequest, knowledgeBytes?: number) => {
+    const prompt = caseInvestigationPrompt(candidate, { compact: casePromptCompactOn(env), structuredOutput: read.generation.structuredOutput, knowledgeBytes });
     const { body, compacted } = caseGeminiDecisionWire(prompt, bounds.maxOutputTokens, bounds.maxInputBytes, generation);
     return { prompt, body, compacted };
   };
-  // SAV-92: the customer context gives way first, level by level (`reduceCaseCustomerContext`), never a card nor a rule. The last level is
+  // Legacy OFF: customer context gives way first (`reduceCaseCustomerContext`), never a card nor a rule. The last level is
   // the exact pre-SAV-92 body: a request that fitted without context still fits, and only then does the runner trim cards as before.
   let built = build(request), sent = request;
-  for (let level = 1; request.customerContext && level < SAV_CASE_CUSTOMER_CONTEXT_LEVELS && Buffer.byteLength(built.body, "utf8") > bounds.maxInputBytes; level++) {
+  if (casePromptCompactOn(env)) {
+    // Reserve the entire bounded customer context, facts and trial ledger. Redundant
+    // prose gives way first; mandatory procedures/qualifications never give way.
+    // If the minimum cannot fit, preflight refuses before any network or spend.
+    for (const knowledgeBytes of [4_000, 2_000, 1_000, 0]) {
+      if (Buffer.byteLength(built.body, "utf8") <= bounds.maxInputBytes) break;
+      built = build(request, knowledgeBytes);
+    }
+  }
+  for (let level = 1; !casePromptCompactOn(env) && request.customerContext && level < SAV_CASE_CUSTOMER_CONTEXT_LEVELS && Buffer.byteLength(built.body, "utf8") > bounds.maxInputBytes; level++) {
     const reduced = reduceCaseCustomerContext(request.customerContext, level);
     const next: CaseInvestigationModelRequest = { ...request };
     if (reduced) next.customerContext = reduced; else delete next.customerContext;
