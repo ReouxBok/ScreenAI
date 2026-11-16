@@ -47,6 +47,13 @@ export type CaseReplyAuthorizer = (request: CaseReplyAuthorizationRequest) => Pr
 export const SAV_CASE_REPLY_REFUSAL_CODES = ["approver_invalid", "authorizer_missing", "authorizer_failed", "decision_absent", "not_authorized"] as const;
 export type CaseReplyAuthorizationOutcome = Readonly<{ allowed: true; basis: string }> | Readonly<{ allowed: false; code: typeof SAV_CASE_REPLY_REFUSAL_CODES[number] }>;
 
+/**
+ * SAV-92 (Studio review): the bases a Studio administrator's decision rests on. Both are human bases (the text must carry the "validated by our team" mention,
+ * `case-reply-mode.ts`). The correction basis is the only one under which a text may differ from the recorded decision's (`pilot-passage-provenance.ts`).
+ */
+export const CASE_REPLY_STUDIO_APPROVAL_BASIS = "studio_admin_review.v1";
+export const CASE_REPLY_STUDIO_CORRECTION_BASIS = "studio_admin_correction.v1";
+
 /** The port that exists when nobody wired one. */
 export const denyAllCaseReplyAuthorizer: CaseReplyAuthorizer = () => ({ allowed: false, reason: "no_authorizer_wired" });
 

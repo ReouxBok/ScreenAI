@@ -46,7 +46,9 @@ import { markSavCaseCallDispatched, releaseSavCaseCall, reserveSavCaseCall, sett
 import { createCaseEffectDriver, ownerBeforeClaim } from "./case-effect-driver";
 import { caseReplyPayloadHash, type CaseReplyProposal } from "./case-effects";
 import { decideCaseReply, enqueueApprovedCaseReply, submitCaseReplyProposal } from "./case-reply-store";
-import type { CaseReplyAuthorizer } from "./case-reply-validation";
+import { CASE_REPLY_STUDIO_APPROVAL_BASIS, CASE_REPLY_STUDIO_CORRECTION_BASIS, type CaseReplyAuthorizer } from "./case-reply-validation";
+import { finalizeCaseReplyProposal } from "./case-reply-outbound";
+import { encodeCaseReplyReviewToken, reviewCaseReply } from "./case-reply-review";
 import { listCaseEvents, readCase, readCaseByTicket } from "./case-store";
 import type { CaseAdmissionQualification, CaseSnapshot, KnowledgeRef } from "./case-types";
 import { recordCaseAfterConfirmedIntake, sweepCaseRelays, type CaseBoundaryDeps } from "./intake-boundary";
@@ -558,6 +560,102 @@ describe("provenance of a pilot reply, recomputed from the recorded decision: no
   it("a production-like consumer with no reader of active versions proves nothing", async () => {
     const mail = await proposed();
     expect(await readPilotReplyProvenance(mail.proposal, { ...provenanceDeps, readActiveSource: async () => null })).toMatchObject({ status: "unproven", reasons: ["source_version_unknown"] });
+  });
+});
+
+describe("SAV-92 review follow-up (P2-2, P2-3): the Studio correction on the REAL provenance reader, store and executor; no stand-in gate", () => {
+  /** A case up to a stored, unapproved proposal of the real decision. */
+  async function proposedReal() {
+    const mail = await agentCase();
+    expect(await investigate(mail.caseId)).toMatchObject({ status: "recorded", outcome: "accepted" });
+    const proposal = await proposalOf(mail.caseId, mail.messageId), submitted = await submitCaseReplyProposal(proposal, storeDeps());
+    if (!submitted.ok) throw Error(`SUBMIT_REFUSED:${submitted.code}`);
+    const version = (await readCase(mail.caseId))!.version;
+    return { ...mail, proposal, validationId: submitted.id, version, token: encodeCaseReplyReviewToken({ validationId: submitted.id, payloadHash: caseReplyPayloadHash(proposal), caseVersion: version }) };
+  }
+  const reviewEnv = () => ({ ...environment, SAV_V2_REPLY_REVIEW: "on" });
+  const reviewDeps = () => ({ env: reviewEnv, store: storeDeps(), sendNow: null, callerDeadlineMs: Date.now() + 100_000 });
+  const admin = { staffUserId: STAFF, email: "admin@example.invalid" };
+  const validations = async (caseId: string) => (await f.client.query<{ id: string; state: string; authorization_basis: string | null; execution_id: string | null }>(
+    "SELECT id, state, authorization_basis, execution_id FROM sav.case_reply_validations WHERE case_id = $1 ORDER BY created_at, id", [caseId])).rows;
+  const CORRECTED = `Bonjour,\n\nPour retrouver votre accès, ouvrez ${ACCESS} puis suivez « Mot de passe oublié ». Texte corrigé par l'équipe (synthétique).`;
+
+  it("the real reader: a person's text proves nothing without the correction flag; with it, only the text comparison is skipped (a retired source, a changed scope are still refused)", async () => {
+    const mail = await proposedReal();
+    const corrected = { ...mail.proposal, text: finalReplyText(CORRECTED) };
+    expect(await readPilotReplyProvenance(corrected, provenanceDeps)).toMatchObject({ status: "unproven", reasons: ["reply_not_from_decision"] });
+    expect(await readPilotReplyProvenance(corrected, provenanceDeps, { humanCorrection: true })).toMatchObject({ status: "proven" });
+    // The production gate turns the flag on for the persisted correction basis ONLY.
+    expect(await provenance(corrected, { basis: CASE_REPLY_STUDIO_CORRECTION_BASIS })).toBeNull();
+    expect(await provenance(corrected, { basis: CASE_REPLY_STUDIO_APPROVAL_BASIS })).toBe("reply_not_from_decision");
+    expect(await provenance(corrected, { basis: null })).toBe("reply_not_from_decision");
+    activeSource = { active: false, title: "x", content: "x", verifiedAt: null };
+    expect(await readPilotReplyProvenance(corrected, provenanceDeps, { humanCorrection: true })).toMatchObject({ status: "unproven", reasons: ["source_retired"] });
+    activeSource = { active: true, title: LOGIN.title, content: LOGIN.content, verifiedAt: LOGIN.verifiedAt };
+    scope = synScope({ revision: "scope-syn-r2" });
+    expect(await provenance(corrected, { basis: CASE_REPLY_STUDIO_CORRECTION_BASIS })).toBe("access_scope_changed");
+    expect(sends).toBe(0);
+  });
+
+  it("P2-2: a correction the provenance would refuse is judged BEFORE storing: the original stays proposed, nothing replaced, nothing queued; once proven, the same correction goes through", async () => {
+    const mail = await proposedReal();
+    activeSource = { active: false, title: "x", content: "x", verifiedAt: null };
+    expect(await reviewCaseReply({ action: "correct", token: mail.token, text: CORRECTED }, admin, reviewDeps())).toMatchObject({ ok: false, code: "provenance_unproven", detail: "source_retired" });
+    expect(await validations(mail.caseId)).toMatchObject([{ id: mail.validationId, state: "proposed", authorization_basis: null, execution_id: null }]);
+    activeSource = { active: true, title: LOGIN.title, content: LOGIN.content, verifiedAt: LOGIN.verifiedAt };
+    expect(await reviewCaseReply({ action: "correct", token: mail.token, text: CORRECTED }, admin, reviewDeps())).toMatchObject({ ok: true, action: "correct", send: "catch_up" });
+    expect(await validations(mail.caseId)).toMatchObject([{ id: mail.validationId, state: "superseded" }, { state: "approved", authorization_basis: CASE_REPLY_STUDIO_CORRECTION_BASIS }]);
+    expect(sends).toBe(0);
+  });
+
+  it("P2-2: a corrected proposal still proposed is sent by « Corriger » with the text unchanged (correction basis, not the text comparison)", async () => {
+    const mail = await proposedReal();
+    const corrected = finalizeCaseReplyProposal({ ...mail.proposal, text: CORRECTED }, { language: "fr", validation: "human" });
+    const stored = await submitCaseReplyProposal(corrected, storeDeps(), { supersedes: { validationId: mail.validationId, payloadHash: caseReplyPayloadHash(mail.proposal) } });
+    if (!stored.ok) throw Error(`SUBMIT_REFUSED:${stored.code}`);
+    const token = encodeCaseReplyReviewToken({ validationId: stored.id, payloadHash: caseReplyPayloadHash(corrected), caseVersion: (await readCase(mail.caseId))!.version });
+    // « Approuver » on it rests on the text comparison: refused, nothing written.
+    expect(await reviewCaseReply({ action: "approve", token }, admin, reviewDeps())).toMatchObject({ ok: false, code: "provenance_unproven", detail: "reply_not_from_decision" });
+    const result = await reviewCaseReply({ action: "correct", token, text: CORRECTED }, admin, reviewDeps());
+    expect(result).toMatchObject({ ok: true, action: "correct", validationId: stored.id });
+    expect(await validations(mail.caseId)).toMatchObject([{ state: "superseded" }, { id: stored.id, state: "approved", authorization_basis: CASE_REPLY_STUDIO_CORRECTION_BASIS }]);
+    expect(await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, mail.caseId))).toHaveLength(1);
+  });
+
+  it("P2-3: the access link rule on a corrected text, with the case's access request open: no link refused, another link refused, the official one accepted", async () => {
+    const mail = await proposedReal();
+    expect((await readCase(mail.caseId))!.body.openRequests.some(request => request.status === "open" && request.family === "access")).toBe(true);
+    expect(await reviewCaseReply({ action: "correct", token: mail.token, text: "Bonjour,\n\nVoici comment retrouver votre accès, sans lien." }, admin, reviewDeps()))
+      .toEqual({ ok: false, code: "text_refused", problems: [{ code: "access_link_missing" }] });
+    expect(await reviewCaseReply({ action: "correct", token: mail.token, text: "Bonjour,\n\nConnectez-vous sur https://login.example.invalid/reset pour retrouver votre accès." }, admin, reviewDeps()))
+      .toMatchObject({ ok: false, code: "text_refused", problems: expect.arrayContaining([{ code: "access_link_invalid", detail: expect.stringContaining("login.example.invalid") }]) });
+    expect(await validations(mail.caseId)).toMatchObject([{ id: mail.validationId, state: "proposed" }]);
+    expect(await reviewCaseReply({ action: "correct", token: mail.token, text: CORRECTED }, admin, reviewDeps())).toMatchObject({ ok: true, action: "correct" });
+  });
+
+  it("P2-3: the REAL executor re-reads the PERSISTED basis: the corrected reply leaves once under the correction basis", async () => {
+    const mail = await proposedReal();
+    const result = await reviewCaseReply({ action: "correct", token: mail.token, text: CORRECTED }, admin, reviewDeps());
+    if (!result.ok || !result.executionId) throw Error(`REVIEW_REFUSED:${JSON.stringify(result)}`);
+    expect(await executeIntakePass(result.executionId, options, {}, driver())).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+    expect(await executeIntakePass(result.executionId, options, {}, driver())).toEqual({ skipped: "occupied" });
+    expect(sends).toBe(1);
+  });
+
+  it("P2-3: the same queued corrected reply whose persisted basis is not the correction basis is held HOLD_PROVENANCE_UNPROVEN by the executor: 0 mail", async () => {
+    const mail = await proposedReal();
+    const result = await reviewCaseReply({ action: "correct", token: mail.token, text: CORRECTED }, admin, reviewDeps());
+    if (!result.ok || !result.executionId) throw Error(`REVIEW_REFUSED:${JSON.stringify(result)}`);
+    const tamper = "UPDATE sav.case_reply_validations SET authorization_basis = $1 WHERE id = $2", values = [CASE_REPLY_STUDIO_APPROVAL_BASIS, result.validationId];
+    // The database already forbids it; the guard is lifted for this one write so the executor's own re-read is what is proven.
+    await expect(f.client.query(tamper, values)).rejects.toThrow("case reply validation decision is immutable");
+    await f.client.exec("ALTER TABLE sav.case_reply_validations DISABLE TRIGGER sav_case_reply_validations_guard");
+    try { await f.client.query(tamper, values); } finally { await f.client.exec("ALTER TABLE sav.case_reply_validations ENABLE TRIGGER sav_case_reply_validations_guard"); }
+    expect(await executeIntakePass(result.executionId, options, {}, driver())).toMatchObject({ reason: "SAV_CASE_EFFECT_HOLD_PROVENANCE_UNPROVEN" });
+    expect(sends).toBe(0);
+    // Held before any new work: no send effect was even planned.
+    expect((await getExecutionEffects(result.executionId)).find(effect => effect.kind === "reply_send")).toBeUndefined();
   });
 });
 

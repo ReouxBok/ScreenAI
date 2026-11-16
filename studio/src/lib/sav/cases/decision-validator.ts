@@ -277,6 +277,23 @@ function accessLinks(text: string) {
   }
   return { present, invalid };
 }
+/**
+ * SAV-92: the text rules of the automatic path that a reply's TEXT alone can be judged on, for a text a person corrected in the Studio. The same primitives as `validate`
+ * below (no copy): no request for a secret, and, when an Access request is open and the reply answers or asks,
+ * the official Access link present and no other link or look-alike brand name. Rules that need the whole decision (citations, impossibility sources, repeated steps on the
+ * pilot ledgers) are not re-run here: the correction keeps the decision's own citations and purpose, and its provenance is proven again at every look.
+ */
+export type CaseReplyTextSafetyProblem = Readonly<{ code: "credential_request_pattern" | "access_link_missing" | "access_link_invalid"; detail?: string }>;
+export function caseReplyTextSafetyProblems(text: string, options: Readonly<{ accessOpen: boolean; answersOrAsks: boolean }>): CaseReplyTextSafetyProblem[] {
+  const problems: CaseReplyTextSafetyProblem[] = [];
+  if (requestsCredential(text)) problems.push({ code: "credential_request_pattern" });
+  if (options.accessOpen && options.answersOrAsks) {
+    const links = accessLinks(text);
+    if (!links.present) problems.push({ code: "access_link_missing" });
+    for (const link of links.invalid) problems.push({ code: "access_link_invalid", detail: link.slice(0, 200) });
+  }
+  return problems;
+}
 const IMPOSSIBILITY_WORDING = /\b(?:impossible|pas possible|ne permet pas|ne peut pas|n'est pas (?:disponible|prevue?|prise? en charge))\b/;
 const ACCOUNT_WORDING = /\b(?:nouve(?:au|l) (?:compte|abonnement)|souscri\w*|creer un (?:autre |second |nouveau )?compte)\b/;
 
