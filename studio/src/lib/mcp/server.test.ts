@@ -80,7 +80,7 @@ it("SAV-24 refuses browsers: cross-origin requests and preflights", async () => 
   expect(preflight.status).toBe(403); expect(preflight.headers.get("access-control-allow-origin")).toBeNull();
 });
 it("SAV-24 lists read tools only while writes are off; with writes on, write tools carry write annotations", async () => {
-  const read = ["get_agent_pause", "get_budget", "get_diagnostics", "get_dossier", "list_dossiers", "whoami"];
+  const read = ["get_agent_pause", "get_budget", "get_diagnostics", "get_dossier", "list_dossiers", "list_v2_cases", "whoami"];
   const write = ["classify_invalid_source_other", "classify_other", "close_handled_outside", "continue_dossier", "reconcile_identification", "reconcile_note",
     "record_choice", "release_hold", "request_reinvestigation", "set_agent_pause"];
   const list = async (flags: Record<string, string>) => ((await (await rpc("tools/list", {}, { env: flags })).json()) as { result: { tools: { name: string; annotations: { readOnlyHint: boolean; destructiveHint: boolean } }[] } }).result.tools;
@@ -182,4 +182,14 @@ it("BF05 GET and DELETE keep every guard before the 405, and replies are private
   }
   const post = await rpc("tools/list");
   expect(post.status).toBe(200); expect(post.headers.get("cache-control")).toBe("private, no-store"); expect(post.headers.get("x-content-type-options")).toBe("nosniff");
+});
+
+it("SAV-92 V2 inventory checks admin before reading and validates input", async () => {
+  for (const caller of [contact, reouven]) {
+    current = caller;
+    expect((await callTool("list_v2_cases")).result?.structuredContent).toMatchObject({ outcome: "refused", code: "SAV_V2_INVENTORY_FORBIDDEN" });
+  }
+  current = ugo;
+  expect((await callTool("list_v2_cases")).result?.structuredContent).toMatchObject({ outcome: "done", data: { attendus: 0, rows: [], nextCursor: null } });
+  expect((await callTool("list_v2_cases", { limit: 101 })).result?.isError).toBe(true);
 });

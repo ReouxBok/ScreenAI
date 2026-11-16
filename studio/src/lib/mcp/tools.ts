@@ -1,5 +1,6 @@
 import "server-only";
 import { z } from "zod";
+import { listV2Cases, v2InventoryInput } from "@/lib/sav/cases/v2-inventory";
 import type { SavClerkUser } from "@/lib/sav/intake/console-auth";
 import { listIntakeConsole } from "@/lib/sav/intake/console-store";
 import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
@@ -124,6 +125,13 @@ const getDiagnostics = { name: "get_diagnostics", title: "Diagnostic technique d
     const diagnostics = await readIntakeRunDiagnostics(input.threadId);
     return diagnostics ? done(diagnostics) : refused("SAV_INTAKE_DOSSIER_NOT_FOUND", "Aucun diagnostic pour ce dossier.");
   } };
+const listV2CasesTool = { name: "list_v2_cases", title: "Inventaire des dossiers V2", write: false,
+  description: "Inventaire V2 réservé aux administrateurs, sans contenu client. from/until : dates ISO inclusives du premier mail client ; state : processing, awaiting_customer, reply_sent, handed_to_team, failed, paused. 25 lignes par défaut, 100 maximum. Réutiliser le curseur et les mêmes filtres : périmètre et attendus figés, valeurs relues par page. hubspot queued inclut les effets incertains, absent signifie aucun effet enregistré. Coûts en micro-USD ; usage inconnu conservé en réservé. Le curseur contient le périmètre : préférer des fenêtres bornées.",
+  input: v2InventoryInput,
+  async run(context: StudioMcpContext, input: z.infer<typeof v2InventoryInput>) {
+    if (context.staff.role !== "admin") return refused("SAV_V2_INVENTORY_FORBIDDEN", "Inventaire V2 réservé aux administrateurs.");
+    return done(await listV2Cases(input));
+  } };
 const getBudget = { name: "get_budget", title: "Budget IA de l’intake", write: false,
   description: "Plafond effectif, dépense confirmée, réservations et coûts incertains, glissant 30 jours et appels. Mêmes chiffres que la page Budget IA, réservée au propriétaire du budget. Lecture seule.",
   input: z.object({}).strict(),
@@ -137,4 +145,4 @@ const whoami = { name: "whoami", title: "Identité Studio", write: false,
   async run(context: StudioMcpContext) { return done({ email: context.staff.email, role: context.staff.role, name: context.staff.name }); } };
 
 /** Read-only tools of this lot. Write tools (SAV-27 to SAV-30) register with write: true. */
-export const studioMcpTools: StudioMcpTool[] = [whoami, listDossiers, getDossier, getDiagnostics, getBudget] as unknown as StudioMcpTool[];
+export const studioMcpTools: StudioMcpTool[] = [whoami, listDossiers, listV2CasesTool, getDossier, getDiagnostics, getBudget] as unknown as StudioMcpTool[];
