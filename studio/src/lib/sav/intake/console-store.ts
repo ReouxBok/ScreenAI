@@ -16,7 +16,7 @@ import { readSavAgentPause, type SavAgentPauseState } from "./agent-pause";
 import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 import { intakeDossierSensitive } from "./observation-binding";
 import { intakeBlockedSubCause, intakeContextRequiredRoute, intakeExecutionDecisionRoute, intakeSensitiveRoute } from "./console-presentation";
-import { observationCoverage, observationLimitsLabel, publicObservationSourceCodes } from "../observation-coverage";
+import { observationConsoleCoverage, observationLimitsLabel, publicObservationSourceCodes } from "../observation-coverage";
 import { readIntakeExecutionProgress } from "./executor";
 import { invalidIntakeAddressMetadata, SAV_INTAKE_INVALID_SOURCE } from "./source-validation";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
@@ -67,7 +67,9 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
         const sensitive = Boolean(binding?.sensitive || await intakeDossierSensitive(threadId,progress.ticketId));
         // SAV-92 (A): a coverage limit (size/count bound, identical at every re-read) gives a partial follow-up, never an
         // "incomplete" one waiting forever; only a real read error keeps the follow-up pending its next daily read.
-        const coverage = observation ? observationCoverage(observation.sourceErrors) : null;
+        // A body really cut at 8 000 characters of text is shown as a named partial follow-up (deterministic, same cut at
+        // every read); the learning gates still read the raw sourceErrors and refuse it.
+        const coverage = observation ? observationConsoleCoverage(observation.sourceErrors) : null;
         const started = Boolean(observation?.lastSyncAt && coverage !== "incomplete" && cycle && cycle.status !== "unknown");
         const finished = started && observation!.closed && Boolean(cycle && (sensitive || ["resolved","closed_without_resolution","abandoned","duplicate"].includes(cycle.qualification ?? "") || ["new","already_covered","amendment","not_reusable","insufficient_evidence","conflict","candidate_revision_required","specialist_review_required","candidate_created","candidate_updated","candidate_linked","admitted","grouped","not_applicable"].includes(cycle.learningDisposition ?? "")));
         result = finished ? { view: "completed", status: sensitive ? "not_applicable_sensitive" : "summary_finished", reason: null }

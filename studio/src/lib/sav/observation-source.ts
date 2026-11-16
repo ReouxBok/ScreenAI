@@ -38,7 +38,9 @@ type RecordObject = {
         sourceId?: string;
     }>>;
 };
-function plain(v: string) { return v.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").trim().slice(0, 8000); }
+/** The cleaned text (tags, scripts and styles removed), BEFORE the 8 000-character bound. */
+function cleaned(v: string) { return v.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").trim(); }
+function plain(v: string) { return cleaned(v).slice(0, 8000); }
 function timestamp(v: string | null | undefined, fallback?: string) { const date = new Date(/^\d{10,}$/.test(v ?? "") ? Number(v) : v || fallback || ""); return Number.isFinite(date.getTime()) ? date.toISOString() : null; }
 /** Only GET and CRM batch/read endpoints are permitted in this collector. */
 async function read<T>(path: string, ids?: string[], signal?: AbortSignal): Promise<T> {
@@ -125,9 +127,11 @@ export async function collectSavObservationSources(ticketId: string): Promise<Ob
                     errors.push(`${type}:timestamp_missing`);
                     continue;
                 }
-                const text = plain(type === "emails" ? (p.hs_email_text || p.hs_email_html || "") : type === "notes" ? (p.hs_note_body || "") : `${p.hs_task_subject || ""}\n${p.hs_task_body || ""}\nStatut enregistré : ${p.hs_task_status || "inconnu"}`);
-                const original = type === "emails" ? (p.hs_email_text || p.hs_email_html || "") : type === "notes" ? (p.hs_note_body || "") : p.hs_task_body || "";
-                if (original.length > 8000)
+                const full = cleaned(type === "emails" ? (p.hs_email_text || p.hs_email_html || "") : type === "notes" ? (p.hs_note_body || "") : `${p.hs_task_subject || ""}\n${p.hs_task_body || ""}\nStatut enregistré : ${p.hs_task_status || "inconnu"}`);
+                const text = full.slice(0, 8000);
+                // SAV-92 (stuck follow-ups): the bound is measured on the cleaned TEXT kept as evidence, not on the raw HTML
+                // (an HTML mail of 9 000 characters may hold 500 characters of text, kept whole). Only text really cut stays an error.
+                if (full.length > 8000)
                     errors.push(`${type}:body_truncated`);
                 const outbound = isHubspotOutboundDirection(p.hs_email_direction || "");
                 const direction = (p.hs_email_direction || "").toUpperCase();

@@ -62,6 +62,20 @@ export function observationCoverage(errors: readonly unknown[] | null | undefine
   const split = splitObservationSourceErrors(errors);
   return split.errors.length ? "incomplete" : split.limits.length ? "partial" : "complete";
 }
+/** SAV-92 (stuck follow-ups): a body cut at 8 000 characters of TEXT is a real error for the learning gates and the
+ * « résolu » qualification (review 575f21c; `sourceErrors` and the observation state keep it), but it is deterministic:
+ * the same immutable object is cut the same way at every daily read. The CONSOLE therefore shows it as a named partial
+ * follow-up instead of an endless "incomplete" one. Any other error still makes the console follow-up incomplete. */
+const BODY_TRUNCATIONS: Record<string, string> = {
+  gmail_body_truncated_8000: "un corps dépasse 8 000 caractères",
+  hubspot_body_truncated_8000: "un corps dépasse 8 000 caractères",
+  studio_review_truncated_8000: "une correction Studio dépasse 8 000 caractères",
+};
+export function observationConsoleCoverage(errors: readonly unknown[] | null | undefined): ObservationCoverage {
+  const split = splitObservationSourceErrors(errors);
+  const other = split.errors.filter(e => !(e.code in BODY_TRUNCATIONS));
+  return other.length ? "incomplete" : split.errors.length || split.limits.length ? "partial" : "complete";
+}
 /** Diagnostic projection: distinct named codes, bounded, never the raw value. */
 export function publicObservationSourceCodes(errors: readonly unknown[] | null | undefined, max = 20): ObservationSourceCode[] {
   const seen = new Map<string, ObservationSourceCode>();
@@ -70,6 +84,8 @@ export function publicObservationSourceCodes(errors: readonly unknown[] | null |
 }
 /** "Suivi partiel : …" — the named limits of a partial coverage, for the console. */
 export function observationLimitsLabel(errors: readonly unknown[] | null | undefined) {
-  const names = [...new Set(splitObservationSourceErrors(errors).limits.map(l => LIMIT_LABELS[l.code] ?? l.code))];
-  return names.length ? `Suivi partiel : ${names.join(" ; ")}. Couverture limitée assumée, sans relance en boucle.` : null;
+  const split = splitObservationSourceErrors(errors);
+  const cut = [...new Set(split.errors.filter(e => e.code in BODY_TRUNCATIONS).map(e => BODY_TRUNCATIONS[e.code]))];
+  const names = [...new Set([...cut, ...split.limits.map(l => LIMIT_LABELS[l.code] ?? l.code)])];
+  return names.length ? `Suivi partiel : ${names.join(" ; ")}. Couverture limitée assumée, sans relance en boucle.${cut.length ? " Texte tronqué : non qualifiable « résolu » ni apprenable sans relecture humaine." : ""}` : null;
 }
