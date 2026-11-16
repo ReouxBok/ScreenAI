@@ -775,6 +775,30 @@ describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
     ctx.customerTexts = { ...ctx.customerTexts, "email:older": `J'ai essayé : ${nextStep}. Cela a échoué.` };
     expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
   });
+  it.each([
+    "Ouvrir une fenêtre privée. Videz le cache.",
+    "Ouvrir une fenêtre privée. Veuillez vider votre cache.",
+    "Ouvrir une fenêtre privée. VIDER LE CACHE DU NAVIGATEUR.",
+  ])("refuses a reworded failed step, with and without pilot scope: %s", text => {
+    mode(true);
+    for (const pilot of [false, true]) {
+      const { decision, ctx } = alternative();
+      if (pilot) ctx.accessScope = { schema: "sav-case-block-scope-2026-11-11.v1", blockId: "synthetic_usage", policyRevision: "synthetic", revision: "synthetic", family: "usage", sources: [{ ...ref("k1"), use: "answer" }] };
+      decision.reply.text = text;
+      expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+    }
+  });
+  it("keeps sent-procedure protection when an alternative repeats another step", () => {
+    mode(true); const { decision, ctx } = alternative();
+    ctx.accessScope = { schema: "sav-case-block-scope-2026-11-11.v1", blockId: "synthetic_usage", policyRevision: "synthetic", revision: "synthetic", family: "usage", sources: [{ ...ref("k1"), use: "answer" }] };
+    decision.reply.text += ". Videz le cache du navigateur.";
+    expect(codes(run(decision, ctx))).toContain("procedure_step_repeated");
+  });
+  it("an unrelated action mentioning the cache is not a repeated failed step", () => {
+    mode(true); const { decision, ctx } = alternative();
+    decision.reply.text += ". Indiquez la taille du cache.";
+    accepted(decision, ctx);
+  });
   it("never weakens sensitive handling or credential checks ON", () => {
     mode(true); const { decision, ctx } = clarification();
     ctx.sensitiveCategories = ["finance"];
@@ -798,6 +822,37 @@ describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
   it.each([true, false])("clarification needs no link ON=%s", on => {
     mode(on); const { decision, ctx } = accessQuestion();
     expect(run(decision, ctx).outcome).toBe(on ? "accepted" : "needs_review");
+  });
+  it.each([
+    "Veuillez vous connecter à votre espace",
+    "Pour vous connecter, saisissez votre e-mail",
+    "Vous pouvez vous reconnecter à votre espace.",
+    "Merci de vous connecter.",
+    "Identifiez-vous dans votre espace.",
+    "Veuillez vous identifier.",
+    "Accédez à votre compte.",
+    "Pour accéder à votre compte, utilisez votre e-mail.",
+    "Vous pouvez accéder à votre espace.",
+  ])("requires a local link for a connection instruction: %s", text => {
+    mode(true); const { decision, ctx } = accessQuestion(text);
+    expect(codes(run(decision, ctx))).toContain("access_link_missing");
+    expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true })).toContainEqual({ code: "access_link_missing" });
+    decision.reply.text += " https://new.limova.ai";
+    accepted(decision, ctx);
+    decision.reply.text = text + "\n\nhttps://new.limova.ai";
+    expect(codes(run(decision, ctx))).toContain("access_link_missing");
+  });
+  it.each([
+    "Vous connecter reste impossible ?",
+    "Avez-vous réussi à vous connecter ?",
+    "La connexion à votre espace est-elle rétablie ?",
+    "Le bouton permet d’accéder à votre compte.",
+    "Vous avez essayé de vous identifier.",
+    "Vous vous connectez habituellement le matin ?",
+  ])("a simple mention of login needs no link: %s", text => {
+    mode(true); const { decision, ctx } = accessQuestion(text);
+    accepted(decision, ctx);
+    expect(caseReplyTextSafetyProblems(text, { accessOpen: true, answersOrAsks: true })).toEqual([]);
   });
   it("requires the link in the connection paragraph, not another section", () => {
     const { decision, ctx } = accessQuestion("Connectez-vous à votre espace.\n\nAutre information : https://new.limova.ai");

@@ -191,13 +191,14 @@ const stepOf = (step: string) => {
   return { verb: (words[0] ?? "").slice(0, 4), object: [...new Set(words.slice(1))].filter(word => !STEP_NOISE.has(word)) };
 };
 const overlap = (object: readonly string[], sentence: string) => object.length ? object.filter(word => sentence.includes(word)).length / object.length : 0;
-function repeatedSteps(reply: string, card: SavRetrievalCandidate, context: CaseDecisionValidationContext, alternative = false): number[] {
+function repeatedSteps(reply: string, card: SavRetrievalCandidate, context: CaseDecisionValidationContext, unusedSentStep?: number): number[] {
   const steps = strings(card.resolution?.steps).map(stepOf), lastMail = Math.max(-Infinity, ...context.sources.filter(row => row.direction === "customer_inbound").map(row => at(row.at)));
   const instructed = sentencesOf(normalize(reply)).filter(sentence => !/^(?:vous avez|merci|comme vous)\b/.test(sentence));
   const restated = steps.flatMap((step, index) => step.object.length >= 2 && step.verb && instructed.some(sentence => sentence.includes(step.verb) && overlap(step.object, sentence) >= 0.7) ? [index] : []);
   if (!restated.length) return [];
   const sent = context.trials.some(trial => trial.knowledge.knowledgeId === card.id && at(trial.askedAt) < lastMail);
-  if (!alternative && sent && restated.length >= Math.ceil(steps.length / 2)) return restated;
+  const repeatedSent = restated.filter(index => index !== unusedSentStep);
+  if (sent && repeatedSent.length && restated.length >= Math.ceil(steps.length / 2)) return repeatedSent;
   const customer = context.sources.filter(row => row.direction === "customer_inbound").sort((a, b) => b.order - a.order);
   const done = new Map<number, boolean>();
   for (const row of customer) {
@@ -318,6 +319,18 @@ function legitimateReconfirmation(question: Extract<CaseDecisionProposal["nextAc
   });
 }
 
+/** A bounded lexical guard, not semantic equivalence: accents/case and verbal endings are
+ * normalized, and at least half the step's objects must recur with its verb root. This also
+ * catches a shortened instruction ("Videz le cache") without rejecting a mere shared object. */
+function rewordsStep(reply: string, text: string) {
+  const step = stepOf(text);
+  return !!step.verb && !!step.object.length && sentencesOf(normalize(reply)).some(sentence => {
+    const words: string[] = sentence.match(/[a-z0-9-]+/g) ?? [];
+    return words.some(word => word.startsWith(step.verb))
+      && step.object.filter(object => words.includes(object)).length / step.object.length >= 0.5;
+  });
+}
+
 /** The current ledger stores a card, not its sent steps. Consequently an alternative needs explicit,
  * latest customer evidence: one exact failed card step and one exact, explicitly untried step, after
  * the single recorded failure. Missing/ambiguous history cannot establish an unused branch. The
@@ -332,7 +345,7 @@ function unusedAlternative(action: Extract<CaseDecisionProposal["nextAction"], {
   const card = context.knowledge.find(row => row.id === step.knowledge.knowledgeId && row.contentVersionId === step.knowledge.contentVersionId);
   const steps = strings(card?.resolution?.steps);
   if (!steps.includes(step.text) || !reply || !squash(reply).includes(squash(step.text))
-    || steps.some(text => text !== step.text && squash(reply).includes(squash(text)))) return false;
+    || steps.some(text => text !== step.text && (squash(reply).includes(squash(text)) || rewordsStep(reply, text)))) return false;
   // A later claim of "untried" cannot erase an earlier explicit report of having tried this step.
   if (context.sources.some(row => row.direction === "customer_inbound" &&
     ownCustomerWords(context.customerTexts[sourceKey(row.ref)] ?? "").replace(QUOTED, " ").split(/[.!?\n]/)
@@ -356,8 +369,11 @@ function unusedAlternative(action: Extract<CaseDecisionProposal["nextAction"], {
 // satisfy a connection instruction. Destination checks still run on the WHOLE reply, unchanged.
 function accessLinkMissing(text: string) {
   if (!smartValidator()) return !accessLinks(text).present;
-  const instruction = /\b(?:connectez-vous|reconnectez-vous|log in|sign in|(?:ouvrez|rendez-vous|allez sur|cliquez|entrez|saisissez|renseignez|utilisez|voici)[^.!?\n]{0,160}(?:connexion|connecter|adresse|code|new\.limova\.ai)|(?:open|visit|enter|click|use)[^.!?\n]{0,160}(?:login|sign-in|sign in|email|code))\b/i;
-  return text.split(/\n\s*\n/).some(section => instruction.test(normalize(section)) && !accessLinks(section).present);
+  // Reflexive infinitives require an instruction/purpose prefix: "vous connecter" alone
+  // can describe the problem. Account access likewise needs an explicit action addressed to the customer.
+  const directedLogin = /\b(?:(?:re)?connectez-vous|identifiez-vous|(?:veuillez|merci de|pour|vous (?:pouvez|devez)|je vous invite a)\s+vous\s+(?:(?:re)?connecter|identifier)|accedez\s+a\s+votre\s+(?:compte|espace)|(?:veuillez|merci de|pour|vous (?:pouvez|devez)|je vous invite a)\s+acceder\s+a\s+votre\s+(?:compte|espace))\b/;
+  const instruction = /\b(?:log in|sign in|(?:ouvrez|rendez-vous|allez sur|cliquez|entrez|saisissez|renseignez|utilisez|voici)[^.!?\n]{0,160}(?:connexion|connecter|adresse|code|new\.limova\.ai)|(?:open|visit|enter|click|use)[^.!?\n]{0,160}(?:login|sign-in|sign in|email|code))\b/i;
+  return text.split(/\n\s*\n/).some(section => (directedLogin.test(normalize(section)) || instruction.test(normalize(section))) && !accessLinks(section).present);
 }
 
 const IMPOSSIBILITY_WORDING = /\b(?:impossible|pas possible|ne permet pas|ne peut pas|n'est pas (?:disponible|prevue?|prise? en charge))\b/;
@@ -823,7 +839,10 @@ Il vous suffira ensuite de saisir ce code sur la page pour accéder à votre esp
     if (requestsCredential(reply.text)) reject("credential_request_pattern", "reply.text");
     // Pilot: an instruction the case already gave, or a step the customer states they did, is not given again. Our own composition reads the same ledgers and is not re-read.
     if (pilot && !composed && (action.kind === "ask" || action.kind === "answer")) for (const card of context.knowledge) {
-      const repeated = repeatedSteps(reply.text, card, context, alternative && action.kind === "answer" && action.steps[0]!.knowledge.knowledgeId === card.id);
+      // Only the proven unused step is exempt from the sent-procedure check, never the whole card.
+      const unusedSentStep = alternative && action.kind === "answer" && action.steps[0]!.knowledge.knowledgeId === card.id
+        ? strings(card.resolution?.steps).indexOf(action.steps[0]!.text) : undefined;
+      const repeated = repeatedSteps(reply.text, card, context, unusedSentStep);
       if (repeated.length) reject("procedure_step_repeated", "reply.text", `${card.id}:${repeated.join(",")}`);
     }
     const accessOpen = [...status].some(([requestId, value]) => value === "open" && families.get(requestId) === "access");
