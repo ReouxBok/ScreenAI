@@ -31,7 +31,7 @@ import { readSavBlockSwitch, savBlockEffectiveMode } from "./block-switch";
 import { savCaseSensitiveWording } from "./investigation-return-qualify";
 import { savEvidenceContains } from "../evidence-text";
 import { containsPromptInjection } from "../policy";
-import { SAV_CASE_BLOCK_REGISTRY } from "./case-block-registry";
+import { savCaseBlockRegistry } from "./case-block-registry";
 import { readHandoffNoticeConfig } from "./case-handoff-notice";
 import type { ExecutorAdapters } from "../intake/execution-types";
 import { SAV_INTAKE_CONTRACT_REVISION, type SavIntakeDecision } from "../intake/contract";
@@ -87,7 +87,7 @@ const SENSITIVE_V1_KINDS = new Set(["finance", "cancellation"]);
  * block's scope. The reply goes out in one mode only: the blocks at the most permissive mode of the mail keep their requests, a stricter block's requests become
  * team parts (`block_switch_restricted`, `planCaseMultiBlockModes`). A single-request mail, and a mail whose requests are all one block's, are read exactly as before.
  */
-export async function firstBlockEvidence(env: Env, messageId: string, gmailMessageId: string, requests: CaseRelayRequest[], registry: readonly CaseBlockDetector[] = SAV_CASE_BLOCK_REGISTRY,
+export async function firstBlockEvidence(env: Env, messageId: string, gmailMessageId: string, requests: CaseRelayRequest[], registry: readonly CaseBlockDetector[] = savCaseBlockRegistry(env),
   source: CaseEntrySource = {}): Promise<CaseAdmissionQualification["requests"]> {
   if (requests.length > 1) return multiRequestEvidence(env, messageId, gmailMessageId, requests, registry, source);
   if (requests.length !== 1 || requests[0].kind !== "support") return [];
@@ -176,7 +176,7 @@ async function multiRequestEvidence(env: Env, messageId: string, gmailMessageId:
   return result;
 }
 const rulesPort = (env: Env): CaseApprovedRulePort => ({context, requests}) =>
-  firstBlockEvidence(env, context.source.messageId, context.source.gmailMessageId, requests, SAV_CASE_BLOCK_REGISTRY,
+  firstBlockEvidence(env, context.source.messageId, context.source.gmailMessageId, requests, savCaseBlockRegistry(env),
     { run: { runId: context.source.runId, runVersion: context.source.runVersion } });
 
 /** Only called for the create intent under V1's execution lease, including its final pre-dispatch check.
@@ -197,7 +197,7 @@ export const creationOwnerForIntake = async (env: Env, input: Parameters<NonNull
     readQualification: async ({messageId, gmailMessageId, requests}) => {
       if (signal.aborted || await intakeHumanRefused(messageId)) return null;
       const { qualification } = qualifyTicketIdentity(decision, await sources.adapterPolicy(), true);
-      return { ...qualification, requests: await firstBlockEvidence(env, messageId, gmailMessageId, requests, SAV_CASE_BLOCK_REGISTRY, { run: { runId: null, runVersion: null } }) };
+      return { ...qualification, requests: await firstBlockEvidence(env, messageId, gmailMessageId, requests, savCaseBlockRegistry(env), { run: { runId: null, runVersion: null } }) };
     },
   })(input);
   if (!decided.assign) return decided;

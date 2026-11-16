@@ -1,6 +1,6 @@
 import type { SavBlockDraft } from "./block-attribution";
 
-/** Phase 1, offline only: no registry entry, published cards or authority to close a ticket. */
+/** Phase 1: no published cards, no authority to close a ticket. Live registry entry only behind `SAV_V2_FOLLOWUPS_BLOCK=on` (`case-block-registry.ts`). */
 export const SAV_FOLLOWUPS_BLOCK = {
   blockId: "followups", label: "Suivis et accusés de réception", family: "usage", mode: "off",
   cardIds: [], supportCardIds: [],
