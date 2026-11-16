@@ -191,6 +191,11 @@ export async function listV2Cases(raw: Input) {
         receivedAt: entered?.toISOString() ?? null, replyConfirmedAt: answered?.toISOString() ?? null,
         replyDelaySeconds: entered && answered && answered >= entered ? (answered.getTime() - entered.getTime()) / 1000 : null,
         hubspot: { note, status }, handoffReason: typeof reason === "string" ? handoffCodes.has(reason) ? reason : "other_internal_reason" : null,
+        questions: (() => {
+          const questions = z.array(z.object({ answeredBy: z.unknown().optional() })).parse(body.questions ?? []);
+          const answered = questions.filter(question => question.answeredBy != null).length;
+          return { asked: questions.length, answered, open: questions.length - answered };
+        })(),
         validatorRefusals: refusals.size,
         cost: { confirmedMicroUsd: complete ? confirmed : null, reservedMicroUsd: complete ? reserved : null, reason: complete ? null : !calls.length ? "no_recorded_call" : ledgerUnreadable ? "receipt_unreadable" : "receipt_missing" },
       });

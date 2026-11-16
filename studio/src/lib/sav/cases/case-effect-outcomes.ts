@@ -6,7 +6,7 @@
 import { createHash } from "node:crypto";
 import { trialRecipientBinding } from "./case-trial-return";
 import { appendCaseEvent, CaseVersionStaleError, readCase, updateCaseRecord, type CaseTx } from "./case-store";
-import type { CaseReplyProposal } from "./case-effects";
+import { caseReplyQuestions, type CaseReplyProposal } from "./case-effects";
 import { scheduleJ2ForConfirmedQuestion } from "./timer-store";
 
 export type ConfirmedReply = Readonly<{
@@ -77,9 +77,10 @@ export async function recordConfirmedCaseReply(input: ConfirmedReply, options: R
     });
     if (typeof trials === "object") return { event, question: "not_applicable", j2: { refused: "owner_not_agent" }, trials };
   }
-  if (proposal.purpose === "question" && !proposal.question) throw new Error("SAV_CASE_EFFECT_QUESTION_MISSING");
-  // Answers use the existing question/timer tracking. The contextual label is internal only; the reminder reads the sealed outbound, never this label.
-  const question = proposal.question ?? { id: `procedure:${input.effectId}`, text: options.contextualJ2 ? "Suivi de la réponse envoyée." : "Avez-vous pu essayer la procédure proposée ?", factKeys: [] };
+  if (proposal.purpose === "question" && !caseReplyQuestions(proposal).length) throw new Error("SAV_CASE_EFFECT_QUESTION_MISSING");
+  // A procedure (or, contextual J2, an answer) also waits for customer feedback: use the existing question/timer tracking, never another outgoing message.
+  // The contextual label is internal only; the reminder reads the sealed outbound, never this label.
+  const questions = proposal.purpose === "question" ? caseReplyQuestions(proposal) : [{ id: `procedure:${input.effectId}`, text: options.contextualJ2 ? "Suivi de la réponse envoyée." : "Avez-vous pu essayer la procédure proposée ?", factKeys: [] }];
 
   // 2. The question is recorded on the case against the effect that sent it (the J2 timer needs it).
   const questionState = await step(async () => {
@@ -87,10 +88,11 @@ export async function recordConfirmedCaseReply(input: ConfirmedReply, options: R
     if (!current) throw new Error("SAV_CASE_EFFECT_CASE_MISSING");
     // A person took the case after the send left: the mail is real and stays in the journal, but the agent writes nothing more and no J2 follows.
     if (current.owner !== "agent") return { refused: "owner_not_agent" } as const;
-    if (current.body.questions.some(candidate => candidate.askedInEffect === input.effectId)) return "already_recorded" as const;
+    const missing = questions.filter(question => !current.body.questions.some(candidate => candidate.askedInEffect === input.effectId && candidate.id === question.id));
+    if (!missing.length) return "already_recorded" as const;
     await updateCaseRecord({
       caseId: current.caseId, expectedVersion: current.version, actor: { type: "agent" },
-      body: { ...current.body, questions: [...current.body.questions, { id: question.id, text: question.text, factKeys: [...question.factKeys], askedAt: sentAt, askedInEffect: input.effectId }] },
+      body: { ...current.body, questions: [...current.body.questions, ...missing.map(question => ({ id: question.id, text: question.text, factKeys: [...question.factKeys], askedAt: sentAt, askedInEffect: input.effectId }))] },
     }, tx);
     return "recorded" as const;
   });

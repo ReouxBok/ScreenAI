@@ -397,3 +397,15 @@ describe("purity", () => {
     expect(source).not.toMatch(/export (async )?function (send|close|dispatch|enqueue)/i);
   });
 });
+
+it.each([0, 1, 2])("one batch timer remains valid with %i answered questions until all are closed", answered => {
+  const current = view();
+  const template = current.body.questions[0]!;
+  const questions = [0, 1, 2].map(index => ({ ...template, id: `q${index + 1}`, ...(index < answered ? { answeredBy: { type: "email", id: "partial" } } : {}) }));
+  const events: J2CaseEventView[] = [{ kind: "inbound_confirmed", direction: "customer_inbound", occurredAt: "2026-10-28T07:59:59.000Z", caseVersion: 20 },
+    { kind: "observation_recorded", direction: "internal", occurredAt: "2026-10-28T08:00:00.000Z", caseVersion: 21, detail: { applied: true, record: { decision: { caseVersion: 20, validation: { outcome: "accepted" } } } } }];
+  expect(revalidate({ view: view({ body: { questions } }), events: events.slice(0, 1) }).status).toBe("deferred");
+  expect(revalidate({ view: view({ body: { questions } }), events }).status).toBe("timer_conditions_met");
+  const closed = questions.map(question => ({ ...question, answeredBy: { type: "email", id: "all" } }));
+  expect(reasonsOf(revalidate({ view: view({ body: { questions: closed } }), events }))).toContain("question_answered");
+});

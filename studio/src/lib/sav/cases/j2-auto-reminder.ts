@@ -6,7 +6,7 @@ import { decryptSavPayload } from "../crypto";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { readSavBlockSwitch, savBlockReplyGate } from "./block-switch";
 import { SAV_CASE_ACCESS_BLOCK_ID } from "./case-types";
-import { caseReplyKey, type CaseReplyProposal } from "./case-effects";
+import { caseReplyKey, caseReplyQuestions, type CaseReplyProposal } from "./case-effects";
 import type { CaseReplySendIntent } from "./case-effect-intents";
 import type { CaseEffectPayload } from "./case-reply-store";
 import { renderSavOutboundReply } from "../reply-format";
@@ -14,7 +14,7 @@ import { caseReplyTextSafetyProblems } from "./decision-validator";
 import { caseReplyEditableBody, prepareCaseReplyText } from "./case-reply-outbound";
 import { readAccessAutoApprovalConfig } from "./customer-return";
 import { readRequestSubjects } from "./intake-boundary";
-import { readCase, listCaseTimers } from "./case-store";
+import { listCaseTimers, readCase } from "./case-store";
 import { revalidateJ2Timer } from "./timer-store";
 
 // No copied question, procedure, link or claim of resolution; no model call.
@@ -32,13 +32,20 @@ export function j2ReminderText(origin: J2Origin, env: Record<string, string | un
     .some(problem => problem.code !== "access_link_missing")) return J2_REMINDER_TEXT;
   const body = caseReplyEditableBody(origin.text);
   let recall: string | null = null;
-  if (origin.purpose === "question" && origin.question?.text && body.includes(origin.question.text)) {
-    const tracked = origin.question.text;
-    const segments = tracked.match(/[^?]*\?/g) ?? [];
-    const questions = segments.map(segment => segment.trim().replace(/^(?:[-•] |\d+[.)] )/, ""));
-    const complete = !tracked.slice(segments.join("").length).trim() && !/[«»“”"]/u.test(tracked);
-    // A tracked question must contain ALL the questions sent, in their original order.
-    const outside = body.replace(origin.question.text, "");
+  const tracked = caseReplyQuestions(origin).map(question => question.text);
+  if (origin.purpose === "question" && tracked.length && tracked.every(Boolean)) {
+    // Multi-question (#288): EVERY tracked question of this mail must appear in the sent body, in order, and together they must hold ALL the questions sent.
+    const questions: string[] = [];
+    let outside = "", cursor = 0, complete = true;
+    for (const text of tracked) {
+      const at = body.indexOf(text, cursor);
+      const segments = text.match(/[^?]*\?/g) ?? [];
+      if (at < 0 || text.slice(segments.join("").length).trim() || /[«»“”"]/u.test(text)) { complete = false; break; }
+      outside += body.slice(cursor, at);
+      cursor = at + text.length;
+      questions.push(...segments.map(segment => segment.trim().replace(/^(?:[-•] |\d+[.)] )/, "")));
+    }
+    outside += body.slice(cursor);
     if (complete && questions.length >= 1 && questions.length <= 5 && questions.every(q => q.endsWith("?") && (q.match(/\?/g) ?? []).length === 1) && !outside.includes("?")) {
       recall = `pour vous demander quelques précisions :\n${questions.map(q => `• ${q}`).join("\n")}`;
     }
@@ -82,6 +89,14 @@ async function readJ2Context(origin: CaseReplyProposal): Promise<J2Origin["j2Con
   const title = titles.get(request.id);
   if (title?.status !== "available" || title.provenance.field !== "ticketSummary" || title.provenance.resultHash !== provenance.resultHash) return undefined;
   return { receivedAt: mail.receivedAt.toISOString(), subject: title.text };
+}
+
+/** OFF: main's fixed reminder, byte for byte (null when the timer or the case is unknown). ON: the contextual mail, built only from the proven origin. */
+export async function readJ2ReminderText(caseId: string, triggerEventId: string, env: Record<string, string | undefined>, origin?: J2Origin | null): Promise<string | null> {
+  if (env.SAV_V2_J2_CONTEXTUAL === "on") return origin ? j2ReminderText(origin, env) : null;
+  const timer = (await listCaseTimers(caseId)).find(timer => `timer:${timer.id}` === triggerEventId);
+  const current = await readCase(caseId);
+  return timer && current ? J2_REMINDER_TEXT : null;
 }
 
 export async function j2AutoGate(env: Record<string, string | undefined>, db: Parameters<typeof readSavBlockSwitch>[0] & Parameters<typeof readSavAgentPause>[0] = requireDb()): Promise<string | null> {

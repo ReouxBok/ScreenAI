@@ -39,6 +39,18 @@ describe("J2 warm follow-up and administrative closure", () => {
     expect(text).not.toContain("Bonjour Marie");
     expectFormat(text);
   });
+  it("multi-question (#288): lists ALL 3 questions tracked separately in the sent mail, exactly and in order", () => {
+    const questions = ["Quel message s’affiche ?", "Depuis quand cela arrive-t-il ?", "Quel navigateur utilisez-vous ?"];
+    const tracked = questions.map((text, i) => ({ id: `in:synthetic:q${i + 1}`, text, factKeys: [`key_${i + 1}`] }));
+    const multi: J2Origin = { ...origin, question: undefined, questions: tracked, text: `Bonjour,\n\n${questions.map(q => `- ${q}`).join("\n")}` };
+    const text = j2ReminderText(multi, on);
+    expect(text).toContain(`pour vous demander quelques précisions :\n${questions.map(q => `• ${q}`).join("\n")}`);
+    expect(text.match(/^• /gm)).toHaveLength(3);
+    expectFormat(text);
+    expect(j2ReminderText(multi, {})).toBe(J2_REMINDER_TEXT);
+    expect(j2ReminderText({ ...multi, text: `${multi.text}\n- Une question non suivie ?` }, on)).toBe(J2_REMINDER_TEXT);
+    expect(j2ReminderText({ ...multi, questions: [...tracked, { ...tracked[0]!, id: "absent", text: "Absente du mail ?" }] }, on)).toBe(J2_REMINDER_TEXT);
+  });
   it("preserves several exact questions sent in one paragraph", () => {
     const sent = "Quel message s’affiche ? Depuis quand cela arrive-t-il ? Quel navigateur utilisez-vous ?";
     const text = j2ReminderText({ ...origin, text: sent, question: { ...origin.question!, text: sent } }, on);

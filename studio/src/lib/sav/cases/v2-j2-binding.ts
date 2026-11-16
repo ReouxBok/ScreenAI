@@ -10,7 +10,7 @@ import type { AdmissionPolicyRecord } from "./admission-runtime";
 import { caseReplyKey, caseReplyPayloadHash, j2TriggerEventId, readCaseEffectsMode, type CaseReplyProposal } from "./case-effects";
 import { submitCaseReplyProposal, decideCaseReply, type CaseReplyStoreDeps } from "./case-reply-store";
 import { queueValidatedCaseReply } from "./case-runtime-effects";
-import { j2ReminderText, j2AutoGate, readJ2Origin } from "./j2-auto-reminder";
+import { readJ2ReminderText, j2AutoGate, readJ2Origin } from "./j2-auto-reminder";
 import { accessAutoReplyAuthorizer } from "./customer-return-store";
 import { readAccessAutoApprovalConfig } from "./customer-return";
 import { judgeCurrentTicketOwner } from "./case-ticket-owner";
@@ -80,8 +80,10 @@ export async function produceAutoJ2(timer: Pick<J2Timer,"id"|"caseId">, caseVers
   if (config.mode !== "on") return "j2_auto_off";
   const origin = await readJ2Origin(timer.caseId, j2TriggerEventId(timer.id), await deps.currentPolicyRevision(), new Date(), deps.env());
   if (!origin) return "reminder_origin_unproven";
+  const text = await readJ2ReminderText(timer.caseId, j2TriggerEventId(timer.id), deps.env(), origin);
+  if (!text) return "reminder_origin_unproven";
   const proposal: CaseReplyProposal = { caseId: timer.caseId, caseVersion, triggerEventId: j2TriggerEventId(timer.id), purpose: "reminder",
-    inboundMessageId: origin.inboundMessageId, recipient: origin.recipient, subject: origin.subject, text: j2ReminderText(origin, deps.env()) };
+    inboundMessageId: origin.inboundMessageId, recipient: origin.recipient, subject: origin.subject, text };
   const proposed = await submitCaseReplyProposal(proposal, deps);
   if (!proposed.ok) return proposed.code;
   if (proposed.state === "approved") return "approved";

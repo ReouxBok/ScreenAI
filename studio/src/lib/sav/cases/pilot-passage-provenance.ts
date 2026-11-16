@@ -4,7 +4,7 @@
 // as `answer` at that exact version AND read as active at that version now. No proof, no validation: anything unread or unknown is a reason, never a default. Nothing is written.
 // No production reader of the active versions and no real scope exist yet: both are injected ports; without them nothing is proven.
 import "server-only";
-import { J2_REMINDER_TEXT, j2ReminderText, readJ2Origin } from "./j2-auto-reminder";
+import { j2ReminderText, readJ2ReminderText, readJ2Origin } from "./j2-auto-reminder";
 import { savKnowledgeFreshness } from "../request-retrieval";
 import { prepareCaseReplyText } from "./case-reply-outbound";
 import type { CaseReplyProposal } from "./case-effects";
@@ -53,18 +53,24 @@ const sameFinalText = (decided: string, proposed: string, purpose: CaseReplyProp
 export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal, "caseId" | "triggerEventId" | "purpose" | "text">, deps: PilotProvenanceDeps,
   /** SAV-92: a text an administrator corrected in the Studio (persisted correction basis only). It skips the text comparison, nothing else: the latest decision,
    * its trigger and purpose, the scope, every source and every incident are still proven, and the incident claims are read on the corrected text too. */
-  options: Readonly<{ humanCorrection?: boolean }> = {}): Promise<PilotProvenance> {
+  options: Readonly<{ humanCorrection?: boolean; reminderInputKey?: string }> = {}): Promise<PilotProvenance> {
   if (proposal.purpose === "reminder") {
-    const env = deps.env?.() ?? {};
-    // Preserve the strict OFF path, including rejection before any origin read.
-    if (env.SAV_V2_J2_CONTEXTUAL !== "on" && proposal.text !== J2_REMINDER_TEXT) return unproven("reply_not_from_decision");
+    const env = deps.env?.() ?? process.env;
+    if (env.SAV_V2_J2_CONTEXTUAL !== "on") {
+      // OFF: main's path exactly, including rejection before any origin read.
+      if (proposal.text !== await readJ2ReminderText(proposal.caseId, proposal.triggerEventId, env)) return unproven("reply_not_from_decision");
+      const origin = await readJ2Origin(proposal.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), deps.now());
+      const reminderInputKey = origin?.questions?.[0]?.id.replace(/:q1$/, "");
+      return origin ? readPilotReplyProvenance(origin, deps, reminderInputKey ? { reminderInputKey } : {}) : unproven("decision_not_latest");
+    }
     const origin = await readJ2Origin(proposal.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), deps.now(), env);
     if (!origin) return unproven("decision_not_latest");
     if (proposal.text !== j2ReminderText(origin, env)) return unproven("reply_not_from_decision");
-    return readPilotReplyProvenance(origin, deps);
+    const reminderInputKey = origin.questions?.[0]?.id.replace(/:q1$/, "");
+    return readPilotReplyProvenance(origin, deps, reminderInputKey ? { reminderInputKey } : {});
   }
   const policyRevision = await deps.currentPolicyRevision();
-  const events = await listCaseEvents(proposal.caseId), inputKey = latestInvestigationInput(events);
+  const events = await listCaseEvents(proposal.caseId), inputKey = options.reminderInputKey ?? latestInvestigationInput(events);
   const read = inputKey ? readCaseInvestigationProgress(events, inputKey) : null;
   // Treatment blocks (11/11): the scope in force of the block the decision was taken under (Access when its stamp names none).
   // SAV-92 (multi-block): every block the decision was taken under, read now.

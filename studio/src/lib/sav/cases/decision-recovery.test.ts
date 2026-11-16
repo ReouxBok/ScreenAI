@@ -11,6 +11,7 @@ describe("SAV-6 refusal typology", () => {
   });
   it("keeps the four product families apart", () => {
     expect(kindsOf("proposal_schema_invalid")).toMatchObject({ kind: "repairable_format", correctable: true, nextStep: "review_model_output" });
+    expect(kindsOf("too_many_questions")).toMatchObject({ kind: "repairable_format", correctable: true, nextStep: "review_model_output" });
     expect(kindsOf("credential_requested")).toMatchObject({ kind: "forbidden_action", correctable: true, nextStep: "observe_and_review" });
     expect(kindsOf("repeated_failed_procedure")).toMatchObject({ kind: "missing_information", correctable: true, nextStep: "ask_wait_or_handoff" });
     expect(kindsOf("context_invalid")).toMatchObject({ kind: "technical", correctable: false, nextStep: "technical_wait" });
