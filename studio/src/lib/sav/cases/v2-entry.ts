@@ -35,6 +35,7 @@ import type { ExecutorAdapters } from "../intake/execution-types";
 import { SAV_INTAKE_CONTRACT_REVISION, type SavIntakeDecision } from "../intake/contract";
 import { readRequestQuotes, relayPaused, type CaseRelayRequest, type CaseBoundaryDeps, type CaseRelayResult } from "./intake-boundary";
 import { loadCaseContinuationPoint, type CaseContinuationPoint, type CaseContinuationTrigger } from "./v2-entry-binding";
+import { requestCaseSettleWake, type CaseSettleWakeStart } from "./case-v2-latency-wakes";
 
 type Env = Record<string, string | undefined>;
 export const savV2EntryEnabled = (env: Env) => env.SAV_V2_ENTRY === "on" && savCaseRecordingEnabled(env);
@@ -260,8 +261,10 @@ function ownerTransport(env: Env, network?: typeof fetch): CaseOwnerReadTranspor
 }
 
 /** `immediateDeadlineMs` (11/11): when the caller must be done; given, a reply queued by the continuation may be sent at once within that budget.
- * Absent (the shared `sav-reconcile` worker): never sent here, the effects catch-up sends it. */
-type EntryDeps = { env: Env; network?: typeof fetch; continuation?: CaseContinuationPoint | null; returnDeps?: Partial<CustomerReturnDeps>; immediateDeadlineMs?: number };
+ * Absent (the shared `sav-reconcile` worker): never sent here, the effects catch-up sends it.
+ * `settleWakeStart` (tests only): the workflow starter of the settle wake (`case-v2-latency-wakes.ts`); absent, the real one. */
+type EntryDeps = { env: Env; network?: typeof fetch; continuation?: CaseContinuationPoint | null; returnDeps?: Partial<CustomerReturnDeps>; immediateDeadlineMs?: number;
+  settleWakeStart?: CaseSettleWakeStart };
 
 function returnSources(input: EntryDeps): CustomerReturnDeps {
   const { env } = input, readOwner = hubspotTicketOwnerReader(ownerTransport(env, input.network));
@@ -432,6 +435,13 @@ export async function continueCaseAfterCommit(caseId: string, trigger: CaseConti
     if (point) {
       const report = await point({ caseId, trigger, env: input.env, ...(input.immediateDeadlineMs === undefined ? {} : { deadlineMs: input.immediateDeadlineMs }) });
       await markContinuation(caseId, trigger, null);
+      // SAV-92 (16/11): refused only because the customer's last mail is still settling: ONE durable wake continues this case when the window ends
+      // (the window itself is unchanged). Every guard is read again by that passage. A failure here never fails the pass; the sweep stays the fallback.
+      if (report.status === "claim_refused" && report.reason === "settling" && report.retryAt) {
+        const wake = await requestCaseSettleWake(caseId, report.retryAt, { env: input.env, ...(input.settleWakeStart ? { start: input.settleWakeStart } : {}) })
+          .catch(() => ({ started: false, reason: "request_threw" }));
+        console.info("sav_v2_settle_wake", { caseId, trigger, retryAt: report.retryAt, started: wake.started, reason: wake.reason });
+      }
       // SAV-18: a block held by its switch is a durable, visible wait (console, diagnostics), cleared by the next pass that is not held.
       await markCaseBlockHold(caseId, report.status === "block_held" ? { blockId: report.detail ?? SAV_CASE_ACCESS_BLOCK_ID, reason: report.reason ?? "block_setting_invalid" } : null);
       // Review batch 3 (B1): a reply naming a team part whose notice could not be queued is a visible, bounded wait (never a silent retry at each sweep):

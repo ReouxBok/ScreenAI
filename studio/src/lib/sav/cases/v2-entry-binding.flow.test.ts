@@ -654,6 +654,7 @@ describe("SAV-80 qualification scope: one bound thread, closed for everything el
 
 import { caseV2EffectsWithTestPorts, sendQueuedCaseReplyNow } from "./v2-effects-binding";
 import type { ImmediateCaseReplySend } from "./immediate-send-budget";
+import { requestCaseReplySend, runCaseReplySend } from "./case-v2-latency-wakes";
 import { intakeRuntimeHash as runtimeHash, savIntakeRuntimeConfig } from "../intake/runtime-contract";
 // The production path of the immediate send (no injected transport or context) reaches Gmail only through these two boundaries; by default they are
 // the real modules (and the network is forbidden), a test routes them to the synthetic provider.
@@ -857,6 +858,78 @@ describe("immediate send: the queued reply leaves at once within the caller's bu
     const [execution] = await effectRows(made.caseId);
     expect(await sendQueuedCaseReplyNow({ env, executionId: execution!.id, callerDeadlineMs: callerDeadline() })).toMatchObject({ pass: { skipped: null, supervised: [] } });
     expect(sends).toBe(1);
+  });
+
+  // SAV-92 (16/11): a reply queued by a caller that cannot send it (the sweep, no deadline, too little time) is handed to ONE separate step with its own budget.
+  function separateSend() {
+    const started: string[] = [];
+    const dispatchSend = (input: { env: Record<string, string | undefined>; executionId: string }) =>
+      requestCaseReplySend({ env: { ...input.env, VERCEL_ENV: "production" }, executionId: input.executionId }, { start: async id => { started.push(id); } });
+    return { started, dispatchSend };
+  }
+
+  it("separate send: the sweep queues -> ONE dispatch; its step sends ONCE while the catch-up runs; later sweeps and passages dispatch and send nothing more", async () => {
+    let r!: ReturnType<typeof rig>;
+    const q = await queued(null, (env, made) => (r = rig(env, made)));
+    const s = separateSend(), immediate: unknown[] = [];
+    const point = await loadCaseContinuationPoint({ sendNow: async input => { immediate.push(input); return r.sendNow(input); }, dispatchSend: s.dispatchSend });
+    expect(await point({ caseId: q.made.caseId, trigger: "sweep", env: q.env })).toEqual({ status: "queued" });
+    expect(immediate).toEqual([]); // the sweep never sends inside the shared worker
+    const [execution] = await effectRows(q.made.caseId);
+    expect(s.started).toEqual([execution!.id]);
+    expect(r.counter.sends).toBe(0);
+    // The step (own budget) and the catch-up at the same time: ONE send.
+    const [step] = await Promise.all([runCaseReplySend(execution!.id, { env: q.env, deadlineMs: Date.now() + 240_000, sendNow: r.sendNow }), r.catchUp()]);
+    expect(step).toEqual(expect.objectContaining({ supervised: expect.any(String) }));
+    expect(r.counter.sends).toBe(1);
+    expect(await effectRows(q.made.caseId)).toEqual([expect.objectContaining({ state: "confirmed" })]);
+    // Replays: another sweep, a relay without deadline, the step started twice by mistake, the catch-up: nothing more.
+    await point({ caseId: q.made.caseId, trigger: "sweep", env: q.env });
+    await point({ caseId: q.made.caseId, trigger: "relay", env: q.env });
+    await runCaseReplySend(execution!.id, { env: q.env, deadlineMs: Date.now() + 240_000, sendNow: r.sendNow });
+    await r.catchUp();
+    expect(s.started).toEqual([execution!.id]);
+    expect(r.counter.sends).toBe(1);
+  });
+
+  it("separate send: a caller whose budget is too short tries at once (refused before any read), then hands off ONCE", async () => {
+    let r!: ReturnType<typeof rig>;
+    const q = await queued(null, (env, made) => (r = rig(env, made)));
+    const s = separateSend();
+    const point = await loadCaseContinuationPoint({ sendNow: input => r.sendNow(input), dispatchSend: s.dispatchSend });
+    expect(await point({ caseId: q.made.caseId, trigger: "relay", env: q.env, deadlineMs: Date.now() + 30_000 })).toEqual({ status: "queued" });
+    expect(r.provider.calls).toEqual([]);
+    const [execution] = await effectRows(q.made.caseId);
+    expect(s.started).toEqual([execution!.id]);
+    await runCaseReplySend(execution!.id, { env: q.env, deadlineMs: Date.now() + 240_000, sendNow: r.sendNow });
+    expect(r.counter.sends).toBe(1);
+  });
+
+  it("separate send: a caller with the time sends inline and dispatches nothing", async () => {
+    let r2!: ReturnType<typeof rig>;
+    const q2 = await queued(null, (env, made) => (r2 = rig(env, made)));
+    const s2 = separateSend();
+    const inline = await loadCaseContinuationPoint({ sendNow: input => r2.sendNow(input), dispatchSend: s2.dispatchSend });
+    expect(await inline({ caseId: q2.made.caseId, trigger: "relay", env: q2.env, deadlineMs: callerDeadline() })).toEqual({ status: "queued" });
+    expect(r2.counter.sends).toBe(1);
+    expect(s2.started).toEqual([]);
+  });
+
+  it("separate send: a closed guard at the step (agent fully paused) sends nothing; the catch-up sends once after the pause", async () => {
+    let r!: ReturnType<typeof rig>;
+    const q = await queued(null, (env, made) => (r = rig(env, made)));
+    const s = separateSend();
+    const point = await loadCaseContinuationPoint({ sendNow: null, dispatchSend: s.dispatchSend });
+    expect(await point({ caseId: q.made.caseId, trigger: "sweep", env: q.env })).toEqual({ status: "queued" });
+    const [execution] = await effectRows(q.made.caseId);
+    const pause = { revision: SAV_AGENT_PAUSE_REVISION, agent: "intake", level: "fully_paused", setBy: "staff@example.invalid", setAt: new Date().toISOString(), reason: "Pause synthétique" };
+    await f.db.insert(savSyncState).values({ key: savAgentPauseKey("intake"), cursor: encryptSavPayload(pause), status: "active", updatedAt: new Date() });
+    try {
+      expect(await runCaseReplySend(execution!.id, { env: q.env, deadlineMs: Date.now() + 240_000, sendNow: r.sendNow })).toEqual({ skipped: "SAV_INTAKE_AGENT_FULLY_PAUSED" });
+    } finally { await f.db.delete(savSyncState).where(eq(savSyncState.key, savAgentPauseKey("intake"))); }
+    expect(r.counter.sends).toBe(0);
+    await r.catchUp();
+    expect(r.counter.sends).toBe(1);
   });
 
   it("the test ports are refused in a production build", () => {
