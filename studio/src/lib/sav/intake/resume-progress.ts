@@ -101,7 +101,8 @@ export const intakeResumeProofKey = (proof: IntakeResumeProof) => digest(proof);
 
 export type IntakeResumeProbe =
   | { state: "progress"; method: IntakeResumeMethod; change: "completed" | "changed"; checked: number }
-  | { state: "same"; checked: number }
+  /** `fault`: reason of the last not-complete read seen by the probe (set by the CRM probe of the store, never content). */
+  | { state: "same"; checked: number; fault?: string | null }
   | { state: "unavailable"; checked: number };
 /**
  * Re-reads, in the order of the analysis, exactly the CRM objects the proof names. Stops at the first progress.
@@ -153,15 +154,36 @@ export function intakeResumeNextProbeAt(holds: number, now: Date) {
 
 /**
  * SAV-92 (stuck dossiers): a HubSpot engagement without a body (or without a date) is returned identically at every
- * re-read, so the probes 10/30/120/360 min would look again forever. After this many consecutive holds on the SAME proof
- * with no progress, and only when the wait ended on such a deterministic fault with every not-complete read « partial »
- * (never a failure, which may be transient), the run is handed to the team: the scheduler stops probing it. Nothing is
- * erased, no attempt and no model call are taken; a CRM change before that still resumes normally, and the operator's
- * resume still probes (progress releases the hand-over).
+ * re-read, so the probes 10/30/120/360 min would look again forever. The run is handed to the team (the scheduler stops
+ * probing it) only after this many CONFIRMATIONS of the same proof: successful probes (« no_progress ») whose not-complete
+ * read failed again with the SAME deterministic fault, every not-complete read of the proof « partial », never « failed ».
+ * - An unavailable probe (outage, abort) is no observation: it neither counts nor resets. Resetting would let a flapping
+ *   provider keep a dead dossier probing forever; counting it would hand over on outages instead of evidence.
+ * - A different fault observed (e.g. history_body_unavailable then partial_batch) restarts the count from that fault; a
+ *   non-deterministic one never hands over. The hand-over names the fault really observed last.
+ * - A probe before the scheduled look (operator's resume) still holds but does not count, so repeated clicks cannot reach
+ *   the bound at once. With the scheduler alone the 4th confirmation comes 10 + 30 + 120 min after the first, i.e.
+ *   about 2 h 40 after the first hold.
+ * Nothing is erased, no attempt and no model call are taken; a CRM change before that still resumes normally, and the
+ * operator's resume still probes (progress releases the hand-over).
  */
 export const SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS = 4;
 export const SAV_INTAKE_DETERMINISTIC_READ_FAULTS: ReadonlySet<string> = new Set(["history_body_unavailable", "history_date_unknown"]);
-export function intakeResumeTeamRequired(proof: IntakeResumeProof, cause: Extract<IntakeResumeDecision, { kind: "hold" }>["cause"], holds: number) {
-  return cause === "no_progress" && holds >= SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS && SAV_INTAKE_DETERMINISTIC_READ_FAULTS.has(proof.incomplete)
+export type IntakeResumeConfirmation = { fault: string | null; confirmations: number; team: boolean };
+export function intakeResumeConfirmation(proof: IntakeResumeProof, cause: Extract<IntakeResumeDecision, { kind: "hold" }>["cause"],
+  observedFault: string | null | undefined, prior: { sameProof: boolean; fault?: unknown; confirmations?: unknown; nextProbeAt?: unknown }, now: Date): IntakeResumeConfirmation {
+  const kept = prior.sameProof ? { fault: typeof prior.fault === "string" ? prior.fault : null, confirmations: typeof prior.confirmations === "number" ? prior.confirmations : 0 } : { fault: null, confirmations: 0 };
+  let next = kept;
+  if (cause === "no_progress") {
+    const fault = observedFault ?? null;
+    if (!fault || !SAV_INTAKE_DETERMINISTIC_READ_FAULTS.has(fault)) next = { fault, confirmations: 0 };
+    else if (fault !== kept.fault) next = { fault, confirmations: 1 };
+    else {
+      const early = prior.sameProof && typeof prior.nextProbeAt === "string" && Date.parse(prior.nextProbeAt) > now.getTime();
+      next = { fault, confirmations: kept.confirmations + (early ? 0 : 1) };
+    }
+  }
+  const team = cause === "no_progress" && next.confirmations >= SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS && next.fault !== null && SAV_INTAKE_DETERMINISTIC_READ_FAULTS.has(next.fault)
     && proof.reads.some(r => r.status === "partial") && proof.reads.every(r => r.status !== "failed");
+  return { ...next, team };
 }

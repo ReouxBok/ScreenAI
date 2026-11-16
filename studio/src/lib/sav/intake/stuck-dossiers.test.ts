@@ -9,7 +9,7 @@ import { collectSavObservationSources } from "../observation-source";
 import { observationConsoleCoverage, observationCoverage, observationLimitsLabel, splitObservationSourceErrors } from "../observation-coverage";
 import { intakeBlockedSubCause, intakeContextReadReason } from "./console-presentation";
 import { SAV_INTAKE_PUBLIC_DIAGNOSTIC_CODES } from "./run-diagnostics";
-import { intakeResumeTeamRequired, SAV_INTAKE_RESUME_REVISION, SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS, type IntakeResumeProof } from "./resume-progress";
+import { intakeResumeConfirmation, SAV_INTAKE_RESUME_REVISION, SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS, type IntakeResumeProof } from "./resume-progress";
 
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 
@@ -80,15 +80,25 @@ describe("B — context waits are classified", () => {
     expect(faults.filter(f => !SAV_INTAKE_PUBLIC_DIAGNOSTIC_CODES.has(f.code)).map(f => f.code)).toEqual([]);
     expect(SAV_INTAKE_PUBLIC_DIAGNOSTIC_CODES.has("resume_team_required")).toBe(true);
   });
-  it("the hand-over to the team needs the bound, no progress, a deterministic fault and only partial (never failed) reads", () => {
+  it("the hand-over counts only scheduled confirmations of the same deterministic fault, on a proof with partial (never failed) reads", () => {
     const read = (status: "complete" | "partial" | "failed") => ({ method: "ticketHistory" as const, arg: "201", status, digest: "0".repeat(64) });
-    const proof = (incomplete: string, ...statuses: Array<"complete" | "partial" | "failed">): IntakeResumeProof =>
-      ({ revision: SAV_INTAKE_RESUME_REVISION, configHash: "c".repeat(64), sourceHash: "s", incomplete, truncated: false, reads: statuses.map(read) });
-    const n = SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS;
-    expect(intakeResumeTeamRequired(proof("history_body_unavailable", "complete", "partial"), "no_progress", n)).toBe(true);
-    expect(intakeResumeTeamRequired(proof("history_body_unavailable", "partial"), "no_progress", n - 1)).toBe(false);
-    expect(intakeResumeTeamRequired(proof("history_body_unavailable", "partial"), "probe_unavailable", n + 5)).toBe(false);
-    expect(intakeResumeTeamRequired(proof("pagination_cycle", "partial"), "no_progress", n + 5)).toBe(false);
-    expect(intakeResumeTeamRequired(proof("history_body_unavailable", "partial", "failed"), "no_progress", n + 5)).toBe(false);
+    const proof = (...statuses: Array<"complete" | "partial" | "failed">): IntakeResumeProof =>
+      ({ revision: SAV_INTAKE_RESUME_REVISION, configHash: "c".repeat(64), sourceHash: "s", incomplete: "history_body_unavailable", truncated: false, reads: statuses.map(read) });
+    const n = SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS, now = new Date("2026-11-16T12:00:00Z"), past = "2026-11-16T11:00:00.000Z", future = "2026-11-16T13:00:00.000Z";
+    const body = "history_body_unavailable", p = proof("complete", "partial");
+    const prior = (confirmations: number, fault: string | null = body, nextProbeAt = past) => ({ sameProof: true, fault, confirmations, nextProbeAt });
+    expect(intakeResumeConfirmation(p, "no_progress", body, prior(n - 1), now)).toEqual({ fault: body, confirmations: n, team: true });
+    expect(intakeResumeConfirmation(p, "no_progress", body, prior(n - 2), now)).toEqual({ fault: body, confirmations: n - 1, team: false });
+    // Unavailable/unchecked: no count, no reset.
+    expect(intakeResumeConfirmation(p, "probe_unavailable", null, prior(n - 1), now)).toEqual({ fault: body, confirmations: n - 1, team: false });
+    // Another fault restarts; a non-deterministic one never hands over; no observed fault is no confirmation.
+    expect(intakeResumeConfirmation(p, "no_progress", "history_date_unknown", prior(n - 1), now)).toEqual({ fault: "history_date_unknown", confirmations: 1, team: false });
+    expect(intakeResumeConfirmation(p, "no_progress", "partial_batch", prior(n + 5), now)).toEqual({ fault: "partial_batch", confirmations: 0, team: false });
+    expect(intakeResumeConfirmation(p, "no_progress", null, prior(n - 1), now)).toEqual({ fault: null, confirmations: 0, team: false });
+    // Before the scheduled look (operator click): held, not counted.
+    expect(intakeResumeConfirmation(p, "no_progress", body, prior(n - 1, body, future), now)).toEqual({ fault: body, confirmations: n - 1, team: false });
+    // Another proof starts from zero; a failed read in the proof never hands over.
+    expect(intakeResumeConfirmation(p, "no_progress", body, { ...prior(n - 1), sameProof: false }, now)).toEqual({ fault: body, confirmations: 1, team: false });
+    expect(intakeResumeConfirmation(proof("partial", "failed"), "no_progress", body, prior(n - 1), now).team).toBe(false);
   });
 });

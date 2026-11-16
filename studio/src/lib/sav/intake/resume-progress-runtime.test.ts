@@ -4,7 +4,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { auditLogs, savIntakeJournal, savIntakeModelCalls, savIntakeRuns, savMailboxes, savMessages, savThreads } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
@@ -33,7 +33,7 @@ async function stored(text = "La connexion ne marche plus.") {
 }
 
 /** One synthetic CRM and one synthetic model; the test moves the CRM between resumes. */
-type History = "partial" | "complete" | "grown" | "no_body";
+type History = "partial" | "complete" | "grown" | "no_body" | "partial_batch";
 function world() {
   const stableNow = Date.now();
   const crm = { history: "partial" as History, ticketSubject: "Connexion fictive", down: false };
@@ -64,6 +64,7 @@ function world() {
       : { results: crm.history === "grown" ? [edge("401"), edge("402")] : [edge("401")] });
     if (path.endsWith("/notes/batch/read")) {
       const wanted = (JSON.parse(String(init?.body)).inputs as { id: string }[]).map(i => i.id);
+      if (crm.history === "partial_batch") return Response.json({ status: "COMPLETE", results: [] });
       return Response.json({ status: "COMPLETE", results: wanted.map(id => note(id, crm.history === "no_body" ? null : id === "401" ? "Panne de connexion déjà investiguée" : "Nouvelle note fictive")) });
     }
     return Response.json({ results: [] });
@@ -306,23 +307,30 @@ it("a released thread with an old human request resumes when the missing CRM his
 });
 
 // SAV-92 (stuck dossiers): an engagement without body is returned identically at every read; the probes must not look again forever.
-it("a missing engagement body: after a bounded number of unchanged holds the run is handed to the team, the scheduler stops probing, nothing is taken", async () => {
+const marker = async (id: string) => (await f.db.select().from(auditLogs).where(eq(auditLogs.entityId, id)))[0].technicalMetadata as Record<string, unknown>;
+/** The scheduled look is due: the next probe is the scheduler's, not an early operator click. */
+const due = (id: string) => f.db.update(auditLogs).set({ technicalMetadata: sql`jsonb_set(${auditLogs.technicalMetadata}, '{nextProbeAt}', to_jsonb(${new Date(Date.now() - 1000).toISOString()}::text))` }).where(eq(auditLogs.entityId, id));
+async function scheduledProbe(id: string, w: ReturnType<typeof world>) { await due(id); return analyse(id, w); }
+
+it("(c) a missing engagement body: after 4 scheduled confirmations of the same fault the run is handed to the team, the scheduler stops probing, nothing is taken", async () => {
   const w = world(); w.crm.history = "no_body";
   const { id, result } = await firstAttempt(w);
   expect(result).toMatchObject({ state: "waiting" });
   expect((await payloadOf(id)).reason).toBe("history_body_unavailable");
   expect((await payloadOf(id)).resumeProof).toMatchObject({ incomplete: "history_body_unavailable" });
   const before = { model: w.seen.model, budget: await readSavIntakeBudget(config) };
-  for (let n = 0; n < SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS - 1; n++) expect(await analyse(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
-  const marker = async () => (await f.db.select().from(auditLogs).where(eq(auditLogs.entityId, id)))[0].technicalMetadata;
-  expect(await marker()).toMatchObject({ state: "held", holds: SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS - 1 });
-  expect((await pendingSavIntakeRuns(config, new Date(Date.now() + 7 * 3600_000))).map(r => r.id)).toContain(id);
   expect(await analyse(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
-  expect(await marker()).toMatchObject({ state: "team_required", cause: "no_progress", holds: SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS, nextProbeAt: null });
+  for (let n = 1; n < SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS - 1; n++) expect(await scheduledProbe(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  expect(await marker(id)).toMatchObject({ state: "held", fault: "history_body_unavailable", confirmations: SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS - 1 });
+  expect((await pendingSavIntakeRuns(config, new Date(Date.now() + 7 * 3600_000))).map(r => r.id)).toContain(id);
+  expect(await scheduledProbe(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  expect(await marker(id)).toMatchObject({ state: "team_required", cause: "no_progress", fault: "history_body_unavailable", confirmations: SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS, nextProbeAt: null });
   // The scheduler no longer probes it, even days later; the operator's button still probes and still takes nothing.
   expect((await pendingSavIntakeRuns(config, new Date(Date.now() + 3 * 86_400_000))).map(r => r.id)).not.toContain(id);
   expect(await analyse(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
   expect((await kinds(id)).filter(k => k === "resume_team_required")).toHaveLength(1);
+  const handover = decryptSavPayload<{ incomplete: string; confirmations: number }>((await f.db.select().from(savIntakeJournal).where(eq(savIntakeJournal.kind, "resume_team_required")))[0].payloadCiphertext);
+  expect(handover).toMatchObject({ incomplete: "history_body_unavailable", confirmations: SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS });
   const row = await run(id);
   expect(row.attempts).toBe(1); expect(row.state).toBe("waiting");
   expect(w.seen.model).toBe(before.model);
@@ -330,12 +338,53 @@ it("a missing engagement body: after a bounded number of unchanged holds the run
   expect(w.seen.crm.every(r => isSavIntakeHubspotRead(r.path, r.method))).toBe(true);
   // Nothing erased: the proof and the plan stay on the run for the team.
   expect((await payloadOf(id)).resumeProof).toBeDefined(); expect((await payloadOf(id)).plan?.decision.disposition.kind).toBe("collect_context");
-});
+}, 30_000);
+
+it("(a) unavailable probes are no observation: 3 unavailable then 1 unchanged read do not hand over", async () => {
+  const w = world(); w.crm.history = "no_body";
+  const { id } = await firstAttempt(w);
+  w.crm.down = true;
+  for (let n = 0; n < 3; n++) expect(await scheduledProbe(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_PROBE_UNAVAILABLE });
+  w.crm.down = false;
+  expect(await scheduledProbe(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  expect(await marker(id)).toMatchObject({ state: "held", holds: 4, confirmations: 1, fault: "history_body_unavailable" });
+  expect(await kinds(id)).not.toContain("resume_team_required");
+  // An outage between confirmations neither counts nor resets.
+  expect(await scheduledProbe(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  w.crm.down = true; expect(await scheduledProbe(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_PROBE_UNAVAILABLE }); w.crm.down = false;
+  expect(await marker(id)).toMatchObject({ confirmations: 2, fault: "history_body_unavailable" });
+}, 30_000);
+
+it("(b) the count is tied to the fault: history_body_unavailable then partial_batch restarts from zero", async () => {
+  const w = world(); w.crm.history = "no_body";
+  const { id } = await firstAttempt(w);
+  for (let n = 0; n < 3; n++) expect(await scheduledProbe(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  expect(await marker(id)).toMatchObject({ confirmations: 3, fault: "history_body_unavailable" });
+  w.crm.history = "partial_batch";
+  expect(await scheduledProbe(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  expect(await marker(id)).toMatchObject({ state: "held", confirmations: 0, fault: "partial_batch" });
+  // A non-deterministic fault never hands over, however often it is seen.
+  for (let n = 0; n < 5; n++) await scheduledProbe(id, w);
+  expect(await marker(id)).toMatchObject({ state: "held", confirmations: 0 });
+  w.crm.history = "no_body";
+  expect(await scheduledProbe(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  expect(await marker(id)).toMatchObject({ state: "held", confirmations: 1, fault: "history_body_unavailable" });
+  expect(await kinds(id)).not.toContain("resume_team_required");
+  expect((await run(id)).attempts).toBe(1);
+}, 30_000);
+
+it("operator clicks before the scheduled look hold but do not count: repeated resumes cannot reach the bound at once", async () => {
+  const w = world(); w.crm.history = "no_body";
+  const { id } = await firstAttempt(w);
+  for (let n = 0; n < 6; n++) expect(await analyse(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  expect(await marker(id)).toMatchObject({ state: "held", holds: 6, confirmations: 1 });
+  expect(await kinds(id)).not.toContain("resume_team_required");
+}, 30_000);
 
 it("a missing engagement body: a CRM change before the bound resumes normally", async () => {
   const w = world(); w.crm.history = "no_body";
   const { id } = await firstAttempt(w);
-  for (let n = 0; n < SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS - 2; n++) expect(await analyse(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  for (let n = 0; n < SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS - 2; n++) expect(await scheduledProbe(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
   w.crm.history = "complete";
   expect(await analyse(id, w)).toMatchObject({ state: "observed" });
   expect((await run(id)).attempts).toBe(2);
