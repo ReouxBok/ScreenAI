@@ -47,7 +47,7 @@ export type CaseEffectRecoveryDriverDeps = Readonly<{
 export type CaseEffectDriverDeps = CaseEffectRecoveryDriverDeps & Readonly<{
   readTicketOwner: CaseTicketOwnerPort;
   /** Pilot (lot C, 4/11): why this reply's provenance is not proven now, or null. Injected only by a pilot consumer; absent, unchanged. A send already engaged never passes here. */
-  pilotProvenance?: (proposal: CaseEffectPayload["proposal"]) => Promise<string | null>;
+  pilotProvenance?: (proposal: CaseEffectPayload["proposal"], context?: Readonly<{ basis?: string | null }>) => Promise<string | null>;
 }>;
 
 const effectIntent = (effect: Effect) => decryptSavPayload<EffectIntent>(effect.intentCiphertext);
@@ -303,7 +303,12 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     if (options.signal.aborted) return fault("ABORTED");
     const { policy } = await readIntakeExecutionAuthority(options.config);
     if (!policy.mutations.includes(permission as typeof policy.mutations[number])) return fault("MUTATION_NOT_GRANTED");
-    if (deps.pilotProvenance && (phases.get(lease) ?? "reply") === "reply" && await deps.pilotProvenance(payloads.get(lease)!.proposal)) return refuseNewWork(lease, "HOLD_PROVENANCE_UNPROVEN");
+    if (deps.pilotProvenance && (phases.get(lease) ?? "reply") === "reply") {
+      const payload = payloads.get(lease)!;
+      // SAV-92: the PERSISTED basis of the approval, read again here (the correction basis is the only one that lets a person's text differ from the decision's).
+      const [stored] = await requireDb().select({ basis: savCaseReplyValidations.authorizationBasis }).from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, payload.validationId));
+      if (await deps.pilotProvenance(payload.proposal, { basis: stored?.basis ?? null })) return refuseNewWork(lease, "HOLD_PROVENANCE_UNPROVEN");
+    }
     await localFenceAfterRead(lease);
   }
 

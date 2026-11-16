@@ -1,7 +1,7 @@
 // SAV-10 raccord (UX side): what the V2 case page may say about the replies pole C's registry holds. Pure: the readers are a port,
 // bound in case-replies-port.ts. Every state is distinct: no reader in this build (absent), a read that failed (unavailable), a page link
 // that is not ours (invalid), and a real empty list. A reply is only "sent" with a confirmed receipt; a started send is "maybe", never "no".
-// Nothing here approves, declines, revokes or queues: no such action exists in the Studio yet.
+// Nothing here approves, declines, revokes or queues: the Studio decision (SAV-92) is the administrators' route `/api/internal/sav/v2/replies/review`, on pole C's registry.
 import { readCaseReplyDisclosure } from "@/lib/sav/cases/case-reply-outbound";
 import { ACCESS_AUTO_APPROVAL_BASIS } from "@/lib/sav/cases/customer-return";
 
@@ -102,8 +102,8 @@ export function describeCaseReply(item: CaseReplyItem): CaseReplyDisplay {
     : "Peut-être partie : l’envoi a commencé sans reçu confirmé. Seule une vérification aura lieu, rien ne sera renvoyé.";
   const tone = status.sent === "yes" ? "success" : status.sent === "no" ? (status.code === "cancelled" ? "danger" : "neutral") : "warning";
   const j2 = j2Labels[status.j2.state] ? { label: j2Labels[status.j2.state]!, dueAt: status.j2.dueAt } : null;
-  // The registry's flag only says the state would accept a decision; who may decide is not settled, so the Studio offers none.
-  const validation = item.approvability.ok ? "Le registre accepterait une décision, mais aucune validation n’est possible depuis le Studio : qui peut valider n’est pas encore décidé."
+  // The registry's flag only says the state would accept a decision; WHO may decide is the route's server-side administrator check (SAV-92).
+  const validation = item.approvability.ok ? "Le registre accepte une décision : seul un administrateur du Studio peut valider, corriger ou refuser cette réponse."
     : item.approvability.reason === "effects_off" ? "Aucune validation possible : envois de l’agent désactivés sur cet environnement."
     : "Déjà décidée.";
   return { purpose: purposeLabels[item.purpose] ?? item.purpose, status: label, sent, tone, j2, validation };
@@ -157,3 +157,61 @@ export function describeCaseReplyDetail(reply: CaseReplyDetail, date: (value: st
   return { mention, mentionOk: disclosure?.mode === "automated" ? automaticBasis : disclosure?.mode === "manual_reviewed" && !automaticBasis, fingerprint: `${reply.payloadHash.slice(0, 12)}…`, decision, timeline, languageProof };
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// SAV-92: what the administrator reads after a decision. Closed codes only; an unknown one says nothing was sent by this request.
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+export type CaseReplyReviewOutcome = Readonly<{
+  ok: boolean; code?: string; detail?: string; action?: "approve" | "correct" | "decline" | "requeue"; send?: "attempted" | "catch_up"; handoff?: "done" | "failed";
+  problems?: readonly Readonly<{ code: string; detail?: string }>[]; approvedValidationId?: string;
+}>;
+const problemLabels: Record<string, string> = {
+  credential_request_pattern: "le texte demande un mot de passe, un code ou un autre secret",
+  access_link_missing: "le lien officiel d’accès à l’application manque",
+  access_link_invalid: "lien ou nom de domaine non autorisé",
+};
+export const caseReplyReviewProblemLabel = (problem: Readonly<{ code: string; detail?: string }>) =>
+  `${problemLabels[problem.code] ?? `règle ${problem.code}`}${problem.code === "access_link_invalid" && problem.detail ? ` : ${problem.detail}` : ""}`;
+const refusalLabels: Record<string, string> = {
+  token_invalid: "Lien de validation invalide. Actualisez la page.",
+  payload_changed: "La proposition a changé depuis l’affichage. Actualisez la page.",
+  already_decided: "Cette proposition a déjà été traitée ou remplacée par une plus récente. Actualisez la page.",
+  not_proposed: "Cette proposition a déjà été traitée ou remplacée par une plus récente. Actualisez la page.",
+  case_version_changed: "Le dossier a changé depuis l’affichage (nouveau mail, reprise, pause ou autre écriture). Actualisez la page.",
+  owner_changed: "Le dossier n’est plus confié à l’agent (repris ou confié à l’équipe).",
+  owner_human: "Le ticket HubSpot est attribué à une personne : l’agent ne répond plus.",
+  owner_none: "Le ticket HubSpot n’a plus de propriétaire V2.",
+  owner_unread: "Propriétaire du ticket HubSpot illisible : envoi refusé par prudence.",
+  owner_read_failed: "Propriétaire du ticket HubSpot illisible : envoi refusé par prudence.", owner_unknown: "Propriétaire du ticket HubSpot illisible : envoi refusé par prudence.",
+  sensitive: "Dossier sensible (finance, résiliation ou autre sujet réservé à l’équipe) : aucun envoi depuis ce bouton. Vous pouvez refuser pour le confier à l’équipe.",
+  paused: "Agent en pause : aucun envoi tant que la pause dure.",
+  block_off: "Bloc éteint : aucun envoi pour ce bloc.", block_paused: "Bloc en pause : aucun envoi pour ce bloc.", block_setting_invalid: "Réglage du bloc illisible : aucun envoi.",
+  effects_off: "Envois de l’agent désactivés sur cet environnement.", execution_off: "Aucune politique d’exécution en vigueur : aucun envoi possible.",
+  text_empty: "Le texte corrigé est vide.", text_too_long: "Le texte corrigé dépasse 6 000 caractères.",
+  text_refused: "Le texte corrigé est refusé par les contrôles de sécurité de l’envoi automatique",
+  reason_invalid: "Motif obligatoire : 3 à 500 caractères.",
+  provenance_unproven: "La provenance de la réponse n’est plus prouvée (décision, périmètre ou fiches modifiés).",
+  not_requeueable: "Cette réponse n’est pas une validation du Studio en attente de mise en file. Actualisez la page.",
+  already_queued: "Cette réponse est déjà en file d’envoi : rien n’est remis. Actualisez la page.",
+  review_off: "La validation depuis le Studio est désactivée sur cet environnement.",
+  proposal_invalid: "Cette proposition porte la mention d’envoi automatique : utilisez « Corriger puis envoyer » (le texte peut rester identique).",
+  new_input: "Un nouveau mail du client est arrivé : la réponse proposée ne vaut plus.",
+  not_admitted: "Le dossier n’est plus admis pour l’agent.", recipient_changed: "Le destinataire n’est plus celui du mail auquel on répond.",
+  trigger_already_approved: "Une réponse à ce mail est déjà validée : une seule réponse par mail.", situation_already_answered: "Cette situation a déjà une réponse validée ou envoyée.",
+  trigger_already_planned: "Une réponse à ce mail est déjà en file d’envoi.", supersedes_invalid: "La proposition corrigée ne correspond plus à celle affichée. Actualisez la page.",
+  review_unconfirmed: "Résultat incertain : vérifiez l’état de la réponse ci-dessous avant toute nouvelle action. Rien ne sera renvoyé automatiquement.",
+};
+export function describeCaseReplyReview(outcome: CaseReplyReviewOutcome): Readonly<{ tone: "success" | "warning" | "danger"; text: string }> {
+  if (outcome.ok && outcome.action === "decline") return outcome.handoff === "failed"
+    ? { tone: "warning", text: "Refus enregistré, rien n’est parti. Le transfert à l’équipe a échoué : confiez le dossier depuis la console." }
+    : { tone: "success", text: "Refus enregistré, rien n’est parti. Le dossier est confié à l’équipe." };
+  if (outcome.ok) return { tone: "success", text: `${outcome.action === "correct" ? "Texte corrigé validé" : outcome.action === "requeue" ? "Réponse remise en file" : "Réponse validée"}. ${outcome.send === "attempted"
+    ? "L’envoi a été lancé par le registre : son état réel (envoyé, incertain, en attente) est affiché ci-dessous."
+    : "Elle part au prochain passage automatique (10 minutes au plus) : son état est affiché ci-dessous."} Une seule réponse par mail, jamais de renvoi automatique.` };
+  const code = outcome.code ?? "unknown";
+  if (outcome.approvedValidationId) return { tone: "danger", text: `Validation enregistrée, mais la mise en file a été refusée (${refusalLabels[code] ?? code}). Rien n’est parti. Actualisez la page : le bouton « Remettre en file » reprend la mise en file quand la cause est levée.` };
+  const base = refusalLabels[code] ?? `Action refusée (code ${code}).`;
+  const problems = code === "text_refused" && outcome.problems?.length ? ` : ${outcome.problems.map(caseReplyReviewProblemLabel).join(" ; ")}.` : code === "text_refused" ? "." : "";
+  return { tone: code === "review_unconfirmed" ? "warning" : "danger", text: `${base}${problems}${code === "review_unconfirmed" ? "" : " Rien n’a été envoyé."}` };
+}

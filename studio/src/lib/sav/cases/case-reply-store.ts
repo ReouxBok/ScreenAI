@@ -23,15 +23,16 @@ import { resolveCaseReplyTrigger } from "./case-reply-trigger";
 import { judgeCurrentTicketOwner, readCaseTicketId, type CaseTicketOwnerPort } from "./case-ticket-owner";
 import { savCaseReplyValidations, type CaseReplyValidationRow } from "./case-reply-validation-table";
 import {
-  authorizeCaseReplyDecision, checkCaseReplySeen, type CaseReplyAuthorizer, type CaseReplyDecisionAction, type CaseReplySeen, type CaseReplyValidationState,
+  authorizeCaseReplyDecision, CASE_REPLY_STUDIO_CORRECTION_BASIS, checkCaseReplySeen, type CaseReplyAuthorizer, type CaseReplyDecisionAction, type CaseReplySeen, type CaseReplyValidationState,
 } from "./case-reply-validation";
 
 export type CaseReplyDecideDeps = Readonly<{
   env: () => Record<string, string | undefined>;
   /** The admission policy revision in force now (null when it cannot be read: nothing is approved on a policy that cannot be read). */
   currentPolicyRevision: () => Promise<string | null>;
-  /** Pilot (lot C, 4/11): why this reply's provenance is not proven now, or null (`pilot-passage-provenance.ts`). Injected only by a pilot consumer; absent, unchanged. */
-  pilotProvenance?: (proposal: CaseReplyProposal) => Promise<string | null>;
+  /** Pilot (lot C, 4/11): why this reply's provenance is not proven now, or null (`pilot-passage-provenance.ts`). Injected only by a pilot consumer; absent, unchanged.
+   * `basis` is the PERSISTED (or, at the approval, the authorizer's) authorization basis: only the Studio correction basis lets a text differ from the decision's (SAV-92). */
+  pilotProvenance?: (proposal: CaseReplyProposal, context?: Readonly<{ basis?: string | null }>) => Promise<string | null>;
 }>;
 /** What NEW reply work (a proposal, a queue entry) needs. The owner port is REQUIRED: there is no default and no way to leave it out and continue (see `case-ticket-owner.ts`). */
 export type CaseReplyStoreDeps = CaseReplyDecideDeps & Readonly<{ readTicketOwner: CaseTicketOwnerPort }>;
@@ -56,9 +57,10 @@ const guardViolation = (error: unknown) => { for (let e: unknown = error; e; e =
  * validation first and the case second (an approval against a new proposal that supersedes the same row) could wait on the other in a cycle, which Postgres
  * resolves by aborting one of them. A test records the lock statements of each function and fails if the order changes (`case-reply-lock-order.test.ts`).
  */
-async function lockCase(tx: ExecutionTx, caseId: string) {
-  const [row] = await tx.select({ id: savCases.id }).from(savCases).where(eq(savCases.id, caseId)).for("update");
-  return Boolean(row);
+/** Locks the case row and returns its version (null when the case row is missing). */
+async function lockCase(tx: ExecutionTx, caseId: string): Promise<number | null> {
+  const [row] = await tx.select({ id: savCases.id, version: savCases.version }).from(savCases).where(eq(savCases.id, caseId)).for("update");
+  return row ? row.version : null;
 }
 
 const PURPOSES = new Set(["question", "answer", "reminder"]);
@@ -101,7 +103,11 @@ export type SubmitCaseReplyResult = Readonly<{ ok: true; id: string; created: bo
  * customer message arrived after the version the proposal is built on, when the recipient is not the stored sender of the message it answers, or when
  * the trigger already holds an approved reply with another content, or when another name of the same situation (B-7, `case-reply-situation.ts`) is already answered.
  */
-export async function submitCaseReplyProposal(requested: CaseReplyProposal, deps: CaseReplyStoreDeps): Promise<SubmitCaseReplyResult> {
+export async function submitCaseReplyProposal(requested: CaseReplyProposal, deps: CaseReplyStoreDeps, options: Readonly<{
+  /** SAV-92 (Studio correction): the proposal a person corrected. Under the case lock it must still be `proposed`, for the same trigger and with the hash they read;
+   * otherwise nothing is stored (`not_proposed` / `supersedes_invalid`). A replay of the same corrected text still finds its own row first (idempotent). */
+  supersedes?: Readonly<{ validationId: string; payloadHash: string }>;
+}> = {}): Promise<SubmitCaseReplyResult> {
   if (!isSupervised(deps)) return refuse("effects_off");
   const problem = proposalProblem(requested);
   if (problem) return refuse("proposal_invalid", problem);
@@ -126,6 +132,13 @@ export async function submitCaseReplyProposal(requested: CaseReplyProposal, deps
     const replyKey = caseReplyKey(proposal.caseId, proposal.triggerEventId), payloadHash = caseReplyPayloadHash(proposal);
     const [existing] = await tx.select().from(savCaseReplyValidations).where(and(eq(savCaseReplyValidations.replyKey, replyKey), eq(savCaseReplyValidations.payloadHash, payloadHash)));
     if (existing) return { ok: true, id: existing.id, created: false, state: existing.state as CaseReplyValidationState };
+    if (options.supersedes) {
+      // Case first (above), validation second: the lock order of this file.
+      const [prior] = await tx.select({ caseId: savCaseReplyValidations.caseId, replyKey: savCaseReplyValidations.replyKey, payloadHash: savCaseReplyValidations.payloadHash, state: savCaseReplyValidations.state })
+        .from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, options.supersedes.validationId)).for("update");
+      if (!prior || prior.caseId !== proposal.caseId || prior.replyKey !== replyKey || prior.payloadHash !== options.supersedes.payloadHash) return refuse("supersedes_invalid");
+      if (prior.state !== "proposed") return refuse("not_proposed", prior.state);
+    }
     if (!facts.admission.admitted) return refuse(facts.admission.reason === "input_newer" ? "new_input" : "not_admitted", facts.admission.reason);
     if (facts.storedSender === null || lower(facts.storedSender) !== lower(proposal.recipient)) return refuse("recipient_changed");
     const [approved] = await tx.select({ id: savCaseReplyValidations.id }).from(savCaseReplyValidations)
@@ -151,8 +164,11 @@ export type DecideCaseReplyResult = Readonly<{ ok: true; id: string; state: Case
  */
 export async function decideCaseReply(input: Readonly<{
   action: Exclude<CaseReplyDecisionAction, "revoke">; validationId: string; approverId: string; seen: CaseReplySeen; authorizer: CaseReplyAuthorizer | null | undefined; deps: CaseReplyDecideDeps;
+  /** SAV-92: the CASE version the person's screen showed. Given, any other version under the case lock refuses (`case_version_changed`): a new mail, a pause
+   * recorded on the case, a takeover or any other write since the screen was built. Absent: unchanged behaviour. */
+  expectedCaseVersion?: number;
 }>): Promise<DecideCaseReplyResult> {
-  const { action, validationId, approverId, seen, authorizer, deps } = input;
+  const { action, validationId, approverId, seen, authorizer, deps, expectedCaseVersion } = input;
   if (!isSupervised(deps)) return refuse("effects_off");
   const target = action === "approve" ? "approved" : "declined";
   const [row] = await requireDb().select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, validationId));
@@ -165,8 +181,20 @@ export async function decideCaseReply(input: Readonly<{
   // A row stored before the contract can still be declined, never approved: nobody validates a text that cannot be sent as written.
   if (action === "approve") { const notFinal = caseReplyStoredTextProblem(proposal.text); if (notFinal) return refuse("proposal_invalid", notFinal); }
   // Pilot: no proof of where this reply comes from, no validation. It can still be declined.
-  if (action === "approve" && deps.pilotProvenance) { const unproven = await deps.pilotProvenance(proposal); if (unproven) return refuse("provenance_unproven", unproven); }
-  const authorization = await authorizeCaseReplyDecision(authorizer, { action, approverId, caseId: row.caseId, replyKey: row.replyKey, payloadHash: row.payloadHash, purpose: proposal.purpose });
+  const request = { action, approverId, caseId: row.caseId, replyKey: row.replyKey, payloadHash: row.payloadHash, purpose: proposal.purpose } as const;
+  let early: Awaited<ReturnType<typeof authorizeCaseReplyDecision>> | null = null;
+  if (action === "approve" && deps.pilotProvenance) {
+    const unproven = await deps.pilotProvenance(proposal);
+    if (unproven) {
+      // SAV-92: a text a person corrected in the Studio differs from the decision's by design. Only the authorizer's explicit correction basis (never a caller's flag)
+      // lets the provenance be judged again without the text comparison; every other proof (latest decision, trigger, purpose, scope, sources) still applies.
+      early = await authorizeCaseReplyDecision(authorizer, request);
+      if (!early.allowed || early.basis !== CASE_REPLY_STUDIO_CORRECTION_BASIS) return refuse("provenance_unproven", unproven);
+      const still = await deps.pilotProvenance(proposal, { basis: early.basis });
+      if (still) return refuse("provenance_unproven", still);
+    }
+  }
+  const authorization = early ?? await authorizeCaseReplyDecision(authorizer, request);
   if (!authorization.allowed) return refuse(authorization.code);
   // The mention the text carries must be the one THIS authority allows: the automated mention only under the automatic rule's basis, the reviewed one only under a human's.
   if (action === "approve") { const wrongMode = caseReplyTextProblemForBasis(proposal.text, authorization.basis); if (wrongMode) return refuse("proposal_invalid", wrongMode); }
@@ -174,11 +202,13 @@ export async function decideCaseReply(input: Readonly<{
   try {
     return await requireDb().transaction(async (tx): Promise<DecideCaseReplyResult> => {
       // Case first, validation second (see the lock order above). An approval reads the facts under that same case lock.
-      const facts = action === "approve" ? await readCaseReplyFacts(tx, proposal, revision, { lockCase: true }) : (await lockCase(tx, row.caseId), null);
+      const facts = action === "approve" ? await readCaseReplyFacts(tx, proposal, revision, { lockCase: true }) : null;
+      const lockedVersion = facts ? facts.caseVersion : await lockCase(tx, row.caseId);
       const [locked] = await tx.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, validationId)).for("update");
       if (!locked) return refuse("unknown");
       if (locked.state === target) return { ok: true, id: locked.id, state: target, changed: false };
       if (locked.state !== "proposed") return refuse("not_proposed", locked.state);
+      if (expectedCaseVersion !== undefined && lockedVersion !== expectedCaseVersion) return refuse("case_version_changed");
       if (facts) {
         if (!facts.admission.admitted) return refuse(facts.admission.reason === "input_newer" ? "new_input" : "not_admitted", facts.admission.reason);
         if (facts.storedSender === null || lower(facts.storedSender) !== locked.recipient) return refuse("recipient_changed");
@@ -250,7 +280,7 @@ export async function enqueueApprovedCaseReply(input: Readonly<{
   // Pilot: the provenance is judged again, outside the transaction: an approved reply whose scope or source changed since is not queued.
   if (deps.pilotProvenance) {
     const [stored] = await requireDb().select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, validationId));
-    const unproven = stored ? await deps.pilotProvenance(proposalOf(stored)) : null;
+    const unproven = stored ? await deps.pilotProvenance(proposalOf(stored), { basis: stored.authorizationBasis }) : null;
     if (unproven) return refuse("provenance_unproven", unproven);
   }
   return requireDb().transaction(async (tx): Promise<EnqueueCaseReplyResult> => {

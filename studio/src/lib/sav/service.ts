@@ -186,6 +186,7 @@ export async function ingestInboundMessage(rawInput: unknown, source?: "gmail_fu
   if (source !== "gmail_full") {
     delete headers["x-studio-automation-headers"];
     delete headers["x-studio-automation-body"];
+    delete headers["x-studio-noise-headers"];
   }
   if (input.autoSubmitted !== undefined) headers["auto-submitted"] = input.autoSubmitted;
 

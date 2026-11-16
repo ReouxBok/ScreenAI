@@ -17,7 +17,7 @@ export const V2_PIPELINE_WIRING: readonly V2WiringStep[] = [
   { step: "proposal", label: "Préparation de la réponse", state: "wired_behind_flag",
     detail: "La décision retenue peut produire une réponse avec la mention IA." },
   { step: "validation", label: "Autorisation de la réponse accès", state: "wired_behind_flag",
-    detail: "La règle du pilote peut autoriser la réponse précise. Cette page permet uniquement de consulter son état." },
+    detail: "La règle du pilote peut autoriser la réponse précise. Une réponse laissée à une personne (bloc en brouillon) peut être approuvée, corrigée ou refusée par un administrateur depuis la page du dossier." },
   { step: "send", label: "File et envoi", state: "wired_behind_flag", flag: "SAV_CASE_EFFECTS",
     detail: "L’exécuteur vérifie l’autorisation avant envoi. Si le reçu manque, il vérifie l’envoi déjà engagé." },
   { step: "follow_up", label: "Relance J2", state: "wired_behind_flag",

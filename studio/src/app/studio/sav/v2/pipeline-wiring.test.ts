@@ -78,7 +78,12 @@ describe("V2 wiring panel = what the sources wire (production caller vs injectab
 
   it("no V2 page, port or view imports a store writer, a runner, a driver or a provider; no server action or route exists under the V2 pages", () => {
     const v2 = [...sources].filter(([file]) => file.startsWith("app/studio/sav/v2/"));
-    for (const [file, text] of v2) {
+    // SAV-92: the one exception is the administrators' decision panel, which posts to its own route (server-side checks, pole C's registry) and nothing else.
+    const REVIEW_POST = `fetch("/api/internal/sav/v2/replies/review", { method: "POST"`;
+    expect(sources.get("app/studio/sav/v2/reply-review-panel.tsx")?.split("fetch(").length).toBe(2);
+    expect(sources.get("app/studio/sav/v2/reply-review-panel.tsx")).toContain(REVIEW_POST);
+    for (const [file, raw] of v2) {
+      const text = file === "app/studio/sav/v2/reply-review-panel.tsx" ? raw.replace(REVIEW_POST, "") : raw;
       expect(text, file).not.toMatch(/"use server"|submitCaseReplyProposal|decideCaseReply|revokeCaseReply|enqueueApprovedCaseReply|runCaseInvestigation|createCaseEffectDriver|executeIntakePass|transitionCaseOwner|appendCaseEvent|fetch\(/);
       expect(text, file).not.toMatch(/from "[^"]*(gmail|hubspot|provider|anthropic|openai|execution-adapters)[^"]*"/i);
     }
