@@ -4,11 +4,12 @@ import { z } from "zod";
 import { requireDb } from "@/db";
 import { auditLogs, staffUsers, savActions, savThreads, savMessages, savIntakeRuns, savIntakeExecutions, savIntakeHumanEvents } from "@/db/schema";
 import { canAccessSav } from "../access";
+import { lockSavSharedSpend } from "../shared-spend";
 import { decryptSavPayload } from "../crypto";
 import { hasUnsettledSavHumanAction, readSavExternalCompletion } from "../external-completion";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 import { executionAdministrator } from "./execution-policy";
-import { activeExecutionEffects, claimEffectRecovery, confirmExecutionEffect, releaseEffectRecovery, withEffectRecoveryLease, type ExecutionTx } from "./execution-store";
+import { activeExecutionEffects, admissionLock, claimEffectRecovery, confirmExecutionEffect, releaseEffectRecovery, withEffectRecoveryLease, type ExecutionTx } from "./execution-store";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
 import { readSavAgentPause, savAgentPauseCode } from "./agent-pause";
 import { intakeRuntimeHash } from "./runtime-contract";
@@ -69,19 +70,30 @@ function selectEffect(execution: Execution, effects: Effect[], messageId: string
 }
 
 /** Every local fence of the existing administrative reconciliations, read under the caller's locks.
- * Without `token`: no execution lease may be active. With it: only this call's recovery lease. */
+ * Without `token`: no execution lease may be active. With it: only this call's recovery lease.
+ * ONE lock order for the pre-check and the confirmation (review Astra on 8958159):
+ *   admission advisory lock -> execution -> thread -> staff -> runs -> agent-pause (shared budget) advisory lock
+ *   (-> console via the version check -> effect row on confirmation).
+ * It extends existing orders without a cycle: withEffectRecoveryLease (admission -> execution),
+ * reconcile_note (admission -> execution -> thread -> staff -> runs), model reservations
+ * (runtime-store assertLease/assertHumanAnalysis: thread -> run -> budget lock) and setSavAgentPause
+ * (budget lock alone). The budget lock is transaction-scoped and taken BEFORE the pause is read: a
+ * pause committed by setSavAgentPause either precedes this read or waits for this transaction's
+ * commit, so no effect is confirmed under a pause recorded in between. */
 async function assertLocal(tx: ExecutionTx, actor: Actor, input: z.infer<typeof request>, snapshot: Execution, expected: IntakeVersionPrecondition | undefined, token?: string) {
   const now = new Date();
+  await admissionLock(tx);
+  const [current] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, snapshot.id)).for("no key update");
+  const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, input.threadId)).for("update");
   const [staff] = await tx.select().from(staffUsers).where(eq(staffUsers.id, actor.id)).for("update");
+  const [latest] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, input.threadId), eq(savMessages.direction, "inbound")))
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+  const runs = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.threadId, input.threadId)).for("update");
+  await lockSavSharedSpend(tx);
   if (!staff?.active || !["admin", "owner"].includes(staff.role) || staff.email !== actor.email || staff.clerkId !== actor.clerkId
     || !canAccessSav(staff.email, staff.role)) return refuse("UNAUTHORIZED");
   // Any agent pause level stops this operator path too: nothing may be handed back while paused.
   if (savAgentPauseCode(await readSavAgentPause(tx))) return refuse("LOCKED");
-  const [current] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, snapshot.id)).for("no key update");
-  const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, input.threadId)).for("update");
-  const [latest] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, input.threadId), eq(savMessages.direction, "inbound")))
-    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
-  const runs = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.threadId, input.threadId)).for("update");
   const run = runs.find(row => row.id === snapshot.runId);
   const commands = await tx.select({ id: savIntakeHumanEvents.id }).from(savIntakeHumanEvents).where(and(
     eq(savIntakeHumanEvents.threadId, input.threadId), inArray(savIntakeHumanEvents.state, ["pending", "reading", "waiting"])));

@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/pglite";
+import * as schema from "@/db/schema";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { auditLogs, savIntakeConsole, savIntakeEffectJournal, savIntakeEffects, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeRuns,
   savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
@@ -215,4 +217,94 @@ it("with the real read-only adapter: a note attached to the ticket is proven; th
   attached = true;
   expect(await run(verify)).toMatchObject({ reconciled: true, kind: "note_associate", objectId: noteId });
   expect(calls.every(c => c.startsWith("GET "))).toBe(true);
+});
+
+// ---- Review Astra (8958159): lock order and pause serialization. PGlite runs ONE connection, so these
+// tests prove the statement order inside each transaction, not a native two-connection interleaving.
+// Existing orders this one extends: withEffectRecoveryLease (admission -> execution), reconcile_note
+// (admission -> execution -> thread -> staff -> runs), model reservations (thread -> run -> budget lock).
+const LOCK_RANK = [
+  ["admission", /sav-intake-common-admission-v1/],
+  ["execution", /from "sav"\."intake_executions"[\s\S]* for (no key )?update/i],
+  ["thread", /from "sav"\."threads"[\s\S]* for update/i],
+  ["staff", /"staff_users"[\s\S]* for update/i],
+  ["runs", /from "sav"\."intake_runs"[\s\S]* for update/i],
+  ["pause", /sav-intake-runtime-model-budget-v1/],
+] as const;
+/** Every transaction of the call, as the ordered list of the locks it takes and of its pause read / effect write. */
+async function recordTransactions(work: () => Promise<unknown>) {
+  const log: string[] = [];
+  const logged = drizzle(f.client as never, { schema, logger: { logQuery: query => { log.push(query); } } }) as unknown as typeof f.db;
+  let n = 0;
+  state.db = new Proxy(logged, { get(target, key, receiver) {
+    if (key !== "transaction") return Reflect.get(target, key, receiver);
+    return async (fn: (tx: unknown) => Promise<unknown>) => { const id = ++n; log.push(`#BEGIN ${id}`); try { return await target.transaction(fn as never); } finally { log.push(`#END ${id}`); } };
+  } });
+  try { await work().catch(error => error); } finally { state.db = f.db; }
+  const transactions: string[][] = [];
+  let current: string[] | null = null;
+  for (const line of log) {
+    if (line.startsWith("#BEGIN")) { current = []; continue; }
+    if (line.startsWith("#END")) { if (current) transactions.push(current); current = null; continue; }
+    if (!current) continue;
+    const lock = LOCK_RANK.find(([, pattern]) => pattern.test(line))?.[0];
+    if (lock) current.push(lock);
+    else if (/from "sav"\."sync_state"/i.test(line)) current.push("read_pause");
+    else if (/^update "sav"\."intake_effects"/i.test(line)) current.push("write_effect");
+  }
+  return transactions;
+}
+const ranks = LOCK_RANK.map(([name]) => name as string);
+/** No transaction ever takes a lock of lower rank after a higher one (re-taking a held lock is free). */
+function assertOneOrder(transactions: string[][]) {
+  for (const steps of transactions) {
+    const held = new Set<string>(); let top = -1;
+    for (const step of steps) {
+      const rank = ranks.indexOf(step);
+      if (rank < 0 || held.has(step)) continue;
+      expect({ step, after: ranks[top] ?? null, ok: rank > top }).toMatchObject({ ok: true });
+      held.add(step); top = rank;
+    }
+  }
+}
+
+it("pre-check and confirmation take ONE lock order: admission, execution, thread, staff, runs, pause", async () => {
+  await noteAssociationCase();
+  const transactions = await recordTransactions(() => run(proven(noteId)));
+  const full = transactions.filter(t => ranks.every(lock => t.includes(lock)));
+  // The read-only pre-check and the confirmation both run the whole fence.
+  expect(full).toHaveLength(2);
+  for (const steps of full) {
+    const first = ranks.map(lock => steps.indexOf(lock));
+    expect(first).toEqual([...first].sort((a, b) => a - b));
+  }
+  assertOneOrder(transactions);
+  // Confirmation: the pause lock is held before the pause is read and until the effect is written.
+  const confirmation = full.find(t => t.includes("write_effect"))!;
+  expect(confirmation.indexOf("pause")).toBeLessThan(confirmation.indexOf("read_pause"));
+  expect(confirmation.indexOf("read_pause")).toBeLessThan(confirmation.indexOf("write_effect"));
+  expect((await f.db.select().from(savIntakeEffects)).every(e => e.state === "confirmed")).toBe(true);
+});
+
+it("a refused call follows the same order (two calls by the same administrator cannot wait on each other)", async () => {
+  await noteAssociationCase();
+  assertOneOrder(await recordTransactions(() => run(vi.fn(async () => ({ confirmed: false, attributed: false })))));
+  await f.db.update(savThreads).set({ aiPaused: true });
+  assertOneOrder(await recordTransactions(() => run(proven(noteId))));
+});
+
+it("a pause recorded between the pre-check and the confirmation stops the confirmation", async () => {
+  await noteAssociationCase();
+  const { setSavAgentPause } = await import("./agent-pause-admin");
+  const verify: Verify = vi.fn(async () => {
+    // The administrator pauses the agent while the HubSpot read is in flight (after the pre-check read "running").
+    await setSavAgentPause({ agent: "intake", level: "actions_paused", reason: "Synthetic pause during verification" });
+    return { confirmed: true, attributed: true, ack: { id: noteId } };
+  });
+  await expect(run(verify)).rejects.toThrow("SAV_INTAKE_EFFECT_RECONCILIATION_LOCKED");
+  expect(verify).toHaveBeenCalledTimes(1);
+  expect((await f.db.select().from(savIntakeEffects)).find(e => e.kind === "note_associate")?.state).toBe("uncertain");
+  expect((await f.db.select().from(auditLogs)).map(a => a.action)).not.toContain("sav_intake_effect_reconciled_from_receipt");
+  const [execution] = await f.db.select().from(savIntakeExecutions);
+  expect(execution.leaseToken).toBeNull();
 });
