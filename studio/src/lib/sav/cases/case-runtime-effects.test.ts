@@ -1004,10 +1004,10 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
 
   // Review Astra n°2 (16/11) ---------------------------------------------------------------------------------------------------------
   /** Wraps the provider's dispatch: `before` / `after` run around the real call for the given kind. */
-  const aroundDispatch = (kind: string, hooks: { before?: () => Promise<void>; after?: () => Promise<void> }) => {
+  const aroundDispatch = (kind: string, hooks: { before?: (intent: { properties?: Record<string, string> }) => Promise<void>; after?: () => Promise<void> }) => {
     const real = options.adapters.dispatch;
     options = { ...options, adapters: { ...options.adapters, dispatch: (async (intent: { kind: string }, ...rest: unknown[]) => {
-      if (intent.kind === kind) await hooks.before?.();
+      if (intent.kind === kind) await hooks.before?.(intent as { properties?: Record<string, string> });
       const result = await (real as (...a: unknown[]) => Promise<unknown>)(intent, ...rest);
       if (intent.kind === kind) await hooks.after?.();
       return result;
@@ -1094,23 +1094,58 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     expect(sends).toBe(1);
   });
 
-  it("[P2] the HubSpot body carries no visible identifier (full body), and a lost ACK after HubSpot removed the hidden comment is still matched, once", async () => {
+  const ACCESS_BODY = "<p>Le client signale un problème d&#39;accès. J&#39;ai répondu avec la procédure de connexion.</p>";
+  const noteCreates = () => p.calls.filter(call => call.method === "POST" && call.path === "/crm/v3/objects/notes");
+
+  it("[P2] the HubSpot body carries no visible identifier (full body); HubSpot removing the hidden comment is still proven by the creation ACK", async () => {
     noteOn();
     const s = await scenario("answer"), { id } = await admit(s);
-    // HubSpot removes the hidden comment, and the creation's answer is lost: no ACK is stored.
+    aroundDispatch("note_create", { after: async () => {
+      for (const note of hubspotNotes()) note.properties.hs_note_body = note.properties.hs_note_body!.replace(/<!-- sav-intake:[a-f0-9]{64} -->$/, "");
+    } });
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
+    const [sealed] = await notesOf(id);
+    expect(sealed!.properties.hs_note_body).toMatch(/^<p>Le client signale un problème d&#39;accès\. J&#39;ai répondu avec la procédure de connexion\.<\/p><!-- sav-intake:[a-f0-9]{64} -->$/);
+    expect(noteCreates().map(call => (call.body as { properties: { hs_note_body: string } }).properties.hs_note_body)).toEqual([sealed!.properties.hs_note_body]);
+    expect(hubspotNotes()).toHaveLength(1);
+    expect(hubspotNotes()[0]!.properties.hs_note_body).toBe(ACCESS_BODY);
+    expect(JSON.stringify(hubspotNotes())).not.toMatch(/Studio intake|sav-intake|reply-summary|inbound:|gm-/);
+    expect(await effectsOf(id)).toMatchObject([{ state: "confirmed" }, { state: "confirmed" }, { state: "confirmed" }]);
+  });
+
+  it("[P1] no ACK and the hidden comment removed: nothing proves the note is ours, it stays uncertain and is never created twice", async () => {
+    noteOn();
+    const s = await scenario("answer"), { id } = await admit(s);
     aroundDispatch("note_create", { after: async () => {
       for (const note of hubspotNotes()) note.properties.hs_note_body = note.properties.hs_note_body!.replace(/<!-- sav-intake:[a-f0-9]{64} -->$/, "");
       throw Error("SAV_TEST_NOTE_ACK_LOST");
     } });
     await pass();
-    for (let n = 0; n < 4 && (await execution(id)).state !== "confirmed"; n++) { await letReconcile(); await expireHeldLease(id); await pass(); }
-    expect(await execution(id)).toMatchObject({ state: "confirmed" });
-    const [sealed] = await notesOf(id);
-    expect(sealed!.properties.hs_note_body).toMatch(/^<p>Le client signale un problème d&#39;accès\. J&#39;ai répondu avec la procédure de connexion\.<\/p><!-- sav-intake:[a-f0-9]{64} -->$/);
-    expect(hubspotNotes()).toHaveLength(1);
-    expect(hubspotNotes()[0]!.properties.hs_note_body).toBe("<p>Le client signale un problème d&#39;accès. J&#39;ai répondu avec la procédure de connexion.</p>");
-    expect(JSON.stringify(hubspotNotes())).not.toMatch(/Studio intake|sav-intake|reply-summary|inbound:|gm-/);
-    expect(await effectsOf(id)).toMatchObject([{ state: "confirmed" }, { state: "confirmed" }, { state: "confirmed" }]);
+    for (let n = 0; n < 4; n++) { await letReconcile(); await expireHeldLease(id); await pass(); }
+    expect(await execution(id)).toMatchObject({ state: "uncertain" });
+    expect((await notesOf(id))[0]!.state).not.toBe("confirmed");
+    expect((await effectsOf(id)).filter(effect => effect.kind === "note_associate")).toEqual([]);
+    expect(noteCreates()).toHaveLength(1);
+    expect(sends).toBe(1);
+  });
+
+  it("[P1] collision: another case's note with the SAME text at the SAME millisecond is never attributed to this case", async () => {
+    noteOn();
+    const s = await scenario("answer"), { id } = await admit(s);
+    // Case B's summary, identical text and instant, already in HubSpot without any marker; this case's own creation never reaches HubSpot.
+    aroundDispatch("note_create", { before: async intent => {
+      p.objects.notes["777001"] = { id: "777001", properties: { hs_note_body: ACCESS_BODY, hs_timestamp: intent.properties!.hs_timestamp! } };
+      throw Error("SAV_TEST_NOTE_CREATE_DOWN");
+    } });
+    await pass();
+    for (let n = 0; n < 4; n++) { await letReconcile(); await expireHeldLease(id); await pass(); }
+    expect(await execution(id)).toMatchObject({ state: "uncertain" });
+    const [own] = await effectsOf(id).then(effects => effects.filter(effect => effect.kind === "note_create"));
+    expect(own!.state).not.toBe("confirmed");
+    expect(own!.ackCiphertext).toBeNull();
+    expect((await effectsOf(id)).filter(effect => effect.kind === "note_associate")).toEqual([]);
+    expect(p.links.get("notes:777001:tickets") ?? []).toEqual([]);
+    expect(noteCreates()).toHaveLength(0);
   });
 
   it("[P2] a replay under `off` of an execution sealed with its note `on` returns the existing execution", async () => {

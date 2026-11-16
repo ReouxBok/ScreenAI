@@ -146,9 +146,6 @@ export function executionProvider(sender = "customer@example.invalid") {
                 });
             if (tail === "search") {
                 const marker = body.filterGroups[0].filters[0].value;
-                // An exact `hs_timestamp` filter (epoch milliseconds), as HubSpot's EQ on a datetime property.
-                if (body.filterGroups[0].filters[0].propertyName === "hs_timestamp" && body.filterGroups[0].filters[0].operator === "EQ")
-                    return Response.json({ results: Object.values(rows).filter(r => Date.parse(r.properties.hs_timestamp ?? "") === Number(marker)).map(r => select(r, body.properties)) });
                 return Response.json({
                     results: Object.values(rows).filter(r => Object.values(r.properties).some(v => v?.includes(marker))).map(r => select(r, body.properties))
                 });

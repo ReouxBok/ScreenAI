@@ -15,7 +15,8 @@ const object = (v: unknown) => z.object({
 const plain = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 export const renderIntakeNote = (text: string, marker: string) => `<p>${plain(text).replace(/\n/g, "<br>")}</p><p>[Studio intake: ${plain(marker)}]</p>`;
 /** SAV-92 (16/11): a note shown to the team with NO visible identifier (the V2 reply's summary note). Its marker is the historical hidden comment, which HubSpot
- * may remove: the note is then matched by its creation ACK (as before) or, with no ACK, by its exact timestamp and exact text (see `verify`). */
+ * may remove: the note is then proven only by its creation ACK (as before). With neither the ACK nor the hidden comment, nothing proves which note is ours (the
+ * summary is deterministic, two cases can share its text and instant): it stays uncertain, never attributed on its date and text. */
 export const renderIntakeNoteHidden = (text: string, marker: string) => `<p>${plain(text).replace(/\n/g, "<br>")}</p><!-- sav-intake:${marker} -->`;
 /** Only the V2 reply's summary note (`note:<case>:reply-summary.<trigger>`) is rendered without a visible marker; every other note keeps the visible one. */
 export const hiddenMarkerNoteKey = (key: string | undefined) => typeof key === "string" && /^note:[^:]+:reply-summary\./.test(key);
@@ -326,21 +327,6 @@ export function createIntakeExecutorAdapters(options: {
             }
             const type = intent.kind === "ticket_create" ? "tickets" : intent.kind === "note_create" ? "notes" : "emails";
             let candidate = ack?.id;
-            // A summary note (no visible marker) whose hidden comment HubSpot may have removed cannot be found by its marker: with no ACK it is searched by its EXACT
-            // timestamp (the approval's own instant, to the millisecond), then proven below by its exact text with or without the comment. One result exactly, or nothing.
-            const hiddenMarker = intent.kind === "note_create" && hiddenMarkerNoteKey(intent.key) && typeof intent.text === "string" && Boolean(intent.marker?.match(/^[a-f0-9]{64}$/))
-                && intent.properties?.hs_note_body === renderIntakeNoteHidden(intent.text, intent.marker!) && Number.isFinite(Date.parse(intent.properties?.hs_timestamp ?? ""));
-            let matchedByTimestamp = false;
-            if (!candidate && hiddenMarker) {
-                const found = z.object({ results: z.array(z.object({ id: z.string() })), paging: z.unknown().optional() }).parse(await hub("/crm/v3/objects/notes/search", "POST", signal, {
-                    filterGroups: [{ filters: [{ propertyName: "hs_timestamp", operator: "EQ", value: String(Date.parse(intent.properties!.hs_timestamp)) }] }],
-                    properties: ["hs_note_body", "hs_timestamp"], limit: 2
-                }));
-                if (found.paging || found.results.length !== 1)
-                    return { confirmed: false, attributed: false };
-                candidate = found.results[0].id;
-                matchedByTimestamp = true;
-            }
             if (!candidate) {
                 const property = type === "tickets" ? "content" : type === "notes" ? "hs_note_body" : "hs_email_text";
                 const found = z.object({
@@ -368,9 +354,9 @@ export function createIntakeExecutorAdapters(options: {
             const createdOwner = type === "tickets" ? intent.properties?.hubspot_owner_id ?? null : null;
             const expected = createdOwner ? Object.fromEntries(Object.entries(intent.properties ?? {}).filter(([key]) => key !== "hubspot_owner_id")) : intent.properties ?? {};
             let ok = row.id === candidate && validNoteIntent && (type === "notes"
-                ? sameNoteProperties(row.properties, intent.properties ?? {}, matchedByTimestamp || Boolean(ack?.id === candidate && ack.operatorCandidate !== true))
+                ? sameNoteProperties(row.properties, intent.properties ?? {}, Boolean(ack?.id === candidate && ack.operatorCandidate !== true))
                 : sameProperties(row.properties, expected));
-            if (!ack && !intent.objectId && !matchedByTimestamp && (!intent.marker || !Object.values(row.properties).some(v => v?.includes(intent.marker!))))
+            if (!ack && !intent.objectId && (!intent.marker || !Object.values(row.properties).some(v => v?.includes(intent.marker!))))
                 ok = false;
             // Without a created owner: empty, as before. With one: the creation is proven by today's owner being it, or else by
             // HubSpot's history showing it was the ticket's FIRST owner, set at its creation (review F3). A person who took the
