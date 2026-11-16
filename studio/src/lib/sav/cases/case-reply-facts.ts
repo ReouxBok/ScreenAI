@@ -1,6 +1,8 @@
 // SAV-10 (pole C): the facts that make a prepared reply stale, read the same way by the submission, the decision and the executor's gate (one rule, one reader).
 import "server-only";
-import { and, eq, gt } from "drizzle-orm";
+import { pendingHandoffReply, provenClosingReply, isTerminalReply } from "./case-terminal-reply";
+import type { CaseSnapshot, CaseEvent } from "./case-types";
+import { and, asc, eq, gt } from "drizzle-orm";
 import { savCaseEvents, savCases, savMessages, savCaseTimers } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import type { ExecutionTx } from "../intake/execution-store";
@@ -26,10 +28,17 @@ export async function readCaseReplyFacts(tx: ExecutionTx, proposal: CaseReplyPro
   // message: `caseAdmissionStatus` alone answers "is the case admitted now", not "is THIS reply still the answer".
   const [newer] = await tx.select({ id: savCaseEvents.id }).from(savCaseEvents)
     .where(and(eq(savCaseEvents.caseId, proposal.caseId), eq(savCaseEvents.kind, "inbound_confirmed"), gt(savCaseEvents.caseVersion, proposal.caseVersion))).limit(1);
+  const terminalRows = row && isTerminalReply(proposal.purpose) ? await tx.select().from(savCaseEvents).where(eq(savCaseEvents.caseId, proposal.caseId)).orderBy(asc(savCaseEvents.caseVersion)).limit(5001) : [];
+  const terminalEvents = terminalRows.map(e => ({ ...e, kind: e.kind as CaseEvent["kind"], direction: e.direction as CaseEvent["direction"], occurredAt: e.occurredAt.toISOString(), createdAt: e.createdAt.toISOString(),
+    ...decryptSavPayload<{ sourceRef: CaseEvent["sourceRef"]; detail: CaseEvent["detail"] }>(e.payloadCiphertext) }));
+  const snapshot = row && isTerminalReply(proposal.purpose) ? { caseId: row.id, ticketId: row.ticketId, owner: row.owner, phase: row.phase, sensitivity: row.sensitivity, body: decryptSavPayload(row.payloadCiphertext) } as CaseSnapshot : null;
+  const pending = snapshot && terminalRows.length <= 5000 && proposal.purpose === "handoff" && pendingHandoffReply(snapshot, terminalEvents, proposal.triggerEventId);
+  const closing = snapshot && terminalRows.length <= 5000 && proposal.purpose === "closing" && provenClosingReply(snapshot, terminalEvents, proposal.triggerEventId);
   const status = !row ? { admitted: false as const, reason: "no_admission" }
-    : caseAdmissionStatus({ owner: row.owner as "agent", admission: row.admissionCiphertext ? decryptSavPayload(row.admissionCiphertext) : null, admissionInputVersion: row.admissionInputVersion }, policyRevision);
+    : caseAdmissionStatus({ owner: pending ? "agent" : row.owner as "agent", admission: row.admissionCiphertext ? decryptSavPayload(row.admissionCiphertext) : null, admissionInputVersion: row.admissionInputVersion }, policyRevision);
   let admission = status.admitted ? newer ? { admitted: false as const, reason: "input_newer" } : status
     : { admitted: false as const, reason: status.reason === "policy_missing" ? "policy_changed" : status.reason };
+  if (isTerminalReply(proposal.purpose) && !(pending || closing)) admission = { admitted: false, reason: "terminal_proof_missing" };
   // Under the SAME case lock as approval / queue / dispatch: a human mail, closed case or obsolete wait cannot cross the last fence.
   if (proposal.purpose === "reminder" && row && admission.admitted) {
     const timerId = /^timer:[0-9a-f-]{36}$/i.test(proposal.triggerEventId) ? proposal.triggerEventId.slice(6) : null;
@@ -44,5 +53,5 @@ export async function readCaseReplyFacts(tx: ExecutionTx, proposal: CaseReplyPro
     if (result?.status !== "timer_conditions_met") admission = { admitted: false, reason: "j2_obsolete_or_deferred" };
   }
   const [stored] = await tx.select({ from: savMessages.fromEmail }).from(savMessages).where(eq(savMessages.id, proposal.inboundMessageId));
-  return { admission, storedSender: stored?.from ?? null, caseVersion: row?.version ?? null, owner: row?.owner ?? null };
+  return { admission, storedSender: stored?.from ?? null, caseVersion: row?.version ?? null, owner: pending ? "agent" : row?.owner ?? null };
 }

@@ -1,4 +1,5 @@
 import "server-only";
+import { readContinuationStop, type ContinuationStop } from "@/lib/sav/cases/continuation-stop";
 import { readIntakeExecutionProgress } from "@/lib/sav/intake/executor";
 import { readCaseByTicket } from "@/lib/sav/cases/case-store";
 import { readCaseReplies } from "../v2/case-replies";
@@ -7,8 +8,8 @@ import { replyFromItems, unifiedConsoleLine, type UnifiedCase, type UnifiedLine,
 type Progress = Awaited<ReturnType<typeof readIntakeExecutionProgress>>;
 type Snapshot = Awaited<ReturnType<typeof readCaseByTicket>>;
 type Replies = Awaited<ReturnType<typeof readCaseReplies>>;
-export type UnifiedReaders = { progress: (messageId: string) => Promise<Progress>; caseByTicket: (ticketId: string) => Promise<Snapshot>; replies: (caseId: string) => Promise<Replies> };
-const defaults: UnifiedReaders = { progress: readIntakeExecutionProgress, caseByTicket: readCaseByTicket, replies: caseId => readCaseReplies(caseReplyReaders, { caseId }) };
+export type UnifiedReaders = { continuationStop?: (caseId: string) => Promise<ContinuationStop | null>; progress: (messageId: string) => Promise<Progress>; caseByTicket: (ticketId: string) => Promise<Snapshot>; replies: (caseId: string) => Promise<Replies> };
+const defaults: UnifiedReaders = { continuationStop: readContinuationStop, progress: readIntakeExecutionProgress, caseByTicket: readCaseByTicket, replies: caseId => readCaseReplies(caseReplyReaders, { caseId }) };
 export const replyOf = (read: Replies) => read.state === "ok" ? read.next ? { state: "unavailable" as const } : replyFromItems(read.items) : read.state === "absent" ? { state: "absent" as const } : { state: "unavailable" as const };
 export function ticketOf(progress: Progress): UnifiedTicket {
   if (!progress?.ticketId) return { state: "none" };
@@ -36,7 +37,7 @@ export async function readUnifiedLines(rows: readonly (UnifiedV1Row & { messageI
       try { const s = await once(caseCache, ticket.ticketId, readers.caseByTicket); if (s && s.ticketId === ticket.ticketId) {
         // One list read (≤10 latest replies) per exact case, already filtered by caseId in SQL; no read per reply.
         let reply; try { reply = replyOf(await once(replyCache, s.caseId, readers.replies)); } catch { reply = { state: "unavailable" as const }; }
-        kase = { state: "found", ticketId: s.ticketId, owner: s.owner, phase: s.phase, updatedAt: s.updatedAt, reply };
+        kase = { state: "found", ticketId: s.ticketId, owner: s.owner, phase: s.phase, updatedAt: s.updatedAt, reply, continuationStop: readers.continuationStop ? await readers.continuationStop(s.caseId) : null };
       } else kase = { state: "absent" }; }
       catch { kase = { state: "unavailable" }; }
     }

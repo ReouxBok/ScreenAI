@@ -5,9 +5,10 @@ import { readOriginalRequestTicket } from "../intake/original-request-ticket";
 //   continueCaseAfterCommit the real trigger after a commit; sweepCaseContinuations its durable catch-up. A failure stays visible (log and one durable marker per case), never swallowed
 // It writes no HubSpot owner, invents no owner id, policy, rule or right: anything absent from the environment admits nobody.
 import "server-only";
+import { markContinuationStop as markContinuation, continuationStopCode } from "./continuation-stop";
 import { and, asc, eq, gt, isNull, lte } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { auditLogs, savCaseEvents, savCases, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeRuns, savMessages, savSyncState, savThreads } from "@/db/schema";
+import { savCaseEvents, savCases, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeRuns, savMessages, savSyncState, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { readSavExternalCompletion } from "../external-completion";
 import { readSavAgentPause } from "../intake/agent-pause";
@@ -427,33 +428,24 @@ async function projectThread(threadId: string) {
   await (await import("../intake/console-store")).projectIntakeThread(threadId).catch(() => { console.error("sav_v2_entry_projection", { threadId }); });
 }
 
-const FAILURE_MARK = { action: "sav_v2_continuation_failed", entityType: "sav_v2_case" } as const;
-/** One durable marker per case, updated in place, cleared by the next success: a failure after a commit can be read later and cannot grow without bound. */
-async function markContinuation(caseId: string, trigger: CaseContinuationTrigger, code: string | null) {
-  const row = and(eq(auditLogs.entityType, FAILURE_MARK.entityType), eq(auditLogs.entityId, caseId), eq(auditLogs.action, FAILURE_MARK.action));
-  const [existing] = await requireDb().select().from(auditLogs).where(row);
-  if (code === null) { if (existing) await requireDb().delete(auditLogs).where(row); return; }
-  const technicalMetadata = { code, trigger, failures: Number((existing?.technicalMetadata as { failures?: unknown } | null)?.failures ?? 0) + 1, lastAt: new Date().toISOString() };
-  if (existing) await requireDb().update(auditLogs).set({ technicalMetadata }).where(row);
-  else await requireDb().insert(auditLogs).values({ actorEmail: "system", ...FAILURE_MARK, entityId: caseId, technicalMetadata });
-}
-
 export type CaseContinuationOutcome = { status: string } | { status: "failed"; code: string };
 /** Called after the commit, on every path. It never undoes or fails what was committed; what went wrong is logged and marked, and the sweep tries the case again. */
 export async function continueCaseAfterCommit(caseId: string, trigger: CaseContinuationTrigger, input: EntryDeps): Promise<CaseContinuationOutcome> {
   let code: string;
-  // SAV-80: no investigation, retrieval or model cost for a case outside the qualification scope or after it expired. Not a failure: nothing is marked.
+  // No investigation or cost outside qualification; keep a durable operator task.
   const scoped = await savV2QualificationCaseAllowed(input.env, caseId).catch(() => ({ allowed: false as const, reason: "qualification_unreadable" }));
   if (!scoped.allowed) {
     // Visible, ids and closed codes only (never an address, subject or text): why a case the agent holds was not continued.
     console.info("sav_v2_continuation_skipped", { caseId, reason: scoped.reason });
+    await markContinuation(caseId, trigger, scoped.reason).catch(error => console.error("sav_v2_entry_continuation_mark", { caseId, errorCode: errorCode(error) }));
     return { status: "qualification_out_of_scope" };
   }
   try {
     const point = input.continuation === undefined ? await loadCaseContinuationPoint() : input.continuation;
     if (point) {
       const report = await point({ caseId, trigger, env: input.env, ...(input.immediateDeadlineMs === undefined ? {} : { deadlineMs: input.immediateDeadlineMs }) });
-      await markContinuation(caseId, trigger, null);
+      const stopCode = continuationStopCode(report);
+      if (stopCode !== undefined) await markContinuation(caseId, trigger, stopCode);
       // SAV-92 (16/11): refused only because the customer's last mail is still settling: ONE durable wake continues this case when the window ends
       // (the window itself is unchanged). Every guard is read again by that passage. A failure here never fails the pass; the sweep stays the fallback.
       if (report.status === "claim_refused" && report.reason === "settling" && report.retryAt) {
@@ -507,7 +499,10 @@ export async function sweepCaseContinuations(input: EntryDeps & { limit?: number
     if (outcome.tried >= limit) break;
     if (!held.has(id)) {
       const scoped = await savV2QualificationCaseAllowed(input.env, id).catch(() => ({ allowed: false as const, reason: "qualification_unreadable" }));
-      if (!scoped.allowed) outcome.outOfScope++;
+      if (!scoped.allowed) {
+        outcome.outOfScope++;
+        await markContinuation(id, "sweep", scoped.reason).catch(error => console.error("sav_v2_entry_continuation_mark", { caseId: id, errorCode: errorCode(error) }));
+      }
       else {
         outcome.tried++;
         const result = await continueCaseAfterCommit(id, "sweep", input);

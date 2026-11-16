@@ -4,6 +4,7 @@
 // acknowledges or verifies anything itself. Not wired to any route, cron or action: OFF until `SAV_CASE_EFFECTS=supervised` AND a person approved a payload.
 import "server-only";
 import { closeAfterConfirmedJ2 } from "./j2-confirmed-closure";
+import { isTerminalReply, closingHandoffReplyEnabled } from "./case-terminal-reply";
 import { j2AutoGate } from "./j2-auto-reminder";
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
@@ -98,7 +99,7 @@ async function commitReceipt(
       if (owned.leaseUntil <= new Date()) return fault("LEASE_LOST");
       const ack = reply && ackOf(reply);
       if (!reply || reply.businessKey !== key || reply.state !== "confirmed" || reply.ackCiphertext !== before.ackCiphertext || !reply.dispatchedAt || !ack?.id || !ack.threadId) return fault("RECEIPT_CHANGED");
-      if (locked.owner !== "agent") throw new ReceiptOwnerChanged();
+      if (locked.owner !== "agent" && !(proposal.purpose === "handoff" && (await readCaseReplyFacts(tx, proposal, currentPolicyRevision, { lockCase: true })).owner === "agent")) throw new ReceiptOwnerChanged();
       if (projectionBlockedByPause(await readSavAgentPause(tx, "intake"), await readSavAgentPause(tx, "v2"))) return fault("RECEIPT_HELD_BY_PAUSE");
       // The J2 counts from the mail's real send time (Gmail's own date, verified within a window of the marker); without it, from the marker.
       const verified = typeof ack.sentAt === "string" ? new Date(ack.sentAt) : null;
@@ -110,7 +111,7 @@ async function commitReceipt(
       // « Waiting for the customer » (OFF unless `SAV_V2_TICKET_STAGES=on`): queued in THIS transaction, from the same locked case and the reply's own policy, so a confirmed reply
       // and its ticket state are born together and a replay or a recovery finds the same execution. Its own pass moves the ticket; nothing is sent from here.
       const closure = await closeAfterConfirmedJ2(tx, proposal, key, sentAt, env());
-      if (closure || proposal.purpose !== "reminder" || env().SAV_V2_J2_CONTEXTUAL !== "on") {
+      if (!isTerminalReply(proposal.purpose) && (closure || proposal.purpose !== "reminder" || env().SAV_V2_J2_CONTEXTUAL !== "on")) {
         const stage = await enqueueCaseTicketStage(tx, { snapshot: closure?.snapshot ?? locked, trigger: closure?.trigger ?? { kind: "reply_confirmed", replyKey: key, sentAt: sentAt.toISOString() }, policy: { id: owned.row.policyId, hash: owned.row.policyHash }, env, threadId: owned.row.threadId });
         await recordCaseComponentOutcome(tx, lease.row.id, "status", stage.ok ? { state: "queued", executionId: stage.executionId } : { state: stage.reason === "stages_disabled" ? "skipped" : "blocked", reason: stage.reason });
       }
@@ -203,6 +204,7 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
   async function eligibility(tx: ExecutionTx, lease: ExecutionLease, phase: Phase, policyRevision: string | null, pauses: readonly [SavAgentPauseState, SavAgentPauseState]) {
     const payload = payloads.get(lease)!;
     const { proposal } = payload;
+    if (phase === "reply" && isTerminalReply(proposal.purpose) && !closingHandoffReplyEnabled(deps.env())) return fault("HOLD_EFFECTS_OFF");
     if (phase === "reply" && proposal.purpose === "reminder") {
       const blocked = await j2AutoGate(deps.env(), tx);
       if (blocked) return fault(`HOLD_${blocked.toUpperCase()}`);

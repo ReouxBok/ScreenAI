@@ -43,7 +43,7 @@ export type CaseReplyQuestion = Readonly<{ id: string; text: string; factKeys: r
 /** Legacy single-question payloads remain valid and keep their approval hash. */
 export const caseReplyQuestions = (proposal: Pick<CaseReplyProposal, "question" | "questions">): readonly CaseReplyQuestion[] => proposal.questions ?? (proposal.question ? [proposal.question] : []);
 
-export type CaseReplyPurpose = "question" | "answer" | "reminder";
+export type CaseReplyPurpose = "question" | "answer" | "reminder" | "closing" | "handoff";
 /**
  * What the agent prepared, as the person saw it. Every field that can change the message or its recipient is part of the hash below.
  * `inboundMessageId` is the stored message (not a quoted address) whose sender is the recipient: the last qualified inbound of the thread.

@@ -159,6 +159,19 @@ describe("access replies without systematic human validation", () => {
   const decide = (overrides: Partial<Parameters<typeof decideAccessAutoApproval>[0]> = {}) =>
     decideAccessAutoApproval({ config, action: "approve", approverId: APPROVER, purpose: "answer", facts, ...overrides });
 
+  it("terminal acknowledgements require the switch, matching action and all existing access permissions", () => {
+    for (const [purpose, nextAction] of [["closing", "confirm_resolution"], ["handoff", "handoff"]]) {
+      const terminalFacts = { ...facts, decision: { ...facts.decision!, nextAction } };
+      expect(decide({ purpose, facts: terminalFacts })).toEqual({ allowed: false, reason: "purpose_not_auto" });
+      const input = { purpose, facts: terminalFacts, env: { SAV_V2_CLOSING_HANDOFF_REPLY: "on" } };
+      expect(decide(input)).toEqual({ allowed: true, basis: ACCESS_AUTO_APPROVAL_BASIS });
+      for (const wrong of ["answer", "ask", "observe_only", purpose === "closing" ? "handoff" : "confirm_resolution"])
+        expect(decide({ ...input, facts: { ...terminalFacts, decision: { ...terminalFacts.decision, nextAction: wrong } } })).toEqual({ allowed: false, reason: "decision_not_reply" });
+      expect(decide({ ...input, facts: { ...terminalFacts, case: { ...terminalFacts.case, sensitivity: "finance" } } })).toEqual({ allowed: false, reason: "sensitive" });
+      expect(decide({ ...input, facts: { ...terminalFacts, ownerNow: "human" } })).toEqual({ allowed: false, reason: "owner_not_v2" });
+    }
+  });
+
   it("only the exact opt-in with a dedicated approver id enables the rule", () => {
     expect(config).toEqual({ mode: "on", approverId: APPROVER });
     expect(readAccessAutoApprovalConfig({ SAV_V2_AUTO_REPLY: "all", SAV_V2_AUTO_APPROVER_ID: APPROVER })).toEqual({ mode: "off", why: "disabled" });

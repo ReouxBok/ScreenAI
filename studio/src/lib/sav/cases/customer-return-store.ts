@@ -162,7 +162,7 @@ export function accessAutoReplyAuthorizer(deps: { env?: Env; readFacts?: (reques
     const config = readAccessAutoApprovalConfig(deps.env ?? {});
     let facts: AccessAutoApprovalFacts | null = null;
     if (config.mode === "on" && deps.readFacts) { try { facts = await deps.readFacts(request); } catch { facts = null; } }
-    const outcome = decideAccessAutoApproval({ config, action: request.action, approverId: request.approverId, purpose: request.purpose, facts });
+    const outcome = decideAccessAutoApproval({ config, action: request.action, approverId: request.approverId, purpose: request.purpose, env: deps.env, facts });
     return outcome.allowed ? { allowed: true, basis: outcome.basis } : { allowed: false, reason: outcome.reason };
   };
 }
