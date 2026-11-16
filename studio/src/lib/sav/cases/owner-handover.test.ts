@@ -10,7 +10,8 @@ vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_AL
 // The real executor must never be loaded here: every test injects its progress reader.
 vi.mock("../intake/executor", () => ({ readIntakeExecutionProgress: () => { throw Error("EXECUTOR_NOT_ALLOWED"); } }));
 import { encryptSavPayload } from "../crypto";
-import { readCaseByTicket } from "./case-store";
+import { listCaseEvents, readCaseByTicket } from "./case-store";
+import type { CaseBoundaryDeps } from "./intake-boundary";
 import { recordCaseAfterConfirmedIntake, sweepCaseRelays } from "./intake-boundary";
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, policyId: string, seq = 8_200_000;
@@ -310,7 +311,7 @@ it.each(["SAV_V2_OWNER_HANDOVER", "SAV_V2_ENTRY", "SAV_V2_WAKE_WORKFLOWS"])("%s 
   expect(readTicket).not.toHaveBeenCalled();
 });
 
-it.each(["starting", "start_failed", "consumed", "team_replied_last"])("absolute event deadline ignores %s even with a future recovery time", async stateName => {
+it.each(["starting", "start_failed", "consumed"])("absolute event deadline ignores %s even with a future recovery time", async stateName => {
   const source = await intake({ classification: "finance" }), s = await scheduled(source.ticketId);
   const old = await marker(source.ticketId);
   await f.db.update(auditLogs).set({ technicalMetadata: { ...old, state: stateName,
@@ -372,4 +373,51 @@ it("switch off recovery abandons an interrupted consumed wake without a second r
   expect(await marker(source.ticketId)).toMatchObject({ state: "abandoned", outcome: "switch_off", retries: 0 });
   expect(await sweep(source.ticketId)).toMatchObject({ relayed: 0 });
   expect(relay).not.toHaveBeenCalled();
+});
+
+
+it("team-last blocks an admissible old mail beyond one hour until a newer confirmed customer mail", async () => {
+  const source = await intake(), s = await scheduled(source.ticketId);
+  const readCreatedTicketOwner = vi.fn(async () => "902");
+  const deps: CaseBoundaryDeps = {
+    env: ENV, ...confirmed(source.ticketId), readCreatedTicketOwner,
+    readAdmissionPolicy: async () => ({ revision: "team-last-policy", admittedFamilies: ["usage"],
+      qualifiedRules: [{ ruleId: "usage-rule", revision: "r1", families: ["usage"] }],
+      approvedBy: "20000000-0000-4000-8000-000000000001", approvedAt: RECEIVED }),
+    readQualification: async ({ requests }) => ({
+      requests: requests.map(request => ({ requestId: request.requestId, family: "usage", provenance: {
+        kind: "qualified_rule", ruleId: "usage-rule", revision: "r1", at: RECEIVED } })),
+      identity: { status: "confirmed", source: { type: "hubspot_object", id: "synthetic-contact" } },
+      crmContext: "complete", teamSignals: [],
+    }),
+  };
+  expect(await runOwnerHandover(source.ticketId, s.token, { env: ENV, now: s.now,
+    readTicket: async () => ({ ...await customer(), lastDirection: "team" }) })).toEqual({ status: "team_replied_last" });
+  const old = await marker(source.ticketId);
+  await f.db.update(auditLogs).set({ technicalMetadata: { ...old, occurredAt: Date.now() - 3_600_001 } })
+    .where(eq(auditLogs.entityId, source.ticketId));
+  expect(await ownerHandoverGraceOpen(source.ticketId)).toBe(true);
+  await sweepCaseRelays({ deps });
+  expect(await readCaseByTicket(source.ticketId)).toBeNull();
+  expect(readCreatedTicketOwner).not.toHaveBeenCalled();
+  expect(await marker(source.ticketId)).toMatchObject({ state: "team_replied_last" });
+
+  // Equal timestamps and outbound mail do not prove a new customer message.
+  const reply = await intake({ ticketId: source.ticketId, threadId: source.threadId });
+  const outbound = await intake({ ticketId: source.ticketId, threadId: source.threadId, direction: "outbound" });
+  await f.db.update(savMessages).set({ receivedAt: new Date(Date.parse(RECEIVED) + 1) }).where(eq(savMessages.id, outbound.messageId));
+  expect(await ownerHandoverGraceOpen(source.ticketId)).toBe(true);
+  await sweepCaseRelays({ deps });
+  expect(await readCaseByTicket(source.ticketId)).toBeNull();
+
+  await f.db.update(savMessages).set({ receivedAt: new Date(Date.parse(RECEIVED) + 1) }).where(eq(savMessages.id, reply.messageId));
+  expect(await ownerHandoverGraceOpen(source.ticketId)).toBe(false);
+  await sweepCaseRelays({ deps });
+  const current = (await readCaseByTicket(source.ticketId))!;
+  expect(current).toMatchObject({ owner: "agent", admission: { target: "agent" } });
+  expect((await listCaseEvents(current.caseId)).filter(event => event.kind === "inbound_confirmed")).toHaveLength(2);
+  expect((await listCaseEvents(current.caseId)).filter(event => event.kind === "owner_changed")).toHaveLength(1);
+  expect(await sweepCaseRelays({ deps })).toMatchObject({ relayed: 0, recovered: 0 });
+  expect((await readCaseByTicket(source.ticketId))?.version).toBe(current.version);
+  expect(state.start).not.toHaveBeenCalled();
 });

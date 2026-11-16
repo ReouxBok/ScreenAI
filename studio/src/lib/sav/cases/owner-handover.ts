@@ -97,10 +97,11 @@ export async function recoverOwnerHandovers(options: { env: Env; limit: number }
   }
 }
 
-/** Active markers block the sweep for at most one hour after the owner event. Consumed
- * means checks are in progress, including a delayed or interrupted CRM read.
+/** Transient markers expire one hour after the owner event. Consumed means checks
+ * are in progress, including a delayed or interrupted CRM read. A team-last result
+ * blocks the old mail until a newer confirmed inbound, regardless of the event age.
  * SQL form also protects the first relay of a case that does not exist yet. */
-export const noOwnerHandoverGrace = (ticketId: unknown) => sql`not exists (select 1 from public.audit_logs h where h.action = ${OWNER_HANDOVER_MARK.action} and h.entity_type = ${OWNER_HANDOVER_MARK.entityType} and h.entity_id = ${ticketId} and (h.technical_metadata->>'occurredAt')::numeric + ${MAX_HANDOVER_AGE_MS} > extract(epoch from clock_timestamp()) * 1000 and ((h.technical_metadata->>'state' in ('starting', 'start_failed', 'consumed')) or (h.technical_metadata->>'state' = 'team_replied_last' and not exists (select 1 from sav.intake_executions e join sav.messages m on m.id = e.message_id where e.ticket_id = h.entity_id and e.state = 'confirmed' and m.direction = 'inbound' and m.received_at > (h.technical_metadata->>'teamLastAt')::timestamptz))))`;
+export const noOwnerHandoverGrace = (ticketId: unknown) => sql`not exists (select 1 from public.audit_logs h where h.action = ${OWNER_HANDOVER_MARK.action} and h.entity_type = ${OWNER_HANDOVER_MARK.entityType} and h.entity_id = ${ticketId} and (((h.technical_metadata->>'occurredAt')::numeric + ${MAX_HANDOVER_AGE_MS} > extract(epoch from clock_timestamp()) * 1000 and h.technical_metadata->>'state' in ('starting', 'start_failed', 'consumed')) or (h.technical_metadata->>'state' = 'team_replied_last' and not exists (select 1 from sav.intake_executions e join sav.messages m on m.id = e.message_id where e.ticket_id = h.entity_id and e.state = 'confirmed' and m.direction = 'inbound' and m.received_at > (h.technical_metadata->>'teamLastAt')::timestamptz))))`;
 export async function ownerHandoverGraceOpen(ticketId: string) {
   const [row] = await requireDb().select({ clear: noOwnerHandoverGrace(ticketId) }).from(auditLogs).limit(1);
   return row ? !row.clear : false;
