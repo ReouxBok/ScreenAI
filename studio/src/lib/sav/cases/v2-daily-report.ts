@@ -132,10 +132,11 @@ export async function v2DailyReport(raw: z.infer<typeof v2DailyReportInput>) {
       }
       for (const [name, kinds] of [['notes', ['note_create', 'note_associate']], ['statuses', ['ticket_stage']]] as const) {
         const relevant = own.filter(e => (kinds as readonly string[]).includes(e.kind ?? ""));
+        const inventoryState = name === 'notes' ? row.hubspot.note : row.hubspot.status;
         const parentRefused = own.some(e => e.parentState === 'refused' && (name === 'notes' ? object(decoded(e.payload).note).text !== undefined : object(decoded(e.payload).intent).target !== undefined));
-        const state = parentRefused ? 'refused' : !relevant.length ? 'absent' : relevant.some(e => e.state === 'uncertain' || e.state === 'dispatched' || e.state === 'acked') ? 'uncertain'
+        const state = parentRefused ? 'refused' : !relevant.length ? inventoryState === 'queued' ? 'pending' : 'absent' : relevant.some(e => e.state === 'uncertain' || e.state === 'dispatched' || e.state === 'acked') ? 'uncertain'
           : relevant.some(e => e.state === 'refused') ? 'refused'
-          : relevant.every(e => e.state === 'confirmed' && e.confirmedAt) && (name !== 'notes' || row.hubspot.note === 'confirmed') ? 'confirmed' : 'pending';
+          : relevant.every(e => e.state === 'confirmed' && e.confirmedAt) && inventoryState === 'confirmed' ? 'confirmed' : 'pending';
         crm[name][state]++;
         if (replies.length && state !== 'confirmed') anomalies.add(c.id);
       }

@@ -80,6 +80,17 @@ it("distinguishes uncertain CRM and requires note association", async () => {
   await effect(c, 'note_associate', 'confirmed', at, id);
   expect((await run()).crm.notes.confirmed).toBe(1);
 });
+it("counts a first CRM execution without materialized effects as pending", async () => {
+  const c = await fixture();
+  await f.db.insert(savCaseEffectExecutions).values({ caseId: c.caseId, threadId: c.threadId, replyKey: `case-stage:${randomUUID()}`, policyId, policyHash: 'fixture', payloadCiphertext: encryptSavPayload({ intent: { target: 'closed' } }) });
+  expect((await run()).crm.statuses).toEqual({ confirmed: 0, uncertain: 0, refused: 0, absent: 0, pending: 1 });
+});
+it("counts an old confirmed status with a new queued execution as pending", async () => {
+  const c = await fixture();
+  await effect(c, 'ticket_stage', 'confirmed', at);
+  await f.db.insert(savCaseEffectExecutions).values({ caseId: c.caseId, threadId: c.threadId, replyKey: `case-stage:${randomUUID()}`, policyId, policyHash: 'fixture', payloadCiphertext: encryptSavPayload({ intent: { target: 'closed' } }) });
+  expect((await run()).crm.statuses).toEqual({ confirmed: 0, uncertain: 0, refused: 0, absent: 0, pending: 1 });
+});
 it("refuses oversized cohorts", async () => {
   await f.db.insert(savCases).values(Array.from({ length: 1001 }, () => ({ ticketId: String(++sequence), createdAt: at, owner: 'agent', phase: 'queued', admissionTarget: 'agent', contractRevision: SAV_CASE_CONTRACT_REVISION, payloadCiphertext: encryptSavPayload(emptyCaseBody()) })));
   await expect(run()).rejects.toThrow('CASE_LIMIT');
