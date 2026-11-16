@@ -150,3 +150,18 @@ export function intakeResumeNextProbeAt(holds: number, now: Date) {
   const delays = SAV_INTAKE_RESUME_PROBE_DELAYS_MS;
   return new Date(now.getTime() + delays[Math.min(Math.max(holds, 1), delays.length) - 1]).toISOString();
 }
+
+/**
+ * SAV-92 (stuck dossiers): a HubSpot engagement without a body (or without a date) is returned identically at every
+ * re-read, so the probes 10/30/120/360 min would look again forever. After this many consecutive holds on the SAME proof
+ * with no progress, and only when the wait ended on such a deterministic fault with every not-complete read « partial »
+ * (never a failure, which may be transient), the run is handed to the team: the scheduler stops probing it. Nothing is
+ * erased, no attempt and no model call are taken; a CRM change before that still resumes normally, and the operator's
+ * resume still probes (progress releases the hand-over).
+ */
+export const SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS = 4;
+export const SAV_INTAKE_DETERMINISTIC_READ_FAULTS: ReadonlySet<string> = new Set(["history_body_unavailable", "history_date_unknown"]);
+export function intakeResumeTeamRequired(proof: IntakeResumeProof, cause: Extract<IntakeResumeDecision, { kind: "hold" }>["cause"], holds: number) {
+  return cause === "no_progress" && holds >= SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS && SAV_INTAKE_DETERMINISTIC_READ_FAULTS.has(proof.incomplete)
+    && proof.reads.some(r => r.status === "partial") && proof.reads.every(r => r.status !== "failed");
+}

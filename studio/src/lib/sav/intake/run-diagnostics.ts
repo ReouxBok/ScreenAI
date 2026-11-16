@@ -23,7 +23,11 @@ const publicCodes = new Set<string>([...Object.keys(intakeContextReasonLabels), 
   "excerpt_not_in_source", "required_source_missing", "message_id_mismatch", "registration_source_invalid", "output_schema_invalid", "visual_structure_invalid",
   "request_limit", "operation_forbidden", "partial_response", "total_mismatch", "pagination_cycle", "page_limit", "archived_contact",
   "aliases_unavailable", "batch_limit", "partial_batch", "conflicting_contact", "contact_limit", "cancelled", "read_unavailable",
-  "ticket_limit", "ticket_membership_conflict", "ticket_content_unavailable", "history_limit", "history_date_unknown", "read_retry_scheduled", "read_retry_stopped", "read_retry_claimed", "resume_held", "resume_progress"]);
+  "ticket_limit", "ticket_membership_conflict", "ticket_content_unavailable", "history_limit", "history_date_unknown", "read_retry_scheduled", "read_retry_stopped", "read_retry_claimed", "resume_held", "resume_progress",
+  // SAV-92 (stuck dossiers): read faults that were missing (diagnostic showed them as no code) and the bounded hand-over to the team.
+  "history_body_unavailable", "wrong_contact", "resume_team_required"]);
+/** Exported for the exhaustiveness test of CRM read faults (closed codes only). */
+export const SAV_INTAKE_PUBLIC_DIAGNOSTIC_CODES: ReadonlySet<string> = publicCodes;
 const outputStages = new Set(["sanitize_wire", "visual_normalize", "decode", "final_schema", "evidence"]);
 const normalizationCounts = ["nullOptionalKeys", "partialImages", "truncatedImageTexts", "truncatedUncertainties", "droppedUncertainties", "droppedRegions", "truncatedRegionTexts", "invalidBoxes", "omittedChars", "discardedRegistrations"];
 /** Allow-listed integer counters only; values and texts are never projected. */

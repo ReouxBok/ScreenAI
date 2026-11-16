@@ -4,7 +4,7 @@ import { requireDb } from "@/db";
 import { auditLogs, savIntakeJournal } from "@/db/schema";
 import { encryptSavPayload } from "../crypto";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
-import { intakeResumeNextProbeAt, intakeResumeProofKey, probeIntakeResume, type IntakeResumeDecision, type IntakeResumeProbe, type IntakeResumeProof } from "./resume-progress";
+import { intakeResumeNextProbeAt, intakeResumeProofKey, intakeResumeTeamRequired, probeIntakeResume, type IntakeResumeDecision, type IntakeResumeProbe, type IntakeResumeProof } from "./resume-progress";
 
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 const MARKER = "sav_intake_resume_hold";
@@ -35,11 +35,16 @@ export async function probeIntakeResumeForRun(proof: IntakeResumeProof, deps: { 
 export async function holdIntakeResume(tx: Tx, runId: string, proof: IntakeResumeProof, cause: Extract<IntakeResumeDecision, { kind: "hold" }>["cause"], now: Date) {
   const key = intakeResumeProofKey(proof);
   const [prior] = await tx.select().from(auditLogs).where(hold(runId)).for("update");
-  const before = prior?.technicalMetadata as { proofKey?: unknown; holds?: unknown; cause?: unknown } | undefined;
+  const before = prior?.technicalMetadata as { proofKey?: unknown; holds?: unknown; cause?: unknown; state?: unknown } | undefined;
   const same = before?.proofKey === key, holds = (same && typeof before?.holds === "number" ? before.holds : 0) + 1;
-  const technicalMetadata = { state: "held", proofKey: key, cause, holds, lastProbeAt: now.toISOString(), nextProbeAt: intakeResumeNextProbeAt(holds, now), configHash: proof.configHash };
+  // SAV-92 (stuck dossiers): a bounded number of holds on a deterministic missing body hands the run to the team; the
+  // scheduler then stops probing it (see noResumeHoldSql). No attempt, no model call, nothing erased.
+  const team = intakeResumeTeamRequired(proof, cause, holds);
+  const technicalMetadata = { state: team ? "team_required" : "held", proofKey: key, cause, holds, lastProbeAt: now.toISOString(), nextProbeAt: team ? null : intakeResumeNextProbeAt(holds, now), configHash: proof.configHash };
   if (prior) await tx.update(auditLogs).set({ technicalMetadata }).where(eq(auditLogs.id, prior.id));
   else await tx.insert(auditLogs).values({ actorEmail: "system", action: MARKER, entityType: MARKER, entityId: runId, technicalMetadata });
+  if (team && !(same && before?.state === "team_required")) await tx.insert(savIntakeJournal).values({ runId, kind: "resume_team_required", payloadCiphertext: encryptSavPayload({
+    cause, holds, attemptsUnchanged: true, modelCallsUnchanged: true, incomplete: proof.incomplete, notComplete: proof.reads.filter(r => r.status !== "complete").map(r => r.method) }) });
   if (!same || before?.cause !== cause) await tx.insert(savIntakeJournal).values({ runId, kind: "resume_held", payloadCiphertext: encryptSavPayload({ cause, attemptsUnchanged: true, modelCallsUnchanged: true,
     incomplete: proof.incomplete, reads: proof.reads.length, notComplete: proof.reads.filter(r => r.status !== "complete").map(r => r.method) }) });
 }
@@ -49,7 +54,8 @@ export async function recordIntakeResumeProgress(tx: Tx, runId: string, probe: E
   await tx.update(auditLogs).set({ technicalMetadata: sql`jsonb_set(${auditLogs.technicalMetadata}, '{state}', '"released"')` }).where(hold(runId));
 }
 
-/** The scheduler leaves a held run alone until its next look; the operator's resume ignores this on purpose. */
+/** The scheduler leaves a held run alone until its next look, and a run handed to the team (SAV-92) for good; the
+ * operator's resume ignores this on purpose. */
 export const noResumeHoldSql = (runId: ReturnType<typeof sql>, now: Date) =>
   sql`not exists(select 1 from public.audit_logs h where h.entity_type='sav_intake_resume_hold' and h.action='sav_intake_resume_hold' and h.entity_id=${runId}::text
-    and h.technical_metadata->>'state'='held' and h.technical_metadata->>'nextProbeAt'>${now.toISOString()})`;
+    and (h.technical_metadata->>'state'='team_required' or h.technical_metadata->>'state'='held' and h.technical_metadata->>'nextProbeAt'>${now.toISOString()}))`;
