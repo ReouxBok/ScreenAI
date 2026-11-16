@@ -4,12 +4,14 @@
 //   driver     what is checked before every plan, marker and send: A's gate (`decideCaseTicketStage`) on facts read just now (mode, pauses, the CRM owner, the case, a customer
 //              mail recorded since the reply), the permission, the lease. A stage already engaged (marker, ack, uncertain) is only verified.
 //   pass       `runCaseTicketStagePass`: the open stages, oldest first.
+//   note       SAV-92 (Ugo 16/11): once a « closed » stage is CONFIRMED, the same execution writes ONE closure note (`note:<case>:closed-summary.cycle-<n>`, hidden
+//              marker) through the existing case note effect, only under `SAV_V2_REPLY_NOTE=on` and `append_case_note`, behind the same guard as the stage.
 // Nothing here is called by a route, a cron or an action. OFF until `SAV_V2_TICKET_STAGES=on` AND the execution policy grants `set_case_ticket_stage`.
 import "server-only";
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, isNull, like, lt, lte, notExists, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, like, lt, lte, notExists, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savCaseEffectExecutions, savIntakeEffectJournal, savIntakeEffects } from "@/db/schema";
+import { savCaseEvents, savCaseEffectExecutions, savIntakeEffectJournal, savIntakeEffects } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { readSavAgentPause, SAV_AGENT_PAUSE_CODES, savAgentPauseCode, type SavAgentPauseState } from "../intake/agent-pause";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "../intake/execution-policy";
@@ -26,6 +28,20 @@ import { v2HubspotOwnerId } from "./intake-boundary";
 import { lockCaseForWrite } from "./case-store";
 import { readCaseTicketId, type CaseTicketOwnerPort } from "./case-ticket-owner";
 import { decideCaseTicketStage, planCaseTicketStage, readCaseTicketStageConfig, type CustomerReturnOwnerNow } from "./customer-return";
+import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, type CaseNoteCreateIntent } from "./case-effect-intents";
+import { caseNoteAssociationKey, caseNoteKey, SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
+import { caseClosureNoteInteractionId, caseClosureNoteText, caseReplyNoteEnabled } from "./case-reply-summary-note";
+import { createIntakeExecutorAdapters } from "../intake/execution-adapters";
+
+const NOTE_KINDS = new Set(["note_create", "note_associate"]);
+const ENGAGED_STATES: readonly string[] = ["dispatched", "acked", "uncertain"];
+const ackOf = (effect: Effect) => effect.ackCiphertext ? decryptSavPayload<{ id?: string }>(effect.ackCiphertext) : null;
+/** SAV-92 (16/11): the closure note's two ledger keys, for a « closed » stage only (null otherwise: a « waiting » stage writes no note). */
+export function closureNoteKeys(payload: TicketStagePayload, caseId: string) {
+  if (payload.intent.target !== "closed" || payload.trigger.kind !== "resolution_recorded") return null;
+  const interactionId = caseClosureNoteInteractionId(payload.trigger.cycle);
+  return { interactionId, create: caseNoteKey(caseId, interactionId), associate: caseNoteAssociationKey(caseId, interactionId) };
+}
 
 const LEASE_MS = 80_000;
 /** After this many refusals by HubSpot itself (nothing written) the effect is no longer taken back: it is verified and left to a person. */
@@ -72,6 +88,7 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
     const pause = { intake: level(await readSavAgentPause(tx, "intake")), v2: level(await readSavAgentPause(tx, "v2")) };
     const snapshot = await lockCaseForWrite(tx, caseId);
     const { intent } = payload;
+    if (payload.trigger.kind === "j2_confirmed" && deps.env().SAV_V2_J2_CONTEXTUAL !== "on") return fault("HOLD_J2_CONTEXTUAL_OFF");
     // What the execution was sealed for must still be what A's rule plans now (same ticket, same key, same stage): otherwise the case or the configuration moved.
     let still = false;
     try {
@@ -83,7 +100,13 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
       still = planned.plan && planned.intent.key === intent.key && planned.intent.stageId === intent.stageId && planned.intent.ticketId === intent.ticketId;
     } catch { still = false; }
     const lastInbound = await lastCustomerInboundAt(tx, caseId);
-    const repliedSince = payload.trigger.kind === "reply_confirmed" && lastInbound !== null && Date.parse(lastInbound) > Date.parse(payload.trigger.sentAt);
+    const repliedSince = (payload.trigger.kind === "reply_confirmed" || payload.trigger.kind === "j2_confirmed") && lastInbound !== null && Date.parse(lastInbound) > Date.parse(payload.trigger.sentAt);
+    if (payload.trigger.kind === "j2_confirmed") {
+      const [newInput] = await tx.select({ id: savCaseEvents.id }).from(savCaseEvents).where(and(
+        eq(savCaseEvents.caseId, caseId), eq(savCaseEvents.kind, "inbound_confirmed"), gt(savCaseEvents.caseVersion, payload.trigger.caseVersion),
+      )).limit(1);
+      if (repliedSince || newInput) return fault("CANCELLED_NEW_INPUT");
+    }
     const decision = decideCaseTicketStage("planned", intent.target, { config, pause, ownerNow, caseStillTarget: still, customerRepliedSince: repliedSince });
     if (decision.action === "hold") return fault(`HOLD_${decision.code.toUpperCase()}`);
     if (decision.action === "cancel") return fault(`CANCELLED_${decision.code.toUpperCase()}`);
@@ -119,6 +142,8 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
     if (options.signal.aborted) return fault("ABORTED");
     const { policy } = await readIntakeExecutionAuthority(options.config);
     if (!policy.mutations.includes(permission as typeof policy.mutations[number])) return fault("MUTATION_NOT_GRANTED");
+    // SAV-92 (16/11): the closure note's switch, read again at the last look before its plan or its marker: `off` now takes it back (the next pass ends without it).
+    if (permission === SAV_CASE_EFFECT_PERMISSIONS.note && !caseReplyNoteEnabled(deps.env())) return refuseNewWork(lease, "HOLD_REPLY_NOTE_OFF");
     // The CRM owner NOW, outside any transaction; the local facts are judged right after it.
     const ownerNow = await ownerNowOf(deps.readTicketOwner, await readCaseTicketId(caseIds.get(lease)!));
     try {
@@ -129,6 +154,37 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
       throw error;
     }
     ownerRead.set(lease, ownerNow);
+  }
+
+  /**
+   * SAV-92 (decision of Ugo, 16/11): after a CONFIRMED « closed » stage, ONE closure note on the ticket, through the existing case note effect (create, then associate
+   * from the confirmed creation's object id). So the note exists only for a closure durably planned AND applied, never for an intention. A planned row is returned as
+   * stored (never rebuilt). A NEW write (plan or marker) needs `SAV_V2_REPLY_NOTE=on` and `append_case_note` in the signed policy; its guard then reads the pauses,
+   * the V2 owner now and that the case is still resolved on this cycle (a new customer mail reopening it cancels the note). A row already engaged is only verified.
+   */
+  async function nextClosureNoteIntent(lease: ExecutionLease, effects: readonly Effect[], stage: Effect, options: Parameters<PassDriver["nextIntent"]>[2]): Promise<EffectIntent | null> {
+    const payload = payloads.get(lease)!, caseId = caseIds.get(lease)!;
+    const keys = closureNoteKeys(payload, caseId);
+    if (!keys) return null;
+    const created = effects.find(effect => effect.businessKey === keys.create), associated = effects.find(effect => effect.businessKey === keys.associate);
+    const stopped = !caseReplyNoteEnabled(deps.env());
+    const newWrite = (effect: Effect | undefined) => !effect || effect.state === "planned";
+    if (!created || created.state !== "confirmed") {
+      if (stopped && newWrite(created)) return null;
+      if (created) return effectIntent(created);
+      const { policy } = await readIntakeExecutionAuthority(options.config);
+      if (!policy.mutations.includes(SAV_CASE_EFFECT_PERMISSIONS.note)) return null;
+      // The note's date is the stage's confirmation (stored with the plan, so a replay finds the same row).
+      const at = new Date(stage.confirmedAt ?? stage.createdAt).toISOString();
+      return buildCaseNoteIntent({ caseId, interactionId: keys.interactionId, ticketId: payload.intent.ticketId, sourceMessageId: caseId,
+        text: caseClosureNoteText(payload.closureFamilies ?? []), at }) as unknown as EffectIntent;
+    }
+    if (associated?.state === "confirmed") return null;
+    if (stopped && newWrite(associated)) return null;
+    if (associated) return effectIntent(associated);
+    const objectId = ackOf(created)?.id;
+    if (!objectId) return fault("NOTE_ACK_MISSING");
+    return buildCaseNoteAssociateIntent({ caseId, interactionId: keys.interactionId, created: effectIntent(created) as unknown as CaseNoteCreateIntent, createEffectId: created.id, objectId }) as unknown as EffectIntent;
   }
 
   const driver: PassDriver = {
@@ -160,11 +216,11 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
       });
     },
     async adopt() { /* a stage is never re-planned against a newer run */ },
-    async nextIntent(lease, effects) {
+    async nextIntent(lease, effects, options) {
       const payload = payloads.get(lease)!;
       const existing = effects.find(effect => effect.businessKey === payload.intent.key);
       // A ledger row that exists is what was planned: its stored intent is returned, never a rebuilt one.
-      if (existing) return existing.state === "confirmed" ? null : effectIntent(existing);
+      if (existing) return existing.state === "confirmed" ? nextClosureNoteIntent(lease, effects, existing, options) : effectIntent(existing);
       if (readCaseTicketStageConfig(deps.env()).mode !== "on") return fault("HOLD_STAGES_OFF");
       const owner = v2HubspotOwnerId(deps.env());
       if (!owner) return fault("HOLD_OWNER_ID_MISSING");
@@ -206,19 +262,30 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
         const stage = effects.find(effect => effect.businessKey === payload.intent.key);
         const [fresh] = stage ? await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, stage.id)).for("share") : [];
         if (!fresh || fresh.state !== "confirmed") return fault("RECEIPT_MISSING");
+        // SAV-92 (16/11): a closure note engaged (marker, ack, uncertain) is never left behind: the execution stays open and it is only verified.
+        const keys = closureNoteKeys(payload, caseIds.get(lease)!);
+        const noteRows = keys ? effects.filter(effect => effect.businessKey === keys.create || effect.businessKey === keys.associate) : [];
+        if (noteRows.some(effect => ENGAGED_STATES.includes(effect.state))) return fault("NOTE_RECEIPT_MISSING");
         await tx.update(savCaseEffectExecutions).set({ state: "confirmed", leaseToken: null, leaseUntil: null, reason: null, updatedAt: new Date() })
           .where(and(eq(savCaseEffectExecutions.id, lease.row.id), eq(savCaseEffectExecutions.leaseToken, lease.token)));
-        await executionJournal(tx, lease.row.id, "execution_confirmed", { stageEffectId: fresh.id });
+        const noteDone = noteRows.length === 2 && noteRows.every(effect => effect.state === "confirmed");
+        await executionJournal(tx, lease.row.id, "execution_confirmed", { stageEffectId: fresh.id,
+          ...(keys ? { note: noteDone ? "confirmed" : "not_written", ...(noteRows.length ? { noteEffectIds: noteRows.map(effect => effect.id) } : {}) } : {}) });
       });
     },
     async end(lease, state, reason) {
       await requireDb().transaction(async tx => {
         // A cancellation is final (the key is never reused); a hold, a pause or an uncertainty keeps the execution open.
         const cancelled = reason.startsWith("SAV_TICKET_STAGE_CANCELLED_");
+        // SAV-92 (16/11): a cancellation that reaches only the closure note (the stage itself is already CONFIRMED, e.g. a customer mail reopened the case before
+        // the note) drops the note and keeps the execution confirmed: the ticket was closed; nothing else is written.
+        const payload = payloads.get(lease);
+        const [stageDone] = cancelled && payload ? await tx.select({ id: savIntakeEffects.id }).from(savIntakeEffects)
+          .where(and(eq(savIntakeEffects.executionId, lease.row.id), eq(savIntakeEffects.businessKey, payload.intent.key), eq(savIntakeEffects.state, "confirmed"))) : [];
         const [row] = await tx.update(savCaseEffectExecutions).set({
-          state: cancelled ? "refused" : state, reason: reason.slice(0, 200), leaseToken: null, leaseUntil: null, updatedAt: new Date(),
+          state: stageDone ? "confirmed" : cancelled ? "refused" : state, reason: reason.slice(0, 200), leaseToken: null, leaseUntil: null, updatedAt: new Date(),
         }).where(and(eq(savCaseEffectExecutions.id, lease.row.id), eq(savCaseEffectExecutions.leaseToken, lease.token))).returning({ id: savCaseEffectExecutions.id });
-        await executionJournal(tx, lease.row.id, row ? (cancelled ? "ticket_stage_cancelled" : "pass_waiting") : "obsolete_pass", { state, reason });
+        await executionJournal(tx, lease.row.id, row ? (stageDone ? "closure_note_cancelled" : cancelled ? "ticket_stage_cancelled" : "pass_waiting") : "obsolete_pass", { state, reason });
       });
     },
   };
@@ -256,6 +323,8 @@ export type TicketStageRuntimeDeps = Readonly<{
   /** Tests inject the runtime pins / policy the V1 environment would provide; by default they are read exactly like the case effects pass. */
   context?: Pick<ExecutionOptions, "runtime" | "policy">;
   adapters?: Pick<ExecutorAdapters, "dispatch" | "verify">;
+  /** SAV-92: the closure note's adapters (tests inject them); by default the existing executor adapters, built only when a note is dispatched or verified. */
+  hubspotNotes?: Pick<ExecutorAdapters, "dispatch" | "verify">;
   schemaInstalled?: () => Promise<boolean>;
 }>;
 export type TicketStagePassResult =
@@ -284,8 +353,12 @@ export async function runCaseTicketStagePass(deps: TicketStageRuntimeDeps): Prom
   }
   const hubspot = deps.adapters ?? createCaseTicketStageAdapters({ network: deps.network, env: deps.env });
   const forbidden = (port: string) => async () => { throw Error(`SAV_TICKET_STAGE_FORBIDDEN_PORT_${port.toUpperCase()}`); };
+  let notes = deps.hubspotNotes;
+  const noteAdapters = () => notes ??= createIntakeExecutorAdapters({ network: deps.network, env: deps.env });
   const adapters: ExecutorAdapters = {
-    dispatch: hubspot.dispatch, verify: hubspot.verify, readCrm: forbidden("readCrm"), gmailCurrent: forbidden("gmailCurrent"), gmailPermissions: forbidden("gmailPermissions"),
+    // SAV-92 (16/11): the closure note goes to the existing executor's HubSpot note adapters; the stage to the stage adapter only.
+    dispatch: (intent, signal) => NOTE_KINDS.has(intent.kind) ? noteAdapters().dispatch(intent, signal) : hubspot.dispatch(intent, signal),
+    verify: (intent, ack, at, signal) => NOTE_KINDS.has(intent.kind) ? noteAdapters().verify(intent, ack, at, signal) : hubspot.verify(intent, ack, at, signal), readCrm: forbidden("readCrm"), gmailCurrent: forbidden("gmailCurrent"), gmailPermissions: forbidden("gmailPermissions"),
     scope: (() => { throw Error("SAV_TICKET_STAGE_FORBIDDEN_PORT_SCOPE"); }) as ExecutorAdapters["scope"],
   };
   const due = await pendingTicketStageExecutions(Math.min(Math.max(Math.trunc(deps.limit ?? 3), 1), 5));

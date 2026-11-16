@@ -1,3 +1,4 @@
+import { caseReplyEditableBody } from "./case-reply-outbound";
 // SAV-10 (pole C): the DURABLE human validation of a prepared reply, and its idempotent hand-off to the executor's queue.
 //   submit  -> `proposed`   what the agent prepared, stored exactly as the person will read it (B produces the proposal, this stores it, it never sends it)
 //   decide  -> `approved` | `declined`   a person, authorized by an INJECTED port that refuses by default, for THIS payload, case version and recipient
@@ -7,6 +8,7 @@
 // the executor's gate re-reads the validation row under a lock in the same transaction as the marker. OFF unless `SAV_CASE_EFFECTS=supervised`
 // (a revocation is a safety action and works in every mode). No validity duration is imposed: a stale reply is cancelled by what changed, not by a clock.
 import "server-only";
+import { CLOSING_REPLY, HANDOFF_REPLY, isTerminalReply, closingHandoffReplyEnabled } from "./case-terminal-reply";
 import { createHash } from "node:crypto";
 import { and, eq, ne } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -15,7 +17,7 @@ import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { executionJournal, type ExecutionTx } from "../intake/execution-store";
 import { assertSavOutboundRecipientAllowed } from "../policy";
 import type { CaseReplyContext } from "./case-effect-intents";
-import { caseReplyKey, caseReplyPayloadHash, readCaseEffectsMode, type CaseReplyProposal } from "./case-effects";
+import { caseReplyKey, caseReplyPayloadHash, caseReplyQuestions, readCaseEffectsMode, type CaseReplyProposal } from "./case-effects";
 import { readCaseReplyFacts } from "./case-reply-facts";
 import { caseReplyStoredTextProblem, caseReplyTextProblemForBasis } from "./case-reply-mode";
 import { findCaseReplySituationTaker } from "./case-reply-situation";
@@ -63,7 +65,7 @@ async function lockCase(tx: ExecutionTx, caseId: string): Promise<number | null>
   return row ? row.version : null;
 }
 
-const PURPOSES = new Set(["question", "answer", "reminder"]);
+const PURPOSES = new Set(["question", "answer", "reminder", "closing", "handoff"]);
 const ADDRESS = /^[^\s@<>,;"]+@[^\s@<>,;"]+\.[^\s@<>,;"]+$/;
 /** Bounded and unique: at most the 6 requests × 8 steps a decision may carry, each with the exact card version the case contract stores. */
 const caseReplyProceduresValid = (procedures: NonNullable<CaseReplyProposal["procedures"]>) => {
@@ -84,11 +86,15 @@ function proposalProblem(proposal: CaseReplyProposal): string | null {
     // authorization basis of the approval (`case-reply-mode.ts`), checked at the approval, the queue and every marker.
     const notFinal = caseReplyStoredTextProblem(proposal.text);
     if (notFinal) return notFinal;
+    if (isTerminalReply(proposal.purpose) && caseReplyEditableBody(proposal.text) !== (proposal.purpose === "closing" ? CLOSING_REPLY : HANDOFF_REPLY)) return "terminal_text";
     if (typeof proposal.subject !== "string" || !proposal.subject.trim() || /[\r\n]/.test(proposal.subject)) return "subject";
     if (typeof proposal.recipient !== "string" || !ADDRESS.test(proposal.recipient.trim())) return "recipient";
     if (typeof proposal.inboundMessageId !== "string" || !proposal.inboundMessageId) return "inbound";
-    if (proposal.purpose === "question" && (!proposal.question?.id || !proposal.question.text.trim() || !/^[A-Za-z0-9._:-]{1,80}$/.test(proposal.question.id))) return "question";
-    if (proposal.purpose !== "question" && proposal.question) return "question";
+    const questions = caseReplyQuestions(proposal);
+    if (proposal.question && proposal.questions !== undefined) return "question";
+    if (proposal.questions !== undefined && (!Array.isArray(proposal.questions) || proposal.questions.length < 2 || proposal.questions.length > 5)) return "question";
+    if (proposal.purpose === "question" && (!questions.length || new Set(questions.map(q => q.id)).size !== questions.length || questions.some(q => !q.id || !q.text.trim() || !/^[A-Za-z0-9._:-]{1,80}$/.test(q.id) || !Array.isArray(q.factKeys) || q.factKeys.some(key => typeof key !== "string") || new Set(q.factKeys).size !== q.factKeys.length))) return "question";
+    if (proposal.purpose !== "question" && (proposal.question || proposal.questions !== undefined)) return "question";
     if (proposal.procedures !== undefined && (proposal.purpose !== "answer" || !Array.isArray(proposal.procedures) || !caseReplyProceduresValid(proposal.procedures))) return "procedures";
     assertSavOutboundRecipientAllowed(lower(proposal.recipient));
     return null;
@@ -109,6 +115,7 @@ export async function submitCaseReplyProposal(requested: CaseReplyProposal, deps
   supersedes?: Readonly<{ validationId: string; payloadHash: string }>;
 }> = {}): Promise<SubmitCaseReplyResult> {
   if (!isSupervised(deps)) return refuse("effects_off");
+  if (isTerminalReply(requested.purpose) && !closingHandoffReplyEnabled(deps.env())) return refuse("effects_off");
   const problem = proposalProblem(requested);
   if (problem) return refuse("proposal_invalid", problem);
   // The CRM owner NOW, before anything is stored: asked outside the transaction, about the ticket of this very case (minimal read, nothing decrypted). The local facts are judged under the case lock afterwards.
@@ -178,6 +185,7 @@ export async function decideCaseReply(input: Readonly<{
   const seenCheck = checkCaseReplySeen({ payloadHash: row.payloadHash, caseVersion: row.caseVersion, recipient: row.recipient }, seen);
   if (seenCheck !== "ok") return refuse(seenCheck);
   const proposal = proposalOf(row);
+  if (action === "approve" && isTerminalReply(proposal.purpose) && !closingHandoffReplyEnabled(deps.env())) return refuse("effects_off");
   // A row stored before the contract can still be declined, never approved: nobody validates a text that cannot be sent as written.
   if (action === "approve") { const notFinal = caseReplyStoredTextProblem(proposal.text); if (notFinal) return refuse("proposal_invalid", notFinal); }
   // Pilot: no proof of where this reply comes from, no validation. It can still be declined.
@@ -301,6 +309,7 @@ export async function enqueueApprovedCaseReply(input: Readonly<{
       return { ok: true, executionId: row.executionId, created: false };
     }
     const proposal = proposalOf(row);
+    if (isTerminalReply(proposal.purpose) && !closingHandoffReplyEnabled(deps.env())) return refuse("effects_off");
     // The last fence before an execution exists also re-reads the text: an approval stored before the contract is never queued (nothing is planned, hashed or sent for it).
     { const notFinal = caseReplyTextProblemForBasis(proposal.text, row.authorizationBasis); if (notFinal) return refuse("proposal_invalid", notFinal); }
     // B-7: the last fence before an execution exists. A situation that another approved reply already queued (or sent) is never queued a second time, even if a database

@@ -4,7 +4,7 @@
 // Nothing here reads, writes or sends. The write is the ticket's pipeline stage and nothing else (never the owner, never a property of the customer's data).
 import type { EffectIntent } from "../intake/execution-types";
 import { SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
-import type { CaseTicketStageIntent, CaseTicketStageTarget } from "./customer-return";
+import type { CaseTicketStageIntent, CaseTicketStageTarget, CaseTicketStageTrigger } from "./customer-return";
 
 export const TICKET_STAGE_KEY_PREFIX = "case-stage:";
 export const TICKET_STAGE_CONTRACT = "sav-v2-ticket-stage.v1";
@@ -13,7 +13,9 @@ export const TICKET_STAGE_CONTRACT = "sav-v2-ticket-stage.v1";
 export type TicketStagePayload = Readonly<{
   contract: typeof TICKET_STAGE_CONTRACT;
   intent: CaseTicketStageIntent;
-  trigger: Readonly<{ kind: "reply_confirmed"; replyKey: string; sentAt: string }> | Readonly<{ kind: "resolution_recorded"; cycle: number }>;
+  trigger: CaseTicketStageTrigger;
+  /** SAV-92 (16/11): « closed » only, the families of the requests the proof resolved, sealed by the closure for its note. Absent (older row): the generic label. */
+  closureFamilies?: readonly string[];
 }>;
 
 const fault = (code: string): never => { throw new Error(`SAV_TICKET_STAGE_${code}`); };

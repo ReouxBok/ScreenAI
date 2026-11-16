@@ -97,6 +97,10 @@
    "saveIntakeChoice",
    "releaseIntakeHumanHoldAction"
   ],
+  "app/studio/sav/blocs/assistant/actions.ts": [
+   "saveBlockBriefAction",
+   "prepareBlockMaterialsAction"
+  ],
   "app/studio/sav/intake/agents/actions.ts": [
    "createAgentKeyAction",
    "revokeAgentKeyAction"
@@ -152,6 +156,9 @@
   "app/studio/trame/actions.ts": [
    "saveOnboardingTemplateAction",
    "publishOnboardingTemplateAction"
+  ],
+  "app/studio/sav/blocs/rodage/actions.ts": [
+   "saveRodageVerdictAction"
   ]
  },
  "guards": {
@@ -168,6 +175,16 @@
   "app/studio/sav/intake/blocks/actions.ts": {
    "action": null,
    "lib": "lib/sav/cases/block-switch-admin.ts setSavBlockSwitch: savBlockSwitchAdministrator() (executionAdministrator) before parsing or writing",
+   "roles": "admin or owner with SAV access"
+  },
+  "app/studio/sav/blocs/assistant/actions.ts": {
+   "action": "savBlockBuilderAdministrator()",
+   "lib": "lib/sav/blocks/block-builder-admin.ts and block-materials-admin.ts: administrator before reads and writes; encrypted sync_state, audit and proposal drafts only; no publication",
+   "roles": "admin or owner with SAV access"
+  },
+  "app/studio/sav/blocs/rodage/actions.ts": {
+   "action": "rodageAdministrator()",
+   "lib": "lib/sav/blocks/block-rodage.ts: administrator before reads/writes; encrypted sync_state verdict and auditLogs only",
    "roles": "admin or owner with SAV access"
   }
  }

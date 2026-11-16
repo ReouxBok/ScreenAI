@@ -6,7 +6,7 @@ import { fakeSlack } from "../../../../test/sav-handoff-fakes";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }));
-import { savCaseEffectExecutions, savIntakeEffectJournal, savIntakeEffects, savMailboxes, savSyncState, savThreads, staffUsers } from "@/db/schema";
+import { savCaseEffectExecutions, savIntakeEffectJournal, savIntakeEffects, savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { approveIntakeExecutionPolicy, type ExecutionPolicy } from "../intake/execution-policy";
 import { executeIntakePass } from "../intake/executor";
@@ -612,11 +612,12 @@ describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case not
       expect(dispatched.map(call => call.kind)).toEqual(["note_create", "note_associate"]);
       const create = dispatched[0]!.intent as { ticketId: string; key: string; permission: string; text: string; properties: { hs_note_body: string } };
       expect(create).toMatchObject({ ticketId: made.ticketId, permission: "append_case_note", key: expect.stringMatching(new RegExp(`^note:${made.c.caseId}:handoff:[0-9a-f]{32}$`)) });
-      expect(create.text.split("\n")[0]).toBe("Transfert à l'équipe SAV (agent V2)");
-      expect(create.text).toContain("Raison du transfert : aucune fiche de connaissance ne couvre la demande");
-      expect(create.text).toContain("Éléments transmis : aucune capture d'écran ni pièce jointe, aucun lien");
+      // SAV-92 (Ugo 16/11): a short narrative, no identifier, no internal term.
+      expect(create.text.split("\n")[0]).toMatch(/^Le client (écrit|signale) : /);
+      expect(create.text.split("\n").slice(-2)).toEqual(["Je n'ai pas de solution adaptée à cette demande.", "Je passe le dossier à l'équipe."]);
+      for (const leak of [made.c.caseId, made.ticketId, "V2", "fiche", "agent", "Transfert à l'équipe SAV"]) expect(create.text).not.toContain(leak);
       // Rendered by the existing note renderer (escaped HTML + marker), so the existing HubSpot verification applies unchanged.
-      expect(create.properties.hs_note_body).toMatch(/^<p>Transfert à l&#39;équipe SAV \(agent V2\)<br>[^]*\[Studio intake: [0-9a-f]{64}\]<\/p>$/);
+      expect(create.properties.hs_note_body).toMatch(/^<p>Le client [^]*Je passe le dossier à l&#39;équipe\.<\/p><p>\[Studio intake: [0-9a-f]{64}\]<\/p>$/);
       expect(dispatched[1]!.intent).toMatchObject({ objectId: "5550001", ticketId: made.ticketId });
       expect((await noteEffects(made.execution!.id)).map(effect => effect.state)).toEqual(["confirmed", "confirmed"]);
       const journal = await f.db.select().from(savIntakeEffectJournal).where(and(eq(savIntakeEffectJournal.executionId, made.execution!.id), eq(savIntakeEffectJournal.kind, "execution_confirmed")));
@@ -645,6 +646,28 @@ describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case not
       expect(hub.calls.filter(call => call.op === "dispatch" && call.kind === "note_associate")).toHaveLength(1);
       expect((await noticeRows()).find(row => row.id === made.execution!.id)).toMatchObject({ state: "confirmed" });
       expect(posts()).toHaveLength(1);
+    });
+  });
+
+  it("SAV-92 (16/11): the customer's link in the stored mail reaches the one note in full, cleaned; http and authentication links are masked; quoted history is not read", async () => {
+    const hub: Hub = { calls: [], failCreate: false };
+    const made = await newCase("gm-note-link");
+    crmReading = () => goodCrm(made.ticketId);
+    await f.db.insert(savMessages).values({ mailboxId, threadId: made.threadId, direction: "inbound", fromEmail: CUSTOMER, toEmails: ["support@example.invalid"], subject: "Connexion",
+      gmailMessageId: randomUUID(), receivedAt: new Date(), createdAt: new Date(), analysisStatus: "intake_execution_confirmed",
+      bodyCiphertext: encryptSavPayload({ attachments: [], headers: {}, text: "Bonjour, voici la conversation : https://app.limova.ai/conversation/c-9?utm_source=abc&lang=fr et http://plain.example.invalid/x et https://app.limova.ai/login?magic=R7mQ2vX9pL4nW8zK\n\nLe lun. 16 nov. 2026, Support <support@example.invalid> a écrit :\n> https://help.example.invalid/article/1" }) });
+    expect(await investigate(made.c.caseId, [handoff()])).toMatchObject({ status: "recorded", outcome: "accepted" });
+    const [execution] = (await noticeRows()).filter(row => row.caseId === made.c.caseId);
+    await granting(async () => {
+      await pass({ hubspot: fakeHub(hub) as never });
+      const creates = hub.calls.filter(call => call.op === "dispatch" && call.kind === "note_create");
+      expect(creates).toHaveLength(1);
+      const text = (creates[0]!.intent as unknown as { text: string }).text;
+      expect(text).toContain("Il nous a envoyé ce lien : https://app.limova.ai/conversation/c-9?lang=fr");
+      // The http link and the authentication link are masked, said once; the quoted history is not read.
+      expect(text).toContain("Il nous a aussi envoyé 2 liens (masqués par sécurité, voir le mail).");
+      expect(text).not.toMatch(/utm_source|abc|plain\.example|help\.example|login|magic|R7mQ2/);
+      expect((await noteEffects(execution!.id)).map(effect => effect.state)).toEqual(["confirmed", "confirmed"]);
     });
   });
 

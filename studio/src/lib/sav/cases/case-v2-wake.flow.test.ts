@@ -33,6 +33,7 @@ import { applyProvenResolution, applyProvenResolutions } from "./case-resolution
 import { HANDOFF_NOTICE_KEY_PREFIX, type HandoffCrmReading } from "./case-handoff-notice";
 import { accessAutoReplyAuthorizer, routeCustomerReturn } from "./customer-return-store";
 import { ACCESS_AUTO_APPROVAL_BASIS } from "./customer-return";
+import { pendingHandoffReply, provenClosingReply } from "./case-terminal-reply";
 import { caseDecisionDraft } from "./investigation-intent";
 import { readCaseInvestigationProgress } from "./investigation-record";
 import { selectCaseKnowledge } from "./investigation-knowledge";
@@ -169,7 +170,9 @@ const readFacts = async (request: { caseId: string }) => {
   const read = readCaseInvestigationProgress(events, inputKey);
   const decision = read.state === "found" ? read.record.decision : null;
   const kind = decision?.validation.outcome === "accepted" ? decision.validation.decision.nextAction.kind : "none";
-  return { case: { owner: snapshot.owner, sensitivity: snapshot.sensitivity, admitted: caseAdmissionStatus(snapshot, "policy-r1").admitted },
+  const pending = kind === "handoff" && pendingHandoffReply(snapshot, events, (await draftOf(snapshot.caseId)).triggerEventId!);
+  const eligible = pending ? { ...snapshot, owner: "agent" as const } : snapshot;
+  return { case: { owner: eligible.owner, sensitivity: snapshot.sensitivity, admitted: caseAdmissionStatus(eligible, "policy-r1").admitted },
     openFamilies: snapshot.body.openRequests.filter(row => row.status === "open").map(row => row.family),
     decision: { accepted: decision?.validation.outcome === "accepted", scopeCurrent: true, shownSourcesVerified: true, nextAction: kind }, ownerNow: await readOwner()(snapshot) };
 };
@@ -179,7 +182,7 @@ async function draftOf(caseId: string, pilot = false) {
   const inputKey = (events.filter(event => event.kind === "observation_recorded").at(-1)?.detail?.record as { inputKey: string }).inputKey;
   const read = readCaseInvestigationProgress(events, inputKey);
   if (read.state !== "found") throw Error("NO_RECORD");
-  return caseDecisionDraft(caseId, read.record, events, pilot ? { accessScope: null } : undefined)!;
+  return caseDecisionDraft(caseId, read.record, events, pilot ? { accessScope: null } : undefined, environment)!;
 }
 /** Proposal in the AUTOMATED format -> approval by the rule (A's authorizer, the persisted basis) -> queue. Returns each step so a test can stop anywhere. */
 async function autoReply(caseId: string, over: { format?: "human" | "automated"; authorizerOverride?: Parameters<typeof decideCaseReply>[0]["authorizer"]; approver?: string } = {}) {
@@ -272,6 +275,77 @@ beforeEach(async () => {
 });
 afterEach(async () => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); await setPause("v2", null); await setPause("intake", null); });
 
+describe("closing and handoff customer acknowledgements", () => {
+  it("sends a confirmed closure once, alongside one closed stage/note and no new waiting stage or timer", async () => {
+    environment = { ...environment, SAV_V2_CLOSING_HANDOFF_REPLY: "on", SAV_V2_REPLY_NOTE: "on" };
+    const made = await queuedAnswer("gm-terminal-close");
+    await wake();
+    const trial = (await readCase(made.caseId))!.body.trials[0]!;
+    await laterMail(made, "gm-terminal-close-confirm", "Merci, ça remarche !");
+    expect(await investigate(made.caseId, [confirmResolution("gm-terminal-close-confirm", trial.id, "ça remarche"), resolvedVerdict])).toMatchObject({ closure: "soft_close" });
+    const snapshot = (await readCase(made.caseId))!, events = await listCaseEvents(made.caseId);
+    const trigger = "inbound:gm-terminal-close-confirm";
+    expect(provenClosingReply(snapshot, events, trigger)).toBe(true);
+    const another = { ...snapshot.body.openRequests[0]!, id: "unresolved-other-request", status: "open" as const };
+    expect(provenClosingReply({ ...snapshot, body: { ...snapshot.body, openRequests: [...snapshot.body.openRequests, another] } }, events, trigger)).toBe(false);
+    expect(provenClosingReply(snapshot, events.map(e => e.kind === "observation_recorded" ? { ...e, detail: { ...e.detail, applied: false } } : e), trigger)).toBe(false);
+    const queued = await autoReply(made.caseId);
+    expect(queued).toMatchObject({ queued: { ok: true, created: true } });
+    const before = sends;
+    await wake(); await wake(); await wake();
+    expect(sends).toBe(before + 1);
+    expect(mimeText(sentBodies.at(-1)!)).toContain("Merci pour votre confirmation");
+    expect(readCaseReplyDisclosure(mimeText(sentBodies.at(-1)!))?.mode).toBe("automated");
+    expect((await stageRows(made.caseId)).filter(row => row.replyKey.includes(":closed:"))).toHaveLength(1);
+    expect((await stageRows(made.caseId)).filter(row => row.replyKey.includes(":waiting_customer:"))).toHaveLength(1); // first answer only
+    expect((await readCase(made.caseId))!.phase).toBe("resolved");
+    expect((await listCaseTimers(made.caseId)).filter(row => row.state === "scheduled")).toHaveLength(0);
+    expect(Object.values(p.objects.notes!)).toHaveLength(2); // First answer summary, then the closure note.
+    expect(Object.values(p.objects.notes!).filter(row => (row.properties.hs_note_body ?? "").includes("Le client a confirm"))).toHaveLength(1);
+  });
+
+  it.each(["off", "human", "new_mail", "uncertain"] as const)("handoff reply respects %s at the executor and never sends twice", async reason => {
+    environment = { ...environment, SAV_V2_CLOSING_HANDOFF_REPLY: "on" };
+    kb.cards = [];
+    const made = await newCase(`gm-terminal-fence-${reason}`);
+    expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
+    expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true } });
+    if (reason === "off") environment.SAV_V2_CLOSING_HANDOFF_REPLY = "off";
+    if (reason === "human") {
+      const current = (await readCase(made.caseId))!;
+      await transitionCaseOwner({ caseId: made.caseId, expectedVersion: current.version, transition: "human_takeover", actor: { type: "human", staffUserId: RULE }, commandKey: "terminal-human-takeover", reason: "human_requested" });
+    }
+    if (reason === "new_mail") await laterMail(made, "gm-terminal-newer", "Une autre question");
+    if (reason === "uncertain") loseAck = true;
+    await wake(); await letReconcile(); await wake();
+    expect(sends).toBe(reason === "uncertain" ? 1 : 0);
+    if (reason === "off") {
+      environment.SAV_V2_CLOSING_HANDOFF_REPLY = "on";
+      await letReconcile(); await wake();
+      expect(sends).toBe(1);
+    }
+  });
+
+  it("sends one handoff acknowledgement on send_case_reply, preserves the human queue and creates no waiting stage", async () => {
+    environment = { ...environment, SAV_V2_CLOSING_HANDOFF_REPLY: "on", SAV_V2_REPLY_NOTE: "on" };
+    kb.cards = [];
+    const made = await newCase("gm-terminal-handoff");
+    expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
+    expect((await readCase(made.caseId))!.owner).toBe("human");
+    const snapshot = (await readCase(made.caseId))!, events = await listCaseEvents(made.caseId);
+    for (const family of ["finance", "cancellation", "identity", "rights", "subscription"] as const)
+      expect(pendingHandoffReply({ ...snapshot, body: { ...snapshot.body, openRequests: snapshot.body.openRequests.map(row => ({ ...row, family })) } }, events, "inbound:gm-terminal-handoff")).toBe(false);
+    expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true, created: true } });
+    await wake(); await wake();
+    expect(sends).toBe(1);
+    expect(mimeText(sentBodies[0]!)).toContain("Votre demande est transmise à un conseiller.");
+    expect((await stageRows(made.caseId))).toHaveLength(0);
+    expect((await readCase(made.caseId))!.phase).toBe("handoff_pending");
+    const effects = await f.db.select().from(savIntakeEffects).where(eq(savIntakeEffects.kind, "reply_send"));
+    expect(effects.filter(row => row.businessKey.includes(made.caseId) && row.state === "confirmed" && row.permission === "send_case_reply")).toHaveLength(1);
+  });
+});
+
 describe("the automatic access reply, from the real investigation to the ticket state", () => {
   it("B's accepted answer -> automated format -> A's rule -> queue -> wake: ONE mail, identical text / hash / MIME, the rule's basis counted on the single ledger, the ticket « waiting »", async () => {
     const made = await queuedAnswer("gm-wake-1");
@@ -313,7 +387,7 @@ describe("the automatic access reply, from the real investigation to the ticket 
     expect(await replyRows(made.caseId)).toHaveLength(1);
   });
 
-  it("a question runs J2 from the VERIFIED sentAt; an answer plans none", async () => {
+  it("a question runs J2 from the VERIFIED sentAt; a procedure answer waits for feedback with one J2 too", async () => {
     const made = await queuedAnswer("gm-wake-q", ask);
     await wake();
     const timers = await listCaseTimers(made.caseId);
@@ -322,9 +396,10 @@ describe("the automatic access reply, from the real investigation to the ticket 
     expect(outbound).toHaveLength(1);
     expect(timers[0]).toMatchObject({ state: "scheduled", sentAt: expect.any(String) });
     expect(Math.abs(Date.parse(timers[0]!.sentAt) - Date.parse(outbound[0]!.occurredAt))).toBeLessThan(5_000);
+    // SAV-92: a proposed procedure also waits for the customer's feedback, so it plans exactly one J2.
     const answered = await queuedAnswer("gm-wake-a");
     await wake();
-    expect(await listCaseTimers(answered.caseId)).toEqual([]);
+    expect(await listCaseTimers(answered.caseId)).toEqual([expect.objectContaining({ state: "scheduled" })]);
   });
 
   it("the format grants nothing: every incompatible (basis, mention) pair is refused with NO row queued and NO mail", async () => {
@@ -809,5 +884,120 @@ describe("review F3/F4: a return is read whole, signature included, before the a
     expect((await readCase(made.caseId))!.body.trials).toMatchObject([{ id: made.trial.id, outcome: "succeeded", result: { source: { type: "email", id: made.mail } } }]);
     expect((await stageRows(made.caseId)).filter(row => row.replyKey.includes(":closed:"))).toHaveLength(1);
     expect(sends).toBe(sentBefore);
+  });
+});
+
+describe("SAV-92 (16/11): the closure note, written once after a CONFIRMED « closed » stage", () => {
+  const CLOSED_BODY = "<p>Le client a confirmé que son problème d&#39;accès est résolu. Ticket fermé.</p>";
+  const closureNotes = () => Object.values(p.objects.notes!).filter(row => (row.properties.hs_note_body ?? "").includes("Le client a confirm"));
+  const closedPatches = () => patches().filter(call => (call.body as { properties: { hs_pipeline_stage?: string } }).properties.hs_pipeline_stage === "4");
+  /** An answered case whose customer then confirms in a mail; the double reading proves the resolution. The closure is NOT applied yet. */
+  async function provenResolution(gmail: string) {
+    const made = await queuedAnswer(gmail);
+    await wake();
+    const trial = (await readCase(made.caseId))!.body.trials[0]!;
+    await laterMail(made, `${gmail}-thanks`, "Merci, ça remarche depuis l'autre navigateur !");
+    expect(await investigate(made.caseId, [confirmResolution(`${gmail}-thanks`, trial.id, "ça remarche"), resolvedVerdict])).toMatchObject({ closure: "soft_close" });
+    return made;
+  }
+  const closingRows = async (caseId: string) => (await stageRows(caseId)).filter(row => row.replyKey.includes(":closed:"));
+
+  it("exact text, hidden marker only, associated to the ticket; ONE note through replays, and a replay of the closure under `off` returns the existing execution", async () => {
+    environment = { ...environment, SAV_V2_REPLY_NOTE: "on" };
+    const made = await provenResolution("gm-close-note");
+    expect((await wake()).closures).toMatchObject({ resolved: 1 });
+    expect(closureNotes()).toEqual([]); // queued, not yet applied: no note on an intention
+    await wake();
+    expect(ticketProps(made.ticketId).hs_pipeline_stage).toBe("4");
+    const notes = closureNotes();
+    expect(notes).toHaveLength(1);
+    const body = notes[0]!.properties.hs_note_body!;
+    expect(body.startsWith(CLOSED_BODY)).toBe(true);
+    expect(body.slice(CLOSED_BODY.length)).toMatch(/^<!-- sav-intake:[a-f0-9]{64} -->$/);
+    expect(body).not.toContain("[Studio intake");
+    expect(body).not.toContain(made.caseId);
+    expect(p.links.get(`notes:${notes[0]!.id}:tickets`)).toEqual([made.ticketId]);
+    const [closing] = await closingRows(made.caseId);
+    expect(closing).toMatchObject({ state: "confirmed" });
+    const effects = await f.db.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, closing!.id));
+    expect(effects.map(row => `${row.kind}:${row.state}`).sort()).toEqual(["note_associate:confirmed", "note_create:confirmed", "ticket_stage:confirmed"]);
+    for (let n = 0; n < 2; n++) await wake();
+    environment = { ...environment, SAV_V2_REPLY_NOTE: undefined };
+    const replay = await applyProvenResolution({ caseId: made.caseId, policy: { id: policyId, hash: policyHash }, env: () => environment, currentPolicyRevision: async () => "policy-r1", readTicketOwner: readOwner() });
+    expect(replay).toMatchObject({ ok: true, applied: "already_resolved", stage: { ok: true, executionId: closing!.id, created: false } });
+    await wake();
+    expect(closureNotes()).toHaveLength(1);
+    expect(closedPatches()).toHaveLength(1);
+    expect(await closingRows(made.caseId)).toHaveLength(1);
+  });
+
+  it("no closure planned (a person took the ticket), or a closure cancelled by a new customer mail: no note, no « closed »", async () => {
+    environment = { ...environment, SAV_V2_REPLY_NOTE: "on" };
+    const taken = await provenResolution("gm-close-taken");
+    ticketProps(taken.ticketId).hubspot_owner_id = TEAM_OWNER;
+    await wake(); await wake();
+    expect(await closingRows(taken.caseId)).toEqual([]);
+    const crossed = await provenResolution("gm-close-crossed");
+    expect((await wake()).closures).toMatchObject({ resolved: 1 });
+    expect(await closingRows(crossed.caseId)).toHaveLength(1);
+    // The customer writes again on the same ticket before the stage is applied: the case is reopened (a new cycle), the queued « closed » no longer applies.
+    const again = await storeLaterMail(crossed, "gm-close-crossed-again", "En fait non, ça ne marche plus.");
+    // Test doubles for V1's two facts only: the mail confirmed on the SAME ticket, and its qualification (the access rule).
+    const deps = { env: { ...environment, SAV_CASE_RECORDING: "on" }, readTicketOwner: async (ticketId: string) => ticketProps(ticketId).hubspot_owner_id,
+      readV1Target: async () => "same_ticket" as const, readMailAdmission: async () => byRule(crossed.requestId) };
+    expect(await routeCustomerReturn(again, deps)).toMatchObject({ route: { route: "reopen" }, caseId: crossed.caseId, written: true });
+    await wake(); await wake();
+    expect((await closingRows(crossed.caseId))[0]).toMatchObject({ state: "refused" });
+    expect(closedPatches()).toHaveLength(0);
+    expect(closureNotes()).toEqual([]);
+  });
+
+  it("the ticket is closed but the note is held (owner unreadable), then a new customer mail reopens the case: the note is dropped, the closure stays confirmed", async () => {
+    environment = { ...environment, SAV_V2_REPLY_NOTE: "on" };
+    const made = await provenResolution("gm-close-late");
+    expect((await wake()).closures).toMatchObject({ resolved: 1 });
+    // Test double of the owner port: the pilot while the ticket is open, unreadable once it is closed (so the note is held after the stage, never planned).
+    const owner = readOwner();
+    const heldAfterStage = async (snapshot: { ticketId: string }) => ticketProps(snapshot.ticketId).hs_pipeline_stage === "4" ? "unknown" as const : owner(snapshot);
+    await runCaseTicketStagePass({ ...wakeDeps().stages, env: () => environment, deadlineMs: Date.now() + 60_000, readTicketOwner: heldAfterStage });
+    expect(closedPatches()).toHaveLength(1);
+    expect(closureNotes()).toEqual([]);
+    expect((await closingRows(made.caseId))[0]).toMatchObject({ state: "waiting", reason: expect.stringContaining("HOLD_OWNER_UNREAD") });
+    const again = await storeLaterMail(made, "gm-close-late-again", "En fait non, ça ne marche plus.");
+    expect(await routeCustomerReturn(again, { env: { ...environment, SAV_CASE_RECORDING: "on" }, readTicketOwner: async (ticketId: string) => ticketProps(ticketId).hubspot_owner_id,
+      readV1Target: async () => "same_ticket" as const, readMailAdmission: async () => byRule(made.requestId) })).toMatchObject({ route: { route: "reopen" }, written: true });
+    await runCaseTicketStagePass({ ...wakeDeps().stages, env: () => environment, deadlineMs: Date.now() + 60_000, readTicketOwner: owner });
+    expect(closureNotes()).toEqual([]);
+    expect((await closingRows(made.caseId))[0]).toMatchObject({ state: "confirmed", reason: expect.stringContaining("CANCELLED_CASE_MOVED") });
+    await wake(); await wake();
+    expect(closureNotes()).toEqual([]);
+    expect(closedPatches()).toHaveLength(1);
+  });
+
+  it("`SAV_V2_REPLY_NOTE` off (absent): the ticket closes once, NO note, the execution is confirmed (turning it on later writes nothing)", async () => {
+    const made = await provenResolution("gm-close-off");
+    await wake(); await wake();
+    expect(ticketProps(made.ticketId).hs_pipeline_stage).toBe("4");
+    expect(closureNotes()).toEqual([]);
+    expect((await closingRows(made.caseId))[0]).toMatchObject({ state: "confirmed" });
+    environment = { ...environment, SAV_V2_REPLY_NOTE: "on" };
+    await wake(); await wake();
+    expect(closureNotes()).toEqual([]);
+    expect(closedPatches()).toHaveLength(1);
+  });
+
+  it("a pause holds the closure and its note (no PATCH, no note); once lifted: one « closed », one note", async () => {
+    environment = { ...environment, SAV_V2_REPLY_NOTE: "on" };
+    const made = await provenResolution("gm-close-pause");
+    expect((await wake()).closures).toMatchObject({ resolved: 1 });
+    await setPause("v2", "actions_paused");
+    await wake(); await wake();
+    expect(closedPatches()).toHaveLength(0);
+    expect(closureNotes()).toEqual([]);
+    await setPause("v2", null);
+    await wake(); await wake();
+    expect(closedPatches()).toHaveLength(1);
+    expect(closureNotes()).toHaveLength(1);
+    expect((await closingRows(made.caseId))[0]).toMatchObject({ state: "confirmed" });
   });
 });

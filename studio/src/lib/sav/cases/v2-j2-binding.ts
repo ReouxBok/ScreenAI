@@ -7,8 +7,14 @@ import { decryptSavPayload } from "../crypto";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "../intake/execution-policy";
 import type { AdmissionPolicyRecord } from "./admission-runtime";
-import { caseReplyKey, j2TriggerEventId, readCaseEffectsMode, type CaseReplyProposal } from "./case-effects";
-import { enqueueApprovedCaseReply, type CaseReplyStoreDeps } from "./case-reply-store";
+import { caseReplyKey, caseReplyPayloadHash, j2TriggerEventId, readCaseEffectsMode, type CaseReplyProposal } from "./case-effects";
+import { submitCaseReplyProposal, decideCaseReply, type CaseReplyStoreDeps } from "./case-reply-store";
+import { queueValidatedCaseReply } from "./case-runtime-effects";
+import { readJ2ReminderText, j2AutoGate, readJ2Origin } from "./j2-auto-reminder";
+import { accessAutoReplyAuthorizer } from "./customer-return-store";
+import { readAccessAutoApprovalConfig } from "./customer-return";
+import { judgeCurrentTicketOwner } from "./case-ticket-owner";
+import { caseAdmissionStatus } from "./admission-policy";
 import { readCase } from "./case-store";
 import { nextSweepPage } from "./case-sweep-cursor";
 import { createCaseTicketOwnerPort } from "./case-v2-wake-ports";
@@ -61,14 +67,44 @@ export async function enqueueApprovedJ2(timer: Pick<J2Timer,"id"|"caseId">, case
   const proposal = decryptSavPayload<CaseReplyProposal>(row.proposalCiphertext);
   if (proposal.purpose !== "reminder" || proposal.triggerEventId !== trigger || proposal.caseId !== timer.caseId ||
       proposal.caseVersion !== caseVersion || row.caseVersion !== caseVersion) return "reminder_approval_stale";
-  const result = await enqueueApprovedCaseReply({validationId:row.id,policy,deps});
+  const result = await queueValidatedCaseReply({validationId:row.id,policy,deps});
   if (result.ok && result.created) onQueued?.(result.executionId);
   return result.ok ? (result.created ? "queued" : "already_queued") : result.code;
 }
 
-/** A wake may fire a due timer and enqueue an already approved, versioned reminder. It cannot author or approve a reminder. */
+/** Authors the deterministic reminder, through the normal durable proposal, rule and queue. */
+export async function produceAutoJ2(timer: Pick<J2Timer,"id"|"caseId">, caseVersion: number, deps: CaseReplyStoreDeps) {
+  const blocked = await j2AutoGate(deps.env());
+  if (blocked) return blocked;
+  const config = readAccessAutoApprovalConfig(deps.env());
+  if (config.mode !== "on") return "j2_auto_off";
+  const origin = await readJ2Origin(timer.caseId, j2TriggerEventId(timer.id), await deps.currentPolicyRevision(), new Date(), deps.env());
+  if (!origin) return "reminder_origin_unproven";
+  const text = await readJ2ReminderText(timer.caseId, j2TriggerEventId(timer.id), deps.env(), origin);
+  if (!text) return "reminder_origin_unproven";
+  const proposal: CaseReplyProposal = { caseId: timer.caseId, caseVersion, triggerEventId: j2TriggerEventId(timer.id), purpose: "reminder",
+    inboundMessageId: origin.inboundMessageId, recipient: origin.recipient, subject: origin.subject, text };
+  const proposed = await submitCaseReplyProposal(proposal, deps);
+  if (!proposed.ok) return proposed.code;
+  if (proposed.state === "approved") return "approved";
+  const decided = await decideCaseReply({ action: "approve", validationId: proposed.id, approverId: config.approverId,
+    seen: { payloadHash: caseReplyPayloadHash(proposal), caseVersion, recipient: proposal.recipient }, expectedCaseVersion: caseVersion, deps,
+    authorizer: accessAutoReplyAuthorizer({ env: deps.env(), readFacts: async () => {
+      if (await j2AutoGate(deps.env())) return null;
+      if (!await readJ2Origin(timer.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), new Date(), deps.env())) return null;
+      const snapshot = await readCase(timer.caseId);
+      if (!snapshot) return null;
+      const owner = await judgeCurrentTicketOwner(deps.readTicketOwner, snapshot.ticketId);
+      return { case: { owner: snapshot.owner, sensitivity: snapshot.sensitivity, admitted: caseAdmissionStatus(snapshot, await deps.currentPolicyRevision()).admitted },
+        openFamilies: snapshot.body.openRequests.filter(r => r.status === "open").map(r => r.family), decision: null, ownerNow: owner.ok ? "v2" : "unknown" };
+    } }) });
+  return decided.ok ? "approved" : decided.code;
+}
+
+/** A due wake authors and approves a reminder only under the dedicated opt-in and Access rule. */
 export async function reconcileCaseJ2({env,deadlineMs,network,sendNow}:Tick) {
   if (!savV2EntryEnabled(env) || env.SAV_V2_J2 !== "on" || readCaseEffectsMode(env).mode !== "supervised") return { skipped:"j2_off" };
+  if (env.SAV_V2_J2_AUTO !== "on") return { skipped: "j2_auto_off" };
   const expired = () => !Number.isFinite(deadlineMs) || Date.now() >= deadlineMs;
   if (expired()) return { skipped:"deadline" };
   const limit = Number(env.SAV_V2_J2_BATCH);
@@ -97,7 +133,8 @@ export async function reconcileCaseJ2({env,deadlineMs,network,sendNow}:Tick) {
   const observed = new Set<string>(), queued: string[] = [];
   const ports:J2Ports={reminderEffect:readJ2ReminderEffect,budgetAvailable,
     onConditionsMet:async ({timer,caseVersion})=>{
-      const status=expired()?"deadline":await enqueueApprovedJ2(timer,caseVersion,{id:config.policyId,hash:config.policyHash},deps,id=>queued.push(id));
+      const produced = expired() ? "deadline" : await produceAutoJ2(timer, caseVersion, deps);
+      const status=produced === "approved" ? await enqueueApprovedJ2(timer,caseVersion,{id:config.policyId,hash:config.policyHash},deps,id=>queued.push(id)) : produced;
       outcomes.push({timerId:timer.id,status});
     }};
   for(let i=0;i<limit&&!expired();i++) {

@@ -72,7 +72,7 @@ export type J2CaseView = Readonly<{
   }>;
 }>;
 // `detail` is read only for owner_changed (its `transition`). An unreadable or unknown transition fails closed: it makes the follow-up obsolete.
-export type J2CaseEventView = Readonly<{ kind: string; direction: string; occurredAt: string; detail?: Readonly<{ transition?: unknown }> | null }>;
+export type J2CaseEventView = Readonly<{ kind: string; direction: string; occurredAt: string; caseVersion?: number; detail?: Readonly<{ transition?: unknown; applied?: unknown; record?: unknown }> | null }>;
 
 // Q9 (Ugo, 2026-10-28): a technical or organisational hold keeps J2; a person taking the case over cancels it. Only these two transitions are
 // organisational (they never mean "a person took it"). A hold release that hands the case to a human ends in owner "human" and is obsolete by owner.
@@ -364,10 +364,14 @@ export function revalidateFiredJ2(input: Readonly<{
   if (view.owner === "system_hold") deferred.add("organizational_hold");
   else if (view.owner !== "agent") obsolete.add("owner_not_agent");
   if (TRANSIENT_PHASES.has(view.phase)) deferred.add("case_phase_transient");
-  else if (view.phase !== "awaiting_customer") obsolete.add("phase_changed");
+  else if (view.phase !== "awaiting_customer") {
+    if (view.phase === "queued" && view.body.questions.filter(question => question.askedInEffect === timer.questionEffectId).length > 1) deferred.add("case_phase_transient");
+    else obsolete.add("phase_changed");
+  }
   if (view.sensitivity !== "none") obsolete.add("sensitive_case");
 
-  const question = view.body.questions.find((candidate) => candidate.askedInEffect === timer.questionEffectId);
+  const batch = view.body.questions.filter(candidate => candidate.askedInEffect === timer.questionEffectId);
+  const question = batch.find(candidate => candidate.answeredBy === undefined || candidate.answeredBy === null) ?? batch[0];
   if (!question) obsolete.add("question_missing");
   else {
     if (question.answeredBy !== undefined && question.answeredBy !== null) obsolete.add("question_answered");
@@ -382,9 +386,20 @@ export function revalidateFiredJ2(input: Readonly<{
   else for (const event of input.events) {
     const occurredMs = Date.parse(event.occurredAt);
     if (Number.isNaN(occurredMs)) { obsolete.add("invalid_time"); continue; }
-    if (event.kind === "inbound_confirmed" && event.direction === "customer_inbound" && occurredMs >= sentMs) obsolete.add("inbound_after_question");
-    else if (event.kind === "owner_changed" && occurredMs >= sentMs && !isOrganizationalTransition(event)) obsolete.add("owner_changed_since");
-    else if (event.kind === "outbound_observed" && event.direction === "human_outbound" && occurredMs >= sentMs) obsolete.add("human_outbound_since");
+    const recordedAfterWait = event.caseVersion !== undefined && event.caseVersion > timer.scheduledAtCaseVersion;
+    if (event.kind === "inbound_confirmed" && event.direction === "customer_inbound" && (occurredMs >= sentMs || recordedAfterWait)) {
+      if (batch.length <= 1) obsolete.add("inbound_after_question");
+      else {
+        const processed = event.caseVersion !== undefined && input.events.some(observation => {
+          const record = observation.detail?.record as { decision?: { caseVersion?: number; validation?: { outcome?: string } } } | undefined;
+          return observation.kind === "observation_recorded" && observation.detail?.applied === true && record?.decision?.validation?.outcome === "accepted"
+            && typeof record.decision.caseVersion === "number" && record.decision.caseVersion >= event.caseVersion!;
+        });
+        if (!processed) deferred.add("case_phase_transient");
+      }
+    }
+    else if (event.kind === "owner_changed" && (occurredMs >= sentMs || recordedAfterWait) && !isOrganizationalTransition(event)) obsolete.add("owner_changed_since");
+    else if (event.kind === "outbound_observed" && event.direction === "human_outbound" && (occurredMs >= sentMs || recordedAfterWait)) obsolete.add("human_outbound_since");
     // The question's own outbound event sits at sentAt: only a strictly later agent message makes it obsolete.
     else if (event.kind === "outbound_observed" && event.direction === "agent_outbound" && occurredMs > sentMs) obsolete.add("newer_agent_message");
   }

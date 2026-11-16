@@ -1,12 +1,14 @@
+import { readOriginalRequestTicket } from "../intake/original-request-ticket";
 // V2 entry (LOCAL, OFF unless SAV_V2_ENTRY=on and SAV_CASE_RECORDING=on). What joins V1's runtime to the V2 case, on the existing stores:
 //   customerReturnGate      before any claim, CRM read or model call of a run: a customer's answer on an open V2 case is consumed there and V1's run ends with it, in one transaction
 //   v2EntryRelayDeps        after V1's confirmed effect: the return route first, then the relay with its admission sources and the owner read
 //   continueCaseAfterCommit the real trigger after a commit; sweepCaseContinuations its durable catch-up. A failure stays visible (log and one durable marker per case), never swallowed
 // It writes no HubSpot owner, invents no owner id, policy, rule or right: anything absent from the environment admits nobody.
 import "server-only";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { markContinuationStop as markContinuation, continuationStopCode } from "./continuation-stop";
+import { and, asc, eq, gt, isNull, lte } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { auditLogs, savCaseEvents, savCases, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeRuns, savMessages, savThreads } from "@/db/schema";
+import { savCaseEvents, savCases, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeRuns, savMessages, savSyncState, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { readSavExternalCompletion } from "../external-completion";
 import { readSavAgentPause } from "../intake/agent-pause";
@@ -96,7 +98,10 @@ export async function firstBlockEvidence(env: Env, messageId: string, gmailMessa
   if (!message) return [];
   const text = decryptSavPayload<{text?: unknown}>(message.body)?.text;
   if (typeof text !== "string") return [];
-  const selected = selectCaseBlockRule(candidates, text, message.subject);
+  const original = await readOriginalRequestTicket(messageId, env);
+  // B may carry a new sensitive request: selecting A must never hide that request.
+  if (original && (savCaseSensitiveWording(text, message.subject) || savCaseSensitiveWording(original.text, original.message.subject))) return [];
+  const selected = selectCaseBlockRule(candidates, original?.text ?? text, original?.message.subject ?? message.subject);
   // Two blocks claiming one mail is a configuration to review: visible, with no customer text, and nobody admitted.
   if (selected.reason === "ambiguous_block") console.error("sav_v2_entry_block_ambiguous", { messageId, blockIds: selected.blockIds });
   if (selected.reason !== "admitted") return [];
@@ -210,12 +215,23 @@ async function v1CreatedTicket(executionId: string, ticketId: string) {
   return v1IntentHash(intent) === create.intentHash && intent.kind === "ticket_create" && intent.key === create.businessKey && decryptSavPayload<{ id?: string }>(create.ackCiphertext).id === ticketId;
 }
 
+/** 16/11: the EXISTING ticket V1 linked or reopened for this execution: it created no ticket, every effect it recorded is confirmed, and its
+ * `email_associate` (intact, hash checked) attached this mail to this very ticket. Uncertain, merely sent or another ticket is no proof. */
+async function v1ExistingTicket(executionId: string, ticketId: string) {
+  const effects = await requireDb().select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, executionId));
+  if (!effects.length || effects.some(effect => effect.kind === "ticket_create" || effect.state !== "confirmed")) return false;
+  const associations = effects.filter(effect => effect.kind === "email_associate");
+  if (associations.length !== 1) return false;
+  const intent = decryptSavPayload<{ kind?: string; key?: string; ticketId?: string }>(associations[0]!.intentCiphertext);
+  return v1IntentHash(intent) === associations[0]!.intentHash && intent.kind === "email_associate" && intent.key === associations[0]!.businessKey && intent.ticketId === ticketId;
+}
+
 /**
  * SAV-81: the relay's binder for a mail V1 already confirmed, in qualification mode only (the scope checks themselves answer `open` or `closed` otherwise).
  * The real test mail opened its thread and V1 created its ticket, but its subject did not match at the creation, so nothing was bound and the relay could
  * never attribute it. This binds it once an operator put that ticket under the V2 owner, with exactly the creation's conditions and V1's current proofs:
  * the execution confirmed on this ticket and run version, no newer run, no operator refusal, the current contract's decision of ONE support request that
- * CREATED this ticket for the unique primary contact, its `ticket_create` confirmed for this ticket, no other mail on the thread, the thread not paused, no
+ * CREATED this ticket (16/11: or linked/reopened this EXISTING ticket, `v1ExistingTicket`) for the unique primary contact, its `ticket_create` confirmed for this ticket, no other mail on the thread, the thread not paused, no
  * person's decision on the mail, not handled outside, and (before the write) no agent pause; then
  * the exact scope (sender, contact, first message, subject, window, hash, revision, one thread). The owner itself is read by the relay, between the read-only
  * check and the write. It writes no CRM owner. Unreadable is refused, never guessed.
@@ -230,8 +246,12 @@ export function qualificationRelayBinder(env: Env): NonNullable<CaseBoundaryDeps
         || source.runVersion !== input.runVersion || freshness.latestRunVersion !== input.runVersion || freshness.humanRefused) return false;
       if (decision.revision !== SAV_INTAKE_CONTRACT_REVISION || decision.messageId !== input.messageId || decision.latestInboundMessageId !== input.messageId
         || decision.classification !== "support" || decision.requests.length !== 1 || decision.requests[0]!.kind !== "support"
-        || disposition.kind !== "ticket" || disposition.target.operation !== "create" || disposition.target.contactId !== disposition.contactScope.primaryContactId) return false;
-      if (!await v1CreatedTicket(input.executionId, input.ticketId)) return false;
+        || disposition.kind !== "ticket" || disposition.target.contactId !== disposition.contactScope.primaryContactId) return false;
+      // 16/11 (Ugo): a tester who already has a ticket. V1 links or reopens it instead of creating one; the same binding, with V1's proof of THAT ticket.
+      const target = disposition.target;
+      if (target.operation === "create") { if (!await v1CreatedTicket(input.executionId, input.ticketId)) return false; }
+      else if (target.operation === "link" || target.operation === "reopen") { if (target.ticketId !== input.ticketId || !await v1ExistingTicket(input.executionId, input.ticketId)) return false; }
+      else return false;
       const db = requireDb();
       const [message] = await db.select({ id: savMessages.id, threadId: savMessages.threadId, receivedAt: savMessages.receivedAt, gmailMessageId: savMessages.gmailMessageId })
         .from(savMessages).where(eq(savMessages.id, input.messageId));
@@ -408,33 +428,24 @@ async function projectThread(threadId: string) {
   await (await import("../intake/console-store")).projectIntakeThread(threadId).catch(() => { console.error("sav_v2_entry_projection", { threadId }); });
 }
 
-const FAILURE_MARK = { action: "sav_v2_continuation_failed", entityType: "sav_v2_case" } as const;
-/** One durable marker per case, updated in place, cleared by the next success: a failure after a commit can be read later and cannot grow without bound. */
-async function markContinuation(caseId: string, trigger: CaseContinuationTrigger, code: string | null) {
-  const row = and(eq(auditLogs.entityType, FAILURE_MARK.entityType), eq(auditLogs.entityId, caseId), eq(auditLogs.action, FAILURE_MARK.action));
-  const [existing] = await requireDb().select().from(auditLogs).where(row);
-  if (code === null) { if (existing) await requireDb().delete(auditLogs).where(row); return; }
-  const technicalMetadata = { code, trigger, failures: Number((existing?.technicalMetadata as { failures?: unknown } | null)?.failures ?? 0) + 1, lastAt: new Date().toISOString() };
-  if (existing) await requireDb().update(auditLogs).set({ technicalMetadata }).where(row);
-  else await requireDb().insert(auditLogs).values({ actorEmail: "system", ...FAILURE_MARK, entityId: caseId, technicalMetadata });
-}
-
 export type CaseContinuationOutcome = { status: string } | { status: "failed"; code: string };
 /** Called after the commit, on every path. It never undoes or fails what was committed; what went wrong is logged and marked, and the sweep tries the case again. */
 export async function continueCaseAfterCommit(caseId: string, trigger: CaseContinuationTrigger, input: EntryDeps): Promise<CaseContinuationOutcome> {
   let code: string;
-  // SAV-80: no investigation, retrieval or model cost for a case outside the qualification scope or after it expired. Not a failure: nothing is marked.
+  // No investigation or cost outside qualification; keep a durable operator task.
   const scoped = await savV2QualificationCaseAllowed(input.env, caseId).catch(() => ({ allowed: false as const, reason: "qualification_unreadable" }));
   if (!scoped.allowed) {
     // Visible, ids and closed codes only (never an address, subject or text): why a case the agent holds was not continued.
     console.info("sav_v2_continuation_skipped", { caseId, reason: scoped.reason });
+    await markContinuation(caseId, trigger, scoped.reason).catch(error => console.error("sav_v2_entry_continuation_mark", { caseId, errorCode: errorCode(error) }));
     return { status: "qualification_out_of_scope" };
   }
   try {
     const point = input.continuation === undefined ? await loadCaseContinuationPoint() : input.continuation;
     if (point) {
       const report = await point({ caseId, trigger, env: input.env, ...(input.immediateDeadlineMs === undefined ? {} : { deadlineMs: input.immediateDeadlineMs }) });
-      await markContinuation(caseId, trigger, null);
+      const stopCode = continuationStopCode(report);
+      if (stopCode !== undefined) await markContinuation(caseId, trigger, stopCode);
       // SAV-92 (16/11): refused only because the customer's last mail is still settling: ONE durable wake continues this case when the window ends
       // (the window itself is unchanged). Every guard is read again by that passage. A failure here never fails the pass; the sweep stays the fallback.
       if (report.status === "claim_refused" && report.reason === "settling" && report.retryAt) {
@@ -459,38 +470,59 @@ export async function continueCaseAfterCommit(caseId: string, trigger: CaseConti
   return { status: "failed", code };
 }
 
-/** How many queued cases the sweep reads the qualification scope of, at most, to fill its slots. */
+/** One stable-id lap over queued agent cases. Updated timestamps and failure markers never move a case within the lap. */
+const CONTINUATION_CURSOR = "sav-v2-sweep.v1:continuation";
 const SCOPE_SCAN = 50;
-/** Durable catch-up after a crash between a commit and its trigger, or a failed trigger: the cases the agent holds that are still queued, bounded. A pause stops it.
- * Never tried or not failing first, then the failure tried longest ago: a case that keeps failing cannot hold a slot against the others. */
+/** Durable, bounded catch-up. Excluded and held cases advance the cursor too; only the handled prefix advances when slots fill.
+ * A crash before saving the cursor can repeat work, so the continuation retains all its usual guards and effect deduplication. */
 export async function sweepCaseContinuations(input: EntryDeps & { limit?: number }) {
   if (!savV2EntryEnabled(input.env)) return { skipped: "off" as const };
   const db = requireDb();
   if (await relayPaused(db)) return { skipped: "paused" as const };
   const limit = Math.min(Math.max(input.limit ?? 4, 1), 20);
-  const candidates = await db.select({ id: savCases.id }).from(savCases).where(and(eq(savCases.owner, "agent"), eq(savCases.phase, "queued"))).orderBy(asc(savCases.updatedAt), asc(savCases.id)).limit(200);
-  // SAV-18: a case held by its block while that block still never sends takes no slot; once the block may act again, it is taken like any other.
+  const [saved] = await db.select({ cursor: savSyncState.cursor, version: savSyncState.processedCount }).from(savSyncState).where(eq(savSyncState.key, CONTINUATION_CURSOR));
+  const after = saved?.cursor && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(saved.cursor) ? saved.cursor : null;
+  const candidates = await db.select({ id: savCases.id }).from(savCases)
+    .where(and(eq(savCases.owner, "agent"), eq(savCases.phase, "queued"), after ? gt(savCases.id, after) : undefined))
+    .orderBy(asc(savCases.id)).limit(SCOPE_SCAN);
+  // Tail and head are disjoint, even when the cursor case was deleted. Count both reads
+  // against the same cap; no case can be revisited within this passage.
+  if (after && candidates.length < SCOPE_SCAN) {
+    candidates.push(...await db.select({ id: savCases.id }).from(savCases)
+      .where(and(eq(savCases.owner, "agent"), eq(savCases.phase, "queued"), lte(savCases.id, after)))
+      .orderBy(asc(savCases.id)).limit(SCOPE_SCAN - candidates.length));
+  }
   const held = await caseIdsStillHeldByBlock(candidates.map(row => row.id), db);
-  const marks = candidates.length ? await db.select({ id: auditLogs.entityId, meta: auditLogs.technicalMetadata }).from(auditLogs)
-    .where(and(eq(auditLogs.entityType, FAILURE_MARK.entityType), eq(auditLogs.action, FAILURE_MARK.action), inArray(auditLogs.entityId, candidates.map(row => row.id)))) : [];
-  const failedAt = new Map(marks.map(mark => [mark.id, Date.parse(String((mark.meta as { lastAt?: unknown } | null)?.lastAt)) || 0]));
-  // Stable sort: untouched cases keep their oldest-first order.
-  const ordered = candidates.filter(row => !held.has(row.id)).sort((a, b) => (failedAt.get(a.id) ?? -1) - (failedAt.get(b.id) ?? -1));
-  // SAV-80: a case outside the qualification scope is never updated by its continuation, so it would keep the oldest slots forever and starve newer
-  // cases. The scope is read first (no database in the open mode or for a closed scope), over a bounded window, and only allowed cases take a slot.
-  const queued: { id: string }[] = [];
-  let outOfScope = 0;
-  for (const row of ordered.slice(0, SCOPE_SCAN)) {
-    if (queued.length >= limit) break;
-    const scoped = await savV2QualificationCaseAllowed(input.env, row.id).catch(() => ({ allowed: false as const, reason: "qualification_unreadable" }));
-    if (scoped.allowed) queued.push(row); else outOfScope++;
+  const outcome = { tried: 0, failed: {} as Record<string, number>, outOfScope: 0 };
+  let handled = 0;
+  for (const { id } of candidates) {
+    if (outcome.tried >= limit) break;
+    if (!held.has(id)) {
+      const scoped = await savV2QualificationCaseAllowed(input.env, id).catch(() => ({ allowed: false as const, reason: "qualification_unreadable" }));
+      if (!scoped.allowed) {
+        outcome.outOfScope++;
+        await markContinuation(id, "sweep", scoped.reason).catch(error => console.error("sav_v2_entry_continuation_mark", { caseId: id, errorCode: errorCode(error) }));
+      }
+      else {
+        outcome.tried++;
+        const result = await continueCaseAfterCommit(id, "sweep", input);
+        if (result.status === "failed") { const code = (result as { code: string }).code; outcome.failed[code] = (outcome.failed[code] ?? 0) + 1; }
+      }
+    }
+    handled++;
   }
-  if (outOfScope) console.info("sav_v2_continuation_sweep_out_of_scope", { count: outOfScope });
-  const outcome = { tried: 0, failed: {} as Record<string, number>, ...(outOfScope ? { outOfScope } : {}) };
-  for (const { id } of queued) {
-    outcome.tried++;
-    const result = await continueCaseAfterCommit(id, "sweep", input);
-    if (result.status === "failed") { const code = (result as { code: string }).code; outcome.failed[code] = (outcome.failed[code] ?? 0) + 1; }
+  const cursor = handled === candidates.length && candidates.length < SCOPE_SCAN ? null : candidates[handled - 1]!.id;
+  // Compare-and-set: a concurrent passage that already committed wins. A stale
+  // passage never overwrites its progress, including after a complete lap (ABA).
+  // processedCount is this cursor's revision, not a case/budget/attempt counter.
+  if (saved) {
+    await db.update(savSyncState).set({ cursor, processedCount: saved.version + 1, updatedAt: new Date() })
+      .where(and(eq(savSyncState.key, CONTINUATION_CURSOR), eq(savSyncState.processedCount, saved.version),
+        saved.cursor === null ? isNull(savSyncState.cursor) : eq(savSyncState.cursor, saved.cursor)));
+  } else {
+    await db.insert(savSyncState).values({ key: CONTINUATION_CURSOR, cursor, status: "idle", processedCount: 1, updatedAt: new Date() })
+      .onConflictDoNothing({ target: savSyncState.key });
   }
-  return outcome;
+  if (outcome.outOfScope) console.info("sav_v2_continuation_sweep_out_of_scope", { count: outcome.outOfScope });
+  return { tried: outcome.tried, failed: outcome.failed, ...(outcome.outOfScope ? { outOfScope: outcome.outOfScope } : {}) };
 }

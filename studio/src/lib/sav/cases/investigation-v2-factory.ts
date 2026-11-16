@@ -94,7 +94,7 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
   const now = input.now ?? (() => new Date()), readPolicyRecord = input.readPolicyRecord!, scope = input.scope ?? { locale: "fr-FR", audience: "support" as const };
   const spendDeps = { env: input.env, now }, model = caseV2ModelSpend(spendDeps);
   const provenance = caseProvenanceReaders({ readPolicyRecord, env: input.env, now, locale: scope.locale, audience: scope.audience });
-  const vectors = caseKnowledgeVectorSearch({ ...scope, now });
+  const vectors = caseKnowledgeVectorSearch({ ...scope, now, env: input.env });
   const readTicketOwner = input.readTicketOwner
     ?? (snapshot => caseTicketOwnerPortFromTransport({ transport: caseHubspotOwnerReadTransport({ env: input.env, ...(input.network ? { network: input.network } : {}) }), env: input.env() })(snapshot));
   const v1Qualify = caseInvestigationQualify({ readConfirmedContext: readConfirmedV1Context, adapterPolicy: input.adapterPolicy ?? (async () => null), readPolicyRecord, now,

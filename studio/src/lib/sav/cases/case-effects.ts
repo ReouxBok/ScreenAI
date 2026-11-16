@@ -39,7 +39,11 @@ export const inboundInteractionId = (gmailMessageId: string) => `inbound:${part(
 /** The interaction of an outbound reply is its own key suffix, so the note of a confirmed reply is derived from the reply, never from a clock. */
 export const replyInteractionId = (triggerEventId: string) => `outbound:${part(triggerEventId, "triggerEventId")}`;
 
-export type CaseReplyPurpose = "question" | "answer" | "reminder";
+export type CaseReplyQuestion = Readonly<{ id: string; text: string; factKeys: readonly string[] }>;
+/** Legacy single-question payloads remain valid and keep their approval hash. */
+export const caseReplyQuestions = (proposal: Pick<CaseReplyProposal, "question" | "questions">): readonly CaseReplyQuestion[] => proposal.questions ?? (proposal.question ? [proposal.question] : []);
+
+export type CaseReplyPurpose = "question" | "answer" | "reminder" | "closing" | "handoff";
 /**
  * What the agent prepared, as the person saw it. Every field that can change the message or its recipient is part of the hash below.
  * `inboundMessageId` is the stored message (not a quoted address) whose sender is the recipient: the last qualified inbound of the thread.
@@ -54,7 +58,9 @@ export type CaseReplyProposal = Readonly<{
   subject: string;
   text: string;
   /** Only for `question`: what the question asked for, recorded on the case once the send is confirmed. */
-  question?: Readonly<{ id: string; text: string; factKeys: readonly string[] }>;
+  question?: CaseReplyQuestion;
+  /** Multi-question mail only (2–5); never combined with the legacy field. */
+  questions?: readonly CaseReplyQuestion[];
   /** Only for `answer`: the procedures this reply asks the customer to try, recorded on the case as pending trials once the send is confirmed, and only then. */
   procedures?: readonly CaseReplyProcedure[];
 }>;
@@ -69,6 +75,7 @@ const lower = (address: string) => address.trim().toLowerCase();
 export const caseReplyPayloadHash = (proposal: CaseReplyProposal) => caseEffectHash({
   caseId: caseIdPart(proposal.caseId), caseVersion: proposal.caseVersion, triggerEventId: proposal.triggerEventId, inboundMessageId: proposal.inboundMessageId,
   purpose: proposal.purpose, recipient: lower(proposal.recipient), subject: proposal.subject, text: proposal.text, question: proposal.question ?? null,
+  questions: proposal.questions,
   // Absent from the hash when there is none: a reply sealed without procedures keeps the hash it was approved under.
   procedures: proposal.procedures?.length ? proposal.procedures : undefined,
 });

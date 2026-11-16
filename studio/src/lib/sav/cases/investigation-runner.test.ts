@@ -120,6 +120,15 @@ describe("Ugo 31/10: a ticket a person owns is not handled by V2 (owner read, fa
     expect(run.records).toEqual([]);
     expect(run.progress.size).toBe(0);
   });
+  it("resumes the same input after explicit reassignment from a person to V2", async () => {
+    const run = fake({ owner: ["human", "v2"] });
+    expect(await runCaseInvestigation("case-1", "observe", run.ports)).toMatchObject({ status: "skipped", reason: "ticket_owner_human", modelCalls: 0 });
+    expect(run.progress.size).toBe(0);
+    expect(run.calls).toHaveLength(0);
+    expect(await runCaseInvestigation("case-1", "observe", run.ports)).toMatchObject({ status: "recorded", modelCalls: 1 });
+    expect(run.calls).toHaveLength(1);
+    expect(run.records).toHaveLength(1);
+  });
   it("an answer outside the contract is not the V2 owner", async () => {
     const run = fake({ owner: "v2" });
     run.ports.readTicketOwner = async () => "90000001" as never;

@@ -18,8 +18,9 @@ export const renderIntakeNote = (text: string, marker: string) => `<p>${plain(te
  * may remove: the note is then proven only by its creation ACK (as before). With neither the ACK nor the hidden comment, nothing proves which note is ours (the
  * summary is deterministic, two cases can share its text and instant): it stays uncertain, never attributed on its date and text. */
 export const renderIntakeNoteHidden = (text: string, marker: string) => `<p>${plain(text).replace(/\n/g, "<br>")}</p><!-- sav-intake:${marker} -->`;
-/** Only the V2 reply's summary note (`note:<case>:reply-summary.<trigger>`) is rendered without a visible marker; every other note keeps the visible one. */
-export const hiddenMarkerNoteKey = (key: string | undefined) => typeof key === "string" && /^note:[^:]+:reply-summary\./.test(key);
+/** Only the V2 reply's summary note (`note:<case>:reply-summary.<trigger>`) and the V2 closure note (`note:<case>:closed-summary.cycle-<n>`, SAV-92 16/11) are
+ * rendered without a visible marker; every other note keeps the visible one. */
+export const hiddenMarkerNoteKey = (key: string | undefined) => typeof key === "string" && /^note:[^:]+:(?:reply|closed)-summary\./.test(key);
 const ownerHistorySchema = z.object({ propertiesWithHistory: z.object({ hubspot_owner_id: z.array(z.object({ value: z.string().nullable().optional(), timestamp: z.string() }).passthrough()).min(1) }).passthrough() }).passthrough();
 const sameProperties = (actual: Record<string, string | null>, expected: Record<string, string>) => Object.entries(expected).every(([k, v]) => k === "hs_timestamp" ? Date.parse(actual[k] ?? "") === Date.parse(v) : actual[k] === v);
 // HubSpot removes this exact historical comment and may append one LF. Do
@@ -261,6 +262,8 @@ export function createIntakeExecutorAdapters(options: {
                 // The executor no longer plans it; verify below stays read-only for any older effect.
                 throw Error("SAV_INTAKE_EXECUTION_OWNER_UNGUARDED");
             else if (intent.kind === "note_associate" || intent.kind === "email_associate") {
+                if (intent.kind === "email_associate" && intent.reuseExistingAssociation && await association("emails", id(intent.objectId), "tickets", id(intent.ticketId), signal))
+                    return { id: intent.objectId };
                 await hub(`/crm/v4/objects/${intent.kind === "note_associate" ? "notes" : "emails"}/${id(intent.objectId)}/associations/default/tickets/${id(intent.ticketId)}`, "PUT", signal);
                 return {
                     id: intent.objectId

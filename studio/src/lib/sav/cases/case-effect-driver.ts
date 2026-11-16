@@ -3,10 +3,13 @@
 // where the parent row lives, what is checked before every marker, what is recorded once the reply is confirmed — and never sends, marks,
 // acknowledges or verifies anything itself. Not wired to any route, cron or action: OFF until `SAV_CASE_EFFECTS=supervised` AND a person approved a payload.
 import "server-only";
+import { closeAfterConfirmedJ2 } from "./j2-confirmed-closure";
+import { isTerminalReply, closingHandoffReplyEnabled } from "./case-terminal-reply";
+import { j2AutoGate } from "./j2-auto-reminder";
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savCaseEffectExecutions, savCases, savIntakeEffects } from "@/db/schema";
+import { savCaseEffectExecutions, savCases, savIntakeEffectJournal, savIntakeEffects } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { readSavAgentPause, SAV_AGENT_PAUSE_CODES, savAgentPauseCode, type SavAgentPauseState } from "../intake/agent-pause";
 import { readIntakeExecutionAuthority } from "../intake/execution-policy";
@@ -96,18 +99,22 @@ async function commitReceipt(
       if (owned.leaseUntil <= new Date()) return fault("LEASE_LOST");
       const ack = reply && ackOf(reply);
       if (!reply || reply.businessKey !== key || reply.state !== "confirmed" || reply.ackCiphertext !== before.ackCiphertext || !reply.dispatchedAt || !ack?.id || !ack.threadId) return fault("RECEIPT_CHANGED");
-      if (locked.owner !== "agent") throw new ReceiptOwnerChanged();
+      if (locked.owner !== "agent" && !(proposal.purpose === "handoff" && (await readCaseReplyFacts(tx, proposal, currentPolicyRevision, { lockCase: true })).owner === "agent")) throw new ReceiptOwnerChanged();
       if (projectionBlockedByPause(await readSavAgentPause(tx, "intake"), await readSavAgentPause(tx, "v2"))) return fault("RECEIPT_HELD_BY_PAUSE");
       // The J2 counts from the mail's real send time (Gmail's own date, verified within a window of the marker); without it, from the marker.
       const verified = typeof ack.sentAt === "string" ? new Date(ack.sentAt) : null;
       const sentAt = verified && Number.isFinite(verified.getTime()) && verified.getTime() >= reply.dispatchedAt.getTime() - 60_000 && verified.getTime() <= reply.dispatchedAt.getTime() + 600_000 ? verified : reply.dispatchedAt;
-      const outcome = await recordConfirmedCaseReply({ proposal, effectId: reply.id, gmailMessageId: ack.id, gmailThreadId: ack.threadId, sentAt, currentPolicyRevision }, { tx });
+      const outcome = await recordConfirmedCaseReply({ proposal, effectId: reply.id, gmailMessageId: ack.id, gmailThreadId: ack.threadId, sentAt, currentPolicyRevision }, { tx, contextualJ2: env().SAV_V2_J2_CONTEXTUAL === "on" });
       if (typeof outcome.question === "object" || typeof outcome.trials === "object") throw new ReceiptOwnerChanged();
       if (typeof outcome.j2 === "object" && outcome.j2.refused !== "inbound_after_question") return fault(`RECEIPT_J2_${outcome.j2.refused.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`);
       if (owned.leaseUntil <= new Date()) return fault("LEASE_LOST");
       // « Waiting for the customer » (OFF unless `SAV_V2_TICKET_STAGES=on`): queued in THIS transaction, from the same locked case and the reply's own policy, so a confirmed reply
       // and its ticket state are born together and a replay or a recovery finds the same execution. Its own pass moves the ticket; nothing is sent from here.
-      await enqueueCaseTicketStage(tx, { snapshot: locked, trigger: { kind: "reply_confirmed", replyKey: key, sentAt: sentAt.toISOString() }, policy: { id: owned.row.policyId, hash: owned.row.policyHash }, env, threadId: owned.row.threadId });
+      const closure = await closeAfterConfirmedJ2(tx, proposal, key, sentAt, env());
+      if (!isTerminalReply(proposal.purpose) && (closure || proposal.purpose !== "reminder" || env().SAV_V2_J2_CONTEXTUAL !== "on")) {
+        const stage = await enqueueCaseTicketStage(tx, { snapshot: closure?.snapshot ?? locked, trigger: closure?.trigger ?? { kind: "reply_confirmed", replyKey: key, sentAt: sentAt.toISOString() }, policy: { id: owned.row.policyId, hash: owned.row.policyHash }, env, threadId: owned.row.threadId });
+        await recordCaseComponentOutcome(tx, lease.row.id, "status", stage.ok ? { state: "queued", executionId: stage.executionId } : { state: stage.reason === "stages_disabled" ? "skipped" : "blocked", reason: stage.reason });
+      }
       await conclude(tx, reply);
       return reply;
     });
@@ -116,6 +123,19 @@ async function commitReceipt(
     if (error instanceof ReceiptOwnerChanged) return fault("CANCELLED_OWNER_CHANGED");
     throw error;
   }
+}
+
+/** The execution lock held by the caller serializes these durable, deduplicated component outcomes. */
+async function recordCaseComponentOutcome(tx: ExecutionTx, executionId: string, component: "note" | "status", outcome: Record<string, string>) {
+  const kind = `case_component_${component}`;
+  const [last] = await tx.select({ payload: savIntakeEffectJournal.payloadCiphertext }).from(savIntakeEffectJournal)
+    .where(and(eq(savIntakeEffectJournal.executionId, executionId), eq(savIntakeEffectJournal.kind, kind)))
+    .orderBy(desc(savIntakeEffectJournal.createdAt), desc(savIntakeEffectJournal.id)).limit(1);
+  const previous = last ? decryptSavPayload<Record<string, string>>(last.payload) : null;
+  // Once queued, the linked execution and its ledger own the status outcome. A later
+  // configuration refusal must not hide an already confirmed (or engaged) effect.
+  if (component === "status" && previous?.executionId && !outcome.executionId) return;
+  if (!previous || JSON.stringify(previous) !== JSON.stringify(outcome)) await executionJournal(tx, executionId, kind, outcome);
 }
 
 /** The reason a verification-only pass leaves on an execution whose reply is confirmed and recorded while its note still waits for a supervised pass. */
@@ -184,6 +204,11 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
   async function eligibility(tx: ExecutionTx, lease: ExecutionLease, phase: Phase, policyRevision: string | null, pauses: readonly [SavAgentPauseState, SavAgentPauseState]) {
     const payload = payloads.get(lease)!;
     const { proposal } = payload;
+    if (phase === "reply" && isTerminalReply(proposal.purpose) && !closingHandoffReplyEnabled(deps.env())) return fault("HOLD_EFFECTS_OFF");
+    if (phase === "reply" && proposal.purpose === "reminder") {
+      const blocked = await j2AutoGate(deps.env(), tx);
+      if (blocked) return fault(`HOLD_${blocked.toUpperCase()}`);
+    }
     const facts = await readCaseReplyFacts(tx, proposal, policyRevision, { lockCase: true });
     // SAV-80, under the case lock, at every look before a NEW plan, marker or send: outside the qualification scope or after it expired the
     // effect is cancelled; an unreadable scope or binding holds it. A verification of an engaged effect never comes here: it stays possible.
@@ -317,15 +342,42 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     await localFenceAfterRead(lease);
   }
 
-  /**
-   * The stage DURABLY queued for this confirmed reply (read after the receipt committed it): the « waiting for the customer » execution of this reply key, unless it
-   * was cancelled. No row (rule said no, switch off, a customer mail crossed the reply before the receipt) or an unbuildable key: null, and the note names no stage.
-   */
-  async function durableReplyStage(proposal: CaseEffectPayload["proposal"]): Promise<CaseReplySummaryStage> {
+  /** Only a confirmed stage execution proves the HubSpot move. Persist ONE wait in the journal:
+   * the next catch-up pass writes without a status if the stage is still undecided, even across
+   * process restarts or unrelated holds. The reply receipt is committed before this wait. */
+  async function durableReplyStage(lease: ExecutionLease, proposal: CaseEffectPayload["proposal"]): Promise<CaseReplySummaryStage> {
     let key: string;
-    try { key = caseTicketStageKey(proposal.caseId, "waiting_customer", caseReplyKey(proposal.caseId, proposal.triggerEventId)); } catch { return null; }
-    const [row] = await requireDb().select({ state: savCaseEffectExecutions.state }).from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.replyKey, key));
-    return row && row.state !== "refused" ? "waiting_customer" : null;
+    const replyKey = caseReplyKey(proposal.caseId, proposal.triggerEventId);
+    let target: "closed" | "waiting_customer" = "waiting_customer";
+    if (proposal.purpose === "reminder" && deps.env().SAV_V2_J2_CONTEXTUAL === "on") {
+      const [closed] = await requireDb().select({ id: savCaseEffectExecutions.id }).from(savCaseEffectExecutions)
+        .where(eq(savCaseEffectExecutions.replyKey, caseTicketStageKey(proposal.caseId, "closed", replyKey)));
+      if (closed) target = "closed";
+    }
+    try { key = caseTicketStageKey(proposal.caseId, target, replyKey); } catch { return null; }
+    const waiting = await requireDb().transaction(async tx => {
+      if (!await ownedExecution(tx, lease)) return fault("LEASE_LOST");
+      const [row] = await tx.select({ state: savCaseEffectExecutions.state }).from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.replyKey, key));
+      if (!row || row.state === "refused") return { stage: null };
+      if (row.state === "confirmed") return { stage: target };
+      const [waited] = await tx.select({ id: savIntakeEffectJournal.id }).from(savIntakeEffectJournal).where(and(
+        eq(savIntakeEffectJournal.executionId, lease.row.id), eq(savIntakeEffectJournal.kind, "reply_note_stage_wait"),
+      )).limit(1);
+      if (waited) return { stage: null };
+      await executionJournal(tx, lease.row.id, "reply_note_stage_wait", { stageKey: key });
+      return { wait: true };
+    });
+    // The receipt is already committed: reuse its pending-note reason so recovery does not
+    // consume the next pass merely recording that same receipt again.
+    if ("wait" in waiting) throw Error(CASE_RECOVERY_NOTE_PENDING);
+    return waiting.stage;
+  }
+  async function skipNote(lease: ExecutionLease, reason: string) {
+    await requireDb().transaction(async tx => {
+      if (!await ownedExecution(tx, lease)) return fault("LEASE_LOST");
+      await recordCaseComponentOutcome(tx, lease.row.id, "note", { state: "skipped", reason });
+    });
+    return null;
   }
   /** A summary note's ledger row that this pass may still write (none yet, or planned: no marker). An engaged or confirmed row is only verified / kept. */
   const newSummaryWrite = (effect: Effect | undefined) => !effect || effect.state === "planned";
@@ -379,25 +431,25 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
       const summaryStopped = summary && !caseReplyNoteEnabled(deps.env());
       if (!created || created.state !== "confirmed") {
         phases.set(lease, "note_create");
-        if (summaryStopped && newSummaryWrite(created)) return null;
+        if (summaryStopped && newSummaryWrite(created)) return skipNote(lease, "reply_note_off");
         if (created) return effectIntent(created);
         // SAV-92 (16/11): the reply's summary note is planned only when the signed policy grants `append_case_note` (as the handoff note): without it the
         // execution ends as before, with no note.
         if (summary) {
           const { policy } = await readIntakeExecutionAuthority(options.config);
-          if (!policy.mutations.includes(SAV_CASE_EFFECT_PERMISSIONS.note)) return null;
+          if (!policy.mutations.includes(SAV_CASE_EFFECT_PERMISSIONS.note)) return skipNote(lease, "mutation_not_granted");
           // Review (16/11): the receipt and the ticket stage are recorded FIRST (the same idempotent transaction the end of the pass commits again), so the note's
-          // ticket sentence names only a stage that is durably queued, never one a customer mail could still cancel before the receipt. The execution stays running.
+          // ticket sentence is resolved from the confirmed stage below. The execution stays running.
           await commitReceipt(lease, proposal, effects, deps, async () => {});
         }
         const [row] = await requireDb().select({ ticketId: savCases.ticketId }).from(savCases).where(eq(savCases.id, proposal.caseId));
         if (!row) return fault("CASE_MISSING");
-        const text = summary ? caseReplySummaryWithStage(note.text, await durableReplyStage(proposal)) : note.text;
+        const text = summary ? caseReplySummaryWithStage(note.text, await durableReplyStage(lease, proposal)) : note.text;
         return buildCaseNoteIntent({ caseId: proposal.caseId, interactionId: note.interactionId, ticketId: row.ticketId, sourceMessageId: proposal.inboundMessageId, text, at: note.at });
       }
       if (associated?.state === "confirmed") return null;
       phases.set(lease, "note_associate");
-      if (summaryStopped && newSummaryWrite(associated)) return null;
+      if (summaryStopped && newSummaryWrite(associated)) return skipNote(lease, "reply_note_off");
       if (associated) return effectIntent(associated);
       const objectId = ackOf(created)?.id;
       if (!objectId) return fault("NOTE_ACK_MISSING");
@@ -429,7 +481,11 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     },
     async finish(lease, effects) {
       // One transaction (see `commitReceipt`): the mail event, the question, the J2 and the execution's confirmation commit together or not at all.
-      await commitReceipt(lease, payloads.get(lease)!.proposal, effects, deps, async (tx, reply) => {
+      const payload = payloads.get(lease)!;
+      await commitReceipt(lease, payload.proposal, effects, deps, async (tx, reply) => {
+        // Recovery may finish a disabled summary without going through the new-work path.
+        if (payload.note && isCaseReplySummary(payload.note.interactionId) && !caseReplyNoteEnabled(deps.env()))
+          await recordCaseComponentOutcome(tx, lease.row.id, "note", { state: "skipped", reason: "reply_note_off" });
         await tx.update(savCaseEffectExecutions).set({ state: "confirmed", leaseToken: null, leaseUntil: null, reason: null, updatedAt: new Date() })
           .where(and(eq(savCaseEffectExecutions.id, lease.row.id), eq(savCaseEffectExecutions.leaseToken, lease.token)));
         await executionJournal(tx, lease.row.id, "execution_confirmed", { replyEffectId: reply.id });

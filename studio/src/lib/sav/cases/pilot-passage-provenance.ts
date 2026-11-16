@@ -4,6 +4,8 @@
 // as `answer` at that exact version AND read as active at that version now. No proof, no validation: anything unread or unknown is a reason, never a default. Nothing is written.
 // No production reader of the active versions and no real scope exist yet: both are injected ports; without them nothing is proven.
 import "server-only";
+import { isTerminalReply, terminalReplyInput } from "./case-terminal-reply";
+import { j2ReminderText, readJ2ReminderText, readJ2Origin } from "./j2-auto-reminder";
 import { savKnowledgeFreshness } from "../request-retrieval";
 import { prepareCaseReplyText } from "./case-reply-outbound";
 import type { CaseReplyProposal } from "./case-effects";
@@ -35,6 +37,7 @@ export type PilotProvenanceDeps = Readonly<{
   readActiveSource: (ref: KnowledgeRef) => Promise<PilotActiveSource | null>;
   readTemporaryIncidents?: IncidentReader;
   now: () => Date;
+  env?: () => Record<string, string | undefined>;
 }>;
 export type PilotProvenanceSource = KnowledgeRef & Readonly<{ use: "answer"; title: string; content: string; verifiedAt: string; verification: "fresh" | "revalidation_due"; evaluatedAt: string }>;
 export type PilotProvenance =
@@ -51,9 +54,24 @@ const sameFinalText = (decided: string, proposed: string, purpose: CaseReplyProp
 export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal, "caseId" | "triggerEventId" | "purpose" | "text">, deps: PilotProvenanceDeps,
   /** SAV-92: a text an administrator corrected in the Studio (persisted correction basis only). It skips the text comparison, nothing else: the latest decision,
    * its trigger and purpose, the scope, every source and every incident are still proven, and the incident claims are read on the corrected text too. */
-  options: Readonly<{ humanCorrection?: boolean }> = {}): Promise<PilotProvenance> {
+  options: Readonly<{ humanCorrection?: boolean; reminderInputKey?: string }> = {}): Promise<PilotProvenance> {
+  if (proposal.purpose === "reminder") {
+    const env = deps.env?.() ?? process.env;
+    if (env.SAV_V2_J2_CONTEXTUAL !== "on") {
+      // OFF: main's path exactly, including rejection before any origin read.
+      if (proposal.text !== await readJ2ReminderText(proposal.caseId, proposal.triggerEventId, env)) return unproven("reply_not_from_decision");
+      const origin = await readJ2Origin(proposal.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), deps.now());
+      const reminderInputKey = origin?.questions?.[0]?.id.replace(/:q1$/, "");
+      return origin ? readPilotReplyProvenance(origin, deps, reminderInputKey ? { reminderInputKey } : {}) : unproven("decision_not_latest");
+    }
+    const origin = await readJ2Origin(proposal.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), deps.now(), env);
+    if (!origin) return unproven("decision_not_latest");
+    if (proposal.text !== j2ReminderText(origin, env)) return unproven("reply_not_from_decision");
+    const reminderInputKey = origin.questions?.[0]?.id.replace(/:q1$/, "");
+    return readPilotReplyProvenance(origin, deps, reminderInputKey ? { reminderInputKey } : {});
+  }
   const policyRevision = await deps.currentPolicyRevision();
-  const events = await listCaseEvents(proposal.caseId), inputKey = latestInvestigationInput(events);
+  const events = await listCaseEvents(proposal.caseId), inputKey = options.reminderInputKey ?? terminalReplyInput(events, latestInvestigationInput(events), deps.env?.() ?? {});
   const read = inputKey ? readCaseInvestigationProgress(events, inputKey) : null;
   // Treatment blocks (11/11): the scope in force of the block the decision was taken under (Access when its stamp names none).
   // SAV-92 (multi-block): every block the decision was taken under, read now.
@@ -63,7 +81,7 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
   if (read.state === "none") return unproven("decision_missing");
   if (read.state !== "found") return unproven("decision_unreadable");
   const stamp = caseAccessScopeStamp(scope.scope);
-  const draft = caseDecisionDraft(proposal.caseId, read.record, events, { accessScope: stamp, ...(scope.blocks ? { blockScopes: scope.blocks.map(caseAccessScopeStamp) } : {}) });
+  const draft = caseDecisionDraft(proposal.caseId, read.record, events, { accessScope: stamp, ...(scope.blocks ? { blockScopes: scope.blocks.map(caseAccessScopeStamp) } : {}) }, deps.env?.() ?? {});
   if (!draft) return unproven("decision_not_accepted");
   if (draft.replyLimit === "access_scope_unknown" || draft.replyLimit === "access_scope_changed") return unproven(draft.replyLimit);
   if (!draft.reply) return unproven("reply_not_from_decision");
@@ -80,7 +98,7 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
     }
   }
   // The type decides, never an empty list: only a real question may rest on no source; an answer must show what supports it.
-  if (!draft.shownSources.length && proposal.purpose !== "question") return unproven("sources_missing");
+  if (!draft.shownSources.length && proposal.purpose !== "question" && !isTerminalReply(proposal.purpose)) return unproven("sources_missing");
   const reasons = new Set<PilotProvenanceReason>(), sources: PilotProvenanceSource[] = [];
   for (const ref of draft.shownSources) {
     // SAV-92 (multi-block): a source shown is proven when one of the decision's block scopes lists it as `answer` at this version (the validator already

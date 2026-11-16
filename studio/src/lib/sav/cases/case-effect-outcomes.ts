@@ -6,7 +6,7 @@
 import { createHash } from "node:crypto";
 import { trialRecipientBinding } from "./case-trial-return";
 import { appendCaseEvent, CaseVersionStaleError, readCase, updateCaseRecord, type CaseTx } from "./case-store";
-import type { CaseReplyProposal } from "./case-effects";
+import { caseReplyQuestions, type CaseReplyProposal } from "./case-effects";
 import { scheduleJ2ForConfirmedQuestion } from "./timer-store";
 
 export type ConfirmedReply = Readonly<{
@@ -46,7 +46,7 @@ async function cas<T>(step: () => Promise<T>): Promise<T> {
  * version throws and rolls the caller's whole transaction back; a retry in another transaction would be a partial commit). Without it the behaviour is the historical one:
  * each step in its own transaction with a bounded compare-and-set retry. Returned refusals ("already recorded", owner, J2 refusal) are the caller's to judge.
  */
-export async function recordConfirmedCaseReply(input: ConfirmedReply, options: Readonly<{ tx?: CaseTx }> = {}): Promise<ConfirmedReplyOutcome> {
+export async function recordConfirmedCaseReply(input: ConfirmedReply, options: Readonly<{ tx?: CaseTx; contextualJ2?: boolean }> = {}): Promise<ConfirmedReplyOutcome> {
   const { proposal } = input, { tx } = options;
   const step = <T>(run: () => Promise<T>): Promise<T> => tx ? run() : cas(run);
   const sentAt = input.sentAt.toISOString();
@@ -58,11 +58,12 @@ export async function recordConfirmedCaseReply(input: ConfirmedReply, options: R
       ...(proposal.purpose === "answer" && proposal.procedures?.length === 1 ? { trialRecipient: trialRecipientBinding(proposal.caseId, proposal.recipient) } : {}) },
   }, tx));
   const event = appended.appended ? "appended" : "already_recorded";
+  let trials: ConfirmedReplyOutcome["trials"];
   if (proposal.purpose !== "question") {
     const procedures = proposal.purpose === "answer" ? proposal.procedures ?? [] : [];
-    if (!procedures.length) return { event, question: "not_applicable", j2: "not_applicable" };
+    if (!procedures.length && !(proposal.purpose === "answer" && options.contextualJ2)) return { event, question: "not_applicable", j2: "not_applicable" };
     // 2 (answer). The sealed procedures become pending trials, dated from the mail that really left. The id comes from the effect, so a replay finds the same trial and adds none.
-    const trials = await step(async () => {
+    if (procedures.length) trials = await step(async () => {
       const current = await readCase(proposal.caseId, tx);
       if (!current) throw new Error("SAV_CASE_EFFECT_CASE_MISSING");
       // A person took the case after the send left: the mail stays in the journal, the agent records nothing more on the case.
@@ -74,10 +75,12 @@ export async function recordConfirmedCaseReply(input: ConfirmedReply, options: R
       await updateCaseRecord({ caseId: current.caseId, expectedVersion: current.version, actor: { type: "agent" }, body: { ...current.body, trials: [...current.body.trials, ...opened] } }, tx);
       return "recorded" as const;
     });
-    return { event, question: "not_applicable", j2: "not_applicable", trials };
+    if (typeof trials === "object") return { event, question: "not_applicable", j2: { refused: "owner_not_agent" }, trials };
   }
-  if (!proposal.question) throw new Error("SAV_CASE_EFFECT_QUESTION_MISSING");
-  const question = proposal.question;
+  if (proposal.purpose === "question" && !caseReplyQuestions(proposal).length) throw new Error("SAV_CASE_EFFECT_QUESTION_MISSING");
+  // A procedure (or, contextual J2, an answer) also waits for customer feedback: use the existing question/timer tracking, never another outgoing message.
+  // The contextual label is internal only; the reminder reads the sealed outbound, never this label.
+  const questions = proposal.purpose === "question" ? caseReplyQuestions(proposal) : [{ id: `procedure:${input.effectId}`, text: options.contextualJ2 ? "Suivi de la réponse envoyée." : "Avez-vous pu essayer la procédure proposée ?", factKeys: [] }];
 
   // 2. The question is recorded on the case against the effect that sent it (the J2 timer needs it).
   const questionState = await step(async () => {
@@ -85,10 +88,11 @@ export async function recordConfirmedCaseReply(input: ConfirmedReply, options: R
     if (!current) throw new Error("SAV_CASE_EFFECT_CASE_MISSING");
     // A person took the case after the send left: the mail is real and stays in the journal, but the agent writes nothing more and no J2 follows.
     if (current.owner !== "agent") return { refused: "owner_not_agent" } as const;
-    if (current.body.questions.some(candidate => candidate.askedInEffect === input.effectId)) return "already_recorded" as const;
+    const missing = questions.filter(question => !current.body.questions.some(candidate => candidate.askedInEffect === input.effectId && candidate.id === question.id));
+    if (!missing.length) return "already_recorded" as const;
     await updateCaseRecord({
       caseId: current.caseId, expectedVersion: current.version, actor: { type: "agent" },
-      body: { ...current.body, questions: [...current.body.questions, { id: question.id, text: question.text, factKeys: [...question.factKeys], askedAt: sentAt, askedInEffect: input.effectId }] },
+      body: { ...current.body, questions: [...current.body.questions, ...missing.map(question => ({ id: question.id, text: question.text, factKeys: [...question.factKeys], askedAt: sentAt, askedInEffect: input.effectId }))] },
     }, tx);
     return "recorded" as const;
   });
@@ -105,5 +109,5 @@ export async function recordConfirmedCaseReply(input: ConfirmedReply, options: R
     }, tx);
   });
   const j2 = scheduled.scheduled ? "scheduled" as const : scheduled.reason === "already_exists" ? "already_scheduled" as const : { refused: scheduled.reason };
-  return { event, question: questionState, j2 };
+  return { event, question: questionState, j2, ...(trials ? { trials } : {}) };
 }

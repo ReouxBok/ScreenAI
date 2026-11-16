@@ -245,6 +245,15 @@ describe("after closure: same incident reopens, a new subject is a new admission
     expect(after.body.cycle.endedBy).toBeUndefined();
     expect(after.body.openRequests.map(request => request.status)).toEqual(["open"]);
   });
+  it("a reply on the same incident after a confirmed J2 closure reopens the same case and starts its next cycle", async () => {
+    const w = await waiting(), c = (await readCase(w.caseId))!;
+    await updateCaseRecord({ caseId: c.caseId, expectedVersion: c.version, actor: { type: "agent" }, phase: "closed_no_reply",
+      body: { ...c.body, waiting: null, cycle: { number: 1, endedBy: "closed_no_reply" } } });
+    const reply = await mail(w.threadId, w.mailboxId, { receivedAt: T1 });
+    expect(await routeCustomerReturn(reply.id, ports({ readV1Target: async () => "same_ticket", readMailAdmission: async () => ADMITTED }).deps))
+      .toMatchObject({ route: { route: "reopen" }, written: true });
+    expect(await readCase(w.caseId)).toMatchObject({ phase: "queued", body: { cycle: { number: 2 }, waiting: null } });
+  });
   it("another ticket (a new subject), a thanks, an automatic reply or V1 not done yet: the closed case is not touched", async () => {
     const w = await resolved();
     const cases: Array<[Partial<CustomerReturnDeps>, unknown]> = [
@@ -358,4 +367,21 @@ describe("revue R03 : une réponse plus ancienne reçue après un mail neuf", ()
     expect(await routeCustomerReturn(reversed.high.id, ports().deps)).toMatchObject({ route: { route: "already_recorded" }, written: false });
     expect((await readCase(reversed.w.caseId))!.version).toBe(version);
   });
+});
+
+
+it("keeps one original J2 and the customer wait when a multi-question customer mail returns", async () => {
+  const w = await waiting();
+  const snapshot = (await readCase(w.caseId))!;
+  const first = snapshot.body.questions[0]!;
+  await updateCaseRecord({ caseId: snapshot.caseId, expectedVersion: snapshot.version, actor: { type: "agent" },
+    body: { ...snapshot.body, questions: [first, { ...first, id: "q2", text: "Seconde question fictive", factKeys: ["second_question"] }] } });
+  const reply = await mail(w.threadId, w.mailboxId, { receivedAt: T1 });
+  const outcome = await routeCustomerReturn(reply.id, ports().deps);
+  expect(outcome).toMatchObject({ route: { route: "continue" }, written: true });
+  const current = (await readCase(w.caseId))!;
+  expect(current.body.waiting).toEqual(snapshot.body.waiting);
+  expect(current.phase).toBe("queued");
+  expect((await timerState(w.timerId)).state).toBe("scheduled");
+  expect(current.body.questions).toHaveLength(2);
 });

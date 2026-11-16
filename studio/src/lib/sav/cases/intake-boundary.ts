@@ -38,7 +38,7 @@ export type CaseBoundaryDeps = {
   readCreatedTicketOwner?: (ticketId: string) => Promise<string | null | undefined>;
   /** The V2 entry (`SAV_V2_ENTRY=on` only): the customer-return route of a mail V1 finished with, before any relay. A result ends it; null lets the normal relay go on. */
   routeReturn?: (messageId: string) => Promise<CaseRelayResult | null>;
-  /** SAV-81 (V2 entry only): in qualification mode, while no thread is bound yet, a mail V1 confirmed on the ticket it created may bind its thread here.
+  /** SAV-81 (V2 entry only): in qualification mode, while no thread is bound yet, a mail V1 confirmed on the ticket it created (16/11: or on the existing ticket it linked or reopened) may bind its thread here.
    * `write: false` checks V1's proofs and the exact scope without writing anything (before any owner read); `write: true` binds atomically, asked only
    * after the fresh reading of the V2 owner. False refuses: the mail is recorded, never attributed. Not injected: no other way to bind than at creation. */
   bindQualificationThread?: (input: { messageId: string; ticketId: string; executionId: string; runId: string | null; runVersion: number; write: boolean }) => Promise<boolean>;
@@ -91,7 +91,8 @@ async function confirmCreatedOwner(proof: CaseOwnerAtCreationProof, deps: CaseBo
 /** Ugo (4/11): the ordinary case. The ticket's owner is ALREADY the V2 owner and the mail is admitted: V2 processes it, whoever set that owner, with one read and no write. Nobody is
  * overwritten, so no compare-and-set is needed. An empty owner is still not taken, a person keeps the ticket, and a case that does not wait (the agent's, the team's, a person's) is not
  * even read. A reading that is not one leaves the case waiting and never loses the mail: the sweep reads again. */
-async function ownerReadProof(input: { ticketId: string; messageId: string; admission: Awaited<ReturnType<typeof relayAdmissionInput>>["admission"]; deps: CaseBoundaryDeps }): Promise<CaseAttributionProof | "pending"> {
+async function ownerReadProof(input: { ticketId: string; messageId: string; admission: Awaited<ReturnType<typeof relayAdmissionInput>>["admission"]; deps: CaseBoundaryDeps;
+  onReading?: (reading: string | null | undefined) => void }): Promise<CaseAttributionProof | "pending"> {
   const { deps, ticketId } = input, ownerId = v2HubspotOwnerId(deps.env);
   if (!deps.readCreatedTicketOwner || !ownerId || await relayPaused(requireDb())) return "pending";
   const current = await readCaseByTicket(ticketId);
@@ -99,6 +100,7 @@ async function ownerReadProof(input: { ticketId: string; messageId: string; admi
   if (decideCaseAdmission({ policy: input.admission.policy, qualification: input.admission.qualification, caseSensitivity: current?.sensitivity ?? "none" }).target !== "agent") return "pending";
   let reading: string | null | undefined;
   try { reading = await deps.readCreatedTicketOwner(ticketId); } catch { return "pending"; }
+  input.onReading?.(reading);
   return reading === ownerId ? { kind: "hubspot_owner_read", messageId: input.messageId, ticketId, ownerId } : "pending";
 }
 
@@ -114,6 +116,15 @@ async function handBackIfOwnerMovedAfterCommit(current: CaseSnapshot, proof: Pic
       reason: reading === null ? "hubspot_owner_removed" : "hubspot_owner_human", sourceRef: { type: "hubspot_object", id: proof.ticketId } });
     return moved.case;
   } catch { return current; }
+}
+
+/** 16/11 (Ugo), qualification only: why a mail V1 linked to or reopened on an EXISTING ticket was or was not taken by V2. V1 decides the owner: it keeps
+ * the ticket's owner on a link or a reopen (`preserveOwnerId`, `stage_new` sets the stage only) and never assigns V2 there (executor « No automatic V2 owner »).
+ * So V2 takes it only when that owner already is the V2 owner. A person (or the V1 team owner) keeps it; no owner is not taken either (V1 left it empty). */
+export type SavV2ExistingTicketOwnerRule = "existing_ticket_taken" | "existing_ticket_human_owner" | "existing_ticket_owner_none" | "existing_ticket_owner_unread";
+export function savV2ExistingTicketOwnerRule(reading: string | null | undefined, ownerId: string | null): SavV2ExistingTicketOwnerRule {
+  if (reading === undefined || !ownerId || (reading !== null && !/^[0-9]{1,20}$/.test(reading))) return "existing_ticket_owner_unread";
+  return reading === null ? "existing_ticket_owner_none" : reading === ownerId ? "existing_ticket_taken" : "existing_ticket_human_owner";
 }
 
 /** The console pauses the intake agent; V2 has its own row. Any level but running on either, or an unreadable
@@ -218,7 +229,7 @@ export async function readRequestQuotes(input: { runId: string | null; runVersio
  * against its own hashes; never the mail. A summary covering several requests is none of their
  * subjects, and two accepted analyses that disagree give none either: absent, with the reason.
  * SAV-92: in a mail of several requests, a request the summary does not describe alone takes its own verified quote, masked the same way. */
-export async function readRequestSubjects(input: { runId: string | null; runVersion: number; messageId: string; gmailMessageId: string; requestIds: string[] }): Promise<Map<string, CaseRequestSubject>> {
+export async function readRequestSubjects(input: { runId: string | null; runVersion: number; messageId: string; gmailMessageId: string; requestIds: string[]; summaryTitleOnly?: true }): Promise<Map<string, CaseRequestSubject>> {
   const subjects = new Map<string, CaseRequestSubject>();
   const all = (reason: CaseSubjectAbsence) => {
     for (const id of input.requestIds) subjects.set(caseRequestId(input.gmailMessageId, id), { status: "absent", reason });
@@ -249,7 +260,7 @@ export async function readRequestSubjects(input: { runId: string | null; runVers
       if (subject.success) subjects.set(key, subject.data); else absent("source_invalid");
       continue;
     }
-    const text = searchableSubject(summary);
+    const text = input.summaryTitleOnly ? maskSearchText(summary.title) : searchableSubject(summary);
     // Masks alone are nothing to search for.
     if (text.replace(/\[[^\]]*masqu[^\]]*\]/g, "").replace(/[^\p{L}\p{N}]+/gu, "").length < SAV_CASE_SUBJECT_LENGTH.min) { absent("redacted_empty"); continue; }
     const subject = available(text, entry, "ticketSummary");
@@ -292,7 +303,7 @@ export async function readIntakeAcknowledgement(messageId: string): Promise<Inta
 export type CaseRelayResult =
   | { skipped: "recording_off" | "intake_not_confirmed" | "source_missing" | "no_case_for_thread" | "thread_case_ambiguous" | "before_case" | "customer_return_wait" | "customer_return_not_consumed" }
   | { caseId: string; version: number; created: boolean; appended: boolean; owner: string; relay: CaseRelayProof["kind"] | "v2_customer_return";
-      admission: { target: string; reasons: string[] } | null };
+      admission: { target: string; reasons: string[] } | null; existingTicket?: SavV2ExistingTicketOwnerRule };
 
 /** V1 → V2 relay (SAV-11): a case event exists only with a durable V1 proof, one per
  * (case, message). Either every required intake effect is confirmed, or V1 classified the
@@ -323,9 +334,10 @@ async function relayConfirmedEffects(messageId: string, progress: NonNullable<In
   if (source.direction !== "inbound" || !source.gmailMessageId) return { skipped: "source_missing" };
   const ticketId = progress.ticketId, executionId = source.execution.id;
   const decision = decryptSavPayload<ExecutionPayload>(source.execution.payloadCiphertext).plan.decision;
+  const target = decision.disposition?.kind === "ticket" ? decision.disposition.target : null, existingTicket = target?.operation === "link" || target?.operation === "reopen";
   const relay: CaseRelayProof = { kind: "intake_effects_confirmed", messageId, executionId, intakeRunId: source.execution.runId, intakeRunVersion: source.execution.runVersion };
   const attribution = await readAttributionProof({ executionId, messageId, ticketId, env: deps.env }) ?? "pending";
-  return relayToCase({ ticketId, threadId: source.threadId, gmailMessageId: source.gmailMessageId, receivedAt: source.receivedAt, decision, relay, deps, confirmedTicket: true, attribution,
+  return relayToCase({ ticketId, threadId: source.threadId, gmailMessageId: source.gmailMessageId, receivedAt: source.receivedAt, decision, relay, deps, confirmedTicket: true, attribution, existingTicket,
     assertFresh: async tx => {
       const [row] = await tx.select({ state: savIntakeExecutions.state, ticketId: savIntakeExecutions.ticketId }).from(savIntakeExecutions)
         .where(eq(savIntakeExecutions.id, executionId)).for("share");
@@ -359,6 +371,8 @@ async function relayAcknowledgement(messageId: string, deps: CaseBoundaryDeps): 
 async function relayToCase(input: {
   ticketId: string; threadId: string; gmailMessageId: string; receivedAt: Date; decision: Pick<SavIntakeDecision, "classification" | "requests">;
   relay: CaseRelayProof; deps: CaseBoundaryDeps; confirmedTicket: boolean; assertFresh: (tx: CaseTx) => Promise<void>; attribution: "pending" | CaseAttributionProof;
+  /** 16/11: V1 linked or reopened an existing ticket (no creation). */
+  existingTicket?: boolean;
 }): Promise<CaseRelayResult> {
   const target: CaseQualificationTarget = { ticketId: input.ticketId, executionId: input.relay.kind === "intake_effects_confirmed" ? input.relay.executionId : null,
     runId: input.relay.intakeRunId, runVersion: input.relay.intakeRunVersion };
@@ -368,6 +382,8 @@ async function relayToCase(input: {
   // admission again under its lock.
   // SAV-80: outside the qualification scope the mail is recorded, never attributed to the agent (no owner read for it either).
   const scope = await savV2QualificationMessageAllowed(input.deps.env ?? process.env, input.relay.messageId), inScope = scope.allowed;
+  // 16/11: set only on the binding path of an existing ticket, once its owner was read.
+  let ownerRule = undefined as SavV2ExistingTicketOwnerRule | undefined;
   let attribution = !inScope || (input.attribution !== "pending" && await relayPaused(requireDb())) ? "pending" as const : input.attribution;
   if (attribution !== "pending" && attribution.kind === "hubspot_owner_at_creation")
     attribution = decideCaseAdmission({ policy: admission.policy, qualification: admission.qualification, caseSensitivity: "none" }).target === "agent"
@@ -379,7 +395,8 @@ async function relayToCase(input: {
     const relay = input.relay, bind = !inScope && !scope.allowed && scope.reason === "qualification_thread_unbound" ? input.deps.bindQualificationThread : undefined;
     const proofs = bind && { messageId: relay.messageId, ticketId: input.ticketId, executionId: relay.executionId, runId: relay.intakeRunId, runVersion: relay.intakeRunVersion };
     if (inScope || (bind && proofs && await bind({ ...proofs, write: false }))) {
-      attribution = await ownerReadProof({ ticketId: input.ticketId, messageId: relay.messageId, admission, deps: input.deps });
+      attribution = await ownerReadProof({ ticketId: input.ticketId, messageId: relay.messageId, admission, deps: input.deps,
+        ...(bind && input.existingTicket ? { onReading: (reading: string | null | undefined) => { ownerRule = savV2ExistingTicketOwnerRule(reading, v2HubspotOwnerId(input.deps.env)); } } : {}) });
       // Bound, then read back: the attribution stands only on a thread the scope now covers.
       if (attribution !== "pending" && bind && proofs && (!await bind({ ...proofs, write: true })
         || !(await savV2QualificationMessageAllowed(input.deps.env ?? process.env, relay.messageId)).allowed)) attribution = "pending";
@@ -403,10 +420,20 @@ async function relayToCase(input: {
     },
   });
   // A proof above means the case could still wait when it was read: on a first relay or on a replay of a waiting mail, what comes back as the agent's was just moved.
-  const settled = attribution !== "pending" && attribution.kind !== "hubspot_owner_verified" && (result.appended || attribution.kind === "hubspot_owner_read") && result.case.owner === "agent"
+  let settled = attribution !== "pending" && attribution.kind !== "hubspot_owner_verified" && (result.appended || attribution.kind === "hubspot_owner_read") && result.case.owner === "agent"
     ? await handBackIfOwnerMovedAfterCommit(result.case, attribution, input.deps) : result.case;
+  // 16/11: « taken » only if the case really is the agent's now (a pause or a binding refused after the read leaves it waiting).
+  if (ownerRule === "existing_ticket_taken" && settled.owner !== "agent") ownerRule = undefined;
+  // A person owns the existing ticket: it stays theirs and the case leaves the wait for good (V2 never re-reads it), the reason in its journal.
+  if (ownerRule === "existing_ticket_human_owner" && caseAwaitsV2Attribution(settled)) {
+    try {
+      settled = (await transitionCaseOwner({ caseId: settled.caseId, expectedVersion: settled.version, transition: "human_takeover", actor: { type: "system" },
+        commandKey: `qualification-existing-ticket.${input.relay.messageId}`, reason: ownerRule, sourceRef: { type: "hubspot_object", id: input.ticketId } })).case;
+    } catch { /* the case keeps waiting with the team, never attributed */ }
+  }
+  if (ownerRule) console.info("sav_v2_qualification_existing_ticket", { messageId: input.relay.messageId, ticketId: input.ticketId, reason: ownerRule, owner: settled.owner });
   return { caseId: settled.caseId, version: settled.version, created: result.created, appended: result.appended, owner: settled.owner, relay: input.relay.kind,
-    admission: settled.admission && { target: settled.admission.target, reasons: settled.admission.reasons } };
+    admission: settled.admission && { target: settled.admission.target, reasons: settled.admission.reasons }, ...(ownerRule ? { existingTicket: ownerRule } : {}) };
 }
 
 /** What the relay decides admission from, for one mail: the current approved policy and V1's

@@ -22,6 +22,7 @@ import type { ExecutionOptions, ExecutorAdapters } from "../intake/execution-typ
 import { listCaseEvents, listCaseTimers, openCaseEvent, readCase, transitionCaseOwner } from "./case-store";
 import { caseDedupeKey } from "./case-types";
 import { createCaseEffectDriver } from "./case-effect-driver";
+import { listV2Cases, v2InventoryInput } from "./v2-inventory";
 import { pendingCaseEffectRecoveries } from "./case-effect-recovery";
 import { recordConfirmedCaseReply } from "./case-effect-outcomes";
 import { caseReplyPayloadHash, type CaseReplyProposal } from "./case-effects";
@@ -33,6 +34,9 @@ import {
   describeCaseReplyForReview, listCaseEffectsNeedingPerson, proposeCaseReplyFromDraft, queueValidatedCaseReply, resolveCaseReplyLanguage, runCaseEffectsPass,
   type CaseReplyDraftInput,
 } from "./case-runtime-effects";
+import { produceAutoJ2, enqueueApprovedJ2 } from "./v2-j2-binding";
+import { J2_REMINDER_TEXT } from "./j2-auto-reminder";
+import { appendCaseEvent, updateCaseRecord } from "./case-store";
 import { nextJ2Slot } from "./j2-calendar";
 import * as timerStore from "./timer-store";
 import * as caseStore from "./case-store";
@@ -158,7 +162,7 @@ beforeEach(async () => {
     const policy: ExecutionPolicy = {
       revision: "sav-intake-execution-2026-10-21.v1", mailboxId, codeRevision: "a".repeat(40), enginePolicyHash: "b".repeat(64), resourcesHash: "c".repeat(64),
       createdAfter: new Date(Date.now() - 10_000).toISOString(), receivedAfter: new Date(Date.now() - 3_600_000).toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-      maxDossiers: 10, mutations: ["send_case_reply", "append_case_note"], admission: { kind: "automatic" },
+      maxDossiers: 10, mutations: ["send_case_reply", "append_case_note", "set_case_ticket_stage"], admission: { kind: "automatic" },
     };
     const grant = await approveIntakeExecutionPolicy(policy);
     policyId = grant.id; policyHash = grant.policyHash;
@@ -881,7 +885,7 @@ describe("the receipt transaction, read as code", () => {
     const inside = body.slice(body.indexOf("transaction(async tx"));
     expect(body.indexOf("deps.currentPolicyRevision()")).toBeLessThan(body.indexOf("transaction(async tx"));
     expect(inside).not.toMatch(/deps\.|adapters|fetch\(|\.transaction\(/);
-    expect(inside).toMatch(/recordConfirmedCaseReply\([^)]*\{ tx \}\)/);
+    expect(inside).toMatch(/recordConfirmedCaseReply\([\s\S]*?, \{ tx, contextualJ2: env\(\)\.SAV_V2_J2_CONTEXTUAL === "on" \}\)/);
   });
 });
 
@@ -953,13 +957,55 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     expect(sends).toBe(1);
   });
 
-  it("stages on: the ticket sentence names only the stage really planned for this reply (waiting for the customer)", async () => {
+  it.each([false, true])("confirmed stage stays visible when resuming the pending note (stages disabled: %s), without duplicate sends", async disableStages => {
+    const inventoryFrom = new Date().toISOString();
+    noteOn(); stagesOn();
+    const s = await scenario("answer"), { id } = await admit(s);
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "waiting", reason: "SAV_CASE_EFFECT_RECOVERY_NOTE_PENDING" }]);
+    expect(sends).toBe(1);
+    expect(await outbound(s.caseId)).toHaveLength(1);
+    expect(await notesOf(id)).toEqual([]);
+    const [stage] = await stageRows(s.caseId);
+    const { createTicketStageDriver } = await import("./case-ticket-stage-store");
+    const { createCaseTicketStageAdapters } = await import("./case-ticket-stage-hubspot");
+    environment.SAV_V2_HUBSPOT_OWNER_ID = "2002";
+    let stageId = "1", patches = 0;
+    const hubspot = createCaseTicketStageAdapters({ env: () => environment, network: (async (_url, init) => {
+      if (init?.method === "PATCH") { stageId = JSON.parse(String(init.body)).properties.hs_pipeline_stage; patches++; }
+      return Response.json({ id: s.ticketId, properties: { hs_pipeline: "0", hs_pipeline_stage: stageId, hubspot_owner_id: "2002" } });
+    }) as typeof fetch });
+    await executeIntakePass(stage!.id, { ...options, adapters: { ...options.adapters, ...hubspot } }, {},
+      createTicketStageDriver({ env: () => environment, readTicketOwner: async () => "v2" }));
+    expect((await stageRows(s.caseId))[0]).toMatchObject({ state: "confirmed" });
+    expect(patches).toBe(1);
+    if (disableStages) environment.SAV_V2_TICKET_STAGES = "off";
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
+    await pass();
+    expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: `${ACCESS_ANSWER} Ticket passé en attente du client.` }]);
+    expect(await notesOf(id)).toHaveLength(1);
+    expect(sends).toBe(1);
+    expect(patches).toBe(1);
+    expect(await stageRows(s.caseId)).toHaveLength(1);
+    const inventory = await listV2Cases(v2InventoryInput.parse({ limit: 100, from: inventoryFrom }));
+    const row = inventory.rows.find(row => row.caseId === s.caseId)!;
+    expect(row.outcomes.find(outcome => outcome.executionId === id)?.status).toEqual({ state: "confirmed", reason: null, message: null });
+    expect(row.hubspot.status).toBe("confirmed");
+  });
+
+  it.each(["refused", "uncertain", "pending", "waiting"] as const)("stage %s after one catch-up: one note without status, no resend", async state => {
     noteOn(); stagesOn();
     const s = await scenario("answer"), { id } = await admit(s);
     await pass();
-    expect((await notesOf(id))[0]!.text).toBe(`${ACCESS_ANSWER} Ticket passé en attente du client.`);
-    const rows = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, s.caseId));
-    expect(rows.some(row => row.replyKey.startsWith("case-stage:") && row.replyKey.includes(":waiting_customer:"))).toBe(true);
+    expect(await notesOf(id)).toEqual([]);
+    const [stage] = await stageRows(s.caseId);
+    await f.db.update(savCaseEffectExecutions).set({ state }).where(eq(savCaseEffectExecutions.id, stage!.id));
+    // An intervening hold / driver restart must not reset the persisted bound.
+    await setPause("v2", "fully_paused"); await pass(); await setPause("v2", null);
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
+    await pass();
+    expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: ACCESS_ANSWER }]);
+    expect(await notesOf(id)).toHaveLength(1);
+    expect(sends).toBe(1);
   });
 
   it("a question: « J'ai demandé au client les informations manquantes. »", async () => {
@@ -1028,14 +1074,20 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     expect(await stageRows(s.caseId)).toEqual([]);
   });
 
-  it("[P1] a customer mail AFTER the note was planned: the stage was already durably queued with the receipt, and the note says so", async () => {
+  it("[P1] a customer mail while the stage waits: the cancelled stage adds no status to the note", async () => {
     noteOn(); stagesOn();
     const s = await scenario("answer"), { id } = await admit(s);
-    aroundDispatch("note_create", { before: async () => { await customerMailAfterReply(s); } });
     await pass();
-    expect((await notesOf(id))[0]!.text).toBe(`${ACCESS_ANSWER} Ticket passé en attente du client.`);
-    expect(await stageRows(s.caseId)).toHaveLength(1);
+    await customerMailAfterReply(s);
+    const [stage] = await stageRows(s.caseId);
+    const { createTicketStageDriver } = await import("./case-ticket-stage-store");
+    environment.SAV_V2_HUBSPOT_OWNER_ID = "2002";
+    await executeIntakePass(stage!.id, options, {}, createTicketStageDriver({ env: () => environment, readTicketOwner: async () => "v2" }));
+    expect((await stageRows(s.caseId))[0]).toMatchObject({ state: "refused", reason: "SAV_TICKET_STAGE_CANCELLED_NEW_INPUT" });
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
+    expect((await notesOf(id))[0]!.text).toBe(ACCESS_ANSWER);
     expect(await execution(id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
   });
 
   it("[P1] the note cannot be created (CRM unreadable after the reply): the receipt and the stage are already recorded; a later pass writes ONE note, no resend", async () => {
@@ -1050,7 +1102,7 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     for (let n = 0; n < 3 && (await execution(id)).state !== "confirmed"; n++) { await expireHeldLease(id); await pass(); }
     expect(await execution(id)).toMatchObject({ state: "confirmed" });
     expect(hubspotNotes()).toHaveLength(1);
-    expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: `${ACCESS_ANSWER} Ticket passé en attente du client.` }]);
+    expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: ACCESS_ANSWER }]);
     expect(await outbound(s.caseId)).toHaveLength(1);
     expect(await stageRows(s.caseId)).toHaveLength(1);
     expect(sends).toBe(1);
@@ -1154,5 +1206,89 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     environment = { ...environment, SAV_V2_REPLY_NOTE: "off" };
     expect(await queueValidatedCaseReply({ validationId, policy: policyArg(), deps: storeDeps() })).toEqual({ ok: true, executionId: id, created: false });
     expect(s.caseId).toBeTruthy();
+  });
+});
+
+
+// SAV-92: real timer -> authored proposal -> dedicated Access rule -> queue -> real executor,
+// with synthetic Gmail/HubSpot adapters only. Provenance is a port here (tested separately).
+describe("automatic J2 production and sending", () => {
+  const RULE = "30000000-0000-4000-8000-000000000042";
+  async function waiting(procedure = false) {
+    environment = { ...environment, SAV_V2_J2_AUTO: "on", SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: RULE };
+    await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-block-switch.v1:access"));
+    await f.db.insert(savSyncState).values({ key: "sav-block-switch.v1:access", status: "installed", cursor: encryptSavPayload({
+      revision: "sav-block-switch.v1", blockId: "access", mode: "auto", paused: false, setBy: "fixture@example.invalid", setAt: AT, reason: "synthetic" }) });
+    const s = await scenario(procedure ? "answer" : "question");
+    const opened = (await readCase(s.caseId))!;
+    const withRequest = await updateCaseRecord({ caseId: s.caseId, expectedVersion: opened.version, actor: { type: "agent" },
+      body: { ...opened.body, openRequests: [{ id: "r1", summary: "Synthetic access request", family: "access", status: "open", openedAt: AT }] } });
+    s.draft = { ...s.draft, decidedOn: withRequest.version };
+    if (procedure) s.draft = { ...s.draft, reply: { purpose: "answer", text: "Synthetic procedure.", procedures: [{ requestId: "r1", procedure: { knowledgeId: randomUUID(), contentVersionId: randomUUID() } }] } };
+    const proposed = await propose(s); await approve(proposed.validationId);
+    const first = await queueValidatedCaseReply({ validationId: proposed.validationId, policy: policyArg(), deps: storeDeps() });
+    if (!first.ok) throw Error(first.code);
+    expect(await run(first.executionId)).toMatchObject({ state: "confirmed" });
+    const [timer] = await listCaseTimers(s.caseId);
+    expect(timer).toBeDefined();
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date(Date.parse(timer!.dueAt) + 60_000));
+    // A fresh synthetic signed authority at J2 (the original short grant has expired).
+    const policy = { ...options.policy, expiresAt: new Date(Date.now() + 3600_000).toISOString(), maxDossiers: 100 };
+    const grant = await approveIntakeExecutionPolicy(policy);
+    environment.SAV_INTAKE_EXECUTION_POLICY_ID = grant.id; environment.SAV_INTAKE_EXECUTION_POLICY_SHA256 = grant.policyHash;
+    options = { ...options, policy, config: { ...options.config, policyId: grant.id, policyHash: grant.policyHash } };
+    const fired = await timerStore.runDueJ2Pass({ now: new Date(), maxEvents: 100, currentPolicyRevision: POLICY,
+      ports: { reminderEffect: async () => "none", budgetAvailable: async () => true } });
+    expect(fired.outcomes.some(row => row.timerId === timer!.id && row.fired)).toBe(true);
+    return { s, timer: timer!, policy: { id: grant.id, hash: grant.policyHash } };
+  }
+  afterEach(() => vi.useRealTimers());
+  async function queued(w: Awaited<ReturnType<typeof waiting>>) {
+    const snapshot = (await readCase(w.s.caseId))!;
+    expect(await Promise.all([produceAutoJ2(w.timer, snapshot.version, storeDeps()), produceAutoJ2(w.timer, snapshot.version, storeDeps())])).toEqual(["approved", "approved"]);
+    let id = "";
+    expect(await enqueueApprovedJ2(w.timer, snapshot.version, w.policy, storeDeps(), value => { id = value; })).toBe("queued");
+    return id;
+  }
+  it.each([false, true])("authors and sends one reminder, replay included; procedure=%s", async procedure => {
+    const w = await waiting(procedure);
+    environment.SAV_V2_REPLY_NOTE = "on";
+    const id = await queued(w);
+    expect(await enqueueApprovedJ2(w.timer, (await readCase(w.s.caseId))!.version, w.policy, storeDeps())).toBe("already_queued");
+    const parent = await execution(id);
+    const payload = decryptSavPayload<{proposal: CaseReplyProposal}>(parent.payloadCiphertext);
+    expect(payload.proposal).toMatchObject({ purpose: "reminder", text: J2_REMINDER_TEXT });
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    await run(id);
+    expect(sends).toBe(2); // initial reply + ONE J2
+    expect((await effectsOf(id)).map(e => e.kind).sort()).toEqual(["note_associate", "note_create", "reply_send"]);
+    expect((await listCaseTimers(w.s.caseId))).toHaveLength(1); // a reminder cannot create another wait
+    expect(await produceAutoJ2(w.timer, (await readCase(w.s.caseId))!.version, storeDeps())).toBe("reminder_origin_unproven");
+  });
+  it.each(["client", "human", "human_late", "owner", "closed", "pause", "off", "global_off", "block_absent", "sensitive", "crm_owner"])("does not author after %s", async reason => {
+    const w = await waiting();
+    if (reason === "client") await newCustomerMail(w.s);
+    if (reason === "human" || reason === "human_late") await appendCaseEvent({ caseId: w.s.caseId, kind: "outbound_observed", direction: "human_outbound", dedupeKey: `outbound:${randomUUID()}`, sourceRef: {type:"email",id:"synthetic-human"}, occurredAt: reason === "human_late" ? AT : new Date().toISOString() });
+    if (reason === "owner") await takeover(w.s.caseId);
+    if (reason === "closed") await updateCaseRecord({ caseId: w.s.caseId, expectedVersion: (await readCase(w.s.caseId))!.version, actor: {type:"agent"}, phase: "closed_no_reply" });
+    if (reason === "pause") await setPause("v2", "actions_paused");
+    if (reason === "off") delete environment.SAV_V2_J2_AUTO;
+    if (reason === "global_off") delete environment.SAV_V2_AUTO_REPLY;
+    if (reason === "block_absent") await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-block-switch.v1:access"));
+    if (reason === "sensitive") await openCaseEvent({ ticketId: w.s.ticketId, threadId: w.s.thread.id,
+      kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(`finance-${randomUUID()}`), sourceRef: {type:"email",id:"synthetic-finance"}, occurredAt: new Date().toISOString(),
+      admission: { ...ADMITTED, qualification: { ...ADMITTED.qualification, requests: [{ ...ADMITTED.qualification.requests[0]!, family: "finance" }] } } });
+    expect(await produceAutoJ2(w.timer, (await readCase(w.s.caseId))!.version, reason === "crm_owner" ? { ...storeDeps(), readTicketOwner: async () => "human" as const } : storeDeps())).not.toBe("approved");
+    expect((await f.db.select().from(savCaseReplyValidations)).filter(r => r.replyKey === `reply:${w.s.caseId}:timer:${w.timer.id}`)).toHaveLength(0);
+    expect(sends).toBe(1);
+  });
+  it.each(["human", "off", "slot", "pause"])("blocks a queued reminder at the final send fence: %s", async reason => {
+    const w = await waiting(); const id = await queued(w);
+    if (reason === "human") await appendCaseEvent({ caseId: w.s.caseId, kind: "outbound_observed", direction: "human_outbound", dedupeKey: `outbound:${randomUUID()}`, sourceRef: {type:"email",id:"synthetic-human"}, occurredAt: new Date().toISOString() });
+    if (reason === "off") delete environment.SAV_V2_J2_AUTO;
+    if (reason === "pause") await setPause("intake", "actions_paused");
+    if (reason === "slot") vi.setSystemTime(new Date("2026-11-21T12:00:00Z"));
+    await run(id);
+    expect(sends).toBe(1);
   });
 });

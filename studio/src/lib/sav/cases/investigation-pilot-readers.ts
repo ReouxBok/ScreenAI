@@ -105,6 +105,7 @@ export function caseProvenanceReaders(input: Readonly<{
 }>): PilotProvenanceDeps {
   const now = input.now ?? caseInvestigationClock;
   return {
+    env: input.env ?? (() => process.env),
     readTemporaryIncidents: readRuntimeTemporaryIncidents,
     accessScope: caseAccessScopeConfigReader(input.env), currentPolicyRevision: casePolicyRevisionReader(input.readPolicyRecord, now),
     readActiveSource: caseActiveSourceReader({ ...(input.locale ? { locale: input.locale } : {}), ...(input.audience ? { audience: input.audience } : {}) }), now,

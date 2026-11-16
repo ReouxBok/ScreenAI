@@ -1,3 +1,4 @@
+import { closingHandoffReplyEnabled, isTerminalReply } from "./case-terminal-reply";
 // V2 customer return (LOCAL, OFF): the PURE part of the joint between a new customer mail and the V2 case it may continue. No database, clock, network or model.
 //   route     which path a new inbound mail takes: continue the SAME case, reopen it (same incident still present), normal admission (new subject, no or
 //             ambiguous link), keep it closed (a thanks or an automatic reply), leave it to the person or the team who owns it, or wait (owner unread, pause)
@@ -128,7 +129,8 @@ export type CaseTicketStageTrigger =
   /** The receipt of a V2 reply is confirmed (`reply:<case>:<trigger>` confirmed by the executor), sent at `sentAt`. */
   | Readonly<{ kind: "reply_confirmed"; replyKey: string; sentAt: string }>
   /** The case cycle `cycle` ended `resolved` on an accepted `confirm_resolution` (evidence checked by the decision validator). */
-  | Readonly<{ kind: "resolution_recorded"; cycle: number }>;
+  | Readonly<{ kind: "resolution_recorded"; cycle: number }>
+  | Readonly<{ kind: "j2_confirmed"; replyKey: string; sentAt: string; cycle: number; caseVersion: number }>;
 export type CaseTicketStagePlanInput = Readonly<{
   config: CaseTicketStageConfig;
   caseId: string;
@@ -156,6 +158,12 @@ export function planCaseTicketStage(input: CaseTicketStagePlanInput): CaseTicket
     if (!Number.isFinite(Date.parse(trigger.sentAt))) return { plan: false, reason: "sent_at_invalid" };
     if (input.lastCustomerInboundAt && Date.parse(input.lastCustomerInboundAt) > Date.parse(trigger.sentAt)) return { plan: false, reason: "customer_replied_since" };
     return { plan: true, intent: { key: caseTicketStageKey(input.caseId, "waiting_customer", trigger.replyKey), target: "waiting_customer", stageId: config.waitingCustomer, ticketId: input.ticketId, caseId: input.caseId } };
+  }
+  if (trigger.kind === "j2_confirmed") {
+    if (current.phase !== "closed_no_reply" || current.cycle.endedBy !== "closed_no_reply" || current.cycle.number !== trigger.cycle) return { plan: false, reason: "j2_closure_stale" };
+    if (!Number.isFinite(Date.parse(trigger.sentAt))) return { plan: false, reason: "sent_at_invalid" };
+    if (input.lastCustomerInboundAt && Date.parse(input.lastCustomerInboundAt) > Date.parse(trigger.sentAt)) return { plan: false, reason: "customer_replied_since" };
+    return { plan: true, intent: { key: caseTicketStageKey(input.caseId, "closed", trigger.replyKey), target: "closed", stageId: config.closed, ticketId: input.ticketId, caseId: input.caseId } };
   }
   // Closing needs a PROVEN resolution: an administrative closure without reply (J2) or a handoff is not one.
   if (current.phase !== "resolved" || current.cycle.endedBy !== "resolved" || current.cycle.number !== trigger.cycle) return { plan: false, reason: "resolution_not_proven" };
@@ -220,20 +228,24 @@ export type AccessAutoApprovalFacts = Readonly<{
 export type AccessAutoApprovalOutcome = Readonly<{ allowed: true; basis: typeof ACCESS_AUTO_APPROVAL_BASIS }> | Readonly<{ allowed: false; reason: string }>;
 
 /** The rule that stands in for a person's approval, and only for this: an access-only, admitted agent case whose reply rests on B's accepted, sourced decision.
- * Anything else (another family, a mixed case, a handoff, an unverified source, an owner not V2) goes to a person, as today. It approves; it never revokes or declines. */
-export function decideAccessAutoApproval(input: Readonly<{ config: AccessAutoApprovalConfig; action: string; approverId: string; purpose: string; facts: AccessAutoApprovalFacts | null }>): AccessAutoApprovalOutcome {
+ * Terminal acknowledgements also require their dedicated switch. Anything else (another family, a mixed case, an unverified source, an owner not V2) goes to a person, as today. It approves; it never revokes or declines. */
+export function decideAccessAutoApproval(input: Readonly<{ config: AccessAutoApprovalConfig; action: string; approverId: string; purpose: string; env?: Readonly<Record<string, string | undefined>>; facts: AccessAutoApprovalFacts | null }>): AccessAutoApprovalOutcome {
   const { config, facts } = input;
   if (config.mode !== "on") return { allowed: false, reason: `auto_${config.why}` };
   if (input.action !== "approve") return { allowed: false, reason: "action_not_auto" };
   if (input.approverId.toLowerCase() !== config.approverId) return { allowed: false, reason: "approver_not_rule" };
-  if (!["answer", "question", "reminder"].includes(input.purpose)) return { allowed: false, reason: "purpose_not_auto" };
+  const terminal = closingHandoffReplyEnabled(input.env ?? {}) && isTerminalReply(input.purpose);
+  if (!["answer", "question", "reminder"].includes(input.purpose) && !terminal) return { allowed: false, reason: "purpose_not_auto" };
   if (!facts) return { allowed: false, reason: "facts_unread" };
   if (facts.case.owner !== "agent" || !facts.case.admitted) return { allowed: false, reason: "case_not_admitted" };
   if (facts.case.sensitivity !== "none") return { allowed: false, reason: "sensitive" };
   if (!facts.openFamilies.length || facts.openFamilies.some(family => family !== "access")) return { allowed: false, reason: "not_access_only" };
   if (input.purpose !== "reminder") {
     if (!facts.decision?.accepted) return { allowed: false, reason: "decision_not_accepted" };
-    if (!["answer", "ask"].includes(facts.decision.nextAction)) return { allowed: false, reason: "decision_not_reply" };
+    const matches = terminal
+      ? facts.decision.nextAction === (input.purpose === "closing" ? "confirm_resolution" : "handoff")
+      : ["answer", "ask"].includes(facts.decision.nextAction);
+    if (!matches) return { allowed: false, reason: "decision_not_reply" };
     if (!facts.decision.scopeCurrent) return { allowed: false, reason: "scope_not_current" };
     if (!facts.decision.shownSourcesVerified) return { allowed: false, reason: "sources_unverified" };
   }

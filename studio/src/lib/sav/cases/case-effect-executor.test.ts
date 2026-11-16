@@ -26,6 +26,7 @@ import { decideCaseReply, enqueueApprovedCaseReply, submitCaseReplyProposal, typ
 import { CASE_REPLY_V2_MODE, prepareCaseReplyText } from "./case-reply-outbound";
 import { renderSavOutboundReply, savReplyFooter } from "../reply-format";
 import type { CaseReplyAuthorizer } from "./case-reply-validation";
+import { listV2Cases, v2InventoryInput } from "./v2-inventory";
 import { nextJ2Slot } from "./j2-calendar";
 
 // SAV-10 on the REAL executor: `executeIntakePass` with the case driver, the real ledger (sav.intake_effects), the real Gmail/HubSpot adapters on the
@@ -521,6 +522,9 @@ describe("one internal note per interaction", () => {
     expect(Object.keys(p.objects.notes)).toHaveLength(0);
     expect(await effectsOf(id)).toMatchObject([{ state: "confirmed" }]);
     expect(await outbound(s.caseId)).toHaveLength(0);
+    const visible = (await listV2Cases(v2InventoryInput.parse({ limit: 100 }))).rows.find(r => r.caseId === s.caseId)!;
+    expect(visible.outcomes).toMatchObject([{ mail: { state: "confirmed" }, note: { state: "blocked", reason: "owner_changed" } }]);
+    expect(await run(id)).toEqual({ skipped: "occupied" }); expect(sends).toBe(1);
   });
 
   it("a note is held by a pause like any effect, and a confirmed reply stays confirmed", async () => {
@@ -535,6 +539,18 @@ describe("one internal note per interaction", () => {
     expect(await run(id)).toEqual({ state: "confirmed", executionId: id });
     expect(Object.keys(p.objects.notes)).toHaveLength(1);
     expect(sends).toBe(1);
+    const visible = (await listV2Cases(v2InventoryInput.parse({ limit: 100 }))).rows.find(r => r.caseId === s.caseId)!;
+    expect(visible.outcomes).toMatchObject([{ mail: { state: "confirmed" }, note: { state: "confirmed" } }]);
+  });
+  it("records an impossible status independently of a confirmed mail without resending", async () => {
+    const s = await scenario("answer"); const { id } = await admit(s);
+    environment.SAV_V2_TICKET_STAGES = "on"; environment.SAV_V2_STAGE_WAITING_CUSTOMER = "invalid stage"; environment.SAV_V2_STAGE_CLOSED = "closed";
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    const rows = await f.db.select().from(savIntakeEffectJournal).where(eq(savIntakeEffectJournal.executionId, id));
+    expect(rows.filter(r => r.kind === "case_component_status").map(r => decryptSavPayload(r.payloadCiphertext))).toEqual([{ state: "blocked", reason: "stages_stage_invalid" }]);
+    const visible = (await listV2Cases(v2InventoryInput.parse({ limit: 100 }))).rows.find(r => r.caseId === s.caseId)!;
+    expect(visible.outcomes).toMatchObject([{ mail: { state: "confirmed" }, status: { state: "blocked", reason: "mapping_invalid" } }]);
+    expect(await run(id)).toEqual({ skipped: "occupied" }); expect(sends).toBe(1);
   });
 });
 

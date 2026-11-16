@@ -8,6 +8,7 @@
 //   describeCaseReplyForReview  the UX read model, behind an access check that runs BEFORE anything is decrypted
 // This file never writes a validation, never decides, never sends, never marks, never resets a counter.
 import "server-only";
+import { isTerminalReply } from "./case-terminal-reply";
 import { and, asc, eq, gte, inArray, isNotNull, isNull, lte, notExists, notInArray, notLike, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savCaseEffectExecutions, savCases, savIntakeEffects, savMessages } from "@/db/schema";
@@ -111,6 +112,7 @@ export async function proposeCaseReplyFromDraft(input: CaseReplyDraftInput, deps
     caseId: input.caseId, caseVersion: input.decidedOn, triggerEventId: input.triggerEventId, inboundMessageId: message.id, purpose: input.reply.purpose,
     recipient: lower(message.fromEmail), subject: message.subject ?? "", text: input.reply.text,
     ...(input.reply.question ? { question: { id: input.reply.question.id, text: input.reply.question.text, factKeys: [...input.reply.question.factKeys] } } : {}),
+    ...(input.reply.questions ? { questions: input.reply.questions.map(question => ({ ...question, factKeys: [...question.factKeys] })) } : {}),
     ...(input.reply.procedures?.length ? { procedures: input.reply.procedures } : {}),
   };
   // `automated` is formatting only: the shared preparer is called with the mode (UX's guidance), not the human-only finalizer. No right comes out of it.
@@ -161,6 +163,7 @@ async function summaryNoteGranted(policy: Readonly<{ id: string; hash: string }>
 
 /** The reply's summary note as sealed at queue time: families of the case's requests (the open ones, else all) and the reply's purpose. Null when unbuildable. */
 async function caseReplySummaryNote(caseId: string, proposal: CaseReplyProposal, decidedAt: Date): Promise<CaseEffectNote | null> {
+  if (isTerminalReply(proposal.purpose)) return null; // The closure/handoff execution owns its internal note.
   const interactionId = caseReplySummaryInteractionId(proposal.triggerEventId);
   if (!/^[A-Za-z0-9._@<>=+:-]{1,200}$/.test(interactionId)) return null;
   const snapshot = await readCase(caseId);

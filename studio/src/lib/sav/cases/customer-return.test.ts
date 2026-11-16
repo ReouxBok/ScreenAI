@@ -85,6 +85,16 @@ describe("ticket stages: « attente client » after a confirmed reply, « fermé
     expect(() => caseTicketStageKey("not-a-case", "closed", "cycle-1")).toThrow("SAV_CASE_STAGE_KEY_INVALID");
   });
 
+  it("confirmed J2 closes administratively only on its own closed cycle and without a newer client mail", () => {
+    const c = { owner: "agent" as const, phase: "closed_no_reply" as const, sensitivity: "none" as const, cycle: { number: 2, endedBy: "closed_no_reply" as const } };
+    const trigger = { kind: "j2_confirmed" as const, replyKey: `reply:${CASE}:timer:syn-j2`, sentAt: "2026-11-03T10:00:00Z", cycle: 2, caseVersion: 10 };
+    expect(plan({ case: c, trigger })).toMatchObject({ plan: true, intent: { target: "closed", stageId: "syn-closed" } });
+    expect(plan({ case: { ...c, phase: "awaiting_customer" }, trigger })).toEqual({ plan: false, reason: "j2_closure_stale" });
+    expect(plan({ case: { ...c, cycle: { number: 3, endedBy: "closed_no_reply" } }, trigger }).plan).toBe(false);
+    expect(plan({ case: c, trigger, lastCustomerInboundAt: "2026-11-03T10:01:00Z" })).toEqual({ plan: false, reason: "customer_replied_since" });
+    expect(plan({ case: { ...c, teamPartPending: true }, trigger }).plan).toBe(false);
+  });
+
   const live: CaseTicketStageLive = { config: stagesOn, pause: { intake: "running", v2: "running" }, ownerNow: "v2", caseStillTarget: true, customerRepliedSince: false };
   it("the gate: confirmed is final, an engaged write is verified only whatever changed, only a planned one is judged", () => {
     expect(decideCaseTicketStage("confirmed", "closed", { ...live, ownerNow: "human" })).toEqual({ action: "done" });
@@ -148,6 +158,19 @@ describe("access replies without systematic human validation", () => {
     decision: { accepted: true, scopeCurrent: true, shownSourcesVerified: true, nextAction: "answer" }, ownerNow: "v2" };
   const decide = (overrides: Partial<Parameters<typeof decideAccessAutoApproval>[0]> = {}) =>
     decideAccessAutoApproval({ config, action: "approve", approverId: APPROVER, purpose: "answer", facts, ...overrides });
+
+  it("terminal acknowledgements require the switch, matching action and all existing access permissions", () => {
+    for (const [purpose, nextAction] of [["closing", "confirm_resolution"], ["handoff", "handoff"]]) {
+      const terminalFacts = { ...facts, decision: { ...facts.decision!, nextAction } };
+      expect(decide({ purpose, facts: terminalFacts })).toEqual({ allowed: false, reason: "purpose_not_auto" });
+      const input = { purpose, facts: terminalFacts, env: { SAV_V2_CLOSING_HANDOFF_REPLY: "on" } };
+      expect(decide(input)).toEqual({ allowed: true, basis: ACCESS_AUTO_APPROVAL_BASIS });
+      for (const wrong of ["answer", "ask", "observe_only", purpose === "closing" ? "handoff" : "confirm_resolution"])
+        expect(decide({ ...input, facts: { ...terminalFacts, decision: { ...terminalFacts.decision, nextAction: wrong } } })).toEqual({ allowed: false, reason: "decision_not_reply" });
+      expect(decide({ ...input, facts: { ...terminalFacts, case: { ...terminalFacts.case, sensitivity: "finance" } } })).toEqual({ allowed: false, reason: "sensitive" });
+      expect(decide({ ...input, facts: { ...terminalFacts, ownerNow: "human" } })).toEqual({ allowed: false, reason: "owner_not_v2" });
+    }
+  });
 
   it("only the exact opt-in with a dedicated approver id enables the rule", () => {
     expect(config).toEqual({ mode: "on", approverId: APPROVER });

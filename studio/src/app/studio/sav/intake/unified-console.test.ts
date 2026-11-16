@@ -180,3 +180,12 @@ it("does not infer absence of an older uncertain send from a partial reply page"
  const protectedLine=unifiedConsoleLine(row({status:"human_hold"}),confirmed,found());
  expect(protectedLine.owner).toBe("Équipe (protection V1)");expect(protectedLine.bucket).toBe("team");
 });
+
+it("shows the durable stop, its age and the ticket owner's explicit resumption action", () => {
+  const line = unifiedConsoleLine(row(), confirmed, { ...found(), reply: { state: "absent" }, continuationStop: {
+    code: "ticket_owner_human", since: "2026-11-16T10:00:00Z", lastAt: "2026-11-16T11:00:00Z", failures: 2,
+    responsible: "ticket_owner", nextAction: "return_ticket_to_v2" } });
+  expect(line).toMatchObject({ bucket: "to_verify", v2Href: "/studio/sav/v2/201" });
+  expect(line.stage).toContain("ticket_owner_human"); expect(line.stage).toContain("2026-11-16T10:00:00Z");
+  expect(line.next).toContain("réattribution explicite");
+});

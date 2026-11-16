@@ -2272,4 +2272,22 @@ describe("SAV-92 projection routes (synthetic)", () => {
     expect(pending.reason).toContain("Collecte du suivi incomplète (hubspot_pipeline_unavailable)");
     expect((await listIntakeConsole({ view: "processing" })).counts.blocked ?? 0).toBe(0);
   });
+  it("A (stuck follow-ups): a body really cut at 8 000 characters is a named partial follow-up in the console, still incomplete for the gates; SOURCE_UNAVAILABLE stays pending", async () => {
+    await observed(); const execution = (await admitIntakeExecution(runId, options))!; await executeIntakePass(execution.id, options);
+    expect(await ensureIntakeObservations()).toEqual({ created: 1 });
+    const [observation] = await db.db.select().from(savResolutionObservations);
+    await syncSavObservation(observation.id, async ticketId => ({ ticketId, subject: "Synthetic", status: "open", updatedAt: new Date().toISOString(), events: [], errors: ["emails:body_truncated"] }));
+    const [row] = await db.db.select().from(savResolutionObservations);
+    // Learning gates unchanged: the observation stays "sources_incomplete" with its raw code.
+    expect(row.state).toBe("sources_incomplete"); expect(row.sourceErrors).toEqual(["emails:body_truncated"]);
+    const partial = await projected();
+    expect(partial).toMatchObject({ view: "learning", status: "followup_partial" });
+    expect(partial.reason).toMatch(/^Suivi partiel : un corps dépasse 8 000 caractères/);
+    expect(partial.reason).not.toContain("Collecte du suivi incomplète");
+    await db.db.update(savResolutionObservations).set({ leaseUntil: null }).where(eq(savResolutionObservations.id, observation.id));
+    await syncSavObservation(observation.id, async ticketId => ({ ticketId, subject: "Synthetic", status: "open", updatedAt: new Date(Date.now() + 1000).toISOString(), events: [], errors: ["SOURCE_UNAVAILABLE"] }));
+    const pending = await projected();
+    expect(pending).toMatchObject({ view: null, status: "followup_pending" });
+    expect(pending.reason).toContain("Collecte du suivi incomplète (source_unavailable)");
+  });
 });

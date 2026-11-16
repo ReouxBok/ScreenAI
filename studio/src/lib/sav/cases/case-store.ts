@@ -1,4 +1,6 @@
+import { hasMultiQuestionWait } from "./case-question-followup";
 import "server-only";
+import { readContinuationStop } from "./continuation-stop";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, count, desc, eq, gt, gte, like, lte, max, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -152,7 +154,7 @@ async function appendLocked(tx: CaseTx, row: CaseRow, input: ValidEvent, threadI
     .where(and(eq(savCases.id, row.id), eq(savCases.version, row.version))).returning();
   if (!next) throw new CaseVersionStaleError(row.version);
   const cancel = timerCancelReason(input, next);
-  if (cancel) await cancelScheduledTimers(tx, row.id, cancel);
+  if (cancel) await cancelScheduledTimers(tx, row.id, cancel, cancel === "customer_inbound" && hasMultiQuestionWait(toSnapshot(row).body) ? toSnapshot(row).body.waiting?.timerId : undefined);
   return { appended: true, row: next };
 }
 
@@ -792,6 +794,7 @@ export async function readCaseDiagnostics(ticketId: string) {
     contractRevision: row.contractRevision, contractSupported: row.contractRevision === SAV_CASE_CONTRACT_REVISION || row.contractRevision in SAV_CASE_CONTRACT_UPGRADES,
     eventCount: events?.total ?? 0, lastEventKind: last?.kind ?? null, updatedAt: row.updatedAt.toISOString(),
     // SAV-18: held by its block's switch (off, paused, unreadable): a visible wait, never a silent skip.
+    continuationStop: await readContinuationStop(row.id, db),
     blockHold: hold ? { blockId: hold.blockId, reason: hold.reason, since: hold.since } : null,
     // SAV-92 (review batch 3, B1): a reply naming a team part whose notice could not be queued; bounded, then the whole mail goes to the team.
     teamPartWait: teamPart ? { code: teamPart.code, detail: teamPart.detail, passes: teamPart.passes, since: teamPart.since, lastAt: teamPart.lastAt, handedToTeam: teamPart.handedToTeam } : null,
@@ -974,7 +977,7 @@ export async function recordCustomerReturn(input: CustomerReturnWrite): Promise<
     const reopened = input.route === "reopen"
       ? before.body.openRequests.filter(request => request.status === "resolved" && !caseSensitivityForFamily(request.family)).map(request => request.id) : [];
     const body = parseBody({
-      ...before.body, waiting: null, trials: await trialsOnCustomerReturn(tx, before, input),
+      ...before.body, waiting: hasMultiQuestionWait(before.body) ? before.body.waiting : null, trials: await trialsOnCustomerReturn(tx, before, input),
       ...(input.route === "reopen" ? { cycle: { number: before.body.cycle.number + 1 },
         openRequests: before.body.openRequests.map(request => reopened.includes(request.id) ? { ...request, status: "open" as const } : request) } : {}),
     });
