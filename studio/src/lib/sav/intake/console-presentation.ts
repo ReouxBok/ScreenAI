@@ -127,7 +127,11 @@ export type IntakeBlockedRow = { blockedCause?: string | null; status: string; r
   /** SAV-92 (C): current run attempts and last update, read with the row; optional so older callers keep their labels. */
   runAttempts?: number | null; runUpdatedAt?: string | Date | null };
 /** Raw CRM read reasons (lowercase) that leave V1 without the context it needs: the team completes it (SAV-92 B). */
-const CONTEXT_READ_REASONS = /^(ticket_limit|history_limit|contact_limit|page_limit|request_limit|batch_limit|partial_batch|partial_response|total_mismatch|pagination_cycle|read_unavailable|cancelled|history_date_unknown|ticket_content_unavailable|ticket_membership_conflict|conflicting_contact|aliases_unavailable|archived_contact|history_incomplete|ticket_search_incomplete|contact_lookup_incomplete|association_incomplete|same_issue_unresolved)$/;
+/** SAV-92 (stuck dossiers): every partial CRM read fault (`ReadFault("partial", …)` in hubspot-readers.ts) is listed here;
+ * an exhaustiveness test reads them from the reader source. `history_body_unavailable` (an engagement without body) and
+ * `wrong_contact` were missing and fell to "cause non classée". */
+const CONTEXT_READ_REASONS = /^(ticket_limit|history_limit|contact_limit|page_limit|request_limit|batch_limit|partial_batch|partial_response|total_mismatch|pagination_cycle|read_unavailable|cancelled|history_date_unknown|history_body_unavailable|wrong_contact|ticket_content_unavailable|ticket_membership_conflict|conflicting_contact|aliases_unavailable|archived_contact|history_incomplete|ticket_search_incomplete|contact_lookup_incomplete|association_incomplete|same_issue_unresolved)$/;
+export const intakeContextReadReason = (reason: string) => CONTEXT_READ_REASONS.test(reason);
 export const INTAKE_CONTEXT_CHANGED_STALL_MS = 24 * 3_600_000;
 export function intakeBlockedSubCause(row: IntakeBlockedRow, now: Date = new Date()): IntakeBlockedSubCause | null {
   if (row.blockedCause !== "technical_wait") return null;

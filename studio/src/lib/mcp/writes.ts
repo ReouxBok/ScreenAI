@@ -13,6 +13,7 @@ import { releaseIntakeHumanHold } from "@/lib/sav/intake/human-hold-release";
 import { recordIntakeHumanCommand } from "@/lib/sav/intake/human-commands";
 import { requestIntakeReinvestigation, reconcileThreadIdentification } from "@/lib/sav/intake/operator-recovery";
 import { reconcileIntakeNoteForClosure } from "@/lib/sav/intake/note-recovery";
+import { reconcileIntakeUncertainEffect } from "@/lib/sav/intake/effect-reconciliation";
 import { recordOperatorCommand, readOperatorPanel } from "@/lib/sav/intake-ux/operator-commands";
 import { savAgentPauseAdministrator, setSavAgentPause, readSavAgentPausePanel } from "@/lib/sav/intake/agent-pause-admin";
 import { readSavAgentPause, SAV_AGENT_PAUSE_LEVELS } from "@/lib/sav/intake/agent-pause";
@@ -192,16 +193,18 @@ const releaseHold = studioMcpWrite("release_hold", "Lever la pause humaine",
     return result.replayed ? alreadyDone("Pause déjà levée par cette même demande.") : done("Pause levée. Le moteur pourra poursuivre si les preuves et la politique le permettent.");
   });
 const recordChoice = studioMcpWrite("record_choice", "Choisir la fiche, le ticket ou la classification",
-  "Enregistre un choix humain conditionnel sur la version courante : select (contactId et éventuel ticketId parmi les candidats de get_dossier), classify (classification) ou refuse. Le worker revalide les preuves avant toute action.",
+  "Enregistre un choix humain conditionnel sur la version courante : select (ticketId et/ou contactId, chacun parmi les candidats de get_dossier ; un contact déjà identifié par email n’est pas un candidat, choisir alors le ticket seul), classify (classification) ou refuse. Le worker revalide les preuves avant toute action.",
   { ...dossierInput, kind: z.enum(["select", "classify", "refuse"]), contactId: z.string().regex(/^\d{1,30}$/).optional(), ticketId: z.string().regex(/^\d{1,30}$/).optional(),
     classification: z.enum(["support", "finance", "cancellation", "other", "partnership", "commercial", "investor"]).optional(), reason }, async (context, input, claim) => {
     const found = await currentDossier(input); if (!found.ok) return found.result;
     const view = intakeDossierView(found.data), { version } = found;
     if (!intakeDossierActions(found.data, view, context.staff).recordChoice || !version.messageId || !version.runId || !version.version || !version.sourceHash) return unavailable("La correction");
-    if (input.kind === "select" && (!input.contactId || !view.contacts.includes(input.contactId) || input.ticketId && !view.tickets.includes(input.ticketId)))
+    // Same rule as the canonical command: a ticket-only selection is valid (the contact was already resolved by the
+    // email lookup and is not a candidate); any contact or ticket given must be among the candidates read.
+    if (input.kind === "select" && (input.contactId && !view.contacts.includes(input.contactId) || input.ticketId && !view.tickets.includes(input.ticketId)))
       return refused("SAV_MCP_NOT_A_CANDIDATE", "Fiche ou ticket hors des candidats de get_dossier.");
-    if (input.kind !== "select" && (input.contactId || input.ticketId) || (input.kind === "classify") !== Boolean(input.classification))
-      return refused("SAV_MCP_INVALID_INPUT", "select exige contactId ; classify exige classification ; refuse n’accepte ni l’un ni l’autre.");
+    if (input.kind !== "select" && (input.contactId || input.ticketId) || input.kind === "select" && !input.contactId && !input.ticketId || (input.kind === "classify") !== Boolean(input.classification))
+      return refused("SAV_MCP_INVALID_INPUT", "select exige ticketId ou contactId ; classify exige classification ; refuse n’accepte ni l’un ni l’autre.");
     const lost = await claim(); if (lost) return lost;
     const result = await recordIntakeHumanCommand({ commandKey: input.idempotencyKey, threadId: input.threadId, messageId: version.messageId, runId: version.runId,
       version: version.version, sourceHash: version.sourceHash, candidatesHash: intakeRuntimeHash(view.contacts), kind: input.kind,
@@ -242,6 +245,15 @@ const reconcileNote = studioMcpWrite("reconcile_note", "Vérifier la note déjà
     await reconcileIntakeNoteForClosure({ threadId: input.threadId, messageId: found.version.messageId });
     return done("Note existante et rattachement vérifiés. Aucune note créée ni aucun mail envoyé.");
   }, { idempotent: false });
+const reconcileEffect = studioMcpWrite("reconcile_effect", "Rapprocher l’action incertaine depuis son reçu",
+  "Vérifie dans HubSpot, en lecture seule, l’unique action incertaine du message courant (note ou email : création avec reçu, ou rattachement au ticket) à partir du reçu déjà enregistré. Aucun identifiant n’est accepté de l’appelant ; rien n’est recréé ni renvoyé ; un résultat non prouvé est refusé sans rien changer. Administrateurs.",
+  { threadId: z.uuid(), versionToken: dossierInput.versionToken }, async (context, input) => {
+    const found = await currentDossier({ ...input, idempotencyKey: "" }); if (!found.ok) return found.result;
+    if (!intakeDossierActions(found.data, intakeDossierView(found.data), context.staff).administratorVerifications || !found.version.messageId) return unavailable("Le rapprochement");
+    const result = await reconcileIntakeUncertainEffect({ threadId: input.threadId, messageId: found.version.messageId }, found.version);
+    if (!result.reconciled) return alreadyDone("Aucune action incertaine : déjà rapprochée. Rien n’a été modifié.");
+    return done("Action existante vérifiée et attribuée à son reçu. Rien n’a été recréé ni envoyé ; le traitement normal reprendra s’il le peut.", { kind: result.kind });
+  }, { idempotent: false });
 const reconcileIdentification = studioMcpWrite("reconcile_identification", "Rapprocher les envois d’identification",
   "Rapproche les demandes d’identification déjà envoyées avec leurs reçus. Ne renvoie aucun mail. Administrateurs.",
   { threadId: z.uuid(), versionToken: dossierInput.versionToken }, async (context, input) => {
@@ -272,5 +284,5 @@ const getAgentPause = { name: "get_agent_pause", title: "État de pause de l’a
   async run() { const panel = await readSavAgentPausePanel(); return { outcome: "done", code: "OK", message: "OK", data: panel } as StudioMcpResult; } } as unknown as StudioMcpTool;
 
 export const studioMcpWriteTools: StudioMcpTool[] = [closeHandledOutside, classifyInvalidSource, classifyOther, releaseHold, recordChoice,
-  requestReinvestigation, continueDossier, reconcileNote, reconcileIdentification, setAgentPause];
+  requestReinvestigation, continueDossier, reconcileNote, reconcileEffect, reconcileIdentification, setAgentPause];
 export const studioMcpPauseReadTool = getAgentPause;

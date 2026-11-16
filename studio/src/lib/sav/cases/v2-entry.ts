@@ -35,6 +35,7 @@ import type { ExecutorAdapters } from "../intake/execution-types";
 import { SAV_INTAKE_CONTRACT_REVISION, type SavIntakeDecision } from "../intake/contract";
 import { readRequestQuotes, relayPaused, type CaseRelayRequest, type CaseBoundaryDeps, type CaseRelayResult } from "./intake-boundary";
 import { loadCaseContinuationPoint, type CaseContinuationPoint, type CaseContinuationTrigger } from "./v2-entry-binding";
+import { requestCaseSettleWake, type CaseSettleWakeStart } from "./case-v2-latency-wakes";
 
 type Env = Record<string, string | undefined>;
 export const savV2EntryEnabled = (env: Env) => env.SAV_V2_ENTRY === "on" && savCaseRecordingEnabled(env);
@@ -209,12 +210,23 @@ async function v1CreatedTicket(executionId: string, ticketId: string) {
   return v1IntentHash(intent) === create.intentHash && intent.kind === "ticket_create" && intent.key === create.businessKey && decryptSavPayload<{ id?: string }>(create.ackCiphertext).id === ticketId;
 }
 
+/** 16/11: the EXISTING ticket V1 linked or reopened for this execution: it created no ticket, every effect it recorded is confirmed, and its
+ * `email_associate` (intact, hash checked) attached this mail to this very ticket. Uncertain, merely sent or another ticket is no proof. */
+async function v1ExistingTicket(executionId: string, ticketId: string) {
+  const effects = await requireDb().select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, executionId));
+  if (!effects.length || effects.some(effect => effect.kind === "ticket_create" || effect.state !== "confirmed")) return false;
+  const associations = effects.filter(effect => effect.kind === "email_associate");
+  if (associations.length !== 1) return false;
+  const intent = decryptSavPayload<{ kind?: string; key?: string; ticketId?: string }>(associations[0]!.intentCiphertext);
+  return v1IntentHash(intent) === associations[0]!.intentHash && intent.kind === "email_associate" && intent.key === associations[0]!.businessKey && intent.ticketId === ticketId;
+}
+
 /**
  * SAV-81: the relay's binder for a mail V1 already confirmed, in qualification mode only (the scope checks themselves answer `open` or `closed` otherwise).
  * The real test mail opened its thread and V1 created its ticket, but its subject did not match at the creation, so nothing was bound and the relay could
  * never attribute it. This binds it once an operator put that ticket under the V2 owner, with exactly the creation's conditions and V1's current proofs:
  * the execution confirmed on this ticket and run version, no newer run, no operator refusal, the current contract's decision of ONE support request that
- * CREATED this ticket for the unique primary contact, its `ticket_create` confirmed for this ticket, no other mail on the thread, the thread not paused, no
+ * CREATED this ticket (16/11: or linked/reopened this EXISTING ticket, `v1ExistingTicket`) for the unique primary contact, its `ticket_create` confirmed for this ticket, no other mail on the thread, the thread not paused, no
  * person's decision on the mail, not handled outside, and (before the write) no agent pause; then
  * the exact scope (sender, contact, first message, subject, window, hash, revision, one thread). The owner itself is read by the relay, between the read-only
  * check and the write. It writes no CRM owner. Unreadable is refused, never guessed.
@@ -229,8 +241,12 @@ export function qualificationRelayBinder(env: Env): NonNullable<CaseBoundaryDeps
         || source.runVersion !== input.runVersion || freshness.latestRunVersion !== input.runVersion || freshness.humanRefused) return false;
       if (decision.revision !== SAV_INTAKE_CONTRACT_REVISION || decision.messageId !== input.messageId || decision.latestInboundMessageId !== input.messageId
         || decision.classification !== "support" || decision.requests.length !== 1 || decision.requests[0]!.kind !== "support"
-        || disposition.kind !== "ticket" || disposition.target.operation !== "create" || disposition.target.contactId !== disposition.contactScope.primaryContactId) return false;
-      if (!await v1CreatedTicket(input.executionId, input.ticketId)) return false;
+        || disposition.kind !== "ticket" || disposition.target.contactId !== disposition.contactScope.primaryContactId) return false;
+      // 16/11 (Ugo): a tester who already has a ticket. V1 links or reopens it instead of creating one; the same binding, with V1's proof of THAT ticket.
+      const target = disposition.target;
+      if (target.operation === "create") { if (!await v1CreatedTicket(input.executionId, input.ticketId)) return false; }
+      else if (target.operation === "link" || target.operation === "reopen") { if (target.ticketId !== input.ticketId || !await v1ExistingTicket(input.executionId, input.ticketId)) return false; }
+      else return false;
       const db = requireDb();
       const [message] = await db.select({ id: savMessages.id, threadId: savMessages.threadId, receivedAt: savMessages.receivedAt, gmailMessageId: savMessages.gmailMessageId })
         .from(savMessages).where(eq(savMessages.id, input.messageId));
@@ -260,8 +276,10 @@ function ownerTransport(env: Env, network?: typeof fetch): CaseOwnerReadTranspor
 }
 
 /** `immediateDeadlineMs` (11/11): when the caller must be done; given, a reply queued by the continuation may be sent at once within that budget.
- * Absent (the shared `sav-reconcile` worker): never sent here, the effects catch-up sends it. */
-type EntryDeps = { env: Env; network?: typeof fetch; continuation?: CaseContinuationPoint | null; returnDeps?: Partial<CustomerReturnDeps>; immediateDeadlineMs?: number };
+ * Absent (the shared `sav-reconcile` worker): never sent here, the effects catch-up sends it.
+ * `settleWakeStart` (tests only): the workflow starter of the settle wake (`case-v2-latency-wakes.ts`); absent, the real one. */
+type EntryDeps = { env: Env; network?: typeof fetch; continuation?: CaseContinuationPoint | null; returnDeps?: Partial<CustomerReturnDeps>; immediateDeadlineMs?: number;
+  settleWakeStart?: CaseSettleWakeStart };
 
 function returnSources(input: EntryDeps): CustomerReturnDeps {
   const { env } = input, readOwner = hubspotTicketOwnerReader(ownerTransport(env, input.network));
@@ -432,6 +450,13 @@ export async function continueCaseAfterCommit(caseId: string, trigger: CaseConti
     if (point) {
       const report = await point({ caseId, trigger, env: input.env, ...(input.immediateDeadlineMs === undefined ? {} : { deadlineMs: input.immediateDeadlineMs }) });
       await markContinuation(caseId, trigger, null);
+      // SAV-92 (16/11): refused only because the customer's last mail is still settling: ONE durable wake continues this case when the window ends
+      // (the window itself is unchanged). Every guard is read again by that passage. A failure here never fails the pass; the sweep stays the fallback.
+      if (report.status === "claim_refused" && report.reason === "settling" && report.retryAt) {
+        const wake = await requestCaseSettleWake(caseId, report.retryAt, { env: input.env, ...(input.settleWakeStart ? { start: input.settleWakeStart } : {}) })
+          .catch(() => ({ started: false, reason: "request_threw" }));
+        console.info("sav_v2_settle_wake", { caseId, trigger, retryAt: report.retryAt, started: wake.started, reason: wake.reason });
+      }
       // SAV-18: a block held by its switch is a durable, visible wait (console, diagnostics), cleared by the next pass that is not held.
       await markCaseBlockHold(caseId, report.status === "block_held" ? { blockId: report.detail ?? SAV_CASE_ACCESS_BLOCK_ID, reason: report.reason ?? "block_setting_invalid" } : null);
       // Review batch 3 (B1): a reply naming a team part whose notice could not be queued is a visible, bounded wait (never a silent retry at each sweep):

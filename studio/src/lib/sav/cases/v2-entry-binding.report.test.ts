@@ -10,4 +10,9 @@ describe("caseContinuationReport", () => {
     expect(caseContinuationReport("skipped", { reason: "Bonjour, je n'arrive pas", detail: "x@y.fr" })).toEqual({ status: "skipped" });
     expect(caseContinuationReport("queued", {})).toEqual({ status: "queued" });
   });
+  it("keeps the settle window's retryAt of a refused claim only, and only as an ISO date (SAV-92)", () => {
+    expect(caseContinuationReport("claim_refused", { reason: "settling", retryAt: "2026-11-16T11:26:40.123Z" })).toEqual({ status: "claim_refused", reason: "settling", retryAt: "2026-11-16T11:26:40.123Z" });
+    expect(caseContinuationReport("claim_refused", { reason: "settling", retryAt: "demain 11h" })).toEqual({ status: "claim_refused", reason: "settling" });
+    expect(caseContinuationReport("queued", { retryAt: "2026-11-16T11:26:40.123Z" })).toEqual({ status: "queued" });
+  });
 });

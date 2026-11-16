@@ -449,7 +449,7 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
         await tx.update(savIntakeRuns).set({ leaseToken: token, leaseUntil: new Date(now.getTime() + 30_000) }).where(eq(savIntakeRuns.id, id));
         return { token, proof, pauseSetAt: pause.setting?.setAt ?? null };
       }
-      if (resume.kind === "hold") { await holdIntakeResume(tx, run.id, proof!, resume.cause, now); options.onHold?.(resume.cause); return null; }
+      if (resume.kind === "hold") { await holdIntakeResume(tx, run.id, proof!, resume.cause, now, finished?.result ?? null); options.onHold?.(resume.cause); return null; }
       if (resume.cause === "progress" && finished?.result.state === "progress") await recordIntakeResumeProgress(tx, run.id, finished.result);
     }
     if (recoveringRead && retry) {

@@ -5,7 +5,7 @@
 //   with its OWN permission: the marker and the rendering are the existing `renderIntakeNote`, so the existing verification applies.
 // Pure builders: nothing is read or sent here. A text, a signature or a status that is not confirmed is passed in by the caller, never invented.
 import { createHash } from "node:crypto";
-import { renderIntakeNote } from "../intake/execution-adapters";
+import { hiddenMarkerNoteKey, renderIntakeNote, renderIntakeNoteHidden } from "../intake/execution-adapters";
 import { assertSavOutboundRecipientAllowed } from "../policy";
 import {
   caseNoteAssociationKey, caseNoteKey, caseReplyKey, checkCaseReplyApproval, SAV_CASE_EFFECT_PERMISSIONS,
@@ -96,7 +96,8 @@ export function buildCaseNoteIntent(input: Readonly<{
   const key = caseNoteKey(input.caseId, input.interactionId), marker = sha(key);
   return {
     kind: "note_create", permission: SAV_CASE_EFFECT_PERMISSIONS.note, key, ticketId: input.ticketId, sourceMessageId: input.sourceMessageId, text: input.text, marker,
-    properties: { hs_note_body: renderIntakeNote(input.text, marker), hs_timestamp: input.at },
+    // The V2 reply's summary note carries no visible identifier (SAV-92, 16/11): the hidden marker, proven by the creation ACK (else uncertain).
+    properties: { hs_note_body: (hiddenMarkerNoteKey(key) ? renderIntakeNoteHidden : renderIntakeNote)(input.text, marker), hs_timestamp: input.at },
   };
 }
 
