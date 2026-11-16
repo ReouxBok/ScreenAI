@@ -33,7 +33,7 @@ describe.skipIf(!URL_)("SAV-92 native effect reconciliation concurrency", () => 
   const on = <T>(store: Store, work: () => Promise<T>) => context.run(store.db, work);
   const pause = (level: "running" | "actions_paused") => on(b, () => setSavAgentPause({ agent: "intake", level, reason: "Synthetic native concurrency fixture" }));
   const reconcile = (store: Store, input: { threadId: string; messageId: string }, verify: ExecutorAdapters["verify"]) =>
-    on(store, () => reconcileIntakeUncertainEffect(input, undefined, { verify }));
+    on(store, () => reconcileIntakeUncertainEffect({ threadId: input.threadId, messageId: input.messageId }, undefined, { verify }));
 
   beforeAll(async () => {
     validateSavNativeTestTarget(URL_!, TOKEN);
