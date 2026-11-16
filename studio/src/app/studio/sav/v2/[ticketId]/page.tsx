@@ -51,7 +51,10 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
     // SAV-18: held by its block's switch, shown as a wait; an unreadable marker is not invented (the administrators' diagnostics read it again).
     readCaseBlockHold(snapshot.caseId).catch(() => null),
     // SAV-92 (review batch 3, B1): a team part whose notice could not be queued, shown as a wait, bounded.
-    readCaseTeamPartWait(snapshot.caseId).catch(() => null), readContinuationStop(snapshot.caseId)]);
+    readCaseTeamPartWait(snapshot.caseId).catch(() => null),
+    // An additional diagnostic must not prevent the dossier and reply registry from opening.
+    // Keep a failed read distinct from a successful read with no durable stop.
+    readContinuationStop(snapshot.caseId).catch(() => undefined)]);
   // Without a choice in the link, the latest reply of the first page is the one shown: its id comes from the list just read for this case, never from a guess.
   const reply = await readCaseReply(caseReplyReaders, { caseId: snapshot.caseId, id: replyId ?? (!repliesCursor && replies.state === "ok" ? replies.items[0]?.id : undefined) });
   // Pole C9, only for the reply the page already read for this case (its id comes from that read, not from the URL), after the staff check.
@@ -87,6 +90,7 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
       : null}
 
     <section className={styles.card} aria-labelledby="v2-situation"><h2 id="v2-situation">Où en est le dossier</h2>
+      {continuationStop === undefined ? <p className={styles.notice} role="status">Arrêts V2 : lecture indisponible. L’absence d’arrêt ne peut pas être confirmée ; un administrateur SAV doit vérifier le diagnostic.</p> : null}
       <p><Status tone={view.situation.tone}>{view.situation.title}</Status>{view.situation.detail ? <span className={styles.small}> {view.situation.detail}</span> : null}</p>
       {notice ? <div id="v2-notice"><p><Status tone={notice.tone}>{notice.line}</Status>{notice.link ? <> <a href={notice.link} target="_blank" rel="noreferrer">Voir le message</a></> : null}</p>
         <p><strong>Action suivante :</strong> {notice.next}</p></div> : null}
