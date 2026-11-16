@@ -339,3 +339,21 @@ describe("review batch 3 (B3): the knowledge search's embeddings are counted in 
     expect(capped.spend).toMatchObject({ embeddingCalls: 1, embeddingRefused: 2 });
   });
 });
+
+it.each([1, 2, 3, 5, 6])("replay aligns with C for %i questions in a single reply", async count => {
+  const texts = ["Quel écran voyez-vous ?", "Quel navigateur utilisez-vous ?", "Depuis quand cela arrive-t-il ?", "Quelle version utilisez-vous ?", "Quel appareil utilisez-vous ?", "Quel système utilisez-vous ?"].slice(0, count);
+  const output = { caseVersion: 2, understanding: { requests: [{ id: "r1", summary: "Connexion", family: "access", status: "open" }], newFacts: [] },
+    nextAction: { kind: "ask", questions: texts.map(text => ({ text, requestId: "r1", reducesUncertainty: "Préciser le problème", seeks: [{ kind: "observed_result" }] })) },
+    reply: { text: `Bonjour, ${SAV_CASE_ACCESS_URL} ${texts.join(" ")}`, citations: [], impossibilityClaims: [], accountAdvice: "none" } };
+  const detail = await runSavReplayDecision({ kind: "synthetic", ref: `batch-${count}`, subject: "", text: login, family: "access", blockId: "access" },
+    { now, mailRef: `batch-${count}`, knowledge: [], model: createSavReplayStubModel({ outputs: [output, output] }), meter: createSavReplaySpendMeter(), blockMode: "automatic" });
+  if (count <= 5) {
+    expect(detail.outcome).toBe("accepted");
+    expect(detail.replyLimit).toBeNull();
+    expect(detail.reply?.draft).toBe(output.reply.text);
+    if (count > 1) expect(detail.ask?.questions).toEqual(texts.map(text => ({ requestId: "r1", text })));
+  } else {
+    expect(detail.reply).toBeNull();
+    expect(detail.rejections).toEqual(expect.arrayContaining([expect.objectContaining({ path: "nextAction.questions", detail: "too_many_questions:max_5" })]));
+  }
+});

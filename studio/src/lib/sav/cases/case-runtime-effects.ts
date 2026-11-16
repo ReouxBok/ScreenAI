@@ -111,6 +111,7 @@ export async function proposeCaseReplyFromDraft(input: CaseReplyDraftInput, deps
     caseId: input.caseId, caseVersion: input.decidedOn, triggerEventId: input.triggerEventId, inboundMessageId: message.id, purpose: input.reply.purpose,
     recipient: lower(message.fromEmail), subject: message.subject ?? "", text: input.reply.text,
     ...(input.reply.question ? { question: { id: input.reply.question.id, text: input.reply.question.text, factKeys: [...input.reply.question.factKeys] } } : {}),
+    ...(input.reply.questions ? { questions: input.reply.questions.map(question => ({ ...question, factKeys: [...question.factKeys] })) } : {}),
     ...(input.reply.procedures?.length ? { procedures: input.reply.procedures } : {}),
   };
   // `automated` is formatting only: the shared preparer is called with the mode (UX's guidance), not the human-only finalizer. No right comes out of it.

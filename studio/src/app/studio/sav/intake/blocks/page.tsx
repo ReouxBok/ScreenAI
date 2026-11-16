@@ -22,8 +22,9 @@ export default async function BlockSwitchPage() {
     {blocks.map(block => <section key={block.blockId} className={styles.choice}>
       <h2>{BLOCK_LABELS[block.blockId] ?? block.blockId}</h2>
       {block.invalid && <p role="alert">Le réglage enregistré est illisible : le bloc n’envoie rien par sécurité (<code>block_setting_invalid</code>) jusqu’à un nouvel enregistrement.</p>}
+      {!block.invalid && !block.setting && block.mode === "auto" && <p>Défaut hérité (auto). Enregistrez un réglage explicite pour ce bloc.</p>}
       <dl>
-        <dt>Mode</dt><dd>{block.invalid ? stateLabel("invalid") : stateLabel(block.mode)}{block.paused ? " — en pause" : ""}{block.setting ? "" : " (valeur par défaut)"}</dd>
+        <dt>Mode</dt><dd>{block.invalid ? stateLabel("invalid") : stateLabel(block.mode)}{block.paused ? " — en pause" : ""}{block.setting || block.invalid ? "" : " (valeur par défaut)"}</dd>
         <dt>État effectif</dt><dd>{stateLabel(block.effective)}</dd>
         {block.setting && <><dt>Depuis</dt><dd>{formatParisDateTime(block.setting.setAt)} par {block.setting.setBy}</dd><dt>Motif</dt><dd>{block.setting.reason}</dd></>}
       </dl>

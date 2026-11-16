@@ -22,6 +22,7 @@ import type { ExecutionOptions, ExecutorAdapters } from "../intake/execution-typ
 import { listCaseEvents, listCaseTimers, openCaseEvent, readCase, transitionCaseOwner } from "./case-store";
 import { caseDedupeKey } from "./case-types";
 import { createCaseEffectDriver } from "./case-effect-driver";
+import { listV2Cases, v2InventoryInput } from "./v2-inventory";
 import { pendingCaseEffectRecoveries } from "./case-effect-recovery";
 import { recordConfirmedCaseReply } from "./case-effect-outcomes";
 import { caseReplyPayloadHash, type CaseReplyProposal } from "./case-effects";
@@ -956,7 +957,8 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     expect(sends).toBe(1);
   });
 
-  it("stages on: mail leaves immediately; the note waits for confirmed HubSpot stage, then writes once", async () => {
+  it.each([false, true])("confirmed stage stays visible when resuming the pending note (stages disabled: %s), without duplicate sends", async disableStages => {
+    const inventoryFrom = new Date().toISOString();
     noteOn(); stagesOn();
     const s = await scenario("answer"), { id } = await admit(s);
     expect((await pass()).supervised).toEqual([{ executionId: id, state: "waiting", reason: "SAV_CASE_EFFECT_RECOVERY_NOTE_PENDING" }]);
@@ -976,11 +978,18 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
       createTicketStageDriver({ env: () => environment, readTicketOwner: async () => "v2" }));
     expect((await stageRows(s.caseId))[0]).toMatchObject({ state: "confirmed" });
     expect(patches).toBe(1);
+    if (disableStages) environment.SAV_V2_TICKET_STAGES = "off";
     expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
     await pass();
     expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: `${ACCESS_ANSWER} Ticket passé en attente du client.` }]);
     expect(await notesOf(id)).toHaveLength(1);
     expect(sends).toBe(1);
+    expect(patches).toBe(1);
+    expect(await stageRows(s.caseId)).toHaveLength(1);
+    const inventory = await listV2Cases(v2InventoryInput.parse({ limit: 100, from: inventoryFrom }));
+    const row = inventory.rows.find(row => row.caseId === s.caseId)!;
+    expect(row.outcomes.find(outcome => outcome.executionId === id)?.status).toEqual({ state: "confirmed", reason: null, message: null });
+    expect(row.hubspot.status).toBe("confirmed");
   });
 
   it.each(["refused", "uncertain", "pending", "waiting"] as const)("stage %s after one catch-up: one note without status, no resend", async state => {
