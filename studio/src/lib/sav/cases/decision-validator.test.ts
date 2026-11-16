@@ -977,6 +977,9 @@ describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
     "Est-ce que le mot de passe permet le login ?",
     "Avez-vous accès à votre espace ?",
     "Est-ce que vous pouvez authentifier votre compte ?",
+    "Est-ce que vous pouvez vous réauthentifier ?",
+    "Pouvez-vous vous reconnecter à votre espace ?",
+    "Est-ce que vous pouvez vous ré-identifier ?",
   ];
   const pastTrialQuestions = [
     "Avez-vous déjà essayé un autre navigateur ?",

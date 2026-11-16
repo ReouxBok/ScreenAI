@@ -358,7 +358,7 @@ function unusedAlternative(action: Extract<CaseDecisionProposal["nextAction"], {
 
 // Broad roots are intentional: a doubt about login requires the URL. Its presence
 // anywhere in the reply satisfies this requirement, including another paragraph.
-const LOGIN_REFERENCE = /\b(?:(?:re|de)?connect\w*|connexion\w*|identif\w*|authent\w*|mot de passe|espace\w*|compte\w*|acced\w*|acces|log\w*|sign[ -]?in)\b/;
+const LOGIN_REFERENCE = /\b(?:re|de|ré|dé)?(?:connect\w*|connexion\w*|identif\w*|authent\w*|mot de passe|espace\w*|compte\w*|acced\w*|accéd\w*|acces|accès|log\w*|sign[ -]?in)\b/;
 // Every sentence must ask for information. Greetings and courtesy are framing,
 // never an exemption for a second instruction or an unknown statement.
 const INFORMATION_QUESTION = /^(?:(?:quel|quelle|quels|quelles)\b|depuis quand\b|pouvez-vous (?:preciser|indiquer|me dire|m'envoyer une capture)\b|avez-vous\b|est-ce que\b|sur (?:quel|quelle|quels|quelles) (?:appareil|navigateur)\b) .+$/;
