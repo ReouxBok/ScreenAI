@@ -9,7 +9,7 @@ const origin: J2Origin = {
   caseId: "10000000-0000-4000-8000-000000000001", caseVersion: 1, triggerEventId: "inbound:synthetic",
   inboundMessageId: "synthetic", recipient: "customer@example.invalid", subject: "UNTRUSTED MAIL SUBJECT", purpose: "question",
   text: "Quel message s’affiche ?", question: { id: "q1", text: "Quel message s’affiche ?", factKeys: ["login_error_message"] },
-  j2Context: { receivedAt: "2026-11-16T09:00:00Z", subject: "votre connexion à Limova" },
+  j2Context: { receivedAt: "2026-11-16T09:00:00Z", subject: "votre connexion à Limova" }, j2OpenQuestionIds: ["q1"],
 };
 const procedure: J2Origin = { ...origin, purpose: "answer", question: undefined,
   procedures: [{ requestId: "r1", procedure: { knowledgeId: "synthetic-card", contentVersionId: "synthetic-v1" } }],
@@ -42,7 +42,7 @@ describe("J2 warm follow-up and administrative closure", () => {
   it("multi-question (#288): lists ALL 3 questions tracked separately in the sent mail, exactly and in order", () => {
     const questions = ["Quel message s’affiche ?", "Depuis quand cela arrive-t-il ?", "Quel navigateur utilisez-vous ?"];
     const tracked = questions.map((text, i) => ({ id: `in:synthetic:q${i + 1}`, text, factKeys: [`key_${i + 1}`] }));
-    const multi: J2Origin = { ...origin, question: undefined, questions: tracked, text: `Bonjour,\n\n${questions.map(q => `- ${q}`).join("\n")}` };
+    const multi: J2Origin = { ...origin, question: undefined, questions: tracked, j2OpenQuestionIds: tracked.map(q => q.id), text: `Bonjour,\n\n${questions.map(q => `- ${q}`).join("\n")}` };
     const text = j2ReminderText(multi, on);
     expect(text).toContain(`pour vous demander quelques précisions :\n${questions.map(q => `• ${q}`).join("\n")}`);
     expect(text.match(/^• /gm)).toHaveLength(3);
@@ -50,6 +50,17 @@ describe("J2 warm follow-up and administrative closure", () => {
     expect(j2ReminderText(multi, {})).toBe(J2_REMINDER_TEXT);
     expect(j2ReminderText({ ...multi, text: `${multi.text}\n- Une question non suivie ?` }, on)).toBe(J2_REMINDER_TEXT);
     expect(j2ReminderText({ ...multi, questions: [...tracked, { ...tracked[0]!, id: "absent", text: "Absente du mail ?" }] }, on)).toBe(J2_REMINDER_TEXT);
+  });
+  it("multi-question: 3 asked, 1 answered, so only the 2 still open are recalled, exactly and in sending order; unknown answers stay neutral", () => {
+    const questions = ["Quel message s’affiche ?", "Depuis quand cela arrive-t-il ?", "Quel navigateur utilisez-vous ?"];
+    const tracked = questions.map((text, i) => ({ id: `in:synthetic:q${i + 1}`, text, factKeys: [`key_${i + 1}`] }));
+    const multi: J2Origin = { ...origin, question: undefined, questions: tracked, j2OpenQuestionIds: [tracked[0]!.id, tracked[2]!.id], text: `Bonjour,\n\n${questions.map(q => `- ${q}`).join("\n")}` };
+    const text = j2ReminderText(multi, on);
+    expect(text).toContain(`pour vous demander quelques précisions :\n• ${questions[0]}\n• ${questions[2]}\n`);
+    expect(text).not.toContain(questions[1]);
+    expect(text.match(/^• /gm)).toHaveLength(2);
+    expectFormat(text);
+    for (const j2OpenQuestionIds of [undefined, [], ["unknown"]]) expect(j2ReminderText({ ...multi, j2OpenQuestionIds }, on)).toBe(J2_REMINDER_TEXT);
   });
   it("preserves several exact questions sent in one paragraph", () => {
     const sent = "Quel message s’affiche ? Depuis quand cela arrive-t-il ? Quel navigateur utilisez-vous ?";

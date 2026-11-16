@@ -21,7 +21,8 @@ import { revalidateJ2Timer } from "./timer-store";
 export const J2_REMINDER_TEXT = prepareCaseReplyText("Bonjour,\n\nNous revenons vers vous au sujet de notre précédent message. Avez-vous pu consulter notre demande ou essayer la procédure proposée ? Vous pouvez nous répondre dans ce fil pour poursuivre votre accompagnement.", "fr", "automated", "reminder");
 
 /** Context is read from the stored inbound and the hash-verified accepted analysis, never the mail subject or a model. */
-export type J2Origin = CaseReplyProposal & { j2Context?: { receivedAt: string; subject: string } };
+/** `j2OpenQuestionIds`: the tracked questions of the sent mail still without an answer on the case (read with the origin); absent = not known, so neutral. */
+export type J2Origin = CaseReplyProposal & { j2Context?: { receivedAt: string; subject: string }; j2OpenQuestionIds?: readonly string[] };
 
 /** Copy complete, unambiguous lists only. No paraphrase, truncation or fact-key-to-question translation. */
 export function j2ReminderText(origin: J2Origin, env: Record<string, string | undefined>): string {
@@ -32,22 +33,26 @@ export function j2ReminderText(origin: J2Origin, env: Record<string, string | un
     .some(problem => problem.code !== "access_link_missing")) return J2_REMINDER_TEXT;
   const body = caseReplyEditableBody(origin.text);
   let recall: string | null = null;
-  const tracked = caseReplyQuestions(origin).map(question => question.text);
-  if (origin.purpose === "question" && tracked.length && tracked.every(Boolean)) {
+  const tracked = caseReplyQuestions(origin);
+  const open = new Set(origin.j2OpenQuestionIds ?? []);
+  if (origin.purpose === "question" && tracked.length && tracked.every(question => question.text) && origin.j2OpenQuestionIds && open.size
+      && new Set(tracked.map(question => question.id)).size === tracked.length && [...open].every(id => tracked.some(question => question.id === id))) {
     // Multi-question (#288): EVERY tracked question of this mail must appear in the sent body, in order, and together they must hold ALL the questions sent.
+    // Only the ones still unanswered are recalled: the mail says no reply was received.
     const questions: string[] = [];
     let outside = "", cursor = 0, complete = true;
-    for (const text of tracked) {
+    for (const { id, text } of tracked) {
       const at = body.indexOf(text, cursor);
       const segments = text.match(/[^?]*\?/g) ?? [];
       if (at < 0 || text.slice(segments.join("").length).trim() || /[«»“”"]/u.test(text)) { complete = false; break; }
       outside += body.slice(cursor, at);
       cursor = at + text.length;
-      questions.push(...segments.map(segment => segment.trim().replace(/^(?:[-•] |\d+[.)] )/, "")));
+      questions.push(...segments.map(segment => (open.has(id) ? "" : "\0") + segment.trim().replace(/^(?:[-•] |\d+[.)] )/, "")));
     }
     outside += body.slice(cursor);
-    if (complete && questions.length >= 1 && questions.length <= 5 && questions.every(q => q.endsWith("?") && (q.match(/\?/g) ?? []).length === 1) && !outside.includes("?")) {
-      recall = `pour vous demander quelques précisions :\n${questions.map(q => `• ${q}`).join("\n")}`;
+    const sent = questions.map(q => q.replace(/^\0/, "")), cited = questions.filter(q => !q.startsWith("\0"));
+    if (complete && cited.length && sent.length <= 5 && sent.every(q => q.endsWith("?") && (q.match(/\?/g) ?? []).length === 1) && !outside.includes("?")) {
+      recall = `pour vous demander quelques précisions :\n${cited.map(q => `• ${q}`).join("\n")}`;
     }
   } else if (origin.purpose === "answer") {
     const numbered = body.split("\n").filter(line => /^\d+[.)] /.test(line));
@@ -131,5 +136,15 @@ export async function readJ2Origin(caseId: string, triggerEventId: string, revis
       effect.businessKey !== caseReplyKey(caseId, origin.triggerEventId) || parent.replyKey !== effect.businessKey) return null;
   const sent = decryptSavPayload<CaseReplySendIntent>(effect.intentCiphertext);
   if (sent.kind !== "reply_send" || sent.key !== effect.businessKey || sent.text !== origin.text || sent.recipient !== origin.recipient.trim().toLowerCase() || sent.sourceMessageId !== origin.inboundMessageId || sent.threadId !== payload.context.gmailThreadId) return null;
-  return { ...origin, j2Context: await readJ2Context(origin) };
+  return { ...origin, j2Context: await readJ2Context(origin), j2OpenQuestionIds: await readJ2OpenQuestionIds(origin, timer.questionEffectId) };
+}
+
+/** The case's record of the mail's questions must match what was sent (same ids and texts); otherwise unknown, so neutral. */
+async function readJ2OpenQuestionIds(origin: CaseReplyProposal, effectId: string): Promise<string[] | undefined> {
+  const current = await readCase(origin.caseId);
+  if (!current) return undefined;
+  const recorded = current.body.questions.filter(question => question.askedInEffect === effectId);
+  const tracked = caseReplyQuestions(origin);
+  if (!tracked.length || recorded.length !== tracked.length || tracked.some(question => recorded.filter(r => r.id === question.id && r.text === question.text).length !== 1)) return undefined;
+  return tracked.filter(question => !recorded.find(r => r.id === question.id)!.answeredBy).map(question => question.id);
 }
