@@ -192,16 +192,18 @@ const releaseHold = studioMcpWrite("release_hold", "Lever la pause humaine",
     return result.replayed ? alreadyDone("Pause déjà levée par cette même demande.") : done("Pause levée. Le moteur pourra poursuivre si les preuves et la politique le permettent.");
   });
 const recordChoice = studioMcpWrite("record_choice", "Choisir la fiche, le ticket ou la classification",
-  "Enregistre un choix humain conditionnel sur la version courante : select (contactId et éventuel ticketId parmi les candidats de get_dossier), classify (classification) ou refuse. Le worker revalide les preuves avant toute action.",
+  "Enregistre un choix humain conditionnel sur la version courante : select (ticketId et/ou contactId, chacun parmi les candidats de get_dossier ; un contact déjà identifié par email n’est pas un candidat, choisir alors le ticket seul), classify (classification) ou refuse. Le worker revalide les preuves avant toute action.",
   { ...dossierInput, kind: z.enum(["select", "classify", "refuse"]), contactId: z.string().regex(/^\d{1,30}$/).optional(), ticketId: z.string().regex(/^\d{1,30}$/).optional(),
     classification: z.enum(["support", "finance", "cancellation", "other", "partnership", "commercial", "investor"]).optional(), reason }, async (context, input, claim) => {
     const found = await currentDossier(input); if (!found.ok) return found.result;
     const view = intakeDossierView(found.data), { version } = found;
     if (!intakeDossierActions(found.data, view, context.staff).recordChoice || !version.messageId || !version.runId || !version.version || !version.sourceHash) return unavailable("La correction");
-    if (input.kind === "select" && (!input.contactId || !view.contacts.includes(input.contactId) || input.ticketId && !view.tickets.includes(input.ticketId)))
+    // Same rule as the canonical command: a ticket-only selection is valid (the contact was already resolved by the
+    // email lookup and is not a candidate); any contact or ticket given must be among the candidates read.
+    if (input.kind === "select" && (input.contactId && !view.contacts.includes(input.contactId) || input.ticketId && !view.tickets.includes(input.ticketId)))
       return refused("SAV_MCP_NOT_A_CANDIDATE", "Fiche ou ticket hors des candidats de get_dossier.");
-    if (input.kind !== "select" && (input.contactId || input.ticketId) || (input.kind === "classify") !== Boolean(input.classification))
-      return refused("SAV_MCP_INVALID_INPUT", "select exige contactId ; classify exige classification ; refuse n’accepte ni l’un ni l’autre.");
+    if (input.kind !== "select" && (input.contactId || input.ticketId) || input.kind === "select" && !input.contactId && !input.ticketId || (input.kind === "classify") !== Boolean(input.classification))
+      return refused("SAV_MCP_INVALID_INPUT", "select exige ticketId ou contactId ; classify exige classification ; refuse n’accepte ni l’un ni l’autre.");
     const lost = await claim(); if (lost) return lost;
     const result = await recordIntakeHumanCommand({ commandKey: input.idempotencyKey, threadId: input.threadId, messageId: version.messageId, runId: version.runId,
       version: version.version, sourceHash: version.sourceHash, candidatesHash: intakeRuntimeHash(view.contacts), kind: input.kind,

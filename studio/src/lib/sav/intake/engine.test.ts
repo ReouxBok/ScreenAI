@@ -789,6 +789,13 @@ describe("choosing between plausible tickets after a complete CRM read", () => {
     Reflect.deleteProperty(plan, "progress");
     expect(intakeSelectableTicketIds(plan, ["203"])).toEqual([]);
   });
+  it("resolves a unique email match as identity evidence, so the human choice lists tickets only and no contact candidates", async () => {
+    const f = setup(), undecided = await f.run();
+    expect(undecided.progress).toMatchObject({ kind: "human_choice", questionCode: "equivalent_ticket_choice" });
+    expect(undecided.candidateContactIds).toBeUndefined();
+    expect(undecided.decision.evidence.filter(e => e.source === "crm_contact").map(e => e.sourceId)).toContain("101");
+    expect(intakeSelectableTicketIds(undecided, [])).toEqual(["201", "202"]);
+  });
   it("keeps an incomplete history out of the choice list", async () => {
     const f = setup();
     f.adapters.ticketHistory = async () => ({ ...read([]), status: "partial" });
