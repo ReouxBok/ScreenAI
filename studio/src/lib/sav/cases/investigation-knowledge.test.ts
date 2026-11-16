@@ -156,6 +156,26 @@ describe("B → C draft: the decision in pole C's own proposal shape (SAV-10), v
     expect(caseDecisionDraft("case-1", stored(handoff, reply("Nous transmettons à l'équipe.")), EVENTS)).toMatchObject({ reply: null, replyLimit: "purpose_not_supported" });
   });
 
+  it("terminal messages are opt-in, deterministic and require a checked customer resolution", () => {
+    const env = { SAV_V2_CLOSING_HANDOFF_REPLY: "on" };
+    const action = { kind: "handoff", reason: "diagnosis_out_of_tools", requestIds: ["r1"], report: { need: "Diagnostic", expectedIntervention: "Vérifier", trialIds: [], hypotheses: [], missingInformation: [], knowledge: [], expected: null, observed: null } };
+    expect(caseDecisionDraft("case-1", stored(action), EVENTS)?.reply).toBeNull();
+    const handoff = caseDecisionDraft("case-1", stored(action, reply("Délai garanti https://evil.invalid")), EVENTS, undefined, env)!;
+    expect(handoff).toMatchObject({ reply: { purpose: "handoff", text: "Votre demande est transmise à un conseiller." }, shownSources: [], citations: [] });
+    expect(caseDecisionDraft("case-1", stored({ ...action, reason: "sensitive_request" }), EVENTS, undefined, env)?.reply).toBeNull();
+    for (const family of ["finance", "cancellation", "identity", "rights", "subscription"]) {
+      const sensitive = stored(action, { understanding: { requests: [{ id: "r1", family, status: "open", summary: "Sensible" }], newFacts: [] } });
+      expect(caseDecisionDraft("case-1", sensitive, EVENTS, undefined, env)?.reply).toBeNull();
+    }
+    const resolved = stored({ kind: "confirm_resolution", requestIds: ["r1"], evidence: [] });
+    expect(caseDecisionDraft("case-1", resolved, EVENTS, undefined, env)?.reply).toBeNull();
+    resolved.decision!.closure = { plan: "soft_close", reason: "checked", verdicts: [{ requestId: "r1", verdict: "resolved" }] };
+    expect(caseDecisionDraft("case-1", resolved, EVENTS, undefined, env)?.reply).toMatchObject({ purpose: "closing", text: expect.stringContaining("Merci pour votre confirmation") });
+    expect(caseDecisionDraft("case-1", resolved, [], undefined, env)).toMatchObject({ reply: null, replyLimit: "inbound_unknown" });
+    resolved.decision!.closure = { plan: "no_close_transfer_thanks", reason: "checked", verdicts: [] };
+    expect(caseDecisionDraft("case-1", resolved, EVENTS, undefined, env)?.reply).toBeNull();
+  });
+
   it("an answer becomes C's `answer` reply; one question becomes C's `question` with its fact keys; several questions are not sent", () => {
     expect(caseDecisionDraft("case-1", stored(answer, reply("Bonjour, voici la marche.")), EVENTS)).toMatchObject({ reply: { purpose: "answer", text: "Bonjour, voici la marche." }, citations: [ref] });
     expect(caseDecisionDraft("case-1", stored(ask(["Quelle version utilisez-vous ?"]), reply("Bonjour, quelle version ?")), EVENTS)!.reply).toEqual({ purpose: "question", text: "Bonjour, quelle version ?",

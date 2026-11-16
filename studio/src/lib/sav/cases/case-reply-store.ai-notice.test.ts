@@ -68,6 +68,20 @@ describe("C's store and the UX outbound contract: refused before creation or has
     expect(await submitCaseReplyProposal(s.proposal("   "), deps)).toEqual({ ok: false, code: "proposal_invalid", detail: "text" });
   });
 
+  it("terminal replies refuse arbitrary text and unsafe links, and need durable terminal proof", async () => {
+    const s = await seed(f);
+    const terminalDeps = { ...deps, env: () => ({ ...deps.env(), SAV_V2_CLOSING_HANDOFF_REPLY: "on" }) };
+    for (const purpose of ["closing", "handoff"] as const) {
+      const unsafe = finalizeCaseReplyProposal({ ...s.proposal("Voir https://evil.invalid"), purpose }, { language: "fr", validation: "human" });
+      expect(await submitCaseReplyProposal(unsafe, terminalDeps)).toEqual({ ok: false, code: "proposal_invalid", detail: "terminal_text" });
+      expect(await submitCaseReplyProposal(unsafe, deps)).toEqual({ ok: false, code: "effects_off" });
+      const text = purpose === "closing" ? "Merci pour votre confirmation, nous sommes ravis que le problème soit résolu. Si le problème revient, vous pouvez répondre à ce message." : "Votre demande est transmise à un conseiller.";
+      const fixed = finalizeCaseReplyProposal({ ...unsafe, text }, { language: "fr", validation: "human" });
+      expect(await submitCaseReplyProposal(fixed, terminalDeps)).toMatchObject({ ok: false, code: "not_admitted", detail: "terminal_proof_missing" });
+    }
+    expect(await count(f, s.caseId)).toBe(0);
+  });
+
   it("a finalized proposal is stored as finalized, shown and approved as is; finalizing it again is the same row (same hash, idempotent submit)", async () => {
     for (const language of ["fr", "en"] as const) {
       const s = await seed(f);

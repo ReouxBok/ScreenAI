@@ -1,3 +1,5 @@
+import { CLOSING_REPLY, HANDOFF_REPLY, closingHandoffReplyEnabled } from "./case-terminal-reply";
+import { isSensitiveCaseFamily } from "./decision-contract";
 import type { CaseEvent, KnowledgeRef } from "./case-types";
 import { inboundInteractionId, type CaseReplyProposal } from "./case-effects";
 import type { CaseDecisionProposal } from "./decision-contract";
@@ -61,15 +63,19 @@ export function caseReplyTriggerOf(events: readonly Pick<CaseEvent, "id" | "dire
  * `pilot`: a consumer in the ACCÈS pilot passes the scope in force now (null when it cannot read one).
  */
 export function caseDecisionDraft(caseId: string, stored: CaseInvestigationStoredRecord, events: readonly Pick<CaseEvent, "id" | "direction" | "sourceRef">[],
-  pilot?: { accessScope: CaseAccessScopeStamp | null; blockScopes?: readonly CaseAccessScopeStamp[] | null }): CaseDecisionDraft | null {
+  pilot?: { accessScope: CaseAccessScopeStamp | null; blockScopes?: readonly CaseAccessScopeStamp[] | null }, env: Readonly<Record<string, string | undefined>> = {}): CaseDecisionDraft | null {
   const decision = stored.decision;
   if (!decision || decision.validation.outcome !== "accepted") return null;
   const proposal = decision.validation.decision, action = proposal.nextAction;
   if (action.kind === "observe_only") return null;
   let reply: CaseDecisionReplyDraft | null = null, replyLimit: CaseDecisionDraft["replyLimit"] = null;
   const triggerEventId = caseReplyTriggerOf(events, stored.inputKey);
-  if (!proposal.reply) replyLimit = "no_reply";
-  // C's executor sends a question or an answer; a closing or handoff message waits for its own purpose there.
+  const terminal = closingHandoffReplyEnabled(env) && !decision.actionsPaused && !proposal.understanding.requests.some(row => isSensitiveCaseFamily(row.family));
+  if (terminal && action.kind === "confirm_resolution" && decision.closure?.plan === "soft_close" && decision.closure.reason === "checked")
+    reply = { purpose: "closing", text: CLOSING_REPLY };
+  else if (terminal && action.kind === "handoff" && action.reason !== "sensitive_request") reply = { purpose: "handoff", text: HANDOFF_REPLY };
+  else if (!proposal.reply) replyLimit = "no_reply";
+  // With the terminal switch off, preserve the historical answer/question path.
   else if (action.kind === "answer") {
     const procedures = caseAnswerProcedures(action, decision.coverage);
     reply = { purpose: "answer", text: proposal.reply.text, ...(procedures.length ? { procedures } : {}) };
@@ -101,7 +107,7 @@ export function caseDecisionDraft(caseId: string, stored: CaseInvestigationStore
   }
   return { caseId, inputKey: stored.inputKey, triggerEventId, decidedOn: decision.caseVersion,
     decisionContract: decision.validation.contractRevision, reply, replyLimit, noteText: caseDecisionNoteText(proposal.nextAction, decision.knowledge),
-    citations: proposal.reply ? [...proposal.reply.citations] : [], shownSources: caseShownSources(proposal), decidedWhileActionsPaused: decision.actionsPaused, ...(stamp ? { accessScope: stamp } : {}),
+    citations: reply && (reply.purpose === "closing" || reply.purpose === "handoff") ? [] : proposal.reply ? [...proposal.reply.citations] : [], shownSources: reply && (reply.purpose === "closing" || reply.purpose === "handoff") ? [] : caseShownSources(proposal), decidedWhileActionsPaused: decision.actionsPaused, ...(stamp ? { accessScope: stamp } : {}),
     ...(blockStamps ? { blockScopes: blockStamps } : {}) };
 }
 

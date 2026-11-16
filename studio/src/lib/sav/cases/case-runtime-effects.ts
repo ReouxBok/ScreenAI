@@ -8,6 +8,7 @@
 //   describeCaseReplyForReview  the UX read model, behind an access check that runs BEFORE anything is decrypted
 // This file never writes a validation, never decides, never sends, never marks, never resets a counter.
 import "server-only";
+import { isTerminalReply } from "./case-terminal-reply";
 import { and, asc, eq, gte, inArray, isNotNull, isNull, lte, notExists, notInArray, notLike, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savCaseEffectExecutions, savCases, savIntakeEffects, savMessages } from "@/db/schema";
@@ -161,6 +162,7 @@ async function summaryNoteGranted(policy: Readonly<{ id: string; hash: string }>
 
 /** The reply's summary note as sealed at queue time: families of the case's requests (the open ones, else all) and the reply's purpose. Null when unbuildable. */
 async function caseReplySummaryNote(caseId: string, proposal: CaseReplyProposal, decidedAt: Date): Promise<CaseEffectNote | null> {
+  if (isTerminalReply(proposal.purpose)) return null; // The closure/handoff execution owns its internal note.
   const interactionId = caseReplySummaryInteractionId(proposal.triggerEventId);
   if (!/^[A-Za-z0-9._@<>=+:-]{1,200}$/.test(interactionId)) return null;
   const snapshot = await readCase(caseId);
