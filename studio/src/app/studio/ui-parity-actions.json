@@ -97,6 +97,9 @@
    "saveIntakeChoice",
    "releaseIntakeHumanHoldAction"
   ],
+  "app/studio/sav/blocs/assistant/actions.ts": [
+   "saveBlockBriefAction"
+  ],
   "app/studio/sav/intake/agents/actions.ts": [
    "createAgentKeyAction",
    "revokeAgentKeyAction"
@@ -168,6 +171,11 @@
   "app/studio/sav/intake/blocks/actions.ts": {
    "action": null,
    "lib": "lib/sav/cases/block-switch-admin.ts setSavBlockSwitch: savBlockSwitchAdministrator() (executionAdministrator) before parsing or writing",
+   "roles": "admin or owner with SAV access"
+  },
+  "app/studio/sav/blocs/assistant/actions.ts": {
+   "action": "savBlockBuilderAdministrator()",
+   "lib": "lib/sav/blocks/block-builder-admin.ts saveSavBlockBuilder: administrator check before any write (sync_state and auditLogs only)",
    "roles": "admin or owner with SAV access"
   }
  }
