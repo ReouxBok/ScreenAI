@@ -201,7 +201,10 @@ class LimovaVoiceSession {
       if (lifecycleId !== this.lifecycleId) return;
       if (!tokenData?.ok || !tokenData.token) {
         if (tokenData?.consentRequired) this.emit('limova-voice-consent-required');
-        throw new Error(tokenData?.error || 'Jeton vocal indisponible.');
+        const error = new Error(tokenData?.error || 'Jeton vocal indisponible.');
+        error.voiceDiagnosticCode = /^[A-Z][A-Z0-9_]{2,79}$/.test(tokenData?.code || '')
+          ? tokenData.code : tokenData?.consentRequired ? 'VOICE_CONSENT_REQUIRED' : 'VOICE_TOKEN_UNAVAILABLE';
+        throw error;
       }
       this.tokenData = tokenData;
       this.lastContextVersion = Number(tokenData.contextVersion || 0);
@@ -221,7 +224,9 @@ class LimovaVoiceSession {
         ? String(error.voiceErrorKey).replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase()
         : 'VOICE_SESSION_FAILED');
       this.diagnostic(diagnosticCode, { name: error.name, message: error.message });
-      this.trackEvent('voice_session_failed', { code: diagnosticCode });
+      if (diagnosticCode !== 'VOICE_MIC_DISMISSED' && diagnosticCode !== 'VOICE_CONSENT_REQUIRED') {
+        this.trackEvent('voice_session_failed', { code: diagnosticCode });
+      }
       this.stop(false, 'error');
       this.emit('limova-voice-status', {
         status: 'error',
@@ -357,6 +362,17 @@ class LimovaVoiceSession {
       const cancelSetup = () => failSetup(new Error('Session vocale annulée.'), 'LIVE_SETUP_CANCELLED');
       this.cancelSocketSetup = cancelSetup;
       const isCurrent = () => lifecycleId === this.lifecycleId && socket === this.socket;
+      const failConnection = (error, code, data = {}) => {
+        if (!isCurrent()) return;
+        if (!setupSettled) {
+          failSetup(error, code, data);
+          return;
+        }
+        if (!this.ready) return;
+        this.diagnostic(code, data);
+        this.stop(false, 'error');
+        this.emit('limova-voice-status', { status: 'error', error: error.message });
+      };
       const timeout = setTimeout(() => failSetup(
         new Error('Connexion vocale expirée.'),
         'LIVE_SETUP_TIMEOUT',
@@ -396,7 +412,7 @@ class LimovaVoiceSession {
         try {
           raw = await this.decodeSocketData(event.data);
         } catch (cause) {
-          failSetup(new Error('Réponse vocale illisible.'), 'LIVE_WS_FRAME_DECODE_FAILED', {
+          failConnection(new Error('Réponse vocale illisible.'), 'LIVE_WS_FRAME_DECODE_FAILED', {
             ...frame,
             name: cause?.name || 'Error'
           });
@@ -407,7 +423,7 @@ class LimovaVoiceSession {
         try {
           message = JSON.parse(raw);
         } catch (_) {
-          failSetup(new Error('Réponse vocale invalide.'), 'LIVE_WS_FRAME_PARSE_FAILED', frame);
+          failConnection(new Error('Réponse vocale invalide.'), 'LIVE_WS_FRAME_PARSE_FAILED', frame);
           return;
         }
         const keys = Object.keys(message).slice(0, 12);
@@ -420,7 +436,7 @@ class LimovaVoiceSession {
         }
         if (message.error) {
           const error = new Error('Gemini Live a refusé la session vocale.');
-          failSetup(error, 'LIVE_SERVER_ERROR', {
+          failConnection(error, 'LIVE_SERVER_ERROR', {
             serverCode: Number(message.error.code || 0),
             serverStatus: String(message.error.status || 'unknown').slice(0, 80)
           });
@@ -447,10 +463,14 @@ class LimovaVoiceSession {
         clearTimeout(timeout);
         this.diagnostic('LIVE_WS_CLOSED', { code: event.code, clean: event.wasClean, reasonLength: String(event.reason || '').length });
         if (!isCurrent()) return;
+        const wasReady = this.ready;
         failSetup(new Error('Connexion vocale fermée.'), 'LIVE_SETUP_CLOSED');
         const wasActive = this.active;
         this.socket = null;
         this.ready = false;
+        // start() or reconnect() owns a failed setup and must finish its catch
+        // before stop() changes the lifecycle and invalidates that handler.
+        if (!wasReady) return;
         const tokenStillValid = new Date(this.tokenData?.expiresAt || 0).getTime() > Date.now();
         const unexpectedClose = !event.wasClean || ![1000, 1001].includes(event.code);
         if (unexpectedClose && wasActive && tokenStillValid && this.reconnectAttempts < 1) {
@@ -462,8 +482,8 @@ class LimovaVoiceSession {
           }, 500);
           return;
         }
-        this.stop(false, event.wasClean ? 'other' : 'error');
-        if (wasActive) this.emit('limova-voice-status', { status: event.wasClean ? 'stopped' : 'error' });
+        this.stop(false, unexpectedClose ? 'error' : 'other');
+        if (wasActive) this.emit('limova-voice-status', { status: unexpectedClose ? 'error' : 'stopped' });
       });
     });
   }
@@ -754,9 +774,10 @@ class LimovaVoiceSession {
           type: 'VOICE_KB_SEARCH',
           query: call.args.query
         }).catch(() => ({ ok: false, error: 'La documentation Limova est indisponible.' }));
-        this.diagnostic(result?.ok ? 'VOICE_KB_SEARCH_SUCCEEDED' : 'VOICE_KB_SEARCH_FAILED', {
+        this.diagnostic(result?.ok ? 'VOICE_KB_SEARCH_SUCCEEDED' : result?.status === 'not_found' ? 'VOICE_KB_SEARCH_NO_RESULTS' : 'VOICE_KB_SEARCH_FAILED', {
           queryLength: call.args.query.length,
-          resultCharacters: String(result?.knowledge || '').length
+          resultCharacters: String(result?.knowledge || '').length,
+          ...(!result?.ok && result?.failureCode ? { failureCode: result.failureCode } : {})
         });
       } else if ((call.name === 'fill_field' || call.name === 'type_text_into_page')
         && Number.isInteger(call.args?.elementId)
@@ -772,7 +793,7 @@ class LimovaVoiceSession {
           elementId: call.args.elementId,
           characterCount: call.args.text.length,
           clarificationRequired: Boolean(result?.clarificationRequired),
-          failureCode: result?.ok ? null : String(result?.failureCode || 'field_operation_failed').slice(0, 80),
+          failureCode: result?.ok ? null : String(result?.failureCode || 'field_unavailable').slice(0, 80),
           contextVersion: Number(result?.contextVersion || call.args?.contextVersion || 0),
           retryWithFreshContext: Boolean(result?.retryWithFreshContext)
         });
@@ -858,6 +879,8 @@ class LimovaVoiceSession {
             ? 'unexpected'
             : result?.ok
               ? 'ok'
+            : result?.status === 'not_found'
+              ? 'not_found'
             : result?.clarificationRequired
               ? 'ambiguous'
               : 'blocked',

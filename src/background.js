@@ -69,7 +69,7 @@ const TECHNICAL_ERROR_MESSAGES = [
   [/^(?:PROXY_NETWORK_FAILED|NETWORK_UNAVAILABLE)$/, 'Impossible de joindre le service Limova. Vérifie ta connexion internet puis réessaie.'],
   [/^(?:PROXY_REQUEST_TIMEOUT|REQUEST_TIMEOUT)$/, 'Charly met trop de temps à répondre. Réessaie dans un instant.'],
   [/^(?:GEMINI_HTTP_5XX|PROXY_RATE_LIMITED)$/, 'Le service est momentanément surchargé. Réessaie dans un instant.'],
-  [/^(?:GEMINI_HTTP_\d+|GEMINI_REQUEST_FAILED|UNEXPECTED_ERROR)$/, 'Charly n’a pas pu répondre. Réessaie dans un instant.']
+  [/^(?:GEMINI_HTTP_\d+|GEMINI_REQUEST_FAILED|UNEXPECTED_ERROR|MESSAGE_HANDLER_FAILED|USER_MESSAGE_FAILED|PAGE_ANALYSIS_FAILED|NEXT_STEP_FAILED|INVALID_SERVICE_RESPONSE|COPILOT_ADK_FAILED|COPILOT_INVALID_RESPONSE)$/, 'Charly n’a pas pu répondre. Réessaie dans un instant.']
 ];
 
 function userFacingErrorMessage(error, code) {
@@ -85,6 +85,9 @@ function isCancellation(error) {
 
 function errorCodeOf(error, fallback = 'UNEXPECTED_ERROR') {
   if (typeof error?.code === 'string' && /^[A-Z0-9_]{3,80}$/.test(error.code)) return error.code;
+  if (error?.name === 'TimeoutError') return 'PROXY_REQUEST_TIMEOUT';
+  if (isCancellation(error)) return 'PROXY_REQUEST_ABORTED';
+  if (error?.name === 'SyntaxError') return 'INVALID_SERVICE_RESPONSE';
   const message = String(error?.message || '');
   if (/connecte-toi|non authentifi|session.*expir/i.test(message)) return 'AUTH_SESSION_MISSING';
   if (/microphone|micro\b/i.test(message)) return 'MIC_PERMISSION_FAILED';
@@ -325,8 +328,29 @@ const initializationPromise = loggerInitializationPromise.then(() => Promise.all
 ]));
 
 Logger.onRecord = entry => {
-  if (entry.level === 'ERROR') analytics.trackError(entry.component, entry.code);
+  if (entry.level === 'ERROR') {
+    analytics.trackError(entry.component, entry.code, {
+      errorType: safeErrorType(entry.data?.name),
+      failureReason: safeFailureReason(entry.data?.failureReason || entry.data?.failureCode || entry.data?.reason)
+    });
+  }
 };
+
+const SAFE_ERROR_TYPES = new Set(['Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError', 'AbortError', 'TimeoutError', 'NetworkError', 'NotAllowedError', 'NotFoundError', 'InvalidStateError', 'SecurityError', 'NotReadableError']);
+const SAFE_FAILURE_REASONS = new Set([
+  'framework_reverted_input', 'sensitive_field', 'ambiguous_field', 'unsupported_field_type',
+  'stale_context', 'field_length_limit', 'missing_text', 'content_script_unavailable', 'field_unavailable', 'text_input_retry_failed',
+  'no_relevant_article', 'knowledge_unavailable',
+  'tab_closed', 'pdf_document', 'restricted_browser_page', 'host_permission_denied', 'navigation_race', 'injection_failed'
+]);
+
+function safeErrorType(value) {
+  return SAFE_ERROR_TYPES.has(value) ? value : null;
+}
+
+function safeFailureReason(value) {
+  return SAFE_FAILURE_REASONS.has(value) ? value : null;
+}
 
 globalThis.addEventListener?.('unhandledrejection', event => {
   Logger.error('service_worker', 'Unhandled promise rejection', event.reason, 'UNHANDLED_REJECTION');
@@ -713,8 +737,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return false;
   }
   handleMessage(request, sender).then(sendResponse).catch(err => {
-    Logger.error('background', 'Message handler error', err);
-    sendResponse({ error: err.message });
+    const code = errorCodeOf(err, 'MESSAGE_HANDLER_FAILED');
+    if (!isCancellation(err)) Logger.error('background', 'Message handler error', err, code);
+    sendResponse({ ok: false, error: userFacingErrorMessage(err, code), code });
   });
   return true;
 });
@@ -1012,11 +1037,14 @@ function recordClientDiagnostic(request) {
     : 'extension_page';
   const code = String(request.code || 'CLIENT_EVENT').toUpperCase().replace(/[^A-Z0-9_]/g, '_').slice(0, 80);
   const data = request.data || null;
-  const errorCode = /(?:^|_)(?:FAILED|ERROR|TIMEOUT|DENIED|BLOCKED|UNAVAILABLE|INVALID)$/.test(code);
+  const expectedRefusal = code === 'VOICE_TEXT_INPUT_FAILED' && [
+    'sensitive_field', 'ambiguous_field', 'unsupported_field_type', 'missing_text', 'field_length_limit'
+  ].includes(data?.failureCode);
+  const errorCode = !expectedRefusal && /(?:^|_)(?:FAILED|ERROR|TIMEOUT|DENIED|BLOCKED|UNAVAILABLE|INVALID)$/.test(code);
   const warningCode = /(?:^|_)(?:DISMISSED|RETRY|RECOVERY_SCHEDULED|MISMATCH)$/.test(code)
     || (code === 'LIVE_WS_CLOSED' && data?.clean === false);
   Logger.record(
-    errorCode ? 'ERROR' : warningCode ? 'WARN' : 'INFO',
+    errorCode ? 'ERROR' : warningCode || expectedRefusal ? 'WARN' : 'INFO',
     component,
     code,
     code,
@@ -1265,8 +1293,11 @@ async function recordEvaluationEvent(event) {
 
 async function runEvaluatedVoiceTool(toolName, targetLabel, operation) {
   const result = await operation();
+  if (result?.cancelled) return result;
   const status = result?.retryWithFreshContext === true
     ? 'not_found'
+    : result?.status === 'not_found'
+      ? 'not_found'
     : result?.status === 'unexpected'
       ? 'unexpected'
       : result?.ok
@@ -1275,7 +1306,12 @@ async function runEvaluatedVoiceTool(toolName, targetLabel, operation) {
           ? 'ambiguous'
           : 'blocked';
   countVoiceAnalytics('toolsUsed');
-  analytics.track('tool_executed', { tool: toolName, status, channel: 'voice' });
+  const failureReason = safeFailureReason(result?.failureCode);
+  analytics.track('tool_executed', {
+    tool: toolName, status, channel: 'voice',
+    ...(failureReason ? { failure_reason: failureReason } : {}),
+    ...(result?.retryWithFreshContext ? { recovery_requested: true } : {})
+  });
   if (evaluationState.active) {
     await recordEvaluationEvent({
       kind: 'tool_result',
@@ -1539,14 +1575,16 @@ async function runUserMessage(text) {
   const generation = sessionGeneration;
   text = String(text || '').trim().slice(0, 8_000);
   if (!text) return { ok: false, error: 'Message vide.' };
-  rememberUserTurn(text, 'text');
+  const turn = rememberUserTurn(text, 'text');
+  activeAbortController?.abort();
+  const isCurrentTurn = () => generation === sessionGeneration && turn === lastUserTurn;
   if (!(await hasAIProcessingConsent())) {
-    if (generation !== sessionGeneration) return { ok: true };
+    if (!isCurrentTurn()) return { ok: true };
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
   const tab = await getActiveAssistedTab();
-  if (generation !== sessionGeneration) return { ok: true };
+  if (!isCurrentTurn()) return { ok: true };
   analytics.track('message_sent', {
     channel: 'text',
     history_length: sessionState.conversationHistory.length,
@@ -1554,6 +1592,7 @@ async function runUserMessage(text) {
     is_limova_page: isLimovaUrl(tab?.url)
   });
   if (tab && isExternalSiteUrl(tab.url)) await ensureContentScript(tab.id).catch(() => false);
+  if (!isCurrentTurn()) return { ok: true };
   if (tab && tab.id !== sessionState.lockedTabId) lockTab(tab.id);
   const operationId = Logger.createOperationId('chat');
 
@@ -1571,10 +1610,10 @@ async function runUserMessage(text) {
     // Initialize onboarding inside the guarded request flow so an expired
     // Limova session produces the same actionable error as every AI request.
     const { limova_onboarding_dismissed } = await chrome.storage.local.get('limova_onboarding_dismissed');
-    if (generation !== sessionGeneration) return { ok: true };
+    if (!isCurrentTurn()) return { ok: true };
     if (!sessionState.onboardingPlan && sessionState.conversationHistory.length === 0 && !limova_onboarding_dismissed) {
       const publishedTemplate = await getPublishedOnboardingTemplate();
-      if (generation !== sessionGeneration) return { ok: true };
+      if (!isCurrentTurn()) return { ok: true };
       sessionState.onboardingPlan = createOnboardingPlan(publishedTemplate);
       analytics.track('onboarding_started', onboardingAnalytics(sessionState.onboardingPlan));
       const current = sessionState.onboardingPlan.steps[0];
@@ -1583,7 +1622,7 @@ async function runUserMessage(text) {
       scheduleSave();
     }
     const copilot = await getCopilotBootstrap(false).catch(() => null);
-    if (generation !== sessionGeneration) return { ok: true };
+    if (!isCurrentTurn()) return { ok: true };
     if (copilot?.sessionId && !sessionState.remoteSessionId) {
       sessionState.remoteSessionId = copilot.sessionId;
       scheduleSave();
@@ -1594,13 +1633,14 @@ async function runUserMessage(text) {
 
     if (tab) {
       pageContext = await getPageContext(tab.id);
-      if (generation !== sessionGeneration) return { ok: true };
+      if (!isCurrentTurn()) return { ok: true };
       if (!copilot?.serverOrchestration) {
         pageAnalysis = await capturePageAnalysis(tab.id, operationId);
-        if (generation !== sessionGeneration) return { ok: true };
+        if (!isCurrentTurn()) return { ok: true };
         consoleLogs = await getConsoleLogs(tab.id);
       }
     }
+    if (!isCurrentTurn()) return { ok: true };
 
     if (copilot?.serverOrchestration) {
       await sendToCopilotV2({
@@ -1624,12 +1664,12 @@ async function runUserMessage(text) {
       _sessionGeneration: generation
     });
   } catch (error) {
-    if (generation !== sessionGeneration) return { ok: true };
+    if (!isCurrentTurn()) return { ok: true };
     if (isCancellation(error)) {
       Logger.event('background', 'USER_MESSAGE_SUPERSEDED', null, operationId);
       return { ok: true };
     }
-    const code = errorCodeOf(error);
+    const code = errorCodeOf(error, 'USER_MESSAGE_FAILED');
     analytics.track('assistant_failed', { trigger: 'user_message', error_code: code });
     Logger.error('background', 'User message handling failed', error, code, operationId);
     broadcastToSidebar({ type: 'ERROR', content: userFacingErrorMessage(error, code), code });
@@ -1710,6 +1750,10 @@ async function handleTakeScreenshot() {
     });
   } catch (error) {
     if (generation !== sessionGeneration) return { ok: true };
+    if (isCancellation(error)) {
+      Logger.event('background', 'PAGE_ANALYSIS_CANCELLED', null, operationId);
+      return { ok: true };
+    }
     const code = errorCodeOf(error, 'PAGE_ANALYSIS_FAILED');
     analytics.track('assistant_failed', { trigger: 'page_analysis_button', error_code: code });
     Logger.error('background', 'Page analysis failed', error, code, operationId);
@@ -1753,6 +1797,10 @@ async function handleNextStep() {
     });
   } catch (error) {
     if (generation !== sessionGeneration) return { ok: true };
+    if (isCancellation(error)) {
+      Logger.event('background', 'NEXT_STEP_CANCELLED', null, operationId);
+      return { ok: true };
+    }
     const code = errorCodeOf(error, 'NEXT_STEP_FAILED');
     analytics.track('assistant_failed', { trigger: 'next_step', error_code: code });
     Logger.error('background', 'Next step failed', error, code, operationId);
@@ -1828,7 +1876,7 @@ async function handleModalDetected(sender, modal = {}) {
       _sessionGeneration: generation
     });
   } catch (error) {
-    if (generation !== sessionGeneration) return { ok: true };
+    if (generation !== sessionGeneration || isCancellation(error)) return { ok: true };
     Logger.error('background', 'Modal detection handling failed', error, errorCodeOf(error, 'MODAL_ANALYSIS_FAILED'), operationId);
   }
 
@@ -1886,7 +1934,9 @@ function normalizedCopilotStatus(result) {
   return 'failed';
 }
 
-async function executeCopilotTool(call, userMessage, operationId) {
+async function executeCopilotTool(call, userMessage, operationId, signal) {
+  const operation = { ...captureVoiceOperation(), signal };
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   const args = call?.args || {};
   let result;
   if (!call?.id || typeof call.name !== 'string') {
@@ -1917,12 +1967,13 @@ async function executeCopilotTool(call, userMessage, operationId) {
     result = await proposeOrExecuteAction(Number(args.elementId), userMessage, {
       toolExplicitRequest: call.name === 'click_element' && args.explicitRequest === true,
       targetLabel: args.targetLabel,
-      requestedContextVersion: requestedVersion
+      requestedContextVersion: requestedVersion,
+      operation
     });
   } else if (call.name === 'fill_field') {
-    result = await typeVoiceText(Number(args.elementId), String(args.text || ''), requestedVersion, args.targetLabel);
+    result = await typeVoiceText(Number(args.elementId), String(args.text || ''), requestedVersion, args.targetLabel, operation);
   } else if (call.name === 'scroll_page') {
-    result = await scrollVoicePage(args.direction, args.amount, args.elementId, args.contextVersion);
+    result = await scrollVoicePage(args.direction, args.amount, args.elementId, args.contextVersion, operation);
   } else if (call.name === 'verify_expected_result') {
     const page = await currentCopilotPage(null);
     return {
@@ -1936,6 +1987,7 @@ async function executeCopilotTool(call, userMessage, operationId) {
     return { callId: call.id, status: 'failed', contextVersion: pageContextVersion, message: 'Outil non pris en charge.' };
   }
 
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   const status = result?.status === 'unexpected' ? 'unexpected' : normalizedCopilotStatus(result);
   let pageContext = result?.pageContext || '';
   if (!pageContext && sessionState.lockedTabId) pageContext = await getPageContext(sessionState.lockedTabId).catch(() => '');
@@ -1966,9 +2018,11 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
   activeAbortController = controller;
   const sessionId = await ensureRemoteCopilotSession(generation, controller.signal);
   if (generation !== sessionGeneration) return;
+  controller.signal.throwIfAborted();
   const idempotencyKey = `${operationId || 'text'}:${userTurnSequence}`;
   const page = await currentCopilotPage(tab, pageContext);
   if (generation !== sessionGeneration) return;
+  controller.signal.throwIfAborted();
   let response = await authorizedProxyFetch('/api/copilot/v2/turn', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1996,6 +2050,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
     signal: controller.signal
   });
   if (generation !== sessionGeneration) return;
+  controller.signal.throwIfAborted();
   if ([404, 409, 503].includes(response.status)) {
     copilotBootstrapCache = null;
     copilotBootstrapCacheExpiresAt = 0;
@@ -2003,6 +2058,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
     const fallbackCapture = tab?.id ? await capturePageAnalysis(tab.id, operationId) : null;
     if (generation !== sessionGeneration) return;
     const consoleLogs = tab?.id ? await getConsoleLogs(tab.id) : '';
+    controller.signal.throwIfAborted();
     return sendToGemini({
       pageAnalysis: fallbackCapture,
       url: privacySafeUrl(tab?.url),
@@ -2017,6 +2073,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
   }
   let data = await response.json().catch(() => ({}));
   if (generation !== sessionGeneration) return;
+  controller.signal.throwIfAborted();
   if (!response.ok) throw codedError('COPILOT_ADK_FAILED', data.error || 'Charly est temporairement indisponible.');
   let actionCount = 0;
   const presenceTabId = tab?.id || sessionState.lockedTabId;
@@ -2025,8 +2082,10 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
       actionCount += 1;
       if (actionCount > 6) throw codedError('COPILOT_ACTION_LIMIT', 'Charly s’est arrêtée pour éviter une boucle d’actions.');
       if (PAGE_ACTION_TOOLS.has(data.call?.name)) await showAgentPresence(presenceTabId);
-      const result = await executeCopilotTool(data.call, userMessage, operationId);
+      controller.signal.throwIfAborted();
+      const result = await executeCopilotTool(data.call, userMessage, operationId, controller.signal);
       if (generation !== sessionGeneration) return;
+      controller.signal.throwIfAborted();
       analytics.track('tool_executed', { tool: String(data.call?.name || 'unknown'), status: result.status, channel: 'text' });
       if (evaluationState.active) await recordEvaluationEvent({
         kind: 'tool_result',
@@ -2045,6 +2104,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
       });
       data = await response.json().catch(() => ({}));
       if (generation !== sessionGeneration) return;
+      controller.signal.throwIfAborted();
       if (!response.ok) throw codedError(response.status === 410 ? 'COPILOT_RUN_EXPIRED' : 'COPILOT_RUN_FAILED', data.error || 'L’action de Charly a expiré. Réessaie.');
     }
   } finally {
@@ -2052,8 +2112,10 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
   }
   if (data.type !== 'message' || typeof data.content !== 'string') throw codedError('COPILOT_INVALID_RESPONSE', 'Réponse Charly invalide.');
   const content = data.content.trim();
+  if (!content) throw codedError('COPILOT_INVALID_RESPONSE', 'Charly n’a pas reçu de réponse. Réessaie dans un instant.');
   if (evaluationState.active) await recordEvaluationEvent({ kind: 'response', status: 'ok', contextVersion: page.contextVersion });
   if (generation !== sessionGeneration) return;
+  controller.signal.throwIfAborted();
   sessionState.conversationHistory.push({ role: 'user', content: userMessage });
   sessionState.conversationHistory.push({ role: 'assistant', content });
   if (sessionState.conversationHistory.length > CONVERSATION_HISTORY_MAX_MESSAGES) {
@@ -2087,7 +2149,7 @@ async function sendToGemini({
   if (generation !== sessionGeneration) return;
   url = privacySafeUrl(url);
   const now = Date.now();
-  if (now - sessionState.lastAnalysisTime < MIN_API_INTERVAL) {
+  if (trigger === 'url_change' && now - sessionState.lastAnalysisTime < MIN_API_INTERVAL) {
     Logger.warn('background', 'API call rate limited');
     broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
     return;
@@ -2116,6 +2178,7 @@ async function sendToGemini({
       consoleLogs: consoleLogs || '',
       maxResults: 5,
       maxChars: 8000,
+      signal: controller.signal,
     });
     if (kbResults) {
       kbContext = (kbContext ? kbContext + '\n\n' : '') +
@@ -2123,6 +2186,7 @@ async function sendToGemini({
     }
   }
   if (generation !== sessionGeneration) return;
+  controller.signal.throwIfAborted();
 
   const systemPrompt = buildSystemPrompt({
     onboardingDocs: kbContext || null,
@@ -2202,6 +2266,7 @@ async function sendToGemini({
       signal: controller.signal
     });
     if (generation !== sessionGeneration) return;
+    controller.signal.throwIfAborted();
 
     if (!response.ok) {
       // Retry on 429 (rate limit) or 503 (high demand) — up to 2 retries
@@ -2211,6 +2276,7 @@ async function sendToGemini({
         broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'analyzing', text: 'Charly réfléchit...' });
         await new Promise(r => setTimeout(r, delay));
         if (generation !== sessionGeneration) return;
+        controller.signal.throwIfAborted();
         return sendToGemini({
           pageAnalysis,
           url,
@@ -2244,6 +2310,7 @@ async function sendToGemini({
 
     const json = await response.json();
     if (generation !== sessionGeneration) return;
+    controller.signal.throwIfAborted();
 
     // A voice session may have started while the legacy request was already
     // returning. Do not let that stale response speak, mutate history or click
@@ -2258,13 +2325,15 @@ async function sendToGemini({
 
     if (!json.candidates?.length) {
       if (json.promptFeedback?.blockReason) {
-        throw new Error(`Requête bloquée : ${json.promptFeedback.blockReason}`);
+        throw codedError('GEMINI_RESPONSE_BLOCKED', 'Charly ne peut pas répondre à cette demande. Essaie de la reformuler.');
       }
-      throw new Error('Pas de réponse de Gemini.');
+      throw codedError('GEMINI_EMPTY_RESPONSE', 'Charly n’a pas reçu de réponse. Réessaie dans un instant.');
     }
 
-    const responseText = json.candidates[0]?.content?.parts?.[0]?.text || '';
-    if (!responseText) throw new Error('Réponse vide de Gemini.');
+    const responseText = (json.candidates[0]?.content?.parts || [])
+      .filter(part => typeof part.text === 'string' && part.thought !== true)
+      .map(part => part.text).join('\n').trim();
+    if (!responseText) throw codedError('GEMINI_EMPTY_RESPONSE', 'Charly n’a pas reçu de réponse. Réessaie dans un instant.');
 
     const responseTime = Date.now() - startTime;
     Logger.logApiResponse({ success: true, status: response.status, responseTime, attempt: _retryCount + 1, operationId });
@@ -2371,7 +2440,7 @@ async function sendToGemini({
       Logger.log('background', `Highlight: ${resolvedHighlights.map(command => command.id).join(', ') || 'none'}`);
       resolvedHighlights.forEach((command, i) => {
         setTimeout(() => {
-          if (generation !== sessionGeneration) return;
+          if (generation !== sessionGeneration || controller.signal.aborted) return;
           highlightTabs.add(sessionState.lockedTabId);
           sendContentMessage(sessionState.lockedTabId, {
             type: 'HIGHLIGHT_ELEMENT',
@@ -2384,15 +2453,17 @@ async function sendToGemini({
 
     for (const elementId of actionCommands) {
       if (generation !== sessionGeneration) return;
+      controller.signal.throwIfAborted();
       const command = resolveElementCommand(elementId, _contextVersion, _elementSnapshot, 'action');
-      if (command) await proposeOrExecuteAction(command.id, userMessage || lastUserMessage);
+      if (command) await proposeOrExecuteAction(command.id, userMessage || lastUserMessage, {
+        operation: { generation, tabId: sessionState.lockedTabId, signal: controller.signal }
+      });
     }
 
   } catch (error) {
     if (generation !== sessionGeneration) return;
-    if (error.name === 'AbortError') {
+    if (isCancellation(error)) {
       Logger.log('background', 'API call aborted (superseded)');
-      broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
       return;
     }
     Logger.logApiResponse({
@@ -3599,7 +3670,7 @@ async function authorizedProxyFetch(path, options = {}, retry = true) {
     timedOut = true;
     controller.abort();
   }, timeoutMs);
-  const forwardAbort = () => controller.abort();
+  const forwardAbort = () => controller.abort(options.signal.reason);
   options.signal?.addEventListener?.('abort', forwardAbort, { once: true });
   try {
     response = await fetch(`${PROXY_URL}${path}`, {
@@ -3608,9 +3679,13 @@ async function authorizedProxyFetch(path, options = {}, retry = true) {
       signal: controller.signal
     });
   } catch (cause) {
-    const code = timedOut ? 'PROXY_REQUEST_TIMEOUT' : cause?.name === 'AbortError' ? 'PROXY_REQUEST_ABORTED' : 'PROXY_NETWORK_FAILED';
-    const error = codedError(code, timedOut ? 'Le service Limova met trop de temps à répondre.' : cause?.message || 'Le proxy Limova est indisponible.', cause);
-    Logger.error('proxy', 'Proxy request failed before response', error, error.code, operationId);
+    const deadlineExpired = timedOut || options.signal?.reason?.name === 'TimeoutError' || cause?.name === 'TimeoutError';
+    const cancelled = options.signal?.aborted && !deadlineExpired;
+    const code = deadlineExpired ? 'PROXY_REQUEST_TIMEOUT' : cancelled ? 'PROXY_REQUEST_ABORTED' : 'PROXY_NETWORK_FAILED';
+    const error = codedError(code, deadlineExpired ? 'Le service Limova met trop de temps à répondre.' : cause?.message || 'Le proxy Limova est indisponible.', cause);
+    if (!cancelled) {
+      Logger.error('proxy', 'Proxy request failed before response', error, error.code, operationId);
+    }
     throw error;
   } finally {
     clearTimeout(timeout);
@@ -3974,7 +4049,7 @@ async function searchVoiceKnowledge(rawQuery) {
   if (!(await hasAIProcessingConsent())) return { ok: false, error: 'Consentement IA requis.' };
   const query = String(rawQuery || '').trim().slice(0, 500);
   if (query.length < 2) return { ok: false, error: 'Question trop courte.' };
-  const knowledge = await getKnowledgeContext(query, {
+  const { knowledge, status } = await getKnowledgeSearchResult(query, {
     url: sessionState.lastUrl || '',
     maxResults: 3,
     maxChars: 6_000
@@ -3986,7 +4061,9 @@ async function searchVoiceKnowledge(rawQuery) {
   });
   return knowledge
     ? { ok: true, knowledge }
-    : { ok: false, error: 'Aucun article pertinent trouvé.' };
+    : status === 'not_found'
+      ? { ok: false, status: 'not_found', failureCode: 'no_relevant_article', error: 'Aucun article pertinent trouvé.' }
+      : { ok: false, failureCode: 'knowledge_unavailable', error: 'La documentation Limova est momentanément indisponible.' };
 }
 
 function formatLearnedActionHints(rawHints) {
@@ -4028,32 +4105,51 @@ function formatRemoteKnowledge(results, maxChars) {
 }
 
 async function getKnowledgeContext(rawQuery, options = {}) {
+  return (await getKnowledgeSearchResult(rawQuery, options)).knowledge;
+}
+
+async function getKnowledgeSearchResult(rawQuery, options = {}) {
   const query = String(rawQuery || '').trim().slice(0, 2_000);
   const maxResults = Math.max(1, Math.min(10, Number(options.maxResults) || 5));
   const maxChars = Math.max(500, Math.min(12_000, Number(options.maxChars) || 8_000));
+  let remoteAvailable = false;
   if (query.length >= 2) {
+    options.signal?.throwIfAborted();
+    const deadline = AbortSignal.timeout(8_000);
+    const controller = new AbortController();
+    const forwardDeadline = () => controller.abort(deadline.reason);
+    const forwardCancellation = () => controller.abort(options.signal.reason);
+    deadline.addEventListener('abort', forwardDeadline, { once: true });
+    options.signal?.addEventListener('abort', forwardCancellation, { once: true });
     try {
       const response = await authorizedProxyFetch('/api/knowledge/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query, path: privacySafeUrl(options.url || sessionState.lastUrl || ''), locale: currentLang === 'fr' ? 'fr-FR' : currentLang === 'es' ? 'es-ES' : 'en-US', contentTypes: ['article', 'onboarding'], limit: maxResults }),
-        signal: AbortSignal.timeout(8_000)
+        signal: controller.signal
       });
       if (response.ok) {
         const data = await response.json();
+        remoteAvailable = Array.isArray(data?.results);
         const formatted = formatRemoteKnowledge(data.results, maxChars);
         if (formatted) {
           Logger.event('knowledge', 'REMOTE_KB_SEARCH_SUCCEEDED', { revision: data.revision || null, articleIds: data.results.map(result => result.id), resultCount: data.results.length });
-          return formatted;
+          return { knowledge: formatted, status: 'ok' };
         }
       }
-      Logger.warn('knowledge', 'Remote knowledge unavailable; embedded fallback used', { status: response.status });
+      if (!remoteAvailable) Logger.warn('knowledge', 'Remote knowledge unavailable; embedded fallback used', { status: response.status }, 'REMOTE_KB_UNAVAILABLE');
     } catch (error) {
+      if (options.signal?.aborted) throw options.signal.reason;
       if (String(error?.code || '').startsWith('AUTH_')) throw error;
-      Logger.warn('knowledge', 'Remote knowledge request failed; embedded fallback used', { error: error?.name || 'unknown' });
+      Logger.warn('knowledge', 'Remote knowledge request failed; embedded fallback used', { error: error?.name || 'unknown' }, 'REMOTE_KB_UNAVAILABLE');
+    } finally {
+      deadline.removeEventListener('abort', forwardDeadline);
+      options.signal?.removeEventListener('abort', forwardCancellation);
     }
   }
-  return searchKB(query, { url: options.url || '', consoleLogs: options.consoleLogs || '', maxResults, maxChars });
+  options.signal?.throwIfAborted();
+  const knowledge = searchKB(query, { url: options.url || '', consoleLogs: options.consoleLogs || '', maxResults, maxChars });
+  return { knowledge, status: knowledge ? 'ok' : remoteAvailable ? 'not_found' : 'unavailable' };
 }
 
 async function getPublishedOnboardingTemplate() {
@@ -4084,6 +4180,7 @@ function captureVoiceOperation() {
 
 function isCurrentOperation(operation) {
   return operation.generation === sessionGeneration
+    && !operation.signal?.aborted
     && (operation.voiceGeneration === undefined || operation.voiceGeneration === voiceSessionGeneration)
     && (operation.tabId == null || operation.tabId === sessionState.lockedTabId);
 }
@@ -4448,6 +4545,7 @@ async function typeVoiceText(elementId, rawText, requestedContextVersion, target
   const response = {
     ok: result?.ok === true,
     clarificationRequired: Boolean(result?.clarificationRequired),
+    failureCode: result?.ok === true ? undefined : safeFailureReason(result?.failureCode || textInputFailureCode(result?.error)),
     error: result?.error || (result?.ok === true ? undefined : 'La saisie a été refusée par la page.')
   };
   if (executedElementId !== elementId) {
@@ -5174,12 +5272,33 @@ async function sendContentMessage(tabId, message, allowRepair = true, operation 
           error: 'Le pilote de page a été restauré ; la cible doit être relue avant l’action.'
         };
       }
-      return chrome.tabs.sendMessage(tabId, message);
+      return await chrome.tabs.sendMessage(tabId, message);
     } catch (repairError) {
-      Logger.error('content_script', 'Content script repair failed', repairError, 'CONTENT_SCRIPT_REPAIR_FAILED');
+      if (!isCurrentOperation(operation)) return cancelledOperation();
+      const failureReason = await contentScriptRepairFailureReason(tabId, repairError);
+      if (!isCurrentOperation(operation)) return cancelledOperation();
+      Logger.error('content_script', 'Content script repair failed', {
+        name: repairError?.name || 'Error',
+        message: repairError?.message,
+        stack: repairError?.stack,
+        failureReason
+      }, 'CONTENT_SCRIPT_REPAIR_FAILED');
       throw repairError;
     }
   }
+}
+
+async function contentScriptRepairFailureReason(tabId, error) {
+  const message = String(error?.message || '').toLowerCase();
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) return 'tab_closed';
+  let url;
+  try { url = new URL(tab.url || ''); } catch { return 'navigation_race'; }
+  if (/pdf/.test(message)) return 'pdf_document';
+  if (!isWebPageUrl(url.href)) return 'restricted_browser_page';
+  if (/permission|cannot access contents|host permission/.test(message)) return 'host_permission_denied';
+  if (/frame|navigation|tab was closed|no tab/.test(message)) return 'navigation_race';
+  return 'injection_failed';
 }
 
 async function confirmPendingAction(actionId) {

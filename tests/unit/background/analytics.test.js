@@ -57,6 +57,33 @@ describe('background usage analytics', () => {
     expect(track).not.toHaveBeenCalled();
   });
 
+  it('forwards only known diagnostic categories, without error messages, stacks or URLs', async () => {
+    await send({ type: 'DIAGNOSTIC_EVENT', component: 'voice', code: 'TEST_DIAGNOSTIC_FAILED', data: {
+      name: 'TypeError', failureCode: 'framework_reverted_input',
+      message: 'private message', stack: 'private stack', url: 'https://private.example/document'
+    } });
+    expect(tracked('extension_error')).toEqual([{
+      component: 'voice', code: 'TEST_DIAGNOSTIC_FAILED', error_type: 'TypeError', failure_reason: 'framework_reverted_input'
+    }]);
+
+    track.mockClear();
+    await send({ type: 'DIAGNOSTIC_EVENT', component: 'voice', code: 'UNKNOWN_DETAILS_FAILED', data: {
+      name: 'private custom name', failureCode: 'private arbitrary text'
+    } });
+    expect(tracked('extension_error')).toEqual([{ component: 'voice', code: 'UNKNOWN_DETAILS_FAILED' }]);
+  });
+
+  it('keeps deliberate field restrictions and ambiguity out of technical error counts', async () => {
+    for (const failureCode of ['sensitive_field', 'ambiguous_field', 'missing_text']) {
+      await send({ type: 'DIAGNOSTIC_EVENT', component: 'voice', code: 'VOICE_TEXT_INPUT_FAILED', data: { failureCode } });
+    }
+    expect(tracked('extension_error')).toEqual([]);
+    await send({ type: 'DIAGNOSTIC_EVENT', component: 'voice', code: 'VOICE_TEXT_INPUT_FAILED', data: {
+      failureCode: 'framework_reverted_input'
+    } });
+    expect(tracked('extension_error')).toEqual([expect.objectContaining({ failure_reason: 'framework_reverted_input' })]);
+  });
+
   it('measures a voice session with its turns and end reason', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(Date.parse('2026-10-23T10:00:00Z'));
