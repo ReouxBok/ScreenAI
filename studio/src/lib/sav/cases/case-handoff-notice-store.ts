@@ -29,12 +29,13 @@ import { caseEffectSchemaInstalled } from "./case-effect-recovery";
 import { createHandoffCrmReader, type HandoffCrmReader } from "./case-handoff-crm";
 import { nextSweepPage } from "./case-sweep-cursor";
 import {
-  buildHandoffNoticeIntent, HANDOFF_NOTICE_CONTRACT, HANDOFF_REASON_LABELS, HANDOFF_NOTICE_KEY_PREFIX, awaitingHandoff, staleHandoffEventKinds, handoffNoticeFacts, handoffNoticeKey, handoffNoticeTrigger,
+  buildHandoffNoticeIntent, HANDOFF_NOTICE_CONTRACT, handoffNoteText, HANDOFF_NOTICE_KEY_PREFIX, awaitingHandoff, staleHandoffEventKinds, handoffNoticeFacts, handoffNoticeKey, handoffNoticeTrigger,
   judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, teamPartNoticeTriggers, type HandoffNoticeFacts, type HandoffNoticeTrigger,
 } from "./case-handoff-notice";
 import { createHandoffSlackAdapters, SLACK_NOT_POSTED_PREFIX } from "./case-handoff-slack";
-import { caseHandoffSummaryLines } from "./case-handoff-summary";
+import type { CaseHandoffReceived } from "./case-handoff-summary";
 import { caseReceivedAttachments, type CaseStoredMailBody } from "./investigation-customer-attachments";
+import { caseCustomerOwnText } from "./investigation-customer-context";
 import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, type CaseNoteCreateIntent } from "./case-effect-intents";
 import { caseNoteAssociationKey, caseNoteKey, SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { createIntakeExecutorAdapters } from "../intake/execution-adapters";
@@ -54,14 +55,15 @@ export type HandoffNoticePayload = Readonly<{ contract: typeof HANDOFF_NOTICE_CO
 const ackOf = (effect: Effect) => effect.ackCiphertext ? decryptSavPayload<{ id?: string }>(effect.ackCiphertext) : null;
 const NOTE_KINDS = new Set(["note_create", "note_associate"]);
 
-/** The HubSpot note of a handoff: team-facing, from the sealed synthesis of the stored case (already masked). Null without a synthesis. */
+/**
+ * The HubSpot note of a handoff: team-facing, from the sealed synthesis of the stored case (already masked). Undefined without a synthesis.
+ * SAV-92 (Ugo 16/11): a short narrative (`handoffNoteText`), no longer the structured list. Same single note, same `interactionId` (hence the same
+ * business keys and the same `[Studio intake: …]` marker the HubSpot verification and the reconciliation rely on); the text is sealed at admission.
+ */
 export function handoffNoteOf(facts: HandoffNoticeFacts, at: string): HandoffNoticePayload["note"] | undefined {
   if (!facts.summary) return undefined;
   const interactionId = `handoff:${createHash("sha256").update(facts.inputKey).digest("hex").slice(0, 32)}`;
-  const text = ["Transfert à l'équipe SAV (agent V2)", `Demande : ${facts.need || "non précisée"}`,
-    ...caseHandoffSummaryLines(facts.summary, HANDOFF_REASON_LABELS[facts.reason]),
-    `Prochaine action proposée : ${facts.expectedIntervention || "à définir par l'équipe"}`].join("\n");
-  return { interactionId, text, at };
+  return { interactionId, text: handoffNoteText({ ...facts, summary: facts.summary }), at };
 }
 const payloadOf = (row: typeof savCaseEffectExecutions.$inferSelect) => decryptSavPayload<HandoffNoticePayload>(row.payloadCiphertext);
 const effectIntent = (effect: Effect) => decryptSavPayload<EffectIntent>(effect.intentCiphertext);
@@ -83,13 +85,18 @@ async function readJournal(caseId: string) {
   return events;
 }
 
-/** SAV-92 (15/11): the files received on the case's last stored customer mails (names masked, type, size), read only; null when unreadable. */
-async function readReceivedAttachments(threadIds: readonly string[]) {
+/**
+ * SAV-92 (15/11): the files received on the case's last stored customer mails (names masked, type, size), read only; null when unreadable.
+ * SAV-92 (16/11): and the customer's OWN text of those mails (quoted history and our replies left out), only scanned for links by the synthesis (never sealed).
+ */
+async function readReceivedAttachments(threadIds: readonly string[]): Promise<CaseHandoffReceived | null> {
   if (!threadIds.length) return null;
   try {
     const rows = await requireDb().select({ body: savMessages.bodyCiphertext }).from(savMessages)
       .where(and(inArray(savMessages.threadId, [...threadIds]), eq(savMessages.direction, "inbound"))).orderBy(sql`${savMessages.receivedAt} desc`).limit(10);
-    return caseReceivedAttachments(rows.map(row => { try { return decryptSavPayload<CaseStoredMailBody>(row.body); } catch { return null; } }));
+    const bodies = rows.map(row => { try { return decryptSavPayload<CaseStoredMailBody>(row.body); } catch { return null; } });
+    const linkTexts = bodies.flatMap(body => { try { return typeof body?.text === "string" ? [caseCustomerOwnText(body.text)] : []; } catch { return []; } });
+    return { ...caseReceivedAttachments(bodies), ...(linkTexts.length ? { linkTexts } : {}) };
   } catch { return null; }
 }
 
