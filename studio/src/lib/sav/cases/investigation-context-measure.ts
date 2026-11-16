@@ -1,4 +1,4 @@
-import { caseDecisionBodyBreakdown } from "./investigation-context-budget";
+import { caseDecisionBodyBreakdown, caseGeminiDecisionWire } from "./investigation-context-budget";
 import { caseDecisionGenerationConfig, type CaseDecisionGeneration } from "./investigation-decision-generation";
 import { caseDecisionProviderSchema, caseInvestigationPrompt } from "./investigation-v2-providers";
 import type { CaseInvestigationModelRequest } from "./investigation-runner";
@@ -12,7 +12,7 @@ import type { CaseInvestigationModelRequest } from "./investigation-runner";
 
 export type CaseContextFixtureCard = Readonly<{
   id?: string; knowledgeId?: string; itemId?: string; contentVersionId?: string; versionId?: string; title?: string;
-  content?: string; bodyMarkdown?: string; resolution?: unknown; metadata?: { resolution?: unknown };
+  content?: string; bodyMarkdown?: string; source?: string; resolution?: unknown; metadata?: { resolution?: unknown };
 }>;
 export type CaseContextFixture = Readonly<{
   maxInputBytes?: number; maxOutputTokens?: number;
@@ -27,11 +27,11 @@ const SENT_CONTENT_CHARACTERS = 6_000; // the decision prompt's existing cut (`c
  * SAV-92 idée 3: `generation` measures the body as it would be sent with the V2 flags (`SAV_V2_STRUCTURED_OUTPUT=on` adds the provider schema,
  * `SAV_V2_THINKING_DECISION` the thinking config). Absent: today's body, the exact previous measure.
  */
-export function measureCaseContextFixture(fixture: CaseContextFixture, generation: Partial<CaseDecisionGeneration> = {}) {
+export function measureCaseContextFixture(fixture: CaseContextFixture, generation: Partial<CaseDecisionGeneration> & { compact?: boolean } = {}) {
   const maxInputBytes = fixture.maxInputBytes ?? 26_000, maxOutputTokens = fixture.maxOutputTokens ?? 4_096;
   const cards = fixture.cards.map((row, index) => ({
     id: String(row.id ?? row.knowledgeId ?? row.itemId ?? `card-${index}`), contentVersionId: String(row.contentVersionId ?? row.versionId ?? `card-${index}-v`),
-    title: String(row.title ?? ""), content: String(row.content ?? row.bodyMarkdown ?? ""), resolution: (row.resolution ?? row.metadata?.resolution ?? null) as never,
+    title: String(row.title ?? ""), source: row.source, content: String(row.content ?? row.bodyMarkdown ?? ""), resolution: (row.resolution ?? row.metadata?.resolution ?? null) as never,
   }));
   const open = (fixture.case?.openRequests ?? [{ id: "r1", status: "open", family: "access", summary: "Demande synthétique." }]) as Array<{ id?: string; family?: string; status?: string }>;
   const version = fixture.case?.version ?? 1;
@@ -41,13 +41,16 @@ export function measureCaseContextFixture(fixture: CaseContextFixture, generatio
     coverage: open.map(row => ({ requestId: String(row.id ?? "r1"), family: row.family ?? "access", status: "covered", knowledge: cards.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId })), limitations: [] })),
   } as unknown as CaseInvestigationModelRequest;
   const wire = caseDecisionGenerationConfig({ structuredOutput: generation.structuredOutput ?? false, thinkingLevel: generation.thinkingLevel ?? null }, () => caseDecisionProviderSchema("decision"));
-  const breakdown = caseDecisionBodyBreakdown(caseInvestigationPrompt(request), maxOutputTokens, false, wire);
+  const prompt = caseInvestigationPrompt(request, generation);
+  const sent = caseGeminiDecisionWire(prompt, maxOutputTokens, maxInputBytes, wire);
+  const totalBytes = Buffer.byteLength(sent.body, "utf8");
+  const breakdown = caseDecisionBodyBreakdown(prompt, maxOutputTokens, sent.compacted, wire);
   const targetBytes = Math.floor(maxInputBytes * SAV_CASE_CONTEXT_TARGET_SHARE);
   const cardsRoomBytes = targetBytes - breakdown.fixedBytes - breakdown.caseBytes;
   const perCard = breakdown.cards.map((row, index) => ({ ...row, title: cards[index]!.title, contentCharacters: [...cards[index]!.content].length,
-    cutAt6000: cards[index]!.content.length > SENT_CONTENT_CHARACTERS }));
-  return { maxInputBytes, targetBytes, fixedBytes: breakdown.fixedBytes, caseBytes: breakdown.caseBytes, knowledgeBytes: breakdown.knowledgeBytes, totalBytes: breakdown.rawBytes,
-    fitsBound: breakdown.rawBytes <= maxInputBytes, fitsTarget: breakdown.rawBytes <= targetBytes, cardsRoomBytes,
+    cutAt6000: !generation.compact && cards[index]!.content.length > SENT_CONTENT_CHARACTERS }));
+  return { maxInputBytes, targetBytes, fixedBytes: breakdown.fixedBytes, caseBytes: breakdown.caseBytes, knowledgeBytes: breakdown.knowledgeBytes, totalBytes, rawBytes: breakdown.rawBytes, compacted: sent.compacted,
+    fitsBound: totalBytes <= maxInputBytes, fitsTarget: totalBytes <= targetBytes, cardsRoomBytes,
     cards: perCard, largestFirst: [...perCard].sort((a, b) => b.bytes - a.bytes).map(row => row.knowledgeId),
     overRoom: perCard.filter(row => row.bytes > cardsRoomBytes).map(row => row.knowledgeId) };
 }

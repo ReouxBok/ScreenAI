@@ -1,10 +1,12 @@
 import "server-only";
+import { readOriginalRequestTicket } from "./original-request-ticket";
+import { intakeWrittenAddresses, savIntakeDeclaredAccount } from "./registration-declaration";
 import { listSavExternalCompletionMessageIds } from "../external-completion";
 import { releaseNeverDispatchedIntakeScopes } from "./execution-store";
 import { intakeRunConfigurationBound } from "./human-binding";
 import { intakeExecutionConfigurationBound } from "./execution-continuity";
 import { createHash } from "node:crypto";
-import { and, eq, inArray, lte, or, sql } from "drizzle-orm";
+import { and, eq, inArray, lte, ne, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savIntakeExecutions, savIntakeExecutionBudget, savIntakeEffects, savIntakeRuns, savMessages, savThreads, savMailboxes, savSyncState } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
@@ -31,7 +33,7 @@ export function requiredExecutionKinds(payload: ExecutionPayload): EffectKind[] 
         return ["identity_send"];
     if (d.kind !== "ticket")
         return [];
-    return [...(d.target.operation === "create" ? ["ticket_create" as const] : []), ...(payload.plan.noteText ? ["note_create" as const, "note_associate" as const] : []), "email_create", "email_associate", ...(d.target.operation === "reopen" || d.target.operation === "link" && !d.target.alreadyNew ? ["stage_new" as const] : [])];
+    return [...(d.target.operation === "create" ? ["ticket_create" as const] : []), ...(payload.plan.noteText || payload.originalRequestTicket ? ["note_create" as const, "note_associate" as const] : []), "email_create", "email_associate", ...(d.target.operation === "reopen" || d.target.operation === "link" && !d.target.alreadyNew ? ["stage_new" as const] : [])];
 }
 function finalTicket(lease: ExecutionLease, effects: Effect[]) {
     const d = lease.payload.plan.decision.disposition;
@@ -42,9 +44,9 @@ function finalTicket(lease: ExecutionLease, effects: Effect[]) {
     const create = effects.find(e => e.kind === "ticket_create" && e.state === "confirmed");
     return create ? ack(create)?.id ?? null : null;
 }
-async function source(lease: ExecutionLease) {
+async function source(lease: ExecutionLease, sourceMessageId = lease.row.messageId) {
     const db = requireDb();
-    const [m] = await db.select().from(savMessages).where(eq(savMessages.id, lease.row.messageId));
+    const [m] = await db.select().from(savMessages).where(eq(savMessages.id, sourceMessageId));
     const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, lease.row.threadId));
     const [mailbox] = thread ? await db.select().from(savMailboxes).where(eq(savMailboxes.id, thread.mailboxId)) : [];
     if (!m || !thread || !mailbox || !m.gmailMessageId)
@@ -107,11 +109,26 @@ async function nextIntent(lease: ExecutionLease, effects: Effect[], options: Exe
     }
     if (d.kind !== "ticket")
         return null;
+    // Resolve only before the first creation intent. Existing tickets/effect receipts are never upgraded.
+    if (d.target.operation === "create" && !effects.some(e => e.kind === "ticket_create") && !lease.payload.originalRequestTicket) {
+        const original = await readOriginalRequestTicket(messageId, options.env());
+        if (original && d.identity.addressOrigin === "customer_declared_registration") {
+            const address = intakeWrittenAddresses(original.current.currentText).map(a => a.address).find(address =>
+                savIntakeDeclaredAccount(original.current.currentText, address, { continuation: true }) &&
+                plan.decision.evidence.some(e => e.id === "email-lookup" && e.sourceId === `lookup-${createHash("sha256").update(address).digest("base64url")}`));
+            if (address) {
+                if (!options.policy.mutations.includes("append_ticket_note")) return fault("MUTATION_NOT_GRANTED");
+                lease.payload.originalRequestTicket = { messageId: original.message.id, address };
+                await saveExecutionPayload(lease);
+            }
+        }
+    }
+    const original = lease.payload.originalRequestTicket;
     if (d.target.operation === "create" && !confirmed("ticket_create")) {
         if (!plan.newTicket)
             return fault("CREATION_INTENT_MISSING");
         // SAV-72: the description is the stored incoming email, not the planner summary.
-        const s = await source(lease), key = `create:${messageId}`, marker = intakeRuntimeHash(key);
+        const s = await source(lease, original?.messageId), key = `create:${messageId}`, marker = intakeRuntimeHash(key);
         const description = intakeTicketDescription({ subject: s.message.subject, text: s.body.text, unreadAttachmentNotice: intakeUnreadAttachmentNotice(plan.newTicket.description) });
         const owner = await ownerAtCreation(lease, options);
         return {
@@ -125,15 +142,21 @@ async function nextIntent(lease: ExecutionLease, effects: Effect[], options: Exe
     const ticketId = finalTicket(lease, effects);
     if (!ticketId)
         return fault("FINAL_TICKET_MISSING");
-    if (plan.noteText && !confirmed("note_create")) {
+    const emailSources = [messageId, ...(original ? [original.messageId] : [])];
+    const sourceConfirmed = (kind: string, id: string) => effects.find(e => e.kind === kind && e.state === "confirmed" && effectIntent(e).sourceMessageId === id);
+    const emailsDone = emailSources.every(id => sourceConfirmed("email_associate", id));
+    const replyEmailId = sourceConfirmed("email_create", messageId);
+    const noteText = original ? (emailsDone ? [plan.noteText,
+        `Le client a donné son adresse d'inscription ${original.address} dans un second mail (identifiant du mail HubSpot : ${replyEmailId ? ack(replyEmailId)?.id : ""}).`].filter(Boolean).join("\n\n") : null) : plan.noteText;
+    if (noteText && !confirmed("note_create")) {
         const key = `note:${messageId}:${ticketId}`, marker = intakeRuntimeHash(key);
         return {
-            kind: "note_create", permission: "append_ticket_note", key, ticketId, sourceMessageId: messageId, text: plan.noteText, marker, properties: {
-                hs_note_body: renderIntakeNote(plan.noteText, marker), hs_timestamp: plan.decision.receivedAt
+            kind: "note_create", permission: "append_ticket_note", key, ticketId, sourceMessageId: messageId, text: noteText, marker, properties: {
+                hs_note_body: renderIntakeNote(noteText, marker), hs_timestamp: plan.decision.receivedAt
             }
         };
     }
-    if (plan.noteText && !confirmed("note_associate")) {
+    if (noteText && !confirmed("note_associate")) {
         const creation = confirmed("note_create")!, id = ack(creation)?.id;
         if (!id)
             return fault("NOTE_ACK_MISSING");
@@ -141,29 +164,44 @@ async function nextIntent(lease: ExecutionLease, effects: Effect[], options: Exe
             kind: "note_associate", permission: "append_ticket_note", key: `note-association:${messageId}:${ticketId}`, ticketId, objectId: id, sourceMessageId: messageId, expectedProperties: effectIntent(creation).properties, confirmedNoteCreate: { effectId: creation.id, objectId: id }
         };
     }
-    if (!confirmed("email_create")) {
-        const s = await source(lease), key = `email:${messageId}`, marker = intakeRuntimeHash(key);
-        return {
-            kind: "email_create", permission: "associate_email", key, sourceMessageId: messageId, marker, ticketId, ...(s.message.hubspotEmailId ? {
-                objectId: s.message.hubspotEmailId
-            } : {}), properties: {
-                hs_timestamp: s.message.receivedAt.toISOString(), hs_email_direction: "INCOMING_EMAIL", hs_email_subject: s.message.subject, hs_email_text: s.message.hubspotEmailId ? s.body.text : `${s.body.text}\n\n[Studio intake email: ${marker}]`, hs_email_headers: JSON.stringify({
-                    from: {
-                        email: s.message.fromEmail
-                    }, to: s.message.toEmails.map(email => ({
-                        email
-                    })), cc: [], bcc: []
-                })
-            }
-        };
-    }
-    if (!confirmed("email_associate")) {
-        const id = ack(confirmed("email_create")!)?.id;
-        if (!id)
-            return fault("EMAIL_ACK_MISSING");
-        return {
-            kind: "email_associate", permission: "associate_email", key: `email-association:${messageId}:${ticketId}`, ticketId, objectId: id, sourceMessageId: messageId, expectedProperties: effectIntent(confirmed("email_create")!).properties
-        };
+    for (const emailMessageId of emailSources) {
+        if (!sourceConfirmed("email_create", emailMessageId)) {
+            const s = await source(lease, emailMessageId);
+            const key = emailMessageId === messageId ? `email:${messageId}` : `email:${messageId}:original:${emailMessageId}`, marker = intakeRuntimeHash(key);
+            // A previous continuation may have confirmed A's email before its execution finished.
+            // Its receipt is authoritative even when finishExecution has not saved hubspotEmailId yet.
+            // The current business key is resumed from its stored intent above, never treated as a prior receipt.
+            const previous = emailMessageId !== messageId ? await requireDb().select().from(savIntakeEffects).where(and(ne(savIntakeEffects.businessKey, key), or(
+                eq(savIntakeEffects.businessKey, `email:${emailMessageId}`),
+                sql`${savIntakeEffects.businessKey} like ${`email:%:original:${emailMessageId}`}`))) : [];
+            if (previous.some(e => e.kind !== "email_create" || e.state !== "confirmed" || !ack(e)?.id || effectIntent(e).sourceMessageId !== emailMessageId))
+                return fault("RECONCILIATION_REQUIRED");
+            const ids = new Set([s.message.hubspotEmailId, ...previous.map(e => ack(e)?.id)].filter(Boolean));
+            if (ids.size > 1) return fault("EMAIL_ACK_CONFLICT");
+            const prior = previous[0], objectId = s.message.hubspotEmailId ?? (prior ? ack(prior)?.id : undefined);
+            return {
+                kind: "email_create", permission: "associate_email", key, sourceMessageId: emailMessageId, marker, ticketId, ...(objectId ? {
+                    objectId
+                } : {}), properties: {
+                    hs_timestamp: s.message.receivedAt.toISOString(), hs_email_direction: "INCOMING_EMAIL", hs_email_subject: s.message.subject, hs_email_text: objectId ? s.body.text : `${s.body.text}\n\n[Studio intake email: ${marker}]`, hs_email_headers: JSON.stringify({
+                        from: {
+                            email: s.message.fromEmail
+                        }, to: s.message.toEmails.map(email => ({
+                            email
+                        })), cc: [], bcc: []
+                    })
+                }, ...(prior && objectId === ack(prior)?.id ? { properties: effectIntent(prior).properties } : {})
+            };
+        }
+        if (!sourceConfirmed("email_associate", emailMessageId)) {
+            const creation = sourceConfirmed("email_create", emailMessageId)!;
+            const id = ack(creation)?.id;
+            if (!id)
+                return fault("EMAIL_ACK_MISSING");
+            return {
+                kind: "email_associate", permission: "associate_email", key: `email-association:${emailMessageId}:${ticketId}`, ...(original ? { reuseExistingAssociation: true } : {}), ticketId, objectId: id, sourceMessageId: emailMessageId, expectedProperties: effectIntent(creation).properties
+            };
+        }
     }
     if ((d.target.operation === "reopen" || d.target.operation === "link" && !d.target.alreadyNew) && !confirmed("stage_new")) {
         // The PATCH sets the stage only, so whatever owner the ticket has is kept. An owner
@@ -598,7 +636,7 @@ export async function readIntakeExecutionProgress(messageId: string) {
     if (!row)
         return null;
     const payload = decryptSavPayload<ExecutionPayload>(row.payloadCiphertext), effects = await getExecutionEffects(row.id), required = requiredExecutionKinds(payload);
-    const confirmed = row.state === "confirmed" && required.length > 0 && required.every(k => effects.some(e => e.kind === k && e.state === "confirmed"));
+    const confirmed = row.state === "confirmed" && required.length > 0 && required.every(k => effects.some(e => e.kind === k && e.state === "confirmed")) && (!payload.originalRequestTicket || [row.messageId, payload.originalRequestTicket.messageId].every(id => effects.some(e => e.kind === "email_associate" && e.state === "confirmed" && effectIntent(e).sourceMessageId === id)));
     return {
         executionId: row.id, runId: row.runId, version: row.runVersion, actorType: "ai", completionSourceHash: payload.completion?.sourceHash ?? null, state: row.state, ticketId: row.ticketId, confirmed, reason: payload.reason ?? null, ...(payload.crmDelta?{crmDelta:publicIntakeCrmDelta(payload.crmDelta)}:{}), ...(payload.crmRecheck?{crmRecheck:publicCrmRecheck(payload.crmRecheck)}:{}), effects: effects.map(e => ({
             id: e.id, kind: e.kind, state: e.state, attemptId: e.attemptId, ack: ack(e), dispatchedAt: e.dispatchedAt, confirmedAt: e.confirmedAt

@@ -262,6 +262,8 @@ export function createIntakeExecutorAdapters(options: {
                 // The executor no longer plans it; verify below stays read-only for any older effect.
                 throw Error("SAV_INTAKE_EXECUTION_OWNER_UNGUARDED");
             else if (intent.kind === "note_associate" || intent.kind === "email_associate") {
+                if (intent.kind === "email_associate" && intent.reuseExistingAssociation && await association("emails", id(intent.objectId), "tickets", id(intent.ticketId), signal))
+                    return { id: intent.objectId };
                 await hub(`/crm/v4/objects/${intent.kind === "note_associate" ? "notes" : "emails"}/${id(intent.objectId)}/associations/default/tickets/${id(intent.ticketId)}`, "PUT", signal);
                 return {
                     id: intent.objectId

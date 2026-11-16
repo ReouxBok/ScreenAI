@@ -6,7 +6,7 @@ import "server-only";
 import { isTerminalReply, closingHandoffReplyEnabled } from "./case-terminal-reply";
 import { j2AutoGate } from "./j2-auto-reminder";
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savCaseEffectExecutions, savCases, savIntakeEffectJournal, savIntakeEffects } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
@@ -109,7 +109,10 @@ async function commitReceipt(
       if (owned.leaseUntil <= new Date()) return fault("LEASE_LOST");
       // « Waiting for the customer » (OFF unless `SAV_V2_TICKET_STAGES=on`): queued in THIS transaction, from the same locked case and the reply's own policy, so a confirmed reply
       // and its ticket state are born together and a replay or a recovery finds the same execution. Its own pass moves the ticket; nothing is sent from here.
-      if (!isTerminalReply(proposal.purpose)) await enqueueCaseTicketStage(tx, { snapshot: locked, trigger: { kind: "reply_confirmed", replyKey: key, sentAt: sentAt.toISOString() }, policy: { id: owned.row.policyId, hash: owned.row.policyHash }, env, threadId: owned.row.threadId });
+      if (!isTerminalReply(proposal.purpose)) {
+        const stage = await enqueueCaseTicketStage(tx, { snapshot: locked, trigger: { kind: "reply_confirmed", replyKey: key, sentAt: sentAt.toISOString() }, policy: { id: owned.row.policyId, hash: owned.row.policyHash }, env, threadId: owned.row.threadId });
+        await recordCaseComponentOutcome(tx, lease.row.id, "status", stage.ok ? { state: "queued", executionId: stage.executionId } : { state: stage.reason === "stages_disabled" ? "skipped" : "blocked", reason: stage.reason });
+      }
       await conclude(tx, reply);
       return reply;
     });
@@ -118,6 +121,19 @@ async function commitReceipt(
     if (error instanceof ReceiptOwnerChanged) return fault("CANCELLED_OWNER_CHANGED");
     throw error;
   }
+}
+
+/** The execution lock held by the caller serializes these durable, deduplicated component outcomes. */
+async function recordCaseComponentOutcome(tx: ExecutionTx, executionId: string, component: "note" | "status", outcome: Record<string, string>) {
+  const kind = `case_component_${component}`;
+  const [last] = await tx.select({ payload: savIntakeEffectJournal.payloadCiphertext }).from(savIntakeEffectJournal)
+    .where(and(eq(savIntakeEffectJournal.executionId, executionId), eq(savIntakeEffectJournal.kind, kind)))
+    .orderBy(desc(savIntakeEffectJournal.createdAt), desc(savIntakeEffectJournal.id)).limit(1);
+  const previous = last ? decryptSavPayload<Record<string, string>>(last.payload) : null;
+  // Once queued, the linked execution and its ledger own the status outcome. A later
+  // configuration refusal must not hide an already confirmed (or engaged) effect.
+  if (component === "status" && previous?.executionId && !outcome.executionId) return;
+  if (!previous || JSON.stringify(previous) !== JSON.stringify(outcome)) await executionJournal(tx, executionId, kind, outcome);
 }
 
 /** The reason a verification-only pass leaves on an execution whose reply is confirmed and recorded while its note still waits for a supervised pass. */
@@ -347,6 +363,13 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     if ("wait" in waiting) throw Error(CASE_RECOVERY_NOTE_PENDING);
     return waiting.stage;
   }
+  async function skipNote(lease: ExecutionLease, reason: string) {
+    await requireDb().transaction(async tx => {
+      if (!await ownedExecution(tx, lease)) return fault("LEASE_LOST");
+      await recordCaseComponentOutcome(tx, lease.row.id, "note", { state: "skipped", reason });
+    });
+    return null;
+  }
   /** A summary note's ledger row that this pass may still write (none yet, or planned: no marker). An engaged or confirmed row is only verified / kept. */
   const newSummaryWrite = (effect: Effect | undefined) => !effect || effect.state === "planned";
 
@@ -399,13 +422,13 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
       const summaryStopped = summary && !caseReplyNoteEnabled(deps.env());
       if (!created || created.state !== "confirmed") {
         phases.set(lease, "note_create");
-        if (summaryStopped && newSummaryWrite(created)) return null;
+        if (summaryStopped && newSummaryWrite(created)) return skipNote(lease, "reply_note_off");
         if (created) return effectIntent(created);
         // SAV-92 (16/11): the reply's summary note is planned only when the signed policy grants `append_case_note` (as the handoff note): without it the
         // execution ends as before, with no note.
         if (summary) {
           const { policy } = await readIntakeExecutionAuthority(options.config);
-          if (!policy.mutations.includes(SAV_CASE_EFFECT_PERMISSIONS.note)) return null;
+          if (!policy.mutations.includes(SAV_CASE_EFFECT_PERMISSIONS.note)) return skipNote(lease, "mutation_not_granted");
           // Review (16/11): the receipt and the ticket stage are recorded FIRST (the same idempotent transaction the end of the pass commits again), so the note's
           // ticket sentence is resolved from the confirmed stage below. The execution stays running.
           await commitReceipt(lease, proposal, effects, deps, async () => {});
@@ -417,7 +440,7 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
       }
       if (associated?.state === "confirmed") return null;
       phases.set(lease, "note_associate");
-      if (summaryStopped && newSummaryWrite(associated)) return null;
+      if (summaryStopped && newSummaryWrite(associated)) return skipNote(lease, "reply_note_off");
       if (associated) return effectIntent(associated);
       const objectId = ackOf(created)?.id;
       if (!objectId) return fault("NOTE_ACK_MISSING");
@@ -449,7 +472,11 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     },
     async finish(lease, effects) {
       // One transaction (see `commitReceipt`): the mail event, the question, the J2 and the execution's confirmation commit together or not at all.
-      await commitReceipt(lease, payloads.get(lease)!.proposal, effects, deps, async (tx, reply) => {
+      const payload = payloads.get(lease)!;
+      await commitReceipt(lease, payload.proposal, effects, deps, async (tx, reply) => {
+        // Recovery may finish a disabled summary without going through the new-work path.
+        if (payload.note && isCaseReplySummary(payload.note.interactionId) && !caseReplyNoteEnabled(deps.env()))
+          await recordCaseComponentOutcome(tx, lease.row.id, "note", { state: "skipped", reason: "reply_note_off" });
         await tx.update(savCaseEffectExecutions).set({ state: "confirmed", leaseToken: null, leaseUntil: null, reason: null, updatedAt: new Date() })
           .where(and(eq(savCaseEffectExecutions.id, lease.row.id), eq(savCaseEffectExecutions.leaseToken, lease.token)));
         await executionJournal(tx, lease.row.id, "execution_confirmed", { replyEffectId: reply.id });

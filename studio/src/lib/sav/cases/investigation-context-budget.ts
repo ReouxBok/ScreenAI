@@ -9,6 +9,7 @@
  */
 
 import type { CaseDecisionGenerationConfig } from "./investigation-decision-generation";
+import { compactInvestigationContext, INVESTIGATION_CONTEXT_INSTRUCTION } from "./investigation-context-view";
 
 export type CaseDecisionPromptParts = Readonly<{ instruction: string; schema: string; payload: Readonly<{ knowledge: readonly unknown[] }> & Record<string, unknown> }>;
 export type CaseDecisionBodyBreakdown = {
@@ -27,8 +28,22 @@ export const SAV_CASE_BREAKDOWN_MAX_CARDS = 200;
  * `investigation-decision-generation.ts`) only APPENDS fields to `generationConfig`; empty or absent, the body is byte-identical to before.
  */
 export function caseGeminiDecisionBody(prompt: Pick<CaseDecisionPromptParts, "instruction" | "schema">, payload: unknown, maxOutputTokens: number, decoding = "", generation: CaseDecisionGenerationConfig = {}) {
-  return JSON.stringify({ systemInstruction: { parts: [{ text: `${prompt.instruction}\n\nSchéma JSON de la réponse :\n${prompt.schema}${decoding}` }] },
+  return JSON.stringify({ systemInstruction: { parts: [{ text: `${prompt.instruction}${prompt.schema ? `\n\nSchéma JSON de la réponse :\n${prompt.schema}` : ""}${decoding}` }] },
     contents: [{ role: "user", parts: [{ text: JSON.stringify(payload) }] }], generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens, ...generation } });
+}
+
+/** Shared by the real transport and offline measurement, including reversible compression. */
+export function caseGeminiDecisionWire(prompt: CaseDecisionPromptParts, maxOutputTokens: number, maxInputBytes: number, generation: CaseDecisionGenerationConfig = {}) {
+  const serialize = (payload: unknown, decoding = "") => caseGeminiDecisionBody(prompt, payload, maxOutputTokens, decoding, generation);
+  let body = serialize(prompt.payload), compacted = false;
+  if (Buffer.byteLength(body, "utf8") > maxInputBytes) {
+    const compact = compactInvestigationContext(prompt.payload);
+    if (compact) {
+      const candidate = serialize(compact, `\n\n${INVESTIGATION_CONTEXT_INSTRUCTION}`);
+      if (Buffer.byteLength(candidate, "utf8") < Buffer.byteLength(body, "utf8")) { body = candidate; compacted = true; }
+    }
+  }
+  return { body, compacted };
 }
 
 const size = (text: string) => Buffer.byteLength(text, "utf8");

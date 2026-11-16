@@ -4,6 +4,7 @@ import { z } from "zod";
 import { requireDb } from "@/db";
 import { savCases, savMessages } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
+import { caseComponentOutcomes } from "./case-component-outcomes";
 import { SAV_CASE_ADMISSION_TEAM_REASONS } from "./case-types";
 
 export const v2InventoryStates = ["processing", "awaiting_customer", "reply_sent", "handed_to_team", "failed", "paused"] as const;
@@ -22,8 +23,8 @@ const handoffCodes = new Set<string>([...SAV_CASE_ADMISSION_TEAM_REASONS, "expli
   "evidence_inaccessible", "diagnosis_out_of_tools", "repeated_failure", "out_of_scope", "decision_refused", "validator_refusals", "awaiting_v2_attribution"]);
 const object = z.record(z.string(), z.unknown());
 
-type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
-async function queryBatch<T extends Record<string, unknown>>(tx: Pick<Tx, "execute">, statement: SQL) {
+export type V2ReadTx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
+async function queryBatch<T extends Record<string, unknown>>(tx: Pick<V2ReadTx, "execute">, statement: SQL) {
   const result = await tx.execute<T>(statement);
   return { rows: Array.isArray(result) ? result : (result as unknown as { rows: T[] }).rows };
 }
@@ -51,21 +52,27 @@ const stateSql = sql<typeof v2InventoryStates[number]>`case
  * Mutable states are display-only filters; every traversed case is listed or filtered out. Histories are bounded and fail explicitly on overflow.
  * No external call, write, lock or payload upgrade. */
 export async function listV2Cases(raw: Input) {
+  return requireDb().transaction(tx => readV2Cases(tx, raw), { isolationLevel: "repeatable read", accessMode: "read only" });
+}
+
+/** Internal batch reader; caller owns the read-only snapshot. */
+export async function readV2Cases(tx: V2ReadTx, raw: Input, untilExclusive = false) {
   const input = v2InventoryInput.parse(raw);
   if (input.from && input.until && Date.parse(input.from) > Date.parse(input.until)) throw Error("SAV_V2_INVENTORY_WINDOW_INVALID");
-  const filters = JSON.stringify([input.from ? new Date(input.from).toISOString() : null, input.until ? new Date(input.until).toISOString() : null, input.state ?? null]);
+  const filters = JSON.stringify([...(untilExclusive ? ["exclusive"] : []), input.from ? new Date(input.from).toISOString() : null, input.until ? new Date(input.until).toISOString() : null, input.state ?? null]);
   let cursor: z.infer<typeof cursorSchema> | null = null;
   if (input.cursor) {
     if (input.cursor.split(".").length !== 4 || input.cursor.split(".").slice(1).some(part => Buffer.from(part, "base64url").toString("base64url") !== part)) invalid();
     try { cursor = cursorSchema.parse(decryptSavPayload(input.cursor)); } catch { invalid(); }
     if (!cursor || cursor.filters !== filters || Date.parse(cursor.after.createdAt) > Date.parse(cursor.snapshotAt)) invalid();
   }
-  return requireDb().transaction(async tx => {
+  return (async () => {
     // Preserve PostgreSQL microseconds in the keyset (JS Date would truncate them).
     const snapshotAt = cursor?.snapshotAt ?? (await queryBatch<{ value: string }>(tx, sql`select clock_timestamp()::text as value`)).rows[0]!.value;
     const observedAt = new Date(snapshotAt).toISOString();
     const scope = and(
       input.from ? sql`${savCases.createdAt} >= ${input.from}::timestamptz` : undefined,
+      untilExclusive && input.until ? sql`${savCases.createdAt} < ${input.until}::timestamptz` : undefined,
       sql`${savCases.createdAt} <= least(${input.until ?? snapshotAt}::timestamptz, ${snapshotAt}::timestamptz)`,
     );
     const attendus = Number((await tx.select({ count: sql<number>`count(*)` }).from(savCases).where(scope))[0]!.count);
@@ -96,10 +103,18 @@ export async function listV2Cases(raw: Input) {
       join lateral (select * from sav.case_effect_executions where case_id=c.id order by created_at, id limit ${historyLimit + 1}) e on true
       where c.id=any(${idArray}::uuid[])`);
     const executionIds = `{${executionRows.rows.map(e => e.id).join(",")}}`;
+    // Latest component result only: one batch over the journal, never one scan per execution.
+    const componentRows = executionRows.rows.length ? await queryBatch<{ executionId: string; kind: string; payload: string }>(tx, sql`
+      select distinct on (execution_id, kind) execution_id as "executionId", kind, payload_ciphertext as payload
+      from sav.intake_effect_journal where execution_id=any(${executionIds}::uuid[])
+        and kind in ('case_component_note','case_component_status') order by execution_id, kind, created_at desc, id desc`) : null;
+    const componentJournal = new Map((componentRows?.rows ?? []).map(e => [`${e.executionId}:${e.kind}`, e.payload]));
     // Four public effect kinds, one aggregate per execution/kind, regardless of ledger length.
     const effectResult = executionRows.rows.length ? await queryBatch<{ executionId: string; kind: string; state: string; confirmedAt: string | null }>(tx, sql`
       select execution_id as "executionId", kind,
-        case when bool_and(state='confirmed' and confirmed_at is not null) then 'confirmed' else 'pending' end as state,
+        case when bool_and(state='confirmed' and confirmed_at is not null) then 'confirmed'
+          when bool_or(state in ('dispatched','acked','uncertain')) then 'uncertain'
+          when bool_or(state='failed') then 'failed' else 'pending' end as state,
         min(confirmed_at)::text as "confirmedAt"
       from sav.intake_effects where execution_id=any(${executionIds}::uuid[])
         and kind in ('reply_send','note_create','note_associate','ticket_stage') group by execution_id, kind`) : null;
@@ -150,6 +165,14 @@ export async function listV2Cases(raw: Input) {
       const entry = entries.rows.find(e => e.caseId === row.id);
       const message = entry ? messageRows.find(m => m.gmailId === entry.key.slice("inbound:".length) && row.threadIds.includes(m.threadId)) : undefined;
       const executions = executionsByCase.get(row.id) ?? [];
+      const componentExecutions = executions.map(e => {
+        const note = componentJournal.get(`${e.id}:case_component_note`), status = componentJournal.get(`${e.id}:case_component_status`);
+        return { ...e, noteExpected: object.safeParse(object.parse(decryptSavPayload(e.payload)).note).success,
+          noteOutcome: note ? object.parse(decryptSavPayload(note)) : null,
+          statusOutcome: status ? object.parse(decryptSavPayload(status)) : null };
+      });
+      const componentEffects = executions.flatMap(e => effectsByExecution.get(e.id) ?? []);
+      const outcomes = componentExecutions.map(e => ({ executionId: e.id, ...caseComponentOutcomes(e, componentExecutions, componentEffects) }));
       const active = executions.filter(e => !["refused", "cancelled"].includes(e.state) && !e.reason?.startsWith("SAV_CASE_EFFECT_CANCELLED_"));
       const effects = executions.flatMap(e => effectsByExecution.get(e.id) ?? []);
       const activeEffects = active.flatMap(e => effectsByExecution.get(e.id) ?? []);
@@ -190,7 +213,7 @@ export async function listV2Cases(raw: Input) {
       rows.push({ caseId: row.id, threadId: message?.threadId ?? row.threadIds[0] ?? null, messageId: message?.id ?? null, state: row.state, phase: row.phase,
         receivedAt: entered?.toISOString() ?? null, replyConfirmedAt: answered?.toISOString() ?? null,
         replyDelaySeconds: entered && answered && answered >= entered ? (answered.getTime() - entered.getTime()) / 1000 : null,
-        hubspot: { note, status }, handoffReason: typeof reason === "string" ? handoffCodes.has(reason) ? reason : "other_internal_reason" : null,
+        outcomes, hubspot: { note, status }, handoffReason: typeof reason === "string" ? handoffCodes.has(reason) ? reason : "other_internal_reason" : null,
         questions: (() => {
           const questions = z.array(z.object({ answeredBy: z.unknown().optional() })).parse(body.questions ?? []);
           const answered = questions.filter(question => question.answeredBy != null).length;
@@ -202,5 +225,5 @@ export async function listV2Cases(raw: Input) {
     }
     const last = page.slice(0, input.limit).at(-1);
     return { attendus, observedAt, statesFilterApplied: !!input.state, filteredOut, rows, nextCursor: page.length > input.limit && last ? encryptSavPayload({ v: 3, filters, after: { createdAt: last.createdAt, id: last.id }, snapshotAt, attendus }) : null };
-  }, { isolationLevel: "repeatable read", accessMode: "read only" });
+  })();
 }

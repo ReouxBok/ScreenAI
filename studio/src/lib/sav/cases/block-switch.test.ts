@@ -10,7 +10,7 @@ import { readSavBlockSwitchPanel, setSavBlockSwitch } from "./block-switch-admin
 
 /*
  * Per-block switch (12/11): mode off | draft | auto and a pause per treatment block, stored like the agent pause (sav-agent-pause.v1):
- * encrypted row in sav.sync_state, actor, reason, timestamp, audited history. No row = today's behaviour (auto, not paused).
+ * encrypted row in sav.sync_state, actor, reason, timestamp, audited history. No row = off, except the frozen legacy Access fallback (auto, not paused).
  */
 let f: Awaited<ReturnType<typeof createSavTestDb>>;
 const admin = { id: "a", email: "admin@example.invalid", role: "admin", active: true };
@@ -23,19 +23,25 @@ beforeEach(async () => {
   await f.db.delete(savSyncState).where(like(savSyncState.key, "sav-block-switch.v1:%")); await f.db.delete(auditLogs);
 });
 
-it("default without any row reproduces today: auto, not paused, for Access and any block; the effective mode follows the global switch", async () => {
-  expect(SAV_BLOCK_SWITCH_DEFAULT).toEqual({ mode: "auto", paused: false });
-  for (const blockId of ["access", "collaborators"]) {
-    const read = await readSavBlockSwitch(f.db, blockId);
-    expect(read).toEqual({ blockId, mode: "auto", paused: false, setting: null, invalid: false });
-    expect(savBlockReplyGate(read)).toEqual({ send: "rule" });
-  }
+it("Access without a row keeps the legacy auto fallback and the global admission restriction", async () => {
   const access = await readSavBlockSwitch(f.db, "access");
-  // Global switch on (SAV_V2_AUTO_REPLY=access + approver): Access is auto, exactly as today; off: a person validates, as today.
+  expect(access).toEqual({ blockId: "access", mode: "auto", paused: false, setting: null, invalid: false });
+  expect(savBlockReplyGate(access)).toEqual({ send: "rule" });
   expect(savBlockEffectiveMode(access, { SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: "30000000-0000-4000-8000-000000000042" })).toBe("auto");
   expect(savBlockEffectiveMode(access, {})).toBe("draft");
-  // Another block never answers alone today (the automatic rule is Access-only): draft at most, whatever its mode.
-  expect(savBlockEffectiveMode(await readSavBlockSwitch(f.db, "collaborators"), { SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: "30000000-0000-4000-8000-000000000042" })).toBe("draft");
+});
+
+it.each(["integrations", "collaborators", "future-block"])("new block %s without a row is off", async blockId => {
+  expect(SAV_BLOCK_SWITCH_DEFAULT).toEqual({ mode: "off", paused: false });
+  const read = await readSavBlockSwitch(f.db, blockId);
+  expect(read).toEqual({ blockId, mode: "off", paused: false, setting: null, invalid: false });
+  expect(savBlockReplyGate(read)).toEqual({ send: "never", code: "block_off" });
+  expect(savBlockEffectiveMode(read, { SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: "30000000-0000-4000-8000-000000000042" })).toBe("off");
+});
+
+it.each(["off", "auto"] as const)("an explicit Access %s setting overrides the legacy fallback", async mode => {
+  await setSavBlockSwitch({ blockId: "access", mode, paused: false, reason: "Réglage synthétique explicite" });
+  expect(await readSavBlockSwitch(f.db, "access")).toMatchObject({ mode, invalid: false, setting: { mode } });
 });
 
 it("off, paused and draft never let the rule send; the stricter of the global switch and the block wins", () => {
@@ -91,7 +97,7 @@ it("stores the switch encrypted, audits actor, previous and next state and reaso
 it("an unreadable row fails closed (never sends) and is replaced by the next change, recorded as invalid", async () => {
   await f.db.insert(savSyncState).values({ key: "sav-block-switch.v1:access", cursor: "corrupt", status: "active" });
   const read = await readSavBlockSwitch(f.db, "access");
-  expect(read).toMatchObject({ invalid: true });
+  expect(read).toMatchObject({ mode: "off", invalid: true });
   expect(savBlockReplyGate(read)).toEqual({ send: "never", code: "block_setting_invalid" });
   await setSavBlockSwitch({ blockId: "access", mode: "auto", paused: false, reason: "Réparation du réglage" });
   expect((await audit())[0]!.technicalMetadata.previous).toBe("invalid");
