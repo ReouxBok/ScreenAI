@@ -306,7 +306,7 @@ const sendRequests = () => p.calls.filter(call => call.path === "gmail/messages/
 const sentNow = () => sentBodies().slice(sentBase);
 
 /** The question, from the V1 mail to the approved and queued reply; nothing has left. */
-async function questionQueued(count = 1) {
+async function questionQueued(count = 1, factKeys?: string[][]) {
   crm.requests.length = 0; sends = 0; sentBase = Object.keys(p.sent).length; requestsBase = p.calls.filter(call => call.path === "gmail/messages/send").length;
   const mail = await v1Mail();
   await personHandsBack(mail.caseId);
@@ -315,7 +315,7 @@ async function questionQueued(count = 1) {
     const result = askTargeted(request);
     if (count > 1) {
       const texts = [QUESTION, "Quel navigateur utilisez-vous ?", "Quel appareil utilisez-vous ?", "Quelle version utilisez-vous ?", "Depuis quand cela arrive-t-il ?"].slice(0, count);
-      result.output.nextAction.questions = texts.map(text => ({ ...result.output.nextAction.questions[0]!, text }));
+      result.output.nextAction.questions = texts.map((text, index) => ({ ...result.output.nextAction.questions[0]!, text, ...(factKeys ? { seeks: factKeys[index]!.map(factKey => ({ kind: "configuration" as const, factKey })) } : {}) }));
       result.output.reply.text = `Bonjour, depuis https://new.limova.ai, ${texts.join(" ")}`;
     }
     return result;
@@ -534,5 +534,39 @@ it.each([1, 2])("J2 after a partial answer recalls only the %i still-open questi
     expect(await submitCaseReplyProposal(proposal, storeDeps())).toMatchObject({ ok: true, created: false });
     expect(await listCaseTimers(mail.caseId)).toHaveLength(1);
     expect(sendRequests()).toBe(1); // only the original question mail has been sent
+  } finally { vi.useRealTimers(); }
+});
+
+
+it("keeps the original J2 valid when browser and device arrive without the shared account_email", async () => {
+  const required = [["browser", "account_email"], ["device", "account_email"]];
+  const { mail, queued } = await questionQueued(2, required);
+  expect((await pass()).supervised).toEqual([{ executionId: queued.executionId, state: "confirmed", reason: null }]);
+  const initial = (await readCase(mail.caseId))!.body;
+  expect(initial.questions.map(question => question.factKeys)).toEqual(required);
+  const [timer] = await listCaseTimers(mail.caseId);
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    vi.setSystemTime(new Date(Date.parse(timer!.sentAt) + 60_000));
+    const partial = await v1Mail({ ticketId: mail.ticketId, threadId: mail.threadId });
+    modelAnswer = ((request: CaseInvestigationModelRequest) => ({ status: "ok", output: {
+      caseVersion: request.snapshot.version,
+      understanding: { requests: askTargeted(request).output.understanding.requests,
+        newFacts: ["browser", "device"].map((key, index) => ({ id: `partial-${index}`, key, statement: "Réponse synthétique", kind: "customer_statement", source: { type: "email", id: partial.gmail } })) },
+      nextAction: { kind: "observe_only" },
+    } })) as never;
+    expect(await runCaseInvestigationRuntime(mail.caseId, wiring().deps)).toMatchObject({ status: "recorded", outcome: "accepted" });
+    const current = (await readCase(mail.caseId))!;
+    expect(current.body.questions.map(question => Boolean(question.answeredBy))).toEqual([false, false]);
+    expect(current.body.waiting?.timerId).toBe(timer!.id);
+    expect(current.phase).toBe("awaiting_customer");
+    expect(await listCaseTimers(mail.caseId)).toMatchObject([{ id: timer!.id, state: "scheduled" }]);
+    vi.setSystemTime(new Date(Date.parse(timer!.dueAt) + 60_000));
+    await j2Pass({ reminderEffect: async () => "none", budgetAvailable: async () => true }, new Date());
+    const trigger = `timer:${timer!.id}`;
+    expect(await readJ2Origin(mail.caseId, trigger, SYN_POLICY.revision, new Date())).not.toBeNull();
+    const text = await readJ2ReminderText(mail.caseId, trigger, { SAV_V2_J2_CONTEXTUAL: "on" });
+    for (const question of initial.questions) expect(text).toContain(question.text);
+    expect(sendRequests()).toBe(1);
   } finally { vi.useRealTimers(); }
 });

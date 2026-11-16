@@ -6,6 +6,10 @@ import { inventoryCaseFamilyKnowledge, SAV_CASE_PILOT_FAMILY_CANDIDATE } from ".
 import { caseReplyPayloadHash, checkCaseReplyApproval } from "./case-effects";
 import { caseDecisionDraft, caseReplyTriggerOf } from "./investigation-intent";
 import { selectCaseKnowledge } from "./investigation-knowledge";
+import { caseBodySchema, emptyCaseBody, type CaseEvent } from "./case-types";
+import { hasMultiQuestionWait, reconcileCaseQuestionAnswers } from "./case-question-followup";
+import { j2ReminderText } from "./j2-auto-reminder";
+import type { CaseDecisionProposal } from "./decision-contract";
 import type { CaseInvestigationStoredRecord } from "./investigation-record";
 
 /* Weekend 30/10: per-request knowledge selection, the SAV-19 inventory and the B → C intents. Pure, synthetic data. */
@@ -170,13 +174,47 @@ describe("B → C draft: the decision in pole C's own proposal shape (SAV-10), v
     }
     const overlapping = caseDecisionDraft("case-1", stored(ask(["Quel écran ?", "Quel navigateur ?"]), reply("Deux questions.")), EVENTS)!.reply!.questions!;
     expect(overlapping.every(question => question.factKeys.length === 1)).toBe(true);
-    expect(overlapping[0]!.factKeys).not.toEqual(overlapping[1]!.factKeys);
+    expect(overlapping.map(question => question.factKeys)).toEqual([["configuration.version"], ["configuration.version"]]);
     const unkeyed = ask(["Q1 ?", "Q2 ?"]);
     unkeyed.questions.forEach(question => { question.seeks = [{ kind: "observed_result" }]; });
     const fallback = caseDecisionDraft("case-1", stored(unkeyed, reply("Deux questions.")), EVENTS)!.reply!;
     expect(fallback.questions?.map(question => question.factKeys[0])).toEqual([expect.stringMatching(/^question_[a-f0-9]{24}$/), expect.stringMatching(/^question_[a-f0-9]{24}$/)]);
     expect(fallback.questions?.[0]!.factKeys).not.toEqual(fallback.questions?.[1]!.factKeys);
     expect(caseDecisionDraft("case-1", stored(ask(["Q1 ?", "Q2 ?", "Q3 ?", "Q4 ?", "Q5 ?", "Q6 ?"]), reply("Six questions.")), EVENTS)).toMatchObject({ reply: null, replyLimit: "too_many_questions" });
+  });
+
+  it.each([
+    [["browser", "device"], [false, false]],
+    [["account_email"], [false, false]],
+    [["browser", "account_email"], [true, false]],
+    [["device", "account_email"], [false, true]],
+    [["browser", "device", "account_email"], [true, true]],
+    [[], [false, false]],
+  ] as const)("preserves shared requirements from draft through partial answers: %j", (keys, answered) => {
+    const action = ask(["Navigateur et compte ?", "Appareil et compte ?"]);
+    const required = [["browser", "account_email"], ["device", "account_email"]];
+    action.questions.forEach((question, index) => { question.seeks = required[index]!.map(factKey => ({ kind: "configuration", factKey })); });
+    const questions = caseDecisionDraft("case-1", stored(action, reply("Deux questions.")), EVENTS)!.reply!.questions!;
+    expect(questions.map(question => question.factKeys)).toEqual(required);
+    const sent = "2026-11-16T09:00:00.000Z", at = "2026-11-16T10:00:00.000Z";
+    const body = caseBodySchema.parse({ ...emptyCaseBody(), questions: questions.map(question => ({ ...question, askedAt: sent, askedInEffect: "effect" })),
+      waiting: { kind: "customer", since: sent, reasonCode: "j2_question", timerId: "timer" } });
+    const source = { type: "email" as const, id: "partial" };
+    const proposal = (factKeys: readonly string[]): CaseDecisionProposal => ({ caseVersion: 8,
+      understanding: { requests: [], newFacts: factKeys.map((key, i) => ({ id: `f${i}`, key, statement: "Réponse synthétique", kind: "customer_statement", source })) },
+      nextAction: { kind: "observe_only" } });
+    const events = [{ direction: "customer_inbound", sourceRef: source, occurredAt: at }] as CaseEvent[];
+    const next = reconcileCaseQuestionAnswers(body, proposal(keys), events);
+    expect(next.questions.map(question => Boolean(question.answeredBy))).toEqual(answered);
+    const pending = answered.some(done => !done);
+    expect(hasMultiQuestionWait(next)).toBe(pending);
+    expect(next.waiting).toEqual(pending ? body.waiting : null);
+    if (pending) questions.forEach((question, index) => {
+      expect(j2ReminderText(next, "effect", true).includes(question.text)).toBe(!answered[index]);
+    });
+    const complete = reconcileCaseQuestionAnswers(next, proposal(required.flat()), events);
+    expect(complete.questions.every(question => question.answeredBy)).toBe(true);
+    expect(complete.waiting).toBeNull();
   });
 
   it("the trigger is the stored mail answered (C's canonical `inbound:<Gmail id>`), never the input key; no stored mail, no reply", () => {

@@ -84,10 +84,8 @@ export function caseDecisionDraft(caseId: string, stored: CaseInvestigationStore
     // A multi-question mail must also track questions whose semantic seek had no canonical fact key.
     // Give those a stable, per-question key the next model sees in the stored context.
     if (questions.length > 1) {
-      const shared = new Set(questions.flatMap(question => question.factKeys).filter(key => questions.filter(question => question.factKeys.includes(key)).length > 1));
       for (const question of questions) {
-        // A shared key cannot prove which of two distinct questions the customer answered.
-        question.factKeys = question.factKeys.filter(key => !shared.has(key));
+        // Keep every required key, including keys shared with other questions.
         if (!question.factKeys.length) question.factKeys = [`question_${createHash("sha256").update(question.id).digest("hex").slice(0, 24)}`];
       }
     }
