@@ -10,7 +10,7 @@ import type { AdmissionPolicyRecord } from "./admission-runtime";
 import { caseReplyKey, caseReplyPayloadHash, j2TriggerEventId, readCaseEffectsMode, type CaseReplyProposal } from "./case-effects";
 import { submitCaseReplyProposal, decideCaseReply, type CaseReplyStoreDeps } from "./case-reply-store";
 import { queueValidatedCaseReply } from "./case-runtime-effects";
-import { J2_REMINDER_TEXT, j2AutoGate, readJ2Origin } from "./j2-auto-reminder";
+import { j2ReminderText, j2AutoGate, readJ2Origin } from "./j2-auto-reminder";
 import { accessAutoReplyAuthorizer } from "./customer-return-store";
 import { readAccessAutoApprovalConfig } from "./customer-return";
 import { judgeCurrentTicketOwner } from "./case-ticket-owner";
@@ -72,7 +72,7 @@ export async function enqueueApprovedJ2(timer: Pick<J2Timer,"id"|"caseId">, case
   return result.ok ? (result.created ? "queued" : "already_queued") : result.code;
 }
 
-/** Authors only the fixed reminder, through the normal durable proposal, rule and queue. */
+/** Authors the deterministic reminder, through the normal durable proposal, rule and queue. */
 export async function produceAutoJ2(timer: Pick<J2Timer,"id"|"caseId">, caseVersion: number, deps: CaseReplyStoreDeps) {
   const blocked = await j2AutoGate(deps.env());
   if (blocked) return blocked;
@@ -81,7 +81,7 @@ export async function produceAutoJ2(timer: Pick<J2Timer,"id"|"caseId">, caseVers
   const origin = await readJ2Origin(timer.caseId, j2TriggerEventId(timer.id), await deps.currentPolicyRevision(), new Date());
   if (!origin) return "reminder_origin_unproven";
   const proposal: CaseReplyProposal = { caseId: timer.caseId, caseVersion, triggerEventId: j2TriggerEventId(timer.id), purpose: "reminder",
-    inboundMessageId: origin.inboundMessageId, recipient: origin.recipient, subject: origin.subject, text: J2_REMINDER_TEXT };
+    inboundMessageId: origin.inboundMessageId, recipient: origin.recipient, subject: origin.subject, text: j2ReminderText(origin, deps.env()) };
   const proposed = await submitCaseReplyProposal(proposal, deps);
   if (!proposed.ok) return proposed.code;
   if (proposed.state === "approved") return "approved";

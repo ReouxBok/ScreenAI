@@ -50,7 +50,7 @@ import { CASE_REPLY_STUDIO_APPROVAL_BASIS, CASE_REPLY_STUDIO_CORRECTION_BASIS, t
 import { finalizeCaseReplyProposal } from "./case-reply-outbound";
 import { encodeCaseReplyReviewToken, reviewCaseReply } from "./case-reply-review";
 import { produceAutoJ2, enqueueApprovedJ2 } from "./v2-j2-binding";
-import { J2_REMINDER_TEXT } from "./j2-auto-reminder";
+import { J2_REMINDER_TEXT, j2ReminderText, readJ2Origin } from "./j2-auto-reminder";
 import { runDueJ2Pass } from "./timer-store";
 import { listCaseEvents, listCaseTimers, readCase, readCaseByTicket } from "./case-store";
 import type { CaseAdmissionQualification, CaseSnapshot, KnowledgeRef } from "./case-types";
@@ -675,7 +675,7 @@ describe("SYN export for UX", () => {
 });
 
 
-it.each([false, true])("J2 follows real decision provenance and refuses a retired source=%s", async retired => {
+it.each([[false, false], [true, false], [false, true], [true, true]])("J2 follows real decision provenance and refuses a retired source=%s contextual=%s", async (retired, contextual) => {
   try {
     const mail = await queued();
     expect(await executeIntakePass(mail.replyExecutionId, options, {}, driver())).toMatchObject({ state: "confirmed" });
@@ -690,7 +690,8 @@ it.each([false, true])("J2 follows real decision provenance and refuses a retire
     await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-block-switch.v1:access"));
     await f.db.insert(savSyncState).values({ key: "sav-block-switch.v1:access", status: "installed", cursor: encryptSavPayload({ revision: "sav-block-switch.v1", blockId: "access", mode: "auto", paused: false, setBy: "fixture@example.invalid", setAt: AT, reason: "synthetic" }) });
     await runDueJ2Pass({ now: new Date(), maxEvents: 10, currentPolicyRevision: POLICY.revision, ports: { reminderEffect: async () => "none", budgetAvailable: async () => true } });
-    const currentProvenance = { ...provenanceDeps, now: () => new Date() };
+    environment.SAV_V2_J2_CONTEXTUAL = contextual ? "on" : "off";
+    const currentProvenance = { ...provenanceDeps, env: () => environment, now: () => new Date() };
     const deps = { ...storeDeps(), pilotProvenance: pilotProvenanceGate(currentProvenance) };
     const snapshot = (await readCase(mail.caseId))!;
     if (retired) {
@@ -699,7 +700,13 @@ it.each([false, true])("J2 follows real decision provenance and refuses a retire
       expect(sends).toBe(1);
       return;
     }
-    expect(await readPilotReplyProvenance({ caseId: mail.caseId, triggerEventId: `timer:${timer!.id}`, purpose: "reminder", text: J2_REMINDER_TEXT }, currentProvenance)).toMatchObject({ status: "proven" });
+    const origin = (await readJ2Origin(mail.caseId, `timer:${timer!.id}`, POLICY.revision, new Date()))!;
+    const text = j2ReminderText(origin, environment);
+    if (!contextual) expect(text).toBe(J2_REMINDER_TEXT);
+    const reminder = { caseId: mail.caseId, triggerEventId: `timer:${timer!.id}`, purpose: "reminder" as const, text };
+    expect(await readPilotReplyProvenance(reminder, currentProvenance)).toMatchObject({ status: "proven" });
+    expect(await readPilotReplyProvenance({ ...reminder, text: `${text} texte inventé` }, currentProvenance))
+      .toMatchObject({ status: "unproven", reasons: ["reply_not_from_decision"] });
     expect(await produceAutoJ2(timer!, snapshot.version, deps)).toBe("approved");
     let id = "";
     expect(await enqueueApprovedJ2(timer!, snapshot.version, { id: grant.id, hash: grant.policyHash }, deps, value => { id = value; })).toBe("queued");
