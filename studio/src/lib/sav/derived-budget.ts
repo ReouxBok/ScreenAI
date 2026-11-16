@@ -5,7 +5,7 @@ import { requireDb } from "@/db";
 import { auditLogs } from "@/db/schema";
 import type { SavGeminiMetadata } from "./gemini-response";
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
-type Stage = "comparison" | "translation";
+type Stage = "comparison" | "translation" | "block_builder";
 export const SAV_DERIVED_COST_REVISION = "sav-derived-usd-2026-10-19.v1";
 export const SAV_DERIVED_MONEY = {
     dayNanoUsd: 1000000000, rollingNanoUsd: 30000000000, alertNanoUsd: 24000000000
@@ -33,7 +33,7 @@ export function savDerivedBudgets() {
         return Number.isFinite(value) ? Math.min(fallback, Math.max(0, Math.floor(value))) : 0;
     };
     return {
-        comparison: bound("SAV_COMPARISON_DAILY_CALLS", 20), translation: bound("SAV_TRANSLATION_DAILY_CALLS", 50), total: bound("SAV_DERIVED_DAILY_CALLS", 60), simulation: 0
+        block_builder: 24, comparison: bound("SAV_COMPARISON_DAILY_CALLS", 20), translation: bound("SAV_TRANSLATION_DAILY_CALLS", 50), total: bound("SAV_DERIVED_DAILY_CALLS", 60), simulation: 0
     };
 }
 /** Full published model input limit covers system/data/schema without estimating
@@ -41,7 +41,9 @@ export function savDerivedBudgets() {
  * guide. Text-only, no tools/cache/grounding, Standard Gemini Developer API.
  * Tariff: ai.google.dev/gemini-api/docs/pricing#gemini-3.6-flash (2026-10-19).
  * The provider's documented contract is an assumption, not a billing guarantee. */
-export function savDerivedCostQuote(model: string, maxOutputTokens: number, now = new Date()) {
+/** Block authoring bounds the complete text wire body to 65536 UTF-8 bytes before dispatch,
+ * conservatively admitting no more than that many input tokens. Other stages retain their original quote. */
+export function savDerivedCostQuote(model: string, maxOutputTokens: number, now = new Date(), stage?: Stage) {
     if (model !== "gemini-3.6-flash")
         return failure("SAV_DERIVED_MODEL_UNPRICED");
     if (!Number.isFinite(now.getTime()) || now.getTime() < PRICE_FROM || now.getTime() >= PRICE_UNTIL)
@@ -49,29 +51,29 @@ export function savDerivedCostQuote(model: string, maxOutputTokens: number, now 
     if (!integer(maxOutputTokens) || maxOutputTokens < 1 || maxOutputTokens > 8192)
         return failure("SAV_DERIVED_REQUEST_UNBOUNDED");
     return {
-        budgetRevision: SAV_DERIVED_COST_REVISION, model, maxInputTokens: INPUT_LIMIT, maxOutputTokens,
+        budgetRevision: SAV_DERIVED_COST_REVISION, model, maxInputTokens: stage === "block_builder" ? 65536 : INPUT_LIMIT, maxOutputTokens,
         inputNanoUsdPerToken: INPUT_NANO_USD, outputNanoUsdPerToken: OUTPUT_NANO_USD,
-        reservedNanoUsd: INPUT_LIMIT * INPUT_NANO_USD + maxOutputTokens * OUTPUT_NANO_USD,
+        reservedNanoUsd: (stage === "block_builder" ? 65536 : INPUT_LIMIT) * INPUT_NANO_USD + maxOutputTokens * OUTPUT_NANO_USD,
         priceExpiresAt: new Date(PRICE_UNTIL).toISOString()
     };
 }
 async function lock(tx: Tx) { await tx.execute(sql `select pg_advisory_xact_lock(hashtext('sav-derived-model-budget'))`); }
-function verifiedUsageCost(metadata: Record<string, unknown>, maxOutputTokens: number) {
+function verifiedUsageCost(metadata: Record<string, unknown>, maxOutputTokens: number, maxInputTokens = INPUT_LIMIT) {
     const { inputTokens, outputTokens, thoughtTokens, totalTokens } = metadata;
     if (![
         inputTokens, outputTokens, thoughtTokens, totalTokens
     ].every(integer) ||
-        (inputTokens as number) < 1 || (inputTokens as number) > INPUT_LIMIT ||
+        (inputTokens as number) < 1 || (inputTokens as number) > maxInputTokens ||
         (outputTokens as number) + (thoughtTokens as number) > maxOutputTokens ||
         (inputTokens as number) + (outputTokens as number) + (thoughtTokens as number) !== totalTokens)
         return null;
     return (inputTokens as number) * INPUT_NANO_USD + ((outputTokens as number) + (thoughtTokens as number)) * OUTPUT_NANO_USD;
 }
 function charge(metadata: Record<string, unknown>) {
-    if(metadata.stage!=="comparison" && metadata.stage!=="translation")return failure("SAV_DERIVED_COST_HISTORY_UNKNOWN");
+    if(metadata.stage!=="comparison" && metadata.stage!=="translation" && metadata.stage!=="block_builder")return failure("SAV_DERIVED_COST_HISTORY_UNKNOWN");
     let quote: ReturnType<typeof savDerivedCostQuote>;
     try {
-        quote = savDerivedCostQuote(String(metadata.model), metadata.maxOutputTokens as number, new Date(PRICE_FROM));
+        quote = savDerivedCostQuote(String(metadata.model), metadata.maxOutputTokens as number, new Date(PRICE_FROM), metadata.stage as Stage);
     }
     catch {
         return failure("SAV_DERIVED_COST_HISTORY_UNKNOWN");
@@ -81,7 +83,7 @@ function charge(metadata: Record<string, unknown>) {
         return failure("SAV_DERIVED_COST_HISTORY_UNKNOWN");
     if (metadata.chargedNanoUsd === undefined)
         return quote.reservedNanoUsd;
-    const verified = verifiedUsageCost(metadata, quote.maxOutputTokens);
+    const verified = verifiedUsageCost(metadata, quote.maxOutputTokens, quote.maxInputTokens);
     if (!metadata.dispatchedAt || !Number.isFinite(Date.parse(String(metadata.settledAt))) || verified === null || verified !== metadata.chargedNanoUsd || verified > quote.reservedNanoUsd)
         return failure("SAV_DERIVED_COST_HISTORY_UNKNOWN");
     return verified;
@@ -91,7 +93,7 @@ async function usage(tx: Tx, now: Date) {
     const rows = await tx.select().from(auditLogs).where(and(eq(auditLogs.action, RESERVED), gt(auditLogs.createdAt, rolling)));
     let dayNanoUsd = 0, rollingNanoUsd = 0, dayCalls = 0;
     const stageCalls = {
-        comparison: 0, translation: 0
+        comparison: 0, translation: 0, block_builder: 0
     };
     for (const row of rows) {
         if (row.createdAt > now)
@@ -102,7 +104,7 @@ async function usage(tx: Tx, now: Date) {
             dayNanoUsd += cost;
             dayCalls++;
             const stage = row.technicalMetadata.stage;
-            if (stage !== "comparison" && stage !== "translation")
+            if (stage !== "comparison" && stage !== "translation" && stage !== "block_builder")
                 return failure("SAV_DERIVED_COST_HISTORY_UNKNOWN");
             stageCalls[stage]++;
         }
@@ -131,11 +133,13 @@ async function alert(tx: Tx, now: Date, rollingNanoUsd: number) {
 export async function reserveSavDerivedCallTx(tx: Tx, stage: Stage, now = new Date(), proofKey?: string, request = {
     model: process.env.SAV_AI_MODEL ?? "gemini-3.6-flash", maxOutputTokens: stage === "comparison" ? 4096 : 8192
 }) {
-    const quote = savDerivedCostQuote(request.model, request.maxOutputTokens, now);
+    const quote = savDerivedCostQuote(request.model, request.maxOutputTokens, now, stage);
+    if (stage === "block_builder" && quote.reservedNanoUsd > 200_000_000) return failure("SAV_DERIVED_COST_CAP");
     await lock(tx);
     await lockSavSharedSpend(tx);
     const used = await usage(tx, now), limits = savDerivedBudgets();
     await assertSavSharedSpend(tx, quote.reservedNanoUsd, now);
+    if (stage === "block_builder" && used.dayNanoUsd + quote.reservedNanoUsd > 2_000_000_000) return failure("SAV_DERIVED_DAILY_CAP");
     if (used.dayCalls >= limits.total || used.stageCalls[stage] >= limits[stage])
         return failure("SAV_DERIVED_DAILY_BUDGET_EXHAUSTED");
     if (used.dayNanoUsd + quote.reservedNanoUsd > SAV_DERIVED_MONEY.dayNanoUsd || used.rollingNanoUsd + quote.reservedNanoUsd > SAV_DERIVED_MONEY.rollingNanoUsd)
@@ -164,7 +168,8 @@ export async function reserveSavDerivedCall(stage: Stage, model: string, maxOutp
  * changed model/configuration never dispatches a second request. */
 export async function dispatchSavDerivedCall(reservationId: string, stage: Stage, model: string, body: Record<string, unknown>, now = new Date()) {
     const config = body.generationConfig as Record<string, unknown> | undefined;
-    const quote = savDerivedCostQuote(model, config?.maxOutputTokens as number, now);
+    const quote = savDerivedCostQuote(model, config?.maxOutputTokens as number, now, stage);
+    if (stage === "block_builder" && Buffer.byteLength(JSON.stringify(body), "utf8") > quote.maxInputTokens) return failure("SAV_DERIVED_REQUEST_UNBOUNDED");
     const allowed = [
         "systemInstruction", "contents", "generationConfig"
     ];
@@ -222,7 +227,7 @@ export async function settleSavDerivedCall(reservationId: string, metadata: SavG
         const { inputTokens, outputTokens, thoughtTokens, totalTokens } = metadata;
         const chargedNanoUsd = verifiedUsageCost({
             ...metadata
-        }, Number(m.maxOutputTokens));
+        }, Number(m.maxOutputTokens), Number(m.maxInputTokens));
         if (!m.dispatchedAt || chargedNanoUsd === null || !integer(m.reservedNanoUsd) || chargedNanoUsd > m.reservedNanoUsd)
             return {
                 settled: false

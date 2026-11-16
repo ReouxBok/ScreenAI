@@ -12,3 +12,10 @@ export async function saveBlockBriefAction(form: FormData) {
   await saveSavBlockBuilder(brief, accepted);
   redirect(`/studio/sav/blocs/assistant?bloc=${encodeURIComponent(brief.blockId)}&result=${prepare ? accepted ? "prepared" : "blocked" : "saved"}`);
 }
+
+export async function prepareBlockMaterialsAction(form: FormData) {
+  await savBlockBuilderAdministrator();
+  const { saveBlockMaterials } = await import("@/lib/sav/blocks/block-materials-admin");
+  await saveBlockMaterials(String(form.get("blockId") ?? ""), form.get("useAi") === "on");
+  redirect(`/studio/sav/blocs/assistant?bloc=${encodeURIComponent(String(form.get("blockId")))}&result=materials`);
+}

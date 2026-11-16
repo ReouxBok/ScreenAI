@@ -98,7 +98,8 @@
    "releaseIntakeHumanHoldAction"
   ],
   "app/studio/sav/blocs/assistant/actions.ts": [
-   "saveBlockBriefAction"
+   "saveBlockBriefAction",
+   "prepareBlockMaterialsAction"
   ],
   "app/studio/sav/intake/agents/actions.ts": [
    "createAgentKeyAction",
@@ -175,7 +176,7 @@
   },
   "app/studio/sav/blocs/assistant/actions.ts": {
    "action": "savBlockBuilderAdministrator()",
-   "lib": "lib/sav/blocks/block-builder-admin.ts saveSavBlockBuilder: administrator check before any write (sync_state and auditLogs only)",
+   "lib": "lib/sav/blocks/block-builder-admin.ts and block-materials-admin.ts: administrator before reads and writes; encrypted sync_state, audit and proposal drafts only; no publication",
    "roles": "admin or owner with SAV access"
   }
  }
