@@ -9,8 +9,9 @@ import { blockedBehind, finishNativeHandle, openNativeHandle, openNativeObserver
 const state = vi.hoisted(() => ({ db: (() => { throw Error("NO_DB_ALLOWED"); }) as () => unknown, user: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db() }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }));
-import { auditLogs, savIntakeEffects, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeRuns, savMailboxes, savMessages, savThreads, staffUsers } from "@/db/schema";
+import { auditLogs, savIntakeEffects, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeRuns, savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
 import { encryptSavPayload } from "../crypto";
+import { savAgentPauseKey } from "./agent-pause";
 import { setSavAgentPause } from "./agent-pause-admin";
 import { reconcileIntakeUncertainEffect } from "./effect-reconciliation";
 import { intakeRuntimeHash } from "./runtime-contract";
@@ -30,6 +31,9 @@ const proof = { confirmed: true, attributed: true, ack: { id: "301" } };
 // Fresh synthetic records, no truncation of the shared CI database. No DATABASE_URL fallback.
 describe.skipIf(!URL_)("SAV-92 native effect reconciliation concurrency", () => {
   let a: Store, b: Store, observer: postgres.Sql, holders: postgres.Sql, mailboxId: string, adminId: string, pidA: number, pidB: number;
+  // The shared intake pause row is written here with this file's encryption key: any later file in the same native job
+  // (other key) would read it as unreadable, i.e. fully_paused (fail closed). It is restored exactly as found.
+  let pauseBefore: (typeof savSyncState.$inferSelect) | undefined, pauseCaptured = false;
   const on = <T>(store: Store, work: () => Promise<T>) => context.run(store.db, work);
   const pause = (level: "running" | "actions_paused") => on(b, () => setSavAgentPause({ agent: "intake", level, reason: "Synthetic native concurrency fixture" }));
   const reconcile = (store: Store, input: { threadId: string; messageId: string }, verify: ExecutorAdapters["verify"]) =>
@@ -44,6 +48,7 @@ describe.skipIf(!URL_)("SAV-92 native effect reconciliation concurrency", () => 
     state.db = () => context.getStore() ?? a.db;
     observer = openNativeObserver(URL_!);
     holders = postgres(URL_!, { max: 1, prepare: false, connect_timeout: 5, onnotice: () => {}, connection: { statement_timeout: 10000, lock_timeout: 5000 } });
+    [pauseBefore] = await a.db.select().from(savSyncState).where(eq(savSyncState.key, savAgentPauseKey("intake"))); pauseCaptured = true;
     pidA = (await a.client.query<{ pid: number }>("select pg_backend_pid() as pid")).rows[0].pid;
     pidB = (await b.client.query<{ pid: number }>("select pg_backend_pid() as pid")).rows[0].pid;
     expect(pidA).not.toBe(pidB);
@@ -59,6 +64,10 @@ describe.skipIf(!URL_)("SAV-92 native effect reconciliation concurrency", () => 
   afterEach(async () => { if (b) await pause("running"); });
   afterAll(async () => {
     state.user = null;
+    if (a && pauseCaptured) {
+      await a.db.delete(savSyncState).where(eq(savSyncState.key, savAgentPauseKey("intake")));
+      if (pauseBefore) await a.db.insert(savSyncState).values(pauseBefore);
+    }
     vi.unstubAllEnvs(); vi.unstubAllGlobals();
     await a?.client.close(); await b?.client.close(); await holders?.end({ timeout: 2 }); await observer?.end({ timeout: 2 });
   });
