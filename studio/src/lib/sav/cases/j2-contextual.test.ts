@@ -50,6 +50,15 @@ describe("J2 warm follow-up and administrative closure", () => {
     expect(text).toContain("en vous proposant la marche à suivre suivante :\n" + procedure.text.split("\n\n")[1]);
     expectFormat(text);
   });
+  it.each([
+    `Bonjour,\n\nVous devez disposer des droits administrateur avant de commencer.\n\n${procedure.text.split("\n\n")[1]}`,
+    `${procedure.text}\n\nCette procédure nécessite une session administrateur active.`,
+    `${procedure.text}\n\nSi vous utilisez un compte invité, demandez d’abord son activation.`,
+  ])("uses the neutral reminder for a prerequisite or condition outside the steps (%s)", text => {
+    const reminder = j2ReminderText({ ...procedure, text }, on);
+    expect(reminder).toBe(J2_REMINDER_TEXT);
+    expectFormat(reminder);
+  });
   it("copies the impossibility explanation that was sent", () => {
     const text = j2ReminderText(impossible, on);
     expect(text).toContain("avec l’explication suivante :\nIl n’est pas possible de réaliser cette opération dans cette version.");

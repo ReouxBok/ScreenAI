@@ -45,10 +45,11 @@ export function j2ReminderText(origin: J2Origin, env: Record<string, string | un
   } else if (origin.purpose === "answer") {
     const numbered = body.split("\n").filter(line => /^\d+[.)] /.test(line));
     if (origin.procedures?.length && numbered.length && numbered.every((line, i) => line.startsWith(`${i + 1}. `) || line.startsWith(`${i + 1}) `))) {
-      // Refuse split lists, continuation lines and ambiguous extra bullets rather than omit an instruction.
+      // Only the greeting may sit outside the list: any other prose could be a prerequisite or condition.
       const block = numbered.join("\n");
       const paragraphs = body.split("\n\n");
-      if (paragraphs.includes(block) && !body.replace(block, "").match(/^(?:[-•] |\d+[.)] )/m)) {
+      const instructions = body.replace(/^Bonjour(?:,)?\n\n/, "");
+      if (paragraphs.includes(block) && instructions === block) {
         recall = `en vous proposant la marche à suivre suivante :\n${block}`;
       }
     } else if (!origin.procedures?.length && !/^(?:[-•] |\d+[.)] )/m.test(body)) {
