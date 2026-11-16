@@ -4,9 +4,9 @@
 //   continueCaseAfterCommit the real trigger after a commit; sweepCaseContinuations its durable catch-up. A failure stays visible (log and one durable marker per case), never swallowed
 // It writes no HubSpot owner, invents no owner id, policy, rule or right: anything absent from the environment admits nobody.
 import "server-only";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, lte } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { auditLogs, savCaseEvents, savCases, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeRuns, savMessages, savThreads } from "@/db/schema";
+import { auditLogs, savCaseEvents, savCases, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeRuns, savMessages, savSyncState, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { readSavExternalCompletion } from "../external-completion";
 import { readSavAgentPause } from "../intake/agent-pause";
@@ -474,38 +474,56 @@ export async function continueCaseAfterCommit(caseId: string, trigger: CaseConti
   return { status: "failed", code };
 }
 
-/** How many queued cases the sweep reads the qualification scope of, at most, to fill its slots. */
+/** One stable-id lap over queued agent cases. Updated timestamps and failure markers never move a case within the lap. */
+const CONTINUATION_CURSOR = "sav-v2-sweep.v1:continuation";
 const SCOPE_SCAN = 50;
-/** Durable catch-up after a crash between a commit and its trigger, or a failed trigger: the cases the agent holds that are still queued, bounded. A pause stops it.
- * Never tried or not failing first, then the failure tried longest ago: a case that keeps failing cannot hold a slot against the others. */
+/** Durable, bounded catch-up. Excluded and held cases advance the cursor too; only the handled prefix advances when slots fill.
+ * A crash before saving the cursor can repeat work, so the continuation retains all its usual guards and effect deduplication. */
 export async function sweepCaseContinuations(input: EntryDeps & { limit?: number }) {
   if (!savV2EntryEnabled(input.env)) return { skipped: "off" as const };
   const db = requireDb();
   if (await relayPaused(db)) return { skipped: "paused" as const };
   const limit = Math.min(Math.max(input.limit ?? 4, 1), 20);
-  const candidates = await db.select({ id: savCases.id }).from(savCases).where(and(eq(savCases.owner, "agent"), eq(savCases.phase, "queued"))).orderBy(asc(savCases.updatedAt), asc(savCases.id)).limit(200);
-  // SAV-18: a case held by its block while that block still never sends takes no slot; once the block may act again, it is taken like any other.
+  const [saved] = await db.select({ cursor: savSyncState.cursor, version: savSyncState.processedCount }).from(savSyncState).where(eq(savSyncState.key, CONTINUATION_CURSOR));
+  const after = saved?.cursor && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(saved.cursor) ? saved.cursor : null;
+  const candidates = await db.select({ id: savCases.id }).from(savCases)
+    .where(and(eq(savCases.owner, "agent"), eq(savCases.phase, "queued"), after ? gt(savCases.id, after) : undefined))
+    .orderBy(asc(savCases.id)).limit(SCOPE_SCAN);
+  // Tail and head are disjoint, even when the cursor case was deleted. Count both reads
+  // against the same cap; no case can be revisited within this passage.
+  if (after && candidates.length < SCOPE_SCAN) {
+    candidates.push(...await db.select({ id: savCases.id }).from(savCases)
+      .where(and(eq(savCases.owner, "agent"), eq(savCases.phase, "queued"), lte(savCases.id, after)))
+      .orderBy(asc(savCases.id)).limit(SCOPE_SCAN - candidates.length));
+  }
   const held = await caseIdsStillHeldByBlock(candidates.map(row => row.id), db);
-  const marks = candidates.length ? await db.select({ id: auditLogs.entityId, meta: auditLogs.technicalMetadata }).from(auditLogs)
-    .where(and(eq(auditLogs.entityType, FAILURE_MARK.entityType), eq(auditLogs.action, FAILURE_MARK.action), inArray(auditLogs.entityId, candidates.map(row => row.id)))) : [];
-  const failedAt = new Map(marks.map(mark => [mark.id, Date.parse(String((mark.meta as { lastAt?: unknown } | null)?.lastAt)) || 0]));
-  // Stable sort: untouched cases keep their oldest-first order.
-  const ordered = candidates.filter(row => !held.has(row.id)).sort((a, b) => (failedAt.get(a.id) ?? -1) - (failedAt.get(b.id) ?? -1));
-  // SAV-80: a case outside the qualification scope is never updated by its continuation, so it would keep the oldest slots forever and starve newer
-  // cases. The scope is read first (no database in the open mode or for a closed scope), over a bounded window, and only allowed cases take a slot.
-  const queued: { id: string }[] = [];
-  let outOfScope = 0;
-  for (const row of ordered.slice(0, SCOPE_SCAN)) {
-    if (queued.length >= limit) break;
-    const scoped = await savV2QualificationCaseAllowed(input.env, row.id).catch(() => ({ allowed: false as const, reason: "qualification_unreadable" }));
-    if (scoped.allowed) queued.push(row); else outOfScope++;
+  const outcome = { tried: 0, failed: {} as Record<string, number>, outOfScope: 0 };
+  let handled = 0;
+  for (const { id } of candidates) {
+    if (outcome.tried >= limit) break;
+    if (!held.has(id)) {
+      const scoped = await savV2QualificationCaseAllowed(input.env, id).catch(() => ({ allowed: false as const, reason: "qualification_unreadable" }));
+      if (!scoped.allowed) outcome.outOfScope++;
+      else {
+        outcome.tried++;
+        const result = await continueCaseAfterCommit(id, "sweep", input);
+        if (result.status === "failed") { const code = (result as { code: string }).code; outcome.failed[code] = (outcome.failed[code] ?? 0) + 1; }
+      }
+    }
+    handled++;
   }
-  if (outOfScope) console.info("sav_v2_continuation_sweep_out_of_scope", { count: outOfScope });
-  const outcome = { tried: 0, failed: {} as Record<string, number>, ...(outOfScope ? { outOfScope } : {}) };
-  for (const { id } of queued) {
-    outcome.tried++;
-    const result = await continueCaseAfterCommit(id, "sweep", input);
-    if (result.status === "failed") { const code = (result as { code: string }).code; outcome.failed[code] = (outcome.failed[code] ?? 0) + 1; }
+  const cursor = handled === candidates.length && candidates.length < SCOPE_SCAN ? null : candidates[handled - 1]!.id;
+  // Compare-and-set: a concurrent passage that already committed wins. A stale
+  // passage never overwrites its progress, including after a complete lap (ABA).
+  // processedCount is this cursor's revision, not a case/budget/attempt counter.
+  if (saved) {
+    await db.update(savSyncState).set({ cursor, processedCount: saved.version + 1, updatedAt: new Date() })
+      .where(and(eq(savSyncState.key, CONTINUATION_CURSOR), eq(savSyncState.processedCount, saved.version),
+        saved.cursor === null ? isNull(savSyncState.cursor) : eq(savSyncState.cursor, saved.cursor)));
+  } else {
+    await db.insert(savSyncState).values({ key: CONTINUATION_CURSOR, cursor, status: "idle", processedCount: 1, updatedAt: new Date() })
+      .onConflictDoNothing({ target: savSyncState.key });
   }
-  return outcome;
+  if (outcome.outOfScope) console.info("sav_v2_continuation_sweep_out_of_scope", { count: outcome.outOfScope });
+  return { tried: outcome.tried, failed: outcome.failed, ...(outcome.outOfScope ? { outOfScope: outcome.outOfScope } : {}) };
 }
