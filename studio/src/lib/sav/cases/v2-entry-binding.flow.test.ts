@@ -879,14 +879,14 @@ describe("immediate send: the queued reply leaves at once within the caller's bu
     expect(s.started).toEqual([execution!.id]);
     expect(r.counter.sends).toBe(0);
     // The step (own budget) and the catch-up at the same time: ONE send.
-    const [step] = await Promise.all([runCaseReplySend(execution!.id, { env: q.env, deadlineMs: Date.now() + 240_000, sendNow: r.sendNow }), r.catchUp()]);
+    const [step] = await Promise.all([runCaseReplySend(execution!.id, { env: { ...q.env, VERCEL_ENV: "production" }, deadlineMs: Date.now() + 240_000, sendNow: r.sendNow }), r.catchUp()]);
     expect(step).toEqual(expect.objectContaining({ supervised: expect.any(String) }));
     expect(r.counter.sends).toBe(1);
     expect(await effectRows(q.made.caseId)).toEqual([expect.objectContaining({ state: "confirmed" })]);
     // Replays: another sweep, a relay without deadline, the step started twice by mistake, the catch-up: nothing more.
     await point({ caseId: q.made.caseId, trigger: "sweep", env: q.env });
     await point({ caseId: q.made.caseId, trigger: "relay", env: q.env });
-    await runCaseReplySend(execution!.id, { env: q.env, deadlineMs: Date.now() + 240_000, sendNow: r.sendNow });
+    expect(await runCaseReplySend(execution!.id, { env: { ...q.env, VERCEL_ENV: "production" }, deadlineMs: Date.now() + 240_000, sendNow: r.sendNow })).toEqual({ skipped: "not_consumed" });
     await r.catchUp();
     expect(s.started).toEqual([execution!.id]);
     expect(r.counter.sends).toBe(1);
@@ -901,7 +901,7 @@ describe("immediate send: the queued reply leaves at once within the caller's bu
     expect(r.provider.calls).toEqual([]);
     const [execution] = await effectRows(q.made.caseId);
     expect(s.started).toEqual([execution!.id]);
-    await runCaseReplySend(execution!.id, { env: q.env, deadlineMs: Date.now() + 240_000, sendNow: r.sendNow });
+    await runCaseReplySend(execution!.id, { env: { ...q.env, VERCEL_ENV: "production" }, deadlineMs: Date.now() + 240_000, sendNow: r.sendNow });
     expect(r.counter.sends).toBe(1);
   });
 
@@ -925,7 +925,7 @@ describe("immediate send: the queued reply leaves at once within the caller's bu
     const pause = { revision: SAV_AGENT_PAUSE_REVISION, agent: "intake", level: "fully_paused", setBy: "staff@example.invalid", setAt: new Date().toISOString(), reason: "Pause synthétique" };
     await f.db.insert(savSyncState).values({ key: savAgentPauseKey("intake"), cursor: encryptSavPayload(pause), status: "active", updatedAt: new Date() });
     try {
-      expect(await runCaseReplySend(execution!.id, { env: q.env, deadlineMs: Date.now() + 240_000, sendNow: r.sendNow })).toEqual({ skipped: "SAV_INTAKE_AGENT_FULLY_PAUSED" });
+      expect(await runCaseReplySend(execution!.id, { env: { ...q.env, VERCEL_ENV: "production" }, deadlineMs: Date.now() + 240_000, sendNow: r.sendNow })).toEqual({ skipped: "SAV_INTAKE_AGENT_FULLY_PAUSED" });
     } finally { await f.db.delete(savSyncState).where(eq(savSyncState.key, savAgentPauseKey("intake"))); }
     expect(r.counter.sends).toBe(0);
     await r.catchUp();

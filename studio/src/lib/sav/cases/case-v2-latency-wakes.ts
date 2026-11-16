@@ -72,6 +72,23 @@ async function setState(mark: { action: string; entityType: string }, entityId: 
 }
 
 /**
+ * Review Astra P2: a step acts only after consuming ITS marker, atomically, under the same advisory lock as the reservation: the marker exists, still names
+ * this wake (`matches`) and is still open (`starting` or `scheduled`/`dispatched`); it is then closed in the same transaction. A duplicate step, a wake replaced by
+ * a later one, a marker already consumed or any SQL error returns false, and the step does nothing (the sweep and the catch-up stay the fallback).
+ */
+async function consume(mark: { action: string; entityType: string }, entityId: string, open: readonly string[], to: string, matches: (current: Meta) => boolean = () => true) {
+  try {
+    return await requireDb().transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`${mark.action}:${entityId}`}))`);
+      const [existing] = await tx.select().from(auditLogs).where(markOf(mark, entityId)).for("update");
+      if (!existing || !open.includes(String(existing.technicalMetadata.state)) || !matches(existing.technicalMetadata)) return false;
+      await tx.update(auditLogs).set({ technicalMetadata: { ...existing.technicalMetadata, state: to, lastAt: new Date().toISOString() } }).where(eq(auditLogs.id, existing.id));
+      return true;
+    });
+  } catch { return false; }
+}
+
+/**
  * Settle wake: called when a passage on `caseId` was refused for `inbound_settling` until `retryAt`. Starts ONE workflow that sleeps until
  * `retryAt + CASE_SETTLE_WAKE_MARGIN_MS` and continues the case. Refused (nothing started) when off, outside production, the date is not ahead, a wake is
  * already pending for this case, or the date is not strictly later than the one already woken for. Never throws.
@@ -98,20 +115,25 @@ export async function requestCaseSettleWake(caseId: string, retryAt: string, opt
   try {
     await (options.start ?? defaultSettleStart)(caseId, wakeAt);
   } catch {
-    await setState(CASE_SETTLE_WAKE_MARK, caseId, "start_failed", current => current.wakeAt === wakeAt).catch(() => undefined);
+    await setState(CASE_SETTLE_WAKE_MARK, caseId, "start_failed", current => current.wakeAt === wakeAt && current.state === "starting").catch(() => undefined);
     return { started: false, reason: "start_failed" };
   }
-  await setState(CASE_SETTLE_WAKE_MARK, caseId, "scheduled", current => current.wakeAt === wakeAt).catch(() => undefined);
+  await setState(CASE_SETTLE_WAKE_MARK, caseId, "scheduled", current => current.wakeAt === wakeAt && current.state === "starting").catch(() => undefined);
   return { started: true, reason: "scheduled", wakeAt };
 }
 
-/** The settle wake's step: the marker of THIS wake is closed first (so a new refusal can schedule the next one), then the case is continued like any trigger. */
+/** The settle wake's step. The switch and the environment are read AGAIN here (a wake scheduled before `SAV_V2_WAKE_WORKFLOWS=off` does nothing); then the
+ * marker of THIS wake is consumed atomically (closed, so a new refusal can schedule the next one) and only a successful consumption continues the case. */
 export async function runCaseSettleWake(caseId: string, wakeAt: string, options: {
   env: Env; deadlineMs: number; /** Tests only. */ continuation?: CaseContinuationPoint | null; /** Tests only. */ settleWakeStart?: CaseSettleWakeStart;
 }) {
+  if (!savV2WakeWorkflowsEnabled(options.env)) { console.info("sav_v2_settle_wake_ran", { caseId, status: "off" }); return { status: "off" }; }
   const { continueCaseAfterCommit, savV2EntryEnabled } = await import("./v2-entry");
   if (!savV2EntryEnabled(options.env)) return { status: "v2_off" };
-  await setState(CASE_SETTLE_WAKE_MARK, caseId, "done", current => current.wakeAt === wakeAt).catch(() => undefined);
+  if (!await consume(CASE_SETTLE_WAKE_MARK, caseId, ["starting", "scheduled"], "done", current => current.wakeAt === wakeAt)) {
+    console.info("sav_v2_settle_wake_ran", { caseId, status: "not_consumed" });
+    return { status: "not_consumed" };
+  }
   const outcome = await continueCaseAfterCommit(caseId, "settle_wake", { env: options.env, immediateDeadlineMs: options.deadlineMs,
     ...(options.continuation === undefined ? {} : { continuation: options.continuation }), ...(options.settleWakeStart ? { settleWakeStart: options.settleWakeStart } : {}) });
   console.info("sav_v2_settle_wake_ran", { caseId, status: outcome.status });
@@ -131,19 +153,24 @@ export async function requestCaseReplySend(input: { env: Env; executionId: strin
   try {
     await (options.start ?? defaultSendStart)(input.executionId);
   } catch {
-    await setState(CASE_REPLY_SEND_MARK, input.executionId, "start_failed").catch(() => undefined);
+    await setState(CASE_REPLY_SEND_MARK, input.executionId, "start_failed", current => current.state === "starting").catch(() => undefined);
     return { started: false, reason: "start_failed" };
   }
-  await setState(CASE_REPLY_SEND_MARK, input.executionId, "dispatched").catch(() => undefined);
+  await setState(CASE_REPLY_SEND_MARK, input.executionId, "dispatched", current => current.state === "starting").catch(() => undefined);
   return { started: true, reason: "dispatched" };
 }
 
-/** The send wake's step: the production sender, inside this step's own budget. A closed summary only (never a payload). */
+/** The send wake's step: the switch and the environment read again, then its dispatch consumed atomically (a duplicate step sends nothing), then the
+ * production sender inside this step's own budget. A closed summary only (never a payload). */
 export async function runCaseReplySend(executionId: string, options: { env: Env; deadlineMs: number; sendNow?: ImmediateCaseReplySend }) {
+  if (!savV2WakeWorkflowsEnabled(options.env)) { console.info("sav_v2_reply_send_ran", { executionId, skipped: "off" }); return { skipped: "off" }; }
+  if (!await consume(CASE_REPLY_SEND_MARK, executionId, ["starting", "dispatched"], "ran")) {
+    console.info("sav_v2_reply_send_ran", { executionId, skipped: "not_consumed" });
+    return { skipped: "not_consumed" };
+  }
   const sendNow = options.sendNow ?? (await import("./v2-effects-binding")).sendQueuedCaseReplyNow;
   const sent = await sendNow({ env: options.env, executionId, callerDeadlineMs: options.deadlineMs }).catch(() => ({ failed: "SAV_V2_SEPARATE_SEND_THREW" }));
   const summary = "pass" in sent ? { supervised: sent.pass.skipped ?? sent.pass.supervisedSkipped ?? (sent.pass.supervised.map(row => row.state).join(",") || "none") } : sent;
-  await setState(CASE_REPLY_SEND_MARK, executionId, "ran").catch(() => undefined);
   console.info("sav_v2_reply_send_ran", { executionId, ...summary });
   return summary;
 }

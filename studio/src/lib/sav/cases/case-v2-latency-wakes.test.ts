@@ -124,9 +124,86 @@ describe("separate send: ONE dispatch per queued execution, sent in its own step
   it("the step sends with ITS OWN deadline (not the caller's) and returns a closed summary; a throwing sender never fails the step", async () => {
     const executionId = randomUUID(), deadlineMs = Date.now() + 240_000;
     const sendNow = vi.fn(async () => ({ pass: { skipped: null, recovery: [], supervised: [{ executionId, state: "confirmed", reason: null }], needsPerson: [] } }));
+    await requestCaseReplySend({ env: PROD, executionId }, { start: async () => {} });
     expect(await runCaseReplySend(executionId, { env: PROD, deadlineMs, sendNow })).toEqual({ supervised: "confirmed" });
     expect(sendNow).toHaveBeenCalledWith({ env: PROD, executionId, callerDeadlineMs: deadlineMs });
-    expect(await runCaseReplySend(executionId, { env: PROD, deadlineMs, sendNow: async () => { throw Error("SYNTHETIC"); } })).toEqual({ failed: "SAV_V2_SEPARATE_SEND_THREW" });
-    expect(await marker(CASE_REPLY_SEND_MARK, executionId)).toEqual([]); // never dispatched through the request: no marker invented by the step
+    const other = randomUUID();
+    await requestCaseReplySend({ env: PROD, executionId: other }, { start: async () => {} });
+    expect(await runCaseReplySend(other, { env: PROD, deadlineMs, sendNow: async () => { throw Error("SYNTHETIC"); } })).toEqual({ failed: "SAV_V2_SEPARATE_SEND_THREW" });
+  });
+});
+
+describe("review Astra (c08082e): the steps re-read the switch, and act only after consuming their own marker atomically", () => {
+  const scheduled = async (caseId: string) => {
+    const start = vi.fn<CaseSettleWakeStart>(async () => {});
+    expect(await requestCaseSettleWake(caseId, new Date(Date.now() + 300_000).toISOString(), { env: PROD, start })).toMatchObject({ started: true });
+    return start.mock.calls[0]![1];
+  };
+  const deadlineMs = () => Date.now() + 240_000;
+
+  it("P1 settle: scheduled -> switch off (or not production) -> the wake runs: ZERO continuation, the marker stays for nobody", async () => {
+    const caseId = randomUUID(), wakeAt = await scheduled(caseId), point = vi.fn<CaseContinuationPoint>(async () => ({ status: "queued" }));
+    expect(await runCaseSettleWake(caseId, wakeAt, { env: { ...V2, SAV_V2_WAKE_WORKFLOWS: "off" }, deadlineMs: deadlineMs(), continuation: point })).toEqual({ status: "off" });
+    expect(await runCaseSettleWake(caseId, wakeAt, { env: { ...V2, VERCEL_ENV: "preview" }, deadlineMs: deadlineMs(), continuation: point })).toEqual({ status: "off" });
+    expect(point).not.toHaveBeenCalled();
+  });
+
+  it("P1 send: dispatched -> switch off (or not production) -> the step runs: ZERO send", async () => {
+    const executionId = randomUUID(), sendNow = vi.fn(async () => ({ skipped: "never" }));
+    await requestCaseReplySend({ env: PROD, executionId }, { start: async () => {} });
+    expect(await runCaseReplySend(executionId, { env: { ...PROD, SAV_V2_WAKE_WORKFLOWS: "off" }, deadlineMs: deadlineMs(), sendNow })).toEqual({ skipped: "off" });
+    expect(await runCaseReplySend(executionId, { env: {}, deadlineMs: deadlineMs(), sendNow })).toEqual({ skipped: "off" });
+    expect(sendNow).not.toHaveBeenCalled();
+  });
+
+  it("P2 settle: the same wake run twice in sequence continues ONCE", async () => {
+    const caseId = randomUUID(), wakeAt = await scheduled(caseId), point = vi.fn<CaseContinuationPoint>(async () => ({ status: "queued" }));
+    expect(await runCaseSettleWake(caseId, wakeAt, { env: V2, deadlineMs: deadlineMs(), continuation: point })).toEqual({ status: "queued" });
+    expect(await runCaseSettleWake(caseId, wakeAt, { env: V2, deadlineMs: deadlineMs(), continuation: point })).toEqual({ status: "not_consumed" });
+    expect(point).toHaveBeenCalledTimes(1);
+  });
+
+  it("P2 settle: an old wake delayed past its replacement continues nothing; the replacing wake continues once", async () => {
+    const caseId = randomUUID(), start = vi.fn<CaseSettleWakeStart>(async () => {}), point = vi.fn<CaseContinuationPoint>(async () => ({ status: "queued" }));
+    const t0 = Date.now();
+    await requestCaseSettleWake(caseId, new Date(t0 + 300_000).toISOString(), { env: PROD, start, now: new Date(t0) });
+    // The first wake is lost past its grace; a later window replaces it.
+    await requestCaseSettleWake(caseId, new Date(t0 + 900_000).toISOString(), { env: PROD, start, now: new Date(t0 + 600_000) });
+    const [[, oldWake], [, newWake]] = start.mock.calls as [string, string][];
+    expect(await runCaseSettleWake(caseId, oldWake!, { env: V2, deadlineMs: deadlineMs(), continuation: point })).toEqual({ status: "not_consumed" });
+    expect(point).not.toHaveBeenCalled();
+    expect(await runCaseSettleWake(caseId, newWake!, { env: V2, deadlineMs: deadlineMs(), continuation: point })).toEqual({ status: "queued" });
+    expect(point).toHaveBeenCalledTimes(1);
+  });
+
+  it("P2 settle: a wake without any marker (never reserved) continues nothing", async () => {
+    const point = vi.fn<CaseContinuationPoint>(async () => ({ status: "queued" }));
+    expect(await runCaseSettleWake(randomUUID(), new Date(Date.now() + 5_000).toISOString(), { env: V2, deadlineMs: deadlineMs(), continuation: point })).toEqual({ status: "not_consumed" });
+    expect(point).not.toHaveBeenCalled();
+  });
+
+  it("P2: an SQL error while consuming -> no continuation, no send; the marker is still open afterwards", async () => {
+    const caseId = randomUUID(), wakeAt = await scheduled(caseId), executionId = randomUUID();
+    await requestCaseReplySend({ env: PROD, executionId }, { start: async () => {} });
+    const point = vi.fn<CaseContinuationPoint>(async () => ({ status: "queued" })), sendNow = vi.fn(async () => ({ skipped: "never" }));
+    const real = state.db;
+    state.db = { transaction: async () => { throw Error("SYNTHETIC_SQL_DOWN"); } };
+    try {
+      expect(await runCaseSettleWake(caseId, wakeAt, { env: V2, deadlineMs: deadlineMs(), continuation: point })).toEqual({ status: "not_consumed" });
+      expect(await runCaseReplySend(executionId, { env: PROD, deadlineMs: deadlineMs(), sendNow })).toEqual({ skipped: "not_consumed" });
+    } finally { state.db = real; }
+    expect(point).not.toHaveBeenCalled();
+    expect(sendNow).not.toHaveBeenCalled();
+    expect(await marker(CASE_SETTLE_WAKE_MARK, caseId)).toEqual([expect.objectContaining({ technicalMetadata: expect.objectContaining({ state: "scheduled" }) })]);
+    expect(await marker(CASE_REPLY_SEND_MARK, executionId)).toEqual([expect.objectContaining({ technicalMetadata: expect.objectContaining({ state: "dispatched" }) })]);
+  });
+
+  it("P2 send: the same dispatch's step run twice (in sequence or together) sends ONCE", async () => {
+    const executionId = randomUUID(), sendNow = vi.fn(async () => ({ skipped: "synthetic" }));
+    await requestCaseReplySend({ env: PROD, executionId }, { start: async () => {} });
+    const results = await Promise.all([0, 1, 2].map(() => runCaseReplySend(executionId, { env: PROD, deadlineMs: deadlineMs(), sendNow })));
+    expect(await runCaseReplySend(executionId, { env: PROD, deadlineMs: deadlineMs(), sendNow })).toEqual({ skipped: "not_consumed" });
+    expect(results.filter(result => "skipped" in result && result.skipped === "not_consumed")).toHaveLength(2);
+    expect(sendNow).toHaveBeenCalledTimes(1);
   });
 });
