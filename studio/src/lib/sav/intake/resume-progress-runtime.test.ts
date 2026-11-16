@@ -129,7 +129,8 @@ it("resuming an unchanged partial history (cron, wake or button, repeated) takes
   // Only reads: the allow-listed GET and search paths of the CRM readers, never anything else.
   expect(w.seen.crm.every(r => isSavIntakeHubspotRead(r.path, r.method))).toBe(true);
   const [marker] = await f.db.select().from(auditLogs).where(eq(auditLogs.entityId, id));
-  expect(marker.technicalMetadata).toMatchObject({ state: "held", cause: "no_progress", holds: 4 });
+  // SAV-92: the three immediate re-looks come before the scheduled look: they hold without moving holds or the schedule.
+  expect(marker.technicalMetadata).toMatchObject({ state: "held", cause: "no_progress", holds: 1 });
   expect(JSON.stringify(marker)).not.toMatch(/@|Connexion/);
 });
 
@@ -373,12 +374,25 @@ it("(b) the count is tied to the fault: history_body_unavailable then partial_ba
   expect((await run(id)).attempts).toBe(1);
 }, 30_000);
 
-it("operator clicks before the scheduled look hold but do not count: repeated resumes cannot reach the bound at once", async () => {
+it("operator clicks before the scheduled look hold but neither count nor move the schedule: holds and nextProbeAt are kept", async () => {
   const w = world(); w.crm.history = "no_body";
   const { id } = await firstAttempt(w);
+  expect(await analyse(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  for (let n = 1; n < 3; n++) expect(await scheduledProbe(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  const scheduled = await marker(id);
+  expect(scheduled).toMatchObject({ state: "held", holds: 3, confirmations: 3 });
   for (let n = 0; n < 6; n++) expect(await analyse(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
-  expect(await marker(id)).toMatchObject({ state: "held", holds: 6, confirmations: 1 });
+  const clicked = await marker(id);
+  expect(clicked).toMatchObject({ state: "held", holds: 3, confirmations: 3, nextProbeAt: scheduled.nextProbeAt });
+  expect((await pendingSavIntakeRuns(config, new Date(Date.parse(String(scheduled.nextProbeAt)) + 1000))).map(r => r.id)).toContain(id);
   expect(await kinds(id)).not.toContain("resume_team_required");
+  // A changed fault seen on an early click resets the count but is no confirmation, and still keeps the schedule.
+  w.crm.history = "partial_batch"; expect(await analyse(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  w.crm.history = "no_body"; expect(await analyse(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  expect(await marker(id)).toMatchObject({ state: "held", holds: 3, confirmations: 0, fault: "history_body_unavailable", nextProbeAt: scheduled.nextProbeAt });
+  expect(await scheduledProbe(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  expect(await marker(id)).toMatchObject({ holds: 4, confirmations: 1 });
+  expect((await run(id)).attempts).toBe(1);
 }, 30_000);
 
 it("a missing engagement body: a CRM change before the bound resumes normally", async () => {

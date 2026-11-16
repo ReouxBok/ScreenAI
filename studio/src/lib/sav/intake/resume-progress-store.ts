@@ -4,7 +4,7 @@ import { requireDb } from "@/db";
 import { auditLogs, savIntakeJournal } from "@/db/schema";
 import { encryptSavPayload } from "../crypto";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
-import { intakeResumeNextProbeAt, intakeResumeConfirmation, intakeResumeProofKey, probeIntakeResume, type IntakeResumeDecision, type IntakeResumeProbe, type IntakeResumeProof } from "./resume-progress";
+import { intakeResumeNextProbeAt, intakeResumeConfirmation, intakeResumeProbeEarly, intakeResumeProofKey, probeIntakeResume, type IntakeResumeDecision, type IntakeResumeProbe, type IntakeResumeProof } from "./resume-progress";
 
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 const MARKER = "sav_intake_resume_hold";
@@ -40,15 +40,18 @@ export async function holdIntakeResume(tx: Tx, runId: string, proof: IntakeResum
   const key = intakeResumeProofKey(proof);
   const [prior] = await tx.select().from(auditLogs).where(hold(runId)).for("update");
   const before = prior?.technicalMetadata as { proofKey?: unknown; holds?: unknown; cause?: unknown; state?: unknown; fault?: unknown; confirmations?: unknown; nextProbeAt?: unknown } | undefined;
-  const same = before?.proofKey === key, holds = (same && typeof before?.holds === "number" ? before.holds : 0) + 1;
+  const same = before?.proofKey === key;
   // SAV-92 (stuck dossiers): only successful probes confirming the same deterministic fault count (see
   // intakeResumeConfirmation); at the bound the run is handed to the team and the scheduler stops probing it
-  // (noResumeHoldSql). No attempt, no model call, nothing erased.
-  const confirmation = intakeResumeConfirmation(proof, cause, probe?.state === "same" ? probe.fault : null,
-    { sameProof: same, fault: before?.fault, confirmations: before?.confirmations, nextProbeAt: before?.nextProbeAt }, now);
+  // (noResumeHoldSql). An early probe (operator's resume before the due time) keeps holds and nextProbeAt: clicks never
+  // push the automatic look away. No attempt, no model call, nothing erased.
+  const priorState = { sameProof: same, state: before?.state, fault: before?.fault, confirmations: before?.confirmations, nextProbeAt: before?.nextProbeAt };
+  const early = intakeResumeProbeEarly(priorState, now);
+  const previousHolds = same && typeof before?.holds === "number" ? before.holds : 0, holds = early ? previousHolds : previousHolds + 1;
+  const confirmation = intakeResumeConfirmation(proof, cause, probe?.state === "same" ? probe.fault : null, priorState, now);
   const team = confirmation.team;
   const technicalMetadata = { state: team ? "team_required" : "held", proofKey: key, cause, holds, fault: confirmation.fault, confirmations: confirmation.confirmations,
-    lastProbeAt: now.toISOString(), nextProbeAt: team ? null : intakeResumeNextProbeAt(holds, now), configHash: proof.configHash };
+    lastProbeAt: now.toISOString(), nextProbeAt: team ? null : early ? before!.nextProbeAt as string : intakeResumeNextProbeAt(holds, now), configHash: proof.configHash };
   if (prior) await tx.update(auditLogs).set({ technicalMetadata }).where(eq(auditLogs.id, prior.id));
   else await tx.insert(auditLogs).values({ actorEmail: "system", action: MARKER, entityType: MARKER, entityId: runId, technicalMetadata });
   if (team && !(same && before?.state === "team_required")) await tx.insert(savIntakeJournal).values({ runId, kind: "resume_team_required", payloadCiphertext: encryptSavPayload({

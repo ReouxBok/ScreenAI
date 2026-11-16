@@ -9,7 +9,7 @@ import { collectSavObservationSources } from "../observation-source";
 import { observationConsoleCoverage, observationCoverage, observationLimitsLabel, splitObservationSourceErrors } from "../observation-coverage";
 import { intakeBlockedSubCause, intakeContextReadReason } from "./console-presentation";
 import { SAV_INTAKE_PUBLIC_DIAGNOSTIC_CODES } from "./run-diagnostics";
-import { intakeResumeConfirmation, SAV_INTAKE_RESUME_REVISION, SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS, type IntakeResumeProof } from "./resume-progress";
+import { intakeResumeConfirmation, intakeResumeProbeEarly, SAV_INTAKE_RESUME_REVISION, SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS, type IntakeResumeProof } from "./resume-progress";
 
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 
@@ -97,6 +97,12 @@ describe("B — context waits are classified", () => {
     expect(intakeResumeConfirmation(p, "no_progress", null, prior(n - 1), now)).toEqual({ fault: null, confirmations: 0, team: false });
     // Before the scheduled look (operator click): held, not counted.
     expect(intakeResumeConfirmation(p, "no_progress", body, prior(n - 1, body, future), now)).toEqual({ fault: body, confirmations: n - 1, team: false });
+    // The due time is checked before any counting: a new deterministic fault seen early resets, never confirms.
+    expect(intakeResumeConfirmation(p, "no_progress", "history_date_unknown", prior(n - 1, body, future), now)).toEqual({ fault: "history_date_unknown", confirmations: 0, team: false });
+    expect(intakeResumeProbeEarly({ sameProof: true, nextProbeAt: future }, now)).toBe(true);
+    expect(intakeResumeProbeEarly({ sameProof: true, nextProbeAt: past }, now)).toBe(false);
+    expect(intakeResumeProbeEarly({ sameProof: false, nextProbeAt: future }, now)).toBe(false);
+    expect(intakeResumeProbeEarly({ sameProof: true, state: "team_required", nextProbeAt: future }, now)).toBe(false);
     // Another proof starts from zero; a failed read in the proof never hands over.
     expect(intakeResumeConfirmation(p, "no_progress", body, { ...prior(n - 1), sameProof: false }, now)).toEqual({ fault: body, confirmations: 1, team: false });
     expect(intakeResumeConfirmation(proof("partial", "failed"), "no_progress", body, prior(n - 1), now).team).toBe(false);

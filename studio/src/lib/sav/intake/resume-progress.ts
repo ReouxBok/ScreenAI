@@ -161,8 +161,8 @@ export function intakeResumeNextProbeAt(holds: number, now: Date) {
  *   provider keep a dead dossier probing forever; counting it would hand over on outages instead of evidence.
  * - A different fault observed (e.g. history_body_unavailable then partial_batch) restarts the count from that fault; a
  *   non-deterministic one never hands over. The hand-over names the fault really observed last.
- * - A probe before the scheduled look (operator's resume) still holds but does not count, so repeated clicks cannot reach
- *   the bound at once. With the scheduler alone the 4th confirmation comes 10 + 30 + 120 min after the first, i.e.
+ * - A probe before the scheduled look (operator's resume) still holds but never confirms (a changed fault seen then may
+ *   only reset) and keeps the schedule, so repeated clicks neither reach the bound at once nor push the next look. With the scheduler alone the 4th confirmation comes 10 + 30 + 120 min after the first, i.e.
  *   about 2 h 40 after the first hold.
  * Nothing is erased, no attempt and no model call are taken; a CRM change before that still resumes normally, and the
  * operator's resume still probes (progress releases the hand-over).
@@ -170,18 +170,22 @@ export function intakeResumeNextProbeAt(holds: number, now: Date) {
 export const SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS = 4;
 export const SAV_INTAKE_DETERMINISTIC_READ_FAULTS: ReadonlySet<string> = new Set(["history_body_unavailable", "history_date_unknown"]);
 export type IntakeResumeConfirmation = { fault: string | null; confirmations: number; team: boolean };
+/** A probe of the same proof before its scheduled look (the operator's resume): it holds, but neither counts as a
+ * confirmation nor moves the schedule (holds and nextProbeAt are kept), so clicks never push the automatic look away. */
+export function intakeResumeProbeEarly(prior: { sameProof: boolean; state?: unknown; nextProbeAt?: unknown }, now: Date) {
+  return prior.sameProof && prior.state !== "team_required" && typeof prior.nextProbeAt === "string" && Date.parse(prior.nextProbeAt) > now.getTime();
+}
 export function intakeResumeConfirmation(proof: IntakeResumeProof, cause: Extract<IntakeResumeDecision, { kind: "hold" }>["cause"],
-  observedFault: string | null | undefined, prior: { sameProof: boolean; fault?: unknown; confirmations?: unknown; nextProbeAt?: unknown }, now: Date): IntakeResumeConfirmation {
+  observedFault: string | null | undefined, prior: { sameProof: boolean; state?: unknown; fault?: unknown; confirmations?: unknown; nextProbeAt?: unknown }, now: Date): IntakeResumeConfirmation {
   const kept = prior.sameProof ? { fault: typeof prior.fault === "string" ? prior.fault : null, confirmations: typeof prior.confirmations === "number" ? prior.confirmations : 0 } : { fault: null, confirmations: 0 };
+  // The due time is checked BEFORE any counting: an early probe (operator's resume) may reset on a changed fault, never confirm.
+  const early = intakeResumeProbeEarly(prior, now);
   let next = kept;
   if (cause === "no_progress") {
     const fault = observedFault ?? null;
     if (!fault || !SAV_INTAKE_DETERMINISTIC_READ_FAULTS.has(fault)) next = { fault, confirmations: 0 };
-    else if (fault !== kept.fault) next = { fault, confirmations: 1 };
-    else {
-      const early = prior.sameProof && typeof prior.nextProbeAt === "string" && Date.parse(prior.nextProbeAt) > now.getTime();
-      next = { fault, confirmations: kept.confirmations + (early ? 0 : 1) };
-    }
+    else if (fault !== kept.fault) next = { fault, confirmations: early ? 0 : 1 };
+    else next = { fault, confirmations: kept.confirmations + (early ? 0 : 1) };
   }
   const team = cause === "no_progress" && next.confirmations >= SAV_INTAKE_RESUME_TEAM_AFTER_HOLDS && next.fault !== null && SAV_INTAKE_DETERMINISTIC_READ_FAULTS.has(next.fault)
     && proof.reads.some(r => r.status === "partial") && proof.reads.every(r => r.status !== "failed");
