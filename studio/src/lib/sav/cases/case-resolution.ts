@@ -111,7 +111,9 @@ export async function applyProvenResolution(input: ResolutionPorts & Readonly<{ 
       };
       current = await updateCaseRecord({ caseId: locked.caseId, expectedVersion: locked.version, actor: { type: "agent" }, body, phase: "resolved" }, tx);
     }
-    const stage = await enqueueCaseTicketStage(tx, { snapshot: current, trigger: { kind: "resolution_recorded", cycle: current.body.cycle.number }, policy: input.policy, env: input.env });
+    // SAV-92 (16/11): the families of the requests THIS proof resolved, sealed for the closure note (no text, no id).
+    const closureFamilies = current.body.openRequests.filter(request => resolvedIds.has(request.id)).map(request => request.family);
+    const stage = await enqueueCaseTicketStage(tx, { snapshot: current, trigger: { kind: "resolution_recorded", cycle: current.body.cycle.number }, policy: input.policy, env: input.env, closureFamilies });
     return { ok: true, applied: ended ? "already_resolved" : "resolved", cycle: current.body.cycle.number, stage };
   });
 }
