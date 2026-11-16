@@ -1,3 +1,4 @@
+import { hasMultiQuestionWait, reconcileCaseQuestionAnswers } from "./case-question-followup";
 import { requireDb } from "@/db";
 import type { CaseAdmissionInput } from "./admission-policy";
 import {
@@ -121,9 +122,16 @@ export function caseInvestigationStorePorts(deps: CaseInvestigationStoreDeps): C
       const action = decision?.validation.outcome === "accepted" ? decision.validation.decision.nextAction : null;
       // An accepted handoff, or (Ugo 14/11) a decision the validator refused twice: the same durable transfer to the team, then the same notice.
       const handoffReason = action?.kind === "handoff" ? action.reason : decision?.validation.outcome === "needs_review" ? decision.refusalHandoff?.reason ?? null : null;
+      const accepted = decision?.validation.outcome === "accepted" ? decision.validation.decision : null;
       decision = null;
       try {
-        const observation = { caseId, claimToken: token, currentPolicyRevision: policyRevision, observation: { record } };
+        const snapshot = accepted ? await readCase(caseId) : null;
+        const body = snapshot && accepted ? reconcileCaseQuestionAnswers(snapshot.body, accepted, await readJournal(caseId)) : null;
+        const batchWait = body && hasMultiQuestionWait(body);
+        const hadBatchWait = snapshot && hasMultiQuestionWait(snapshot.body);
+        const phase = hadBatchWait && accepted?.nextAction.kind === "observe_only" ? batchWait ? "awaiting_customer" as const : "queued" as const
+          : hadBatchWait && (accepted?.nextAction.kind === "ask" || accepted?.nextAction.kind === "answer") ? "queued" as const : undefined;
+        const observation = { caseId, claimToken: token, currentPolicyRevision: policyRevision, observation: { record, ...(body ? { body } : {}), ...(phase ? { phase } : {}) } };
         if (handoffReason) {
           // The team owns the case even when Slack is off or unavailable. A stale or replayed
           // observation must never take the case away from its current owner.

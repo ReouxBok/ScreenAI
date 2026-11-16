@@ -58,6 +58,7 @@ export const caseDecisionRefusalKinds: Record<CaseDecisionRejectionCode, CaseDec
   login_procedure_redundant: "missing_information",
   procedure_step_repeated: "missing_information",
   proposal_schema_invalid: "repairable_format",
+  too_many_questions: "repairable_format",
   // The model receives the version it must echo: a mismatch is its error; a real change is caught by the re-read.
   case_version_stale: "repairable_format",
   observe_only_with_reply: "repairable_format",

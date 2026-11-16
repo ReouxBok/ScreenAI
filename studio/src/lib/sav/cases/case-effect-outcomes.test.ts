@@ -142,3 +142,15 @@ describe("what a confirmed reply does NOT do", () => {
     expect(await listCaseTimers(caseId)).toEqual([]);
   });
 });
+
+it.each([2, 3, 5])("records %i questions independently, one confirmed mail and one J2, idempotently", async count => {
+  const { caseId } = await opened(`gm-batch-${count}`);
+  const { question: _legacy, ...base } = proposalFor(caseId, "question", `inbound:gm-batch-${count}`);
+  const questions = Array.from({ length: count }, (_, index) => ({ id: `in:batch:q${index + 1}`, text: `Question ${index + 1} ?`, factKeys: [`configuration_q${index + 1}`] }));
+  const input = confirmed({ ...base, questions }, `batch-${count}`, `sent-batch-${count}`);
+  expect(await recordConfirmedCaseReply(input)).toMatchObject({ question: "recorded", j2: "scheduled" });
+  expect(await recordConfirmedCaseReply(input)).toMatchObject({ question: "already_recorded", j2: "already_scheduled" });
+  expect((await readCase(caseId))!.body.questions).toEqual(questions.map(question => ({ ...question, askedAt: SENT.toISOString(), askedInEffect: `batch-${count}` })));
+  expect(await listCaseTimers(caseId)).toHaveLength(1);
+  expect((await listCaseEvents(caseId)).filter(event => event.kind === "outbound_observed")).toHaveLength(1);
+});
