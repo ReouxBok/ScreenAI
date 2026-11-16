@@ -11,7 +11,7 @@ export const SAV_INTEGRATIONS_BLOCK = {
   blockId: "integrations", label: "Intégrations et connexions d'outils", family: "usage", mode: "off",
   cardIds: [], supportCardIds: [],
   neighbours: ["access", "finance", "cancellation", "video"],
-  exclusions: ["bug plateforme", "données sensibles", "jeton secret", "mot de passe", "code de connexion", "vidéo"],
+  exclusions: ["bug plateforme", "données sensibles", "jeton secret", "mot de passe", "code de connexion", "code de vérification WhatsApp", "numéro WhatsApp", "vidéo"],
   askBefore: [
     "Identifier l'outil, l'opération bloquée et le message d'erreur exact.",
     "Vérifier le diagnostic en lecture seule du compte connecté, sa date et sa source ; un statut connecté ne prouve pas la lecture.",

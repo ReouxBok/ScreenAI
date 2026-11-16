@@ -54,13 +54,19 @@ describe("SAV-92 integrations: offline and unbound by default", () => {
     expect(noSearch).not.toHaveBeenCalled();
   });
 
-  it("keeps exactly one third outside the fake index and reserves all providers in the indexed set", () => {
-    expect([indexed.length, holdout.length]).toEqual([18, 9]);
-    expect(new Set(SAV_INTEGRATIONS_TEST_PHRASES.map(row => row.text)).size).toBe(27);
+  it("keeps the holdout outside the fake index and reserves all providers in the indexed set", () => {
+    expect([indexed.length, holdout.length]).toEqual([28, 19]);
+    expect(new Set(SAV_INTEGRATIONS_TEST_PHRASES.map(row => row.text)).size).toBe(47);
     expect(toolCards.every(row => row.card.content.length > 0)).toBe(true);
     const indexContent = [...toolCards.map(row => row.card.content), loginCard.content].join("\n");
     for (const row of holdout) expect(indexContent).not.toContain(row.text);
     expect(savBlockManifestProblems(blocks)).toEqual([]);
+  });
+});
+
+describe("unchanged Access detector boundary", () => {
+  it.each(SAV_INTEGRATIONS_TEST_PHRASES)("$id [$split]: personal access only when expected", row => {
+    expect(firstPersonalLoginRequest(row.text, "")).toBe(row.expected === "access");
   });
 });
 
@@ -76,17 +82,17 @@ describe("synthetic attribution/replay contract (not real retrieval quality)", (
     if (row.expected === "access") expect(firstPersonalLoginRequest(row.text, "")).toBe(true);
   });
 
-  it("reports index and holdout separately and leaves undersized sets below the existing release gate", async () => {
+  it("reports index and holdout separately without treating a synthetic gate as release qualification", async () => {
     const report = await runSavBlockReplay(SAV_INTEGRATIONS_TEST_PHRASES.map(item), { blocks, now }, { search });
-    for (const [split, expected] of [["index", [13, 3, 2]], ["holdout", [5, 1, 3]]] as const) {
+    for (const [split, expected] of [["index", [13, 11, 4]], ["holdout", [5, 9, 5]]] as const) {
       const results = SAV_INTEGRATIONS_TEST_PHRASES.flatMap((phrase, index) => phrase.split === split
         ? [{ phrase, cards: report.items[index]!.topCards, attribution: report.items[index]!.attribution }] : []);
       const m = measureSavBlockRouting(boundDraft, results);
       expect([m.top3.hits, m.neighbourRejection.hits, m.traps.hits]).toEqual(expected);
       expect([m.top3.rate, m.neighbourRejection.rate, m.traps.rate]).toEqual([1, 1, 1]);
       expect(m.misses).toEqual([]);
-      expect(m.gate.passed).toBe(false); // 18 / 9 individually: neither is a qualified release set.
-      expect(m.gate.reasons).toEqual([`too_few_phrases:${results.length}<20`]);
+      expect(m.gate.passed).toBe(split === "index"); // Synthetic lexical doubles only; no semantic or release qualification.
+      expect(m.gate.reasons).toEqual(split === "index" ? [] : [`too_few_phrases:${results.length}<20`]);
     }
   });
 
