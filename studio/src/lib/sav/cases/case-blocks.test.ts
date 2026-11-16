@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-const state = vi.hoisted(() => ({ message: null as null | { body: string; subject: string }, reads: 0 }));
+const state = vi.hoisted(() => ({ message: null as null | { body: string; subject: string; receivedAt: Date }, reads: 0 }));
 // The entry reads one stored mail; nothing else of the database is reachable from this file.
 vi.mock("@/db", () => ({ requireDb: () => ({ select: () => ({ from: () => ({ where: async () => { state.reads += 1; return state.message ? [state.message] : []; } }) }) }) }));
 import { encryptSavPayload } from "../crypto";
@@ -44,7 +44,7 @@ const BLOCK_ENV = { SAV_V2_ADMISSION_POLICY_JSON: policyRecord(), [SAV_V2_BLOCK_
 let extraEnv: Record<string, string> = BLOCK_ENV;
 const env = (rules: readonly unknown[]) => ({ SAV_V2_ADMISSION_RULES_JSON: JSON.stringify(rules), ...extraEnv });
 const request = [{ requestId: "gm-syn/r1", kind: "support" }] as Parameters<typeof firstBlockEvidence>[3];
-const mail = (text: string, subject: string) => { state.message = { body: encryptSavPayload({ text }), subject }; };
+const mail = (text: string, subject: string) => { state.message = { body: encryptSavPayload({ text }), subject, receivedAt: new Date(AT) }; };
 const evidence = (rules: readonly unknown[], registry: readonly CaseBlockDetector[] = REGISTRY) => firstBlockEvidence(env(rules), "message-syn", "gm-syn", request, registry);
 
 beforeEach(() => {
@@ -83,11 +83,14 @@ describe("entry: every approved rule is evaluated, exactly one block admits", ()
     expect(state.reads).toBe(1);
     mail(OTHER_TEXT, OTHER_SUBJECT);
     expect(await evidence([ACCESS_RULE], SAV_CASE_BLOCK_REGISTRY)).toEqual([]);
-    // As before: no rule, or a request that is not one support request, reads no mail and admits nobody.
+    // As before: no rule reads no mail and admits nobody.
     state.reads = 0;
     expect(await evidence([], SAV_CASE_BLOCK_REGISTRY)).toEqual([]);
-    expect(await firstBlockEvidence(env([ACCESS_RULE]), "message-syn", "gm-syn", [...request, { requestId: "gm-syn/r2", kind: "support" }] as never)).toEqual([]);
     expect(state.reads).toBe(0);
+    // SAV-92 (changed on purpose): a mail of two support requests is now read request by request (`case-multi-request.test.ts`); without any stored quote
+    // of its requests, no detector can read them and nobody is admitted, as before.
+    expect(await firstBlockEvidence(env([ACCESS_RULE]), "message-syn", "gm-syn", [...request, { requestId: "gm-syn/r2", kind: "support" }] as never, SAV_CASE_BLOCK_REGISTRY,
+      { readQuotes: async () => new Map() })).toEqual([]);
   });
 
   it("(b) Access + a second block: an Access mail is Access's, the block's mail is the block's (blockId recorded), a mail of neither is nobody's", async () => {

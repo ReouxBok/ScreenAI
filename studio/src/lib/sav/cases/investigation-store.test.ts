@@ -40,7 +40,8 @@ const card = { id: "k1", contentVersionId: "k1-v1", title: "Fiche k1", content: 
 const ask = (snapshot: CaseSnapshot) => {
   const requests = snapshot.body.openRequests.filter(row => row.status === "open").map(row => ({ id: row.id, summary: "Demande.", family: row.family, status: "open" }));
   return { caseVersion: snapshot.version, understanding: { requests, newFacts: [] },
-    nextAction: { kind: "ask", questions: [{ text: "Quel résultat obtenez-vous après l'opération ?", requestId: requests[0]!.id, reducesUncertainty: "Savoir où cela échoue.", seeks: [{ kind: "observed_result" }] }] } };
+    // SAV-92 review P2-3: the question covers every open request (a second mail adds its own).
+    nextAction: { kind: "ask", questions: requests.slice(0, 4).map(row => ({ text: "Quel résultat obtenez-vous après l'opération ?", requestId: row.id, reducesUncertainty: "Savoir où cela échoue.", seeks: [{ kind: "observed_result" }] })) } };
 };
 
 /** Mail relayed by V1 after confirmation: the first one with an admitting qualification, later ones with intake hints only. */

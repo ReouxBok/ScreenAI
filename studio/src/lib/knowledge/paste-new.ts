@@ -1,5 +1,6 @@
 import type { CanonicalKnowledge } from "./contracts";
 import { parsePastedKnowledge } from "./paste-document";
+import { savCardVersionValidityChecks } from "./card-checks";
 
 // Prepares a NEW knowledge draft from pasted text, for the existing proposal flow
 // (saveSavKnowledgeProposal, mode "new"). Pure: no model, embedding, database or publication.
@@ -12,7 +13,7 @@ const emptyBase: CanonicalKnowledge = {
 };
 
 // Text that addresses the assistant is kept as reviewed data; it never becomes a permission.
-const injectionPatterns = [
+export const knowledgeInjectionPatterns = [
   /\b(ignore[sz]?|oublie[sz]?)\b.{0,40}\b(instructions?|consignes?|règles?|previous|above)\b/i,
   /\b(system prompt|prompt système|consignes? système)\b/i,
   /\b(you are now|tu es désormais|vous êtes désormais|à partir de maintenant,? tu)\b/i,
@@ -40,27 +41,45 @@ function structure(text: string) {
   return [titleLine, "## Objectif", objective, ...(steps.length ? ["## Procédure proposée", ...steps] : [])].filter(Boolean).join("\n");
 }
 
-export function preparePastedKnowledge(input: PasteNewInput): PasteNewPreparation {
-  const text = normalizePastedText(input.text ?? "");
+// SAV-92: a new card pasted here has no context field, so its version and validity lines are read from the text (« Version produit : V3 »,
+// « Validité : 2027-01-31 »), then checked by the same rule as the server (card-checks.ts).
+const CONTEXT_LINE = /^\s*(?:[-*•]\s*)?(version produit|validit[ée])\s*:\s*(.*?)\s*$/i;
+function contextLines(text: string) {
+  let productVersion = "", validUntil: string | undefined;
+  const kept = text.split("\n").filter(line => {
+    const match = CONTEXT_LINE.exec(line);
+    if (!match) return true;
+    if (/^version/i.test(match[1])) productVersion = match[2].slice(0, 100);
+    else validUntil = match[2] || undefined;
+    return false;
+  });
+  return { text: kept.join("\n").trim(), productVersion, validUntil };
+}
+
+export function preparePastedKnowledge(input: PasteNewInput, now: Date = new Date()): PasteNewPreparation {
+  const pasted = normalizePastedText(input.text ?? "");
+  if (pasted.length > pasteNewLimits.textChars) throw new Error(`Le texte dépasse ${pasteNewLimits.textChars.toLocaleString("fr-FR")} caractères. Découpez-le en plusieurs fiches.`);
+  const context = contextLines(pasted), text = context.text;
   if (!text) throw new Error("Collez le texte de la connaissance.");
-  if (text.length > pasteNewLimits.textChars) throw new Error(`Le texte dépasse ${pasteNewLimits.textChars.toLocaleString("fr-FR")} caractères. Découpez-le en plusieurs fiches.`);
   const parsed = parsePastedKnowledge(structure(text), emptyBase);
   const title = (input.title?.trim() || parsed.title).slice(0, pasteNewLimits.titleChars);
   const label = input.sourceLabel?.trim() ?? ""; const ref = input.sourceRef?.trim() ?? "";
   if (ref && !/^(?:https:\/\/[^\s]+|(?:content|sav-learning|sav-observation|knowledge-source):[a-z0-9:._-]+)$/i.test(ref)) throw new Error("La référence de source doit être une adresse https:// ou une référence interne (content:…, knowledge-source:…).");
   if (ref && label.length < 3) throw new Error("Donnez un libellé d’au moins 3 caractères à la source.");
-  const document = parsed.document;
+  const document: CanonicalKnowledge = { ...parsed.document, productVersion: context.productVersion, ...(context.validUntil ? { validUntil: context.validUntil } : {}) };
+  const versionChecks = savCardVersionValidityChecks(document, now);
+  if (versionChecks.some(check => check.code === "valid_until_invalid")) throw new Error("La ligne « Validité » doit être une date réelle au format AAAA-MM-JJ.");
   const missing: string[] = [];
   if (!title) missing.push("Titre");
   if (!ref) missing.push("Origine (source vérifiable)");
-  if (!document.productVersion) missing.push("Version produit et date de validité");
+  for (const check of versionChecks) if (check.severity === "error") missing.push(check.message);
   if (!document.steps.length) missing.push("Procédure (étapes numérotées)");
   if (!document.expectedResult) missing.push("Résultat attendu");
   if (!document.escalation) missing.push("Escalade (quand passer à un humain)");
-  const warnings = text.split("\n").filter(line => injectionPatterns.some(pattern => pattern.test(line))).slice(0, 10)
-    .map(line => `Consigne adressée à l’assistant, conservée comme donnée à revoir : « ${line.trim().slice(0, 160)} »`);
+  const warnings = [...versionChecks.filter(check => check.severity === "warning").map(check => check.message), ...text.split("\n").filter(line => knowledgeInjectionPatterns.some(pattern => pattern.test(line))).slice(0, 10)
+    .map(line => `Consigne adressée à l’assistant, conservée comme donnée à revoir : « ${line.trim().slice(0, 160)} »`)];
   const sources = ref ? [{ label, ref }] : [];
   // Content key (generated step ids excluded): the same paste saved twice keeps one draft revision.
-  const fingerprint = JSON.stringify([title, structure(text), label, ref]);
+  const fingerprint = JSON.stringify([title, structure(text), label, ref, context.productVersion, context.validUntil ?? ""]);
   return { title, document, sources, missing, warnings, fingerprint };
 }

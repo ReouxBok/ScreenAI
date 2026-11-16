@@ -79,11 +79,12 @@ async function accessCase(gmail: string) {
 
 type Answer = (request: CaseInvestigationModelRequest) => CaseInvestigationModelResult;
 const understood = (snapshot: CaseSnapshot) => ({ requests: snapshot.body.openRequests.filter(row => row.status === "open").map(row => ({ id: row.id, summary: "Connexion impossible.", family: "access", status: "open" })), newFacts: [] });
-/** The procedure of `cited`, for `target` (default: the first open request), with the access link `link`. */
-const answerWith = (cited: KnowledgeRef, options: { target?: (snapshot: CaseSnapshot) => string; link?: string } = {}): Answer => request => {
-  const u = understood(request.snapshot), requestId = options.target?.(request.snapshot) ?? u.requests[0]!.id;
+/** The procedure of `cited`, for `target` (default: every open request, SAV-92 review P2-3), with the access link `link`. */
+const answerWith = (cited: KnowledgeRef, options: { target?: (snapshot: CaseSnapshot) => string | string[]; link?: string } = {}): Answer => request => {
+  const u = understood(request.snapshot), target = options.target?.(request.snapshot);
+  const requestIds = target === undefined ? u.requests.map(row => row.id) : Array.isArray(target) ? target : [target];
   return { status: "ok", output: { caseVersion: request.snapshot.version, understanding: u,
-    nextAction: { kind: "answer", requestIds: [requestId], steps: [{ text: "Suivre la fiche citée.", knowledge: cited }], expectedResult: "La connexion fonctionne." },
+    nextAction: { kind: "answer", requestIds, steps: [{ text: "Suivre la fiche citée.", knowledge: cited }], expectedResult: "La connexion fonctionne." },
     reply: { text: `Bonjour, voici la marche à suivre${options.link === "" ? "" : ` depuis ${options.link ?? ACCESS}`} : suivre la fiche.`, citations: [cited], impossibilityClaims: [], accountAdvice: "none" } } };
 };
 /** A targeted question: what the customer saw, for the request without knowledge. */
@@ -202,10 +203,12 @@ describe("useful supervised proposal: published knowledge per request, provenanc
     const ticketId = String(++ticketSeq), threadId = randomUUID(), id = "gm-sj-link";
     const c = await mail(ticketId, threadId, id, byRule(caseRequestId(id, "r1"), caseRequestId(id, "r2")), { r1: "Connexion impossible à la plateforme.", r2: "Code de vérification jamais reçu." });
     const second = () => caseRequestId(id, "r2");
-    const { report, calls } = await investigate(c.caseId, [answerWith(refOf(LOGIN), { target: second }), answerWith(refOf(CODE), { target: second })]);
+    // The correction also covers r1 (SAV-92 review P2-3: a reply covers every open request); CODE is linked to r2, which it answers.
+    const both = () => [caseRequestId(id, "r1"), second()];
+    const { report, calls } = await investigate(c.caseId, [answerWith(refOf(LOGIN), { target: second }), answerWith(refOf(CODE), { target: both })]);
     expect(calls[0]!.coverage!.map(row => [row.requestId, row.status, row.knowledge.map(ref => ref.knowledgeId)]))
       .toEqual([[caseRequestId(id, "r1"), "covered", ["k-login"]], [second(), "covered", ["k-code"]]]);
-    expect(calls[1]!.feedback.map(row => [row.code, row.path])).toEqual([["knowledge_not_linked_to_request", "nextAction.steps.0.knowledge"]]);
+    expect(calls[1]!.feedback.map(row => [row.code, row.path])).toEqual([["knowledge_not_linked_to_request", "nextAction.steps.0.knowledge"], ["proposal_request_uncovered", "nextAction"]]);
     expect(report).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 2 });
   });
 });

@@ -223,7 +223,10 @@ export const caseBlockHoldLabels: Record<string, string> = {
   block_setting_invalid: "Réglage du bloc illisible : traité comme un bloc éteint jusqu’à un nouvel enregistrement.",
 };
 export type CasePilotBlockHold = Readonly<{ blockId: string; reason: string; since: string }> | null;
-export function buildCasePilotView(input: { snapshot: CaseSnapshot; events: readonly CaseEvent[]; timers: readonly CaseTimer[]; pause: SavAgentPauseState; now: Date; blockHold?: CasePilotBlockHold }) {
+/** SAV-92 (review batch 3, B1): a reply naming a team part whose notice could not be queued (`team_part_handoff_unavailable`). */
+export type CasePilotTeamPartWait = Readonly<{ code: string; detail: string; passes: number; since: string; handedToTeam: string | null }> | null;
+export function buildCasePilotView(input: { snapshot: CaseSnapshot; events: readonly CaseEvent[]; timers: readonly CaseTimer[]; pause: SavAgentPauseState; now: Date; blockHold?: CasePilotBlockHold;
+  teamPartWait?: CasePilotTeamPartWait }) {
   const { snapshot, events, timers, pause, now } = input, body = snapshot.body;
   const firstInbound = [...events].sort((a, b) => a.caseVersion - b.caseVersion).find(event => event.kind === "inbound_confirmed") ?? null;
 
@@ -256,6 +259,11 @@ export function buildCasePilotView(input: { snapshot: CaseSnapshot; events: read
   else if (pause.level !== "running") waits.push({ label: pauseLabels[pause.level], detail: pause.setting ? `Depuis ${pause.setting.setAt} par ${pause.setting.setBy}` : undefined, needsPerson: false });
   if (input.blockHold) waits.push({ label: caseBlockHoldLabels[input.blockHold.reason] ?? caseBlockHoldLabels.block_setting_invalid,
     detail: `Bloc ${input.blockHold.blockId}, motif ${input.blockHold.reason}${input.blockHold.since ? `, depuis ${input.blockHold.since}` : ""}.`, needsPerson: input.blockHold.reason === "block_setting_invalid" });
+  if (input.teamPartWait) waits.push(input.teamPartWait.handedToTeam
+    ? { label: "Partie équipe non signalée : la notice à l’équipe n’a pas pu être mise en file, le mail entier a été remis à l’équipe. Aucune réponse n’a été envoyée au client.",
+        detail: `Code ${input.teamPartWait.code} (${input.teamPartWait.detail}), ${input.teamPartWait.passes} passage(s) refusé(s), depuis ${input.teamPartWait.since}, remis le ${input.teamPartWait.handedToTeam}.`, needsPerson: true }
+    : { label: "Partie équipe en attente : la réponse qui annonce une partie transmise à l’équipe n’est pas proposée tant que la notice à l’équipe n’est pas mise en file. Au-delà de la limite, le mail entier part à l’équipe.",
+        detail: `Code ${input.teamPartWait.code} (${input.teamPartWait.detail}), ${input.teamPartWait.passes} passage(s) refusé(s)${input.teamPartWait.since ? `, depuis ${input.teamPartWait.since}` : ""}.`, needsPerson: true });
   // A relayed case waits for the V2 owner read on the ticket (no V1 attribution needed since 4/11); that is not a handoff to the team.
   const awaitingAttribution = caseAwaitsV2Attribution(snapshot);
   if (awaitingAttribution) waits.push({ label: "En attente du propriétaire V2 : l’agent prend le dossier dès que le propriétaire actuel du ticket HubSpot est lu comme V2. Ticket sans propriétaire ou tenu par une personne : il reste à l’équipe, rien n’est écrit.", needsPerson: false });

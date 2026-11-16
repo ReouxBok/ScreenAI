@@ -14,7 +14,7 @@ const isSensitive = (family: string) => (SAV_CASE_SENSITIVE_FAMILIES as readonly
 function provenAdmissible(request: CaseAdmissionQualification["requests"][number], policy: CaseAdmissionPolicy) {
   const { provenance, family } = request;
   if (provenance.kind === "human") return true;
-  if (provenance.kind === "intake_hint") return false;
+  if (provenance.kind === "intake_hint" || provenance.kind === "team_part") return false;
   return policy.qualifiedRules.some(rule => rule.ruleId === provenance.ruleId && rule.revision === provenance.revision && (rule.families as readonly string[]).includes(family)
     && approvedBlock(rule.blockId) === approvedBlock(provenance.blockId));
 }
@@ -53,13 +53,16 @@ export function decideCaseAdmission(input: CaseAdmissionInput & { caseSensitivit
   for (const signal of qualification.teamSignals) reasons.add(signal.kind);
   if (!policy) reasons.add("policy_missing");
   else if (!policy.success) reasons.add("policy_invalid");
-  if (!families.length) reasons.add("no_request");
-  if (families.includes("unknown")) reasons.add("family_unknown");
+  // SAV-92 (Ugo 14/11): a request no active block covers (`team_part`, read by the entry) is the team's part of an admitted mail. It is never what admits:
+  // the other requests must all be proven, and a mail with team parts only has no request for the agent. Exclusions above still read every request.
+  const handled = qualification.requests.filter(request => request.provenance.kind !== "team_part");
+  if (!handled.length) reasons.add("no_request");
+  if (handled.some(request => request.family === "unknown")) reasons.add("family_unknown");
   if (qualification.identity.status !== "confirmed") reasons.add("identity_unconfirmed");
   if (qualification.crmContext !== "complete") reasons.add("context_incomplete");
   if (policy?.success) {
     const admitted = policy.data.admittedFamilies as readonly string[];
-    const known = qualification.requests.filter(request => request.family !== "unknown" && !isSensitive(request.family));
+    const known = handled.filter(request => request.family !== "unknown" && !isSensitive(request.family));
     if (known.some(request => !admitted.includes(request.family))) reasons.add("family_not_admitted");
     if (known.some(request => admitted.includes(request.family) && !provenAdmissible(request, policy.data))) reasons.add("qualification_unproven");
   }

@@ -4,6 +4,10 @@ import { ZodError } from "zod";
 import { revalidatePath } from "next/cache";
 import { requireSavApiStaff } from "@/lib/sav/auth";
 import { activateSavKnowledgeVersion, getSavKnowledgeDetail, paginateSavKnowledge, previewSavKnowledgeProposal, previewSavKnowledgeReview, publishSavKnowledgeVersion, reviewSavKnowledgeProposal, saveSavKnowledgeProposal, startSavKnowledgeRevision, submitSavKnowledgeProposal } from "@/lib/knowledge/workspace";
+import { SavCardUnsafeContentError } from "@/lib/knowledge/onboarding-extraction";
+import { savCardFieldLabel } from "@/lib/knowledge/card-checks";
+import { savCardTextProblemMessage } from "@/lib/knowledge/card-safety";
+import { verifySavKnowledgeCard, type SavCardVerificationInput } from "@/lib/knowledge/verify-card";
 import { knowledgeErrorMessage } from "./workspace-labels";
 
 function message(error: unknown) {
@@ -14,6 +18,11 @@ function message(error: unknown) {
     if (path === "document.objective") return "Précisez la demande couverte par cette connaissance.";
     if (path.startsWith("document.steps")) return "Vérifiez chaque étape : nom, but et instruction sont nécessaires avant soumission.";
     return "Certains champs sont incomplets ou trop longs. Vérifiez votre saisie ; elle est conservée.";
+  }
+  // SAV-92: a refused field is named with its reason, instead of « L’action n’a pas abouti ».
+  if (error instanceof SavCardUnsafeContentError && error.fields.length) {
+    const [first] = error.fields, more = error.fields.length - 1;
+    return `${savCardFieldLabel(first!.path)} : ${first!.problems.map(savCardTextProblemMessage).join(" ")}${more > 0 ? ` (${more} autre${more > 1 ? "s" : ""} champ${more > 1 ? "s" : ""} à corriger : utilisez « Vérifier ma fiche »)` : ""} Vos saisies sont conservées.`;
   }
   return knowledgeErrorMessage(error instanceof Error ? error.message : "ACTION_FAILED");
 }
@@ -75,4 +84,11 @@ export async function loadSavFactDictionaryAction() {
   const { readActiveSavPlaybook } = await import("@/lib/sav/playbook");
   const book = await readActiveSavPlaybook();
   return book.document.facts.map(f => ({ key: f.key, label: f.label }));
+}
+
+/** SAV-92 « Vérifier ma fiche »: all card checks at once, read-only (no save, no submission, no model). */
+export async function verifyKnowledgeCardAction(input: SavCardVerificationInput) {
+  await requireSavApiStaff();
+  try { return { verification: verifySavKnowledgeCard(input, new Date()), error: null }; }
+  catch { return { verification: null, error: "La vérification n’a pas abouti. Vos saisies sont conservées ; réessayez." }; }
 }

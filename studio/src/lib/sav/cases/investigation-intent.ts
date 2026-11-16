@@ -1,7 +1,7 @@
 import type { CaseEvent, KnowledgeRef } from "./case-types";
 import { inboundInteractionId, type CaseReplyProposal } from "./case-effects";
 import type { CaseDecisionProposal } from "./decision-contract";
-import { caseAccessScopeStampProblem, type CaseAccessScopeStamp } from "./investigation-access-scope";
+import { caseAccessScopeStampProblem, caseStampBlockId, type CaseAccessScopeStamp } from "./investigation-access-scope";
 import type { CaseInvestigationStoredRecord } from "./investigation-record";
 
 /*
@@ -41,6 +41,8 @@ export type CaseDecisionDraft = {
   decidedWhileActionsPaused: boolean;
   /** Pilot ACCÈS: the scope the decision was validated under, for C to compare again at its last check before sending. */
   accessScope?: CaseAccessScopeStamp;
+  /** SAV-92 (multi-block): every block scope the decision was validated under; each must still be the one in force. */
+  blockScopes?: CaseAccessScopeStamp[];
 };
 
 /** The stored customer mail an input answers, as C's canonical trigger; null when the input names no stored mail. */
@@ -59,7 +61,7 @@ export function caseReplyTriggerOf(events: readonly Pick<CaseEvent, "id" | "dire
  * `pilot`: a consumer in the ACCÈS pilot passes the scope in force now (null when it cannot read one).
  */
 export function caseDecisionDraft(caseId: string, stored: CaseInvestigationStoredRecord, events: readonly Pick<CaseEvent, "id" | "direction" | "sourceRef">[],
-  pilot?: { accessScope: CaseAccessScopeStamp | null }): CaseDecisionDraft | null {
+  pilot?: { accessScope: CaseAccessScopeStamp | null; blockScopes?: readonly CaseAccessScopeStamp[] | null }): CaseDecisionDraft | null {
   const decision = stored.decision;
   if (!decision || decision.validation.outcome !== "accepted") return null;
   const proposal = decision.validation.decision, action = proposal.nextAction;
@@ -89,9 +91,18 @@ export function caseDecisionDraft(caseId: string, stored: CaseInvestigationStore
     const problem = caseAccessScopeStampProblem(stamp, pilot?.accessScope ?? null);
     if (problem) { reply = null; replyLimit = problem; }
   }
+  // SAV-92 (multi-block): a decision taken under several blocks is used only while EVERY one of their scopes is still the one in force.
+  const blockStamps = decision.blockScopes;
+  if (blockStamps !== undefined && replyLimit !== "access_scope_unknown" && replyLimit !== "access_scope_changed") {
+    const current = pilot?.blockScopes ?? null;
+    const problem = !current ? "access_scope_unknown" as const : blockStamps.map(recorded => caseAccessScopeStampProblem(recorded,
+      current.find(row => caseStampBlockId(row) === caseStampBlockId(recorded)) ?? null)).find(Boolean) ?? null;
+    if (problem) { reply = null; replyLimit = problem; }
+  }
   return { caseId, inputKey: stored.inputKey, triggerEventId, decidedOn: decision.caseVersion,
     decisionContract: decision.validation.contractRevision, reply, replyLimit, noteText: caseDecisionNoteText(proposal.nextAction, decision.knowledge),
-    citations: proposal.reply ? [...proposal.reply.citations] : [], shownSources: caseShownSources(proposal), decidedWhileActionsPaused: decision.actionsPaused, ...(stamp ? { accessScope: stamp } : {}) };
+    citations: proposal.reply ? [...proposal.reply.citations] : [], shownSources: caseShownSources(proposal), decidedWhileActionsPaused: decision.actionsPaused, ...(stamp ? { accessScope: stamp } : {}),
+    ...(blockStamps ? { blockScopes: blockStamps } : {}) };
 }
 
 /**

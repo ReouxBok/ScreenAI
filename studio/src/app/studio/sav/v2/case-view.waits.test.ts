@@ -160,3 +160,19 @@ it("shows the closed transport failure and counts without calling it a generic p
     diagnostic: { stage: "http", code: "http_rejected", networkAttempted: true, httpStatus: 403 } };
   const exhausted = waitOf(); expect(exhausted.needsPerson).toBe(true); expect(exhausted.detail).toContain("HTTP 403");
 });
+
+describe("SAV-92 (review batch 3, B1): a team part whose notice could not be queued is a visible wait", () => {
+  const withWait = (teamPartWait: Parameters<typeof buildCasePilotView>[0]["teamPartWait"]) => buildCasePilotView({ snapshot: base as unknown as CaseSnapshot, events: [], timers: [],
+    pause: { level: "running", setting: null, invalid: false }, now: new Date("2026-10-31T10:00:00.000Z"), teamPartWait }).waits.find(w => /Partie équipe/.test(w.label));
+  it("waiting: the closed code, its detail and the refused passes; handed to the team: said, with the date", () => {
+    progress.waiting = null;
+    expect(withWait(null)).toBeUndefined();
+    const waiting = withWait({ code: "team_part_handoff_unavailable", detail: "disabled", passes: 2, since: SINCE, handedToTeam: null })!;
+    expect(waiting).toMatchObject({ needsPerson: true });
+    expect(waiting.label).toContain("Au-delà de la limite, le mail entier part à l’équipe.");
+    expect(waiting.detail).toBe(`Code team_part_handoff_unavailable (disabled), 2 passage(s) refusé(s), depuis ${SINCE}.`);
+    const handed = withWait({ code: "team_part_handoff_unavailable", detail: "disabled", passes: 6, since: SINCE, handedToTeam: "2026-10-31T11:30:00.000Z" })!;
+    expect(handed.label).toContain("le mail entier a été remis à l’équipe");
+    expect(handed.detail).toContain("remis le 2026-10-31T11:30:00.000Z");
+  });
+});

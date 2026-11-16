@@ -9,7 +9,7 @@ import { prepareCaseReplyText } from "./case-reply-outbound";
 import type { CaseReplyProposal } from "./case-effects";
 import { listCaseEvents } from "./case-store";
 import type { KnowledgeRef } from "./case-types";
-import { caseAccessScopeStamp, caseAccessSourceProblem, caseStampBlockId, readCaseAccessScope, type CaseAccessScopeStamp } from "./investigation-access-scope";
+import { caseAccessScopeStamp, caseAccessSourceProblem, readCaseDecisionScopes, type CaseAccessScopeStamp } from "./investigation-access-scope";
 import { caseDecisionDraft } from "./investigation-intent";
 import { readCaseInvestigationProgress } from "./investigation-record";
 import { latestInvestigationInput } from "./investigation-runner";
@@ -56,13 +56,14 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
   const events = await listCaseEvents(proposal.caseId), inputKey = latestInvestigationInput(events);
   const read = inputKey ? readCaseInvestigationProgress(events, inputKey) : null;
   // Treatment blocks (11/11): the scope in force of the block the decision was taken under (Access when its stamp names none).
-  const scope = await readCaseAccessScope(deps.accessScope, policyRevision, caseStampBlockId(read?.state === "found" ? read.record.decision?.accessScope : undefined));
+  // SAV-92 (multi-block): every block the decision was taken under, read now.
+  const scope = await readCaseDecisionScopes(deps.accessScope, policyRevision, read?.state === "found" ? read.record.decision : undefined);
   if (!scope.ok) return unproven(scope.problem);
   if (!inputKey || !read) return unproven("decision_missing");
   if (read.state === "none") return unproven("decision_missing");
   if (read.state !== "found") return unproven("decision_unreadable");
   const stamp = caseAccessScopeStamp(scope.scope);
-  const draft = caseDecisionDraft(proposal.caseId, read.record, events, { accessScope: stamp });
+  const draft = caseDecisionDraft(proposal.caseId, read.record, events, { accessScope: stamp, ...(scope.blocks ? { blockScopes: scope.blocks.map(caseAccessScopeStamp) } : {}) });
   if (!draft) return unproven("decision_not_accepted");
   if (draft.replyLimit === "access_scope_unknown" || draft.replyLimit === "access_scope_changed") return unproven(draft.replyLimit);
   if (!draft.reply) return unproven("reply_not_from_decision");
@@ -82,7 +83,10 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
   if (!draft.shownSources.length && proposal.purpose !== "question") return unproven("sources_missing");
   const reasons = new Set<PilotProvenanceReason>(), sources: PilotProvenanceSource[] = [];
   for (const ref of draft.shownSources) {
-    const problem = caseAccessSourceProblem(scope.scope, ref);
+    // SAV-92 (multi-block): a source shown is proven when one of the decision's block scopes lists it as `answer` at this version (the validator already
+    // tied it to a request of that very block).
+    const problems = (scope.blocks ?? [scope.scope]).map(one => caseAccessSourceProblem(one, ref));
+    const problem = problems.every(Boolean) ? problems[0]! : null;
     if (problem) { reasons.add(problem); continue; }
     let active: PilotActiveSource | null;
     try { active = await deps.readActiveSource(ref); } catch { active = null; }

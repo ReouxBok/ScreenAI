@@ -12,11 +12,12 @@ import { caseInvestigationReturnAwareQualify, caseReturnContentRule } from "./in
 import { caseCallLedgerOnStore, type CaseInvestigationRuntimeDeps } from "./investigation-runtime";
 import {
   caseCustomerTextsReader, caseGeminiDecisionPreflight, caseGeminiDecisionProvider, caseGeminiEmbeddingTransport, caseHubspotOwnerReadTransport, caseKnowledgeVectorSearch,
-  caseV2PauseState, caseV2ProviderConfigProblems, SAV_CASE_INVESTIGATION_PROMPT_REVISION, SAV_V2_MODEL_ENV, type CaseV2Network,
+  caseV2PauseState, caseV2ProviderConfigProblems, caseInvestigationPromptRevision, SAV_V2_MODEL_ENV, type CaseV2Network,
 } from "./investigation-v2-providers";
 import { caseV2EmbeddingSpend, caseV2ModelSpend, readCaseV2SpendPolicy, readCaseV2TransportPolicy } from "./investigation-v2-spend";
 import { pilotProvenanceGate, type PilotProvenanceDeps } from "./pilot-passage-provenance";
 import { readSavV2QualificationScope } from "./qualification-scope";
+import { caseAttachmentMediaMode } from "./investigation-customer-attachments-reader";
 import { caseCustomerContextReader } from "./investigation-customer-context-reader";
 import { readRuntimeTemporaryIncidents } from "@/lib/knowledge/temporary-incidents-runtime";
 
@@ -100,9 +101,10 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
     qualify: caseInvestigationReturnAwareQualify(v1Qualify, { readPolicyRecord, now, ...(input.returnRule ? { returnRules: caseReturnContentRule(input.returnRule, now) } : {}) }),
     customerTexts: caseCustomerTextsReader(),
     // SAV-92: the customer's mails and V1's CRM snapshot, read only from the database (no HubSpot call), masked and bounded.
-    customerContext: caseCustomerContextReader(),
+    customerContext: caseCustomerContextReader({ env: input.env }),
     // What the decision rests on, read now: the contract, the active knowledge revision, the configured model and this prompt.
-    revisions: async () => ({ rules: SAV_CASE_DECISION_CONTRACT_REVISION, playbookId: await vectors.readRevision(), model: input.env()[SAV_V2_MODEL_ENV] ?? "", prompt: SAV_CASE_INVESTIGATION_PROMPT_REVISION }),
+    revisions: async () => ({ rules: SAV_CASE_DECISION_CONTRACT_REVISION, playbookId: await vectors.readRevision(), model: input.env()[SAV_V2_MODEL_ENV] ?? "",
+      prompt: caseInvestigationPromptRevision(caseAttachmentMediaMode(input.env()) !== "off") }),
     ledger: caseCallLedgerOnStore,
     knowledge: { vectors, embed: caseGeminiEmbeddingTransport({ env: input.env, ...(input.network ? { network: input.network } : {}) }), spend: caseV2EmbeddingSpend(spendDeps) },
     model: { preflight: caseGeminiDecisionPreflight(input.env), money: model.money, releaseMoney: model.release, provider: model.provider(caseGeminiDecisionProvider({ env: input.env, ...(input.network ? { network: input.network } : {}) })) },

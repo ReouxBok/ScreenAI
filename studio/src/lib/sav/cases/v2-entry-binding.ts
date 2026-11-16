@@ -7,8 +7,9 @@ export type CaseContinuationPoint = (input: { caseId: string; trigger: CaseConti
 
 const CODE = /^[a-z0-9_]{1,80}$/, DETAIL = /^[a-z0-9_,.:-]{1,160}$/;
 /** Closed codes only (never client, provider or CRM text): why a passage stopped, for the operator and the logs. */
-export function caseContinuationReport(status: string, source: { reason?: unknown; detail?: unknown; problem?: unknown }): CaseContinuationReport {
-  const reason = typeof source.reason === "string" ? source.reason : typeof source.problem === "string" ? source.problem : undefined;
+export function caseContinuationReport(status: string, source: { reason?: unknown; detail?: unknown; problem?: unknown; code?: unknown }): CaseContinuationReport {
+  // A refused proposal names its closed code as `code` (e.g. `team_part_handoff_unavailable`, review batch 3 B1): kept, so the entry can mark the wait.
+  const reason = typeof source.reason === "string" ? source.reason : typeof source.problem === "string" ? source.problem : typeof source.code === "string" ? source.code : undefined;
   const detail = typeof source.detail === "string" ? source.detail : undefined;
   return { status, ...(reason && CODE.test(reason) ? { reason } : {}), ...(detail && DETAIL.test(detail) ? { detail } : {}) };
 }

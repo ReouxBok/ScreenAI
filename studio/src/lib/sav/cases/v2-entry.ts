@@ -17,17 +17,23 @@ import { hubspotTicketOwnerReader, type CaseOwnerReadTransport } from "./admissi
 import { admissionPolicyPort, admissionPolicyRevisionPort, qualifyTicketIdentity, type AdmissionPolicyRecord, type V1AdmissionAdapterPolicy } from "./admission-runtime";
 import { savCaseRecordingEnabled, v1IntentHash, type CaseTx } from "./case-store";
 import { caseIdsStillHeldByBlock, markCaseBlockHold } from "./case-block-hold";
-import { caseDedupeKey, SAV_CASE_ACCESS_BLOCK_ID } from "./case-types";
+import { settleCaseTeamPartWait, SAV_CASE_TEAM_PART_WAIT_CODE } from "./case-team-part-wait";
+import { caseDedupeKey, SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_AGENT_REQUESTS_PER_MAIL, type CaseAdmissionQualification, type CaseTeamPartReason } from "./case-types";
 import { readCaseAccessScope } from "./investigation-access-scope";
 import { caseAccessScopeConfigReader } from "./investigation-pilot-readers";
 import { routeCustomerReturn, type CustomerReturnDeps } from "./customer-return-store";
 import { v2OwnerAtCreationPort } from "./owner-attribution";
 import { bindSavV2QualificationThread, previewSavV2QualificationThread, savV2QualificationCaseAllowed, savV2QualificationMessageAllowed } from "./qualification-scope";
-import { caseBlockCandidates, caseBlockRuleProvenance, selectCaseBlockRule, type CaseBlockDetector, type CaseEntryRule } from "./case-blocks";
+import { caseBlockCandidates, caseBlockRuleProvenance, caseRuleBlockId, planCaseMultiBlockModes, selectCaseBlockRule, selectCaseRequestBlock, type CaseBlockDetector, type CaseEntryBlockMode, type CaseEntryRule } from "./case-blocks";
+import { readSavBlockSwitch, savBlockEffectiveMode } from "./block-switch";
+import { savCaseSensitiveWording } from "./investigation-return-qualify";
+import { savEvidenceContains } from "../evidence-text";
+import { containsPromptInjection } from "../policy";
 import { SAV_CASE_BLOCK_REGISTRY } from "./case-block-registry";
+import { readHandoffNoticeConfig } from "./case-handoff-notice";
 import type { ExecutorAdapters } from "../intake/execution-types";
 import { SAV_INTAKE_CONTRACT_REVISION, type SavIntakeDecision } from "../intake/contract";
-import { relayPaused, type CaseRelayRequest, type CaseBoundaryDeps, type CaseRelayResult } from "./intake-boundary";
+import { readRequestQuotes, relayPaused, type CaseRelayRequest, type CaseBoundaryDeps, type CaseRelayResult } from "./intake-boundary";
 import { loadCaseContinuationPoint, type CaseContinuationPoint, type CaseContinuationTrigger } from "./v2-entry-binding";
 
 type Env = Record<string, string | undefined>;
@@ -44,12 +50,43 @@ function parseEnvJson<T>(env: Env, name: string): T | null {
   try { return JSON.parse(value) as T; } catch { throw Error(`SAV_V2_ENTRY_${name.replace(/^SAV_V2_/, "")}_INVALID`); }
 }
 
+/** A block other than Access is admitted only with its own valid scope for the policy in force: otherwise its case would go to V2 and wait
+ * forever (`block_scope_missing`). Access is not checked here, exactly as before blocks. An unreadable policy is no policy: nobody is admitted. */
+async function blockScopeAvailable(env: Env, messageId: string, blockId: string) {
+  if (blockId === SAV_CASE_ACCESS_BLOCK_ID) return true;
+  const policyRevision = await admissionPolicyRevisionPort({ read: async () => readV2EntryPolicyRecord(env), now: () => new Date() })().catch(() => null);
+  const scope = await readCaseAccessScope(caseAccessScopeConfigReader(() => env), policyRevision, blockId);
+  if (!scope.ok) console.error("sav_v2_entry_block_not_admitted", { messageId, blockId, reason: "block_scope_unavailable", problem: scope.problem });
+  return scope.ok;
+}
+
+/** SAV-92: where the entry reads each request's own words (the quote V1 verified), by V1 request id. `runId: null` (V1's creation): the message's latest run. */
+export type CaseRequestQuotesPort = typeof readRequestQuotes;
+/** SAV-92 (multi-block): the effective mode of one block, read now (`savBlockEffectiveMode` on its switch); a read that fails is `off` (fail closed). */
+export type CaseEntryBlockModePort = (blockId: string) => Promise<CaseEntryBlockMode>;
+export type CaseEntrySource = { run?: { runId: string | null; runVersion: number | null }; readQuotes?: CaseRequestQuotesPort; blockMode?: CaseEntryBlockModePort };
+const entryBlockMode = (env: Env): CaseEntryBlockModePort => async blockId => {
+  try { return savBlockEffectiveMode(await readSavBlockSwitch(requireDb(), blockId), env); } catch { return "off"; }
+};
+const SENSITIVE_V1_KINDS = new Set(["finance", "cancellation"]);
+
 /**
  * Approved rules are data, read from the environment; none is the default and proves nothing. `decideCaseAdmission` still checks each against the approved policy.
  * Treatment blocks (11/11): every approved `support` rule is evaluated, each by its block's detector (`case-block-registry.ts`); exactly one match admits, with
  * the rule's block in its provenance. No candidate, no match or several (ambiguous) admit nobody. The mail is read only when a candidate exists.
+ *
+ * SAV-92 (Ugo 14/11), a mail of several requests:
+ *   - any finance or cancellation request (V1), or any sensitive wording in the customer's own words, keeps the WHOLE mail with the team: nobody is admitted;
+ *   - otherwise each request is read on its own verified words by the same detectors: exactly one block gives that request to its block; none, two blocks
+ *     (ambiguous, per request), a block without scope, a request that is not support or has no stored words leaves THAT request to the team (`team_part`);
+ *   - nobody is admitted when no request is a block's.
+ * SAV-92 (Ugo 15/11), requests of SEVERAL blocks: each stays with its block and ONE decision answers them all in ONE reply, each request checked against its own
+ * block's scope. The reply goes out in one mode only: the blocks at the most permissive mode of the mail keep their requests, a stricter block's requests become
+ * team parts (`block_switch_restricted`, `planCaseMultiBlockModes`). A single-request mail, and a mail whose requests are all one block's, are read exactly as before.
  */
-export async function firstBlockEvidence(env: Env, messageId: string, gmailMessageId: string, requests: CaseRelayRequest[], registry: readonly CaseBlockDetector[] = SAV_CASE_BLOCK_REGISTRY) {
+export async function firstBlockEvidence(env: Env, messageId: string, gmailMessageId: string, requests: CaseRelayRequest[], registry: readonly CaseBlockDetector[] = SAV_CASE_BLOCK_REGISTRY,
+  source: CaseEntrySource = {}): Promise<CaseAdmissionQualification["requests"]> {
+  if (requests.length > 1) return multiRequestEvidence(env, messageId, gmailMessageId, requests, registry, source);
   if (requests.length !== 1 || requests[0].kind !== "support") return [];
   const candidates = caseBlockCandidates(parseEnvJson<CaseEntryRule[]>(env, "SAV_V2_ADMISSION_RULES_JSON") ?? [], registry);
   if (!candidates.length) return [];
@@ -62,21 +99,79 @@ export async function firstBlockEvidence(env: Env, messageId: string, gmailMessa
   // Two blocks claiming one mail is a configuration to review: visible, with no customer text, and nobody admitted.
   if (selected.reason === "ambiguous_block") console.error("sav_v2_entry_block_ambiguous", { messageId, blockIds: selected.blockIds });
   if (selected.reason !== "admitted") return [];
-  // A block other than Access is admitted only with its own valid scope for the policy in force: otherwise its case would go to V2 and wait
-  // forever (`block_scope_missing`). V1 and the team keep the mail. Access is not checked here, exactly as before blocks.
-  if (selected.block.blockId !== SAV_CASE_ACCESS_BLOCK_ID) {
-    // An unreadable policy is no policy: the scope cannot match it, nobody is admitted.
-    const policyRevision = await admissionPolicyRevisionPort({ read: async () => readV2EntryPolicyRecord(env), now: () => new Date() })().catch(() => null);
-    const scope = await readCaseAccessScope(caseAccessScopeConfigReader(() => env), policyRevision, selected.block.blockId);
-    if (!scope.ok) {
-      console.error("sav_v2_entry_block_not_admitted", { messageId, blockId: selected.block.blockId, reason: "block_scope_unavailable", problem: scope.problem });
-      return [];
-    }
-  }
+  if (!await blockScopeAvailable(env, messageId, selected.block.blockId)) return [];
   return [{ requestId: requests[0].requestId, family: selected.rule.family, provenance: caseBlockRuleProvenance(selected.rule) }];
 }
+
+async function multiRequestEvidence(env: Env, messageId: string, gmailMessageId: string, requests: CaseRelayRequest[], registry: readonly CaseBlockDetector[],
+  source: CaseEntrySource): Promise<CaseAdmissionQualification["requests"]> {
+  if (requests.some(request => SENSITIVE_V1_KINDS.has(request.kind)) || !requests.some(request => request.kind === "support")) return [];
+  const candidates = caseBlockCandidates(parseEnvJson<CaseEntryRule[]>(env, "SAV_V2_ADMISSION_RULES_JSON") ?? [], registry);
+  if (!candidates.length) return [];
+  const [message] = await requireDb().select({ body: savMessages.bodyCiphertext, subject: savMessages.subject, receivedAt: savMessages.receivedAt }).from(savMessages)
+    .where(and(eq(savMessages.id, messageId), eq(savMessages.gmailMessageId, gmailMessageId), eq(savMessages.direction, "inbound")));
+  if (!message) return [];
+  const text = decryptSavPayload<{text?: unknown}>(message.body)?.text;
+  if (typeof text !== "string") return [];
+  if (savCaseSensitiveWording(text, message.subject)) { console.error("sav_v2_entry_multi_sensitive", { messageId }); return []; }
+  const prefix = `${gmailMessageId}/`, v1Id = (request: CaseRelayRequest) => request.requestId.startsWith(prefix) ? request.requestId.slice(prefix.length) : null;
+  const ids = requests.flatMap(request => { const id = v1Id(request); return id ? [id] : []; });
+  let quotes: Map<string, string>;
+  try {
+    quotes = await (source.readQuotes ?? readRequestQuotes)({ runId: source.run?.runId ?? null, runVersion: source.run?.runVersion ?? null, messageId, gmailMessageId, requestIds: ids });
+  } catch { quotes = new Map(); }
+  const at = message.receivedAt.toISOString(), scopes = new Map<string, boolean>();
+  const teamPart = (requestId: string, reason: CaseTeamPartReason) => ({ requestId, family: "unknown" as const, provenance: { kind: "team_part" as const, reason, at } });
+  const admitted: CaseAdmissionQualification["requests"] = [], parts: CaseAdmissionQualification["requests"] = [], blocks = new Set<string>();
+  for (const request of requests) {
+    if (request.kind !== "support") { parts.push(teamPart(request.requestId, "not_support")); continue; }
+    const quote = quotes.get(request.requestId);
+    // The quote must still be the customer's words of THIS stored mail (an inherited request quotes an older one).
+    // Review of batch 2 (finding 5): words that read as an instruction are not read as a request: that request is the team's.
+    if (!quote || !savEvidenceContains(text, quote) || containsPromptInjection(quote)) { parts.push(teamPart(request.requestId, "request_text_unavailable")); continue; }
+    const selected = selectCaseRequestBlock(candidates, quote);
+    if (selected.reason === "ambiguous_block") {
+      console.error("sav_v2_entry_block_ambiguous", { messageId, requestId: request.requestId, blockIds: selected.blockIds });
+      parts.push(teamPart(request.requestId, "ambiguous_block")); continue;
+    }
+    if (selected.reason !== "admitted") { parts.push(teamPart(request.requestId, "no_block_match")); continue; }
+    const blockId = selected.block.blockId;
+    if (!scopes.has(blockId)) scopes.set(blockId, await blockScopeAvailable(env, messageId, blockId));
+    if (!scopes.get(blockId)) { parts.push(teamPart(request.requestId, "block_scope_unavailable")); continue; }
+    blocks.add(blockId);
+    admitted.push({ requestId: request.requestId, family: selected.rule.family, provenance: caseBlockRuleProvenance(selected.rule) });
+  }
+  if (!admitted.length) return [];
+  let result = [...admitted, ...parts];
+  if (blocks.size > 1) {
+    // SAV-92 (15/11): several blocks in one mail. Their modes are read now; a stricter block never holds back the one reply, its requests go to the team.
+    const read = source.blockMode ?? entryBlockMode(env), modes = new Map<string, CaseEntryBlockMode>();
+    for (const blockId of [...blocks].sort()) modes.set(blockId, await read(blockId).catch(() => "off" as const));
+    const plan = planCaseMultiBlockModes(modes), restricted = new Set(plan.restricted);
+    console.info("sav_v2_entry_several_blocks", { messageId, kept: plan.kept, restricted: plan.restricted });
+    const blockOf = (row: CaseAdmissionQualification["requests"][number]) => row.provenance.kind === "qualified_rule" ? caseRuleBlockId({ family: row.family as CaseEntryRule["family"], blockId: row.provenance.blockId }) : null;
+    const moved = admitted.filter(row => restricted.has(blockOf(row) ?? ""));
+    if (moved.length) result = [...admitted.filter(row => !moved.includes(row)), ...parts, ...moved.map(row => teamPart(row.requestId, "block_switch_restricted"))];
+  }
+  // Counter-review of 66e648a: one reply covers every request the agent keeps, and an `ask` holds at most 4 questions. Beyond that, the extra requests (in the
+  // mail's order) are the team's, with the notice, rather than a decision refused for leaving them uncovered.
+  const kept = result.filter(row => row.provenance.kind !== "team_part");
+  if (kept.length > SAV_CASE_AGENT_REQUESTS_PER_MAIL) {
+    const over = kept.slice(SAV_CASE_AGENT_REQUESTS_PER_MAIL);
+    console.info("sav_v2_entry_request_limit", { messageId, kept: SAV_CASE_AGENT_REQUESTS_PER_MAIL, toTeam: over.length });
+    result = [...result.filter(row => !over.includes(row)), ...over.map(row => teamPart(row.requestId, "request_limit"))];
+  }
+  // SAV-92 (review of batch 2, finding 1): a team part is only ever left to the team through its notice. No notice channel configured, nobody is admitted and
+  // the WHOLE mail stays with the team, as before multi-request mails: the customer is never told « transmis à notre équipe » with nothing reaching the team.
+  if (result.some(row => row.provenance.kind === "team_part") && readHandoffNoticeConfig(env).mode !== "on") {
+    console.error("sav_v2_entry_team_part_without_notice", { messageId });
+    return [];
+  }
+  return result;
+}
 const rulesPort = (env: Env): CaseApprovedRulePort => ({context, requests}) =>
-  firstBlockEvidence(env, context.source.messageId, context.source.gmailMessageId, requests);
+  firstBlockEvidence(env, context.source.messageId, context.source.gmailMessageId, requests, SAV_CASE_BLOCK_REGISTRY,
+    { run: { runId: context.source.runId, runVersion: context.source.runVersion } });
 
 /** Only called for the create intent under V1's execution lease, including its final pre-dispatch check.
  * No ticket or confirmed execution exists yet. The post-create relay independently requires both. */
@@ -85,7 +180,8 @@ export const creationOwnerForIntake = async (env: Env, input: Parameters<NonNull
   const disposition = decision.disposition;
   if (!savV2EntryEnabled(env) || signal.aborted || decision.revision !== SAV_INTAKE_CONTRACT_REVISION
     || decision.latestInboundMessageId !== decision.messageId || decision.classification !== "support"
-    || decision.requests.length !== 1 || decision.requests[0].kind !== "support"
+    // SAV-92: a mail of several requests too (at least one support, no finance or cancellation); the entry decides each request below.
+    || !decision.requests.some(request => request.kind === "support") || decision.requests.some(request => SENSITIVE_V1_KINDS.has(request.kind))
     || disposition.kind !== "ticket" || disposition.target.operation !== "create"
     || disposition.target.contactId !== disposition.contactScope.primaryContactId)
     return { assign: false as const, reason: "not_admitted" };
@@ -95,7 +191,7 @@ export const creationOwnerForIntake = async (env: Env, input: Parameters<NonNull
     readQualification: async ({messageId, gmailMessageId, requests}) => {
       if (signal.aborted || await intakeHumanRefused(messageId)) return null;
       const { qualification } = qualifyTicketIdentity(decision, await sources.adapterPolicy(), true);
-      return { ...qualification, requests: await firstBlockEvidence(env, messageId, gmailMessageId, requests) };
+      return { ...qualification, requests: await firstBlockEvidence(env, messageId, gmailMessageId, requests, SAV_CASE_BLOCK_REGISTRY, { run: { runId: null, runVersion: null } }) };
     },
   })(input);
   if (!decided.assign) return decided;
@@ -338,6 +434,12 @@ export async function continueCaseAfterCommit(caseId: string, trigger: CaseConti
       await markContinuation(caseId, trigger, null);
       // SAV-18: a block held by its switch is a durable, visible wait (console, diagnostics), cleared by the next pass that is not held.
       await markCaseBlockHold(caseId, report.status === "block_held" ? { blockId: report.detail ?? SAV_CASE_ACCESS_BLOCK_ID, reason: report.reason ?? "block_setting_invalid" } : null);
+      // Review batch 3 (B1): a reply naming a team part whose notice could not be queued is a visible, bounded wait (never a silent retry at each sweep):
+      // marked with its closed code, then, at the bound, the whole mail goes to the team. A failure of this step never undoes the pass.
+      const teamPartRefused = report.status === "proposal_refused" && report.reason === SAV_CASE_TEAM_PART_WAIT_CODE;
+      const wait = await settleCaseTeamPartWait(caseId, teamPartRefused ? { ...(report.detail ? { detail: report.detail } : {}) } : null)
+        .catch(error => { console.error("sav_v2_entry_team_part_wait", { caseId, errorCode: errorCode(error) }); return null; });
+      if (teamPartRefused) console.warn("sav_v2_entry_team_part_wait", { caseId, state: wait?.state ?? "unmarked", ...(wait && "passes" in wait ? { passes: wait.passes } : {}) });
       return report;
     }
     code = "point_not_bound";

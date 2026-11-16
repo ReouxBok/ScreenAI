@@ -109,6 +109,9 @@ export type IntakeRuntimePayload = {
   provenance?:unknown; traces?: unknown[]; reason?: string;
   /** Fixed when the run is created; analysis, repairs and resumes keep it. Absent: current. */
   pipeline?: SavIntakePipeline;
+  /** SAV-92 (multi-request mails): each current request's own words as the current reader validated them (verbatim in the message), from its validated
+   * evidence; the engine never receives them. V2's entry reads them to attribute each request to its block. Absent: none captured (single-call reader). */
+  requestQuotes?: { messageId: string; requests: Array<{ id: string; quote: string }> };
   effects: "not_connected";
 };
 export function assertSavIntakeObservation(plan: IntakePlan) {

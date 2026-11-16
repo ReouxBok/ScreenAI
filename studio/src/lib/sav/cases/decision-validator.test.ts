@@ -115,15 +115,16 @@ describe("SAV-6 structural invariants", () => {
     expect(codes(run(proposal({ kind: "observe_only" }, { reply: reply("Bonjour") }), ctx))).toEqual(["observe_only_with_reply"]);
   });
   it("rejects references to unknown requests and accepts known ones", () => {
-    expect(codes(run(proposal(ask(undefined, undefined, "r9"))))).toEqual(["request_reference_unknown"]);
+    expect(codes(run(proposal(ask(undefined, undefined, "r9"))))).toEqual(["request_reference_unknown", "proposal_request_uncovered"]);
     accepted(proposal(ask(undefined, undefined, "r1")));
   });
   it("rejects a decision that silently drops a still-open request or repeats one", () => {
     const ctx = context({ requests: [{ id: "r1", family: "usage", status: "open" }, { id: "r2", family: "technical", status: "open" }] });
-    expect(codes(run(proposal(ask()), ctx))).toEqual(["open_request_omitted"]);
+    expect(codes(run(proposal(ask()), ctx))).toEqual(["open_request_omitted", "proposal_request_uncovered"]);
     const both = { requests: [request("r1"), request("r2", "technical")], newFacts: [] };
-    accepted(proposal(ask(), { understanding: both }), ctx);
-    expect(codes(run(proposal(ask(), { understanding: { requests: [request("r1"), request("r1"), request("r2", "technical")], newFacts: [] } }), ctx))).toEqual(["request_duplicate"]);
+    const askBoth = { kind: "ask", questions: [...ask().questions, ...ask(undefined, "Quel message s'affiche à l'écran ?", "r2").questions] };
+    accepted(proposal(askBoth, { understanding: both }), ctx);
+    expect(codes(run(proposal(askBoth, { understanding: { requests: [request("r1"), request("r1"), request("r2", "technical")], newFacts: [] } }), ctx))).toEqual(["request_duplicate"]);
   });
   it("accepts every SAV-5 source type, including CRM objects and timers", () => {
     const sources: Source[] = [
@@ -219,7 +220,8 @@ describe("SAV-6 repeated failed procedure (C02)", () => {
   it("does not block a different procedure or the same one on another request", () => {
     accepted(proposal(answer("k2")), ctx());
     const two = context({ requests: [{ id: "r1", family: "usage", status: "open" }, { id: "r2", family: "usage", status: "open" }], trials: [failed("r2")] });
-    accepted(proposal(answer("k1"), { understanding: { requests: [request("r1"), request("r2")], newFacts: [] } }), two);
+    // SAV-92 P2-3: the answer leaves r2 open, so only the coverage rule refuses it, never the repeated procedure.
+    expect(codes(run(proposal(answer("k1"), { understanding: { requests: [request("r1"), request("r2")], newFacts: [] } }), two))).toEqual(["proposal_request_uncovered"]);
   });
 });
 
@@ -320,7 +322,7 @@ describe("SAV-6 sensitive requests stay human", () => {
   it("M6: a finance request mixed with usage blocks an autonomous answer on the whole case", () => {
     const ctx = context({ requests: [{ id: "r1", family: "usage", status: "open" }, { id: "r2", family: "finance", status: "open" }] });
     const understanding = { requests: [request("r1"), request("r2", "finance")], newFacts: [] };
-    expect(codes(run(proposal(answer("k1"), { understanding }), ctx))).toEqual(["sensitive_requires_human"]);
+    expect(codes(run(proposal(answer("k1"), { understanding }), ctx))).toEqual(["sensitive_requires_human", "proposal_request_uncovered"]);
     accepted(proposal(handoff("sensitive_request", {}, ["r1", "r2"]), { understanding }), ctx);
   });
   it("rejects reclassifying a sensitive request as ordinary", () => {
@@ -593,7 +595,7 @@ describe("SAV-6 resolution and 'merci'", () => {
     });
     it("rejects marking a request resolved without evidence, or acting on it afterwards", () => {
       expect(codes(run(proposal(ask(undefined, undefined, "r2"), { understanding: both({ status: "resolved" }) }), ctx))).toEqual(["request_resolved_without_evidence"]);
-      expect(codes(run(proposal(ask(undefined, undefined, "r1"), { understanding: both({ status: "resolved", resolvedBy: { source: email("m2"), trialId: "t1", quote: "ça remarche" } }) }), ctx))).toEqual(["request_not_open"]);
+      expect(codes(run(proposal(ask(undefined, undefined, "r1"), { understanding: both({ status: "resolved", resolvedBy: { source: email("m2"), trialId: "t1", quote: "ça remarche" } }) }), ctx))).toEqual(["request_not_open", "proposal_request_uncovered"]);
     });
     it("rejects a confirmation missing evidence for one of its requests", () => {
       const result = run(proposal(confirm([evidence()], ["r1", "r2"]), { understanding: both() }), ctx);
@@ -605,7 +607,7 @@ describe("SAV-6 resolution and 'merci'", () => {
     const ctx = context({ requests: [{ id: "r-old", family: "integration", status: "resolved" }, { id: "r2", family: "usage", status: "open" }] });
     const understanding = { requests: [request("r2")], newFacts: [] };
     accepted(proposal(answer("k1", [], ["r2"]), { understanding }), ctx);
-    expect(codes(run(proposal(ask(undefined, undefined, "r-old"), { understanding }), ctx))).toEqual(["request_not_open"]);
+    expect(codes(run(proposal(ask(undefined, undefined, "r-old"), { understanding }), ctx))).toEqual(["request_not_open", "proposal_request_uncovered"]);
   });
 });
 
@@ -620,14 +622,16 @@ describe("SAV-7 weekend: a card supports only the requests it was retrieved for"
   it("an answer step citing a card retrieved for another request is refused with its own code; the linked card is accepted", () => {
     const ctx = context({ ...two, coverage: coverage([["r1", ["k1"]], ["r2", ["k2"]]]) });
     const result = run(proposal(answer("k1", [], ["r2"]), both), ctx);
-    expect(result.outcome === "needs_review" && result.rejections.map(row => [row.code, row.path, row.detail])).toEqual([["knowledge_not_linked_to_request", "nextAction.steps.0.knowledge", "k1"]]);
-    accepted(proposal(answer("k2", [], ["r2"]), both), ctx);
+    expect(result.outcome === "needs_review" && result.rejections.map(row => [row.code, row.path, row.detail])).toEqual([["knowledge_not_linked_to_request", "nextAction.steps.0.knowledge", "k1"], ["proposal_request_uncovered", "nextAction", "r1"]]);
+    // The linked card is accepted: only the coverage rule (SAV-92 P2-3, r1 left open) remains.
+    expect(codes(run(proposal(answer("k2", [], ["r2"]), both), ctx))).toEqual(["proposal_request_uncovered"]);
   });
   it("a reply may cite the card of any open request; an impossibility needs a card retrieved for its own request", () => {
     const ctx = context({ ...two, coverage: coverage([["r1", ["k1"]], ["r2", ["k2"]]]) });
-    accepted(proposal(answer("k2", [], ["r2"]), { ...both, reply: reply("Bonjour, voici les étapes.", { citations: [ref("k1"), ref("k2")] }) }), ctx);
+    // Citing r1's card is not refused; only the coverage rule (SAV-92 P2-3, r1 left open) remains.
+    expect(codes(run(proposal(answer("k2", [], ["r2"]), { ...both, reply: reply("Bonjour, voici les étapes.", { citations: [ref("k1"), ref("k2")] }) }), ctx))).toEqual(["proposal_request_uncovered"]);
     const claim = { impossibilityClaims: [{ requestId: "r2", statement: "Ce champ n'est pas synchronisé.", knowledge: ref("k1") }] };
-    expect(codes(run(proposal(answer("k2", [], ["r2"]), { ...both, reply: reply("Ce champ n'est pas synchronisé.", claim) }), ctx))).toEqual(["knowledge_not_linked_to_request"]);
+    expect(codes(run(proposal(answer("k2", [], ["r2"]), { ...both, reply: reply("Ce champ n'est pas synchronisé.", claim) }), ctx))).toEqual(["proposal_request_uncovered", "knowledge_not_linked_to_request"]);
   });
   it("an invalid card keeps its own code: the link rule never hides why a card is refused", () => {
     const ctx = context({ knowledge: [card("k1", { validUntil: "2026-10-01" })], coverage: coverage([["r1", ["k1"]]]) });
@@ -664,5 +668,23 @@ describe("SAV-6 purity", () => {
     expect(imports("decision-context.ts")).toEqual(["../request-retrieval", "./admission-policy", "./case-types", "./decision-contract"]);
     // Pole A's admission rule is pure: no store, database or clock behind it.
     expect(imports("admission-policy.ts")).toEqual(["./case-types"]);
+  });
+});
+
+describe("SAV-92 review P2-3: a reply covers every request still open", () => {
+  const two = context({ requests: [{ id: "r1", family: "usage", status: "open" }, { id: "r2", family: "usage", status: "open" }] });
+  const both = { understanding: { requests: [request("r1"), request("r2")], newFacts: [] } };
+  it("an answer on r1 only while r2 is open is refused with `proposal_request_uncovered` naming r2", () => {
+    const result = run(proposal(answer("k1", [], ["r1"]), both), two);
+    expect(result.outcome).toBe("needs_review");
+    if (result.outcome === "needs_review") expect(result.rejections.map(row => [row.code, row.path, row.detail])).toEqual([["proposal_request_uncovered", "nextAction", "r2"]]);
+    expect(codes(run(proposal(ask(undefined, undefined, "r1"), both), two))).toEqual(["proposal_request_uncovered"]);
+  });
+  it("covered: an answer naming both, or a question per request, is accepted; a team part already handed off needs no cover", () => {
+    accepted(proposal(answer("k1", [], ["r1", "r2"]), both), two);
+    accepted(proposal({ kind: "ask", questions: [...ask().questions, ...ask(undefined, "Quel message s'affiche ?", "r2").questions] }, both), two);
+    // A team part opened handed off by the admission is not open: the answer on r1 covers the mail (the notice and the fixed sentence carry r2).
+    accepted(proposal(answer("k1", [], ["r1"]), { understanding: { requests: [request("r1")], newFacts: [] } }),
+      context({ requests: [{ id: "r1", family: "usage", status: "open" }, { id: "r2", family: "usage", status: "handed_off" }] }));
   });
 });

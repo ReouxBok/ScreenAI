@@ -109,7 +109,8 @@ const answer = (request: CaseInvestigationModelRequest) => {
   const snapshot: CaseSnapshot = request.snapshot, open = snapshot.body.openRequests.filter(row => row.status === "open");
   return { status: "ok" as const, output: { caseVersion: snapshot.version,
     understanding: { requests: open.map(row => ({ id: row.id, summary: "Connexion impossible.", family: "access", status: "open" })), newFacts: [] },
-    nextAction: { kind: "answer", requestIds: [open[0]!.id], steps: [{ text: "Suivre la fiche citée.", knowledge: refOf(LOGIN) }], expectedResult: "La connexion fonctionne." },
+    // SAV-92 review P2-3: one reply covers every open request (a second mail adds its own).
+    nextAction: { kind: "answer", requestIds: open.map(row => row.id), steps: [{ text: "Suivre la fiche citée.", knowledge: refOf(LOGIN) }], expectedResult: "La connexion fonctionne." },
     reply: { text: `Bonjour, voici la marche à suivre depuis ${ACCESS} : suivre la fiche.`, citations: [refOf(LOGIN)], impossibilityClaims: [], accountAdvice: "none" } } };
 };
 const realLedger: CaseCallLedgerPort = { reserve: reserveSavCaseCall, markDispatched: markSavCaseCallDispatched, settle: settleSavCaseCall, release: releaseSavCaseCall };
