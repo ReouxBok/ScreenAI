@@ -37,6 +37,7 @@ export type ExecutionPayload = {
     crmRecheck?: import("./crm-recheck").CrmRecheckState;
     lastRunId: string;
     acceptedFingerprint: string;
+    originalRequestTicket?: { messageId: string; address: string };
     effectsConfirmed?: boolean;
     concurrentHistoryHash?: string;
     completion?: { sourceHash: string; messageHash: string };
@@ -50,6 +51,7 @@ export type EffectIntent = {
     objectId?: string;
     properties?: Record<string, string>;
     expectedProperties?: Record<string, string>;
+    reuseExistingAssociation?: boolean;
     confirmedNoteCreate?: { effectId: string; objectId: string };
     text?: string;
     marker?: string;
