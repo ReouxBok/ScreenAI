@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 vi.mock("@/db", () => ({ requireDb: () => { throw Error("NO_DB_ALLOWED"); } }));
 import { emptyCaseBody, type CaseBody } from "./case-types";
-import { customerLinkOf, customerLinksOf, CASE_HANDOFF_SUMMARY_LIMITS, type CaseHandoffReceived } from "./case-handoff-summary";
+import { customerLinkOf, customerLinkScan, customerLinksOf, CASE_HANDOFF_SUMMARY_LIMITS, type CaseHandoffReceived } from "./case-handoff-summary";
 import { handoffNoteText, handoffNoticeFacts, type HandoffReason } from "./case-handoff-notice";
 import { handoffNoteOf } from "./case-handoff-notice-store";
 
@@ -31,7 +31,7 @@ const withTrials = (outcome: "failed" | "pending") => body({
   questions: [{ id: "q1", text: "Quel message s'affiche ?", factKeys: [], askedAt: AT(2), askedInEffect: "e1", answeredBy: email("gm-syn-2") }],
   trials: [trial("t1", "syn-access-reset", "failed", 3), trial("t2", "syn-access-magic-link", outcome, 6)],
 });
-const MAIL_LINKS = customerLinksOf(["Voici la conversation : https://app.example.invalid/conversation/c-77?token=abc123&lang=fr."]);
+const MAIL_TEXTS = ["Voici la conversation : https://app.example.invalid/conversation/c-77?utm_source=abc123&lang=fr."];
 
 describe("HubSpot handoff note: a short narrative (exact texts)", () => {
   it("simple case: V1's subject, nothing asked, tried or sent", () => {
@@ -42,14 +42,13 @@ describe("HubSpot handoff note: a short narrative (exact texts)", () => {
   });
 
   it("with trials and a link: neutral labels, the outcome of the last trial, the full cleaned link, the files", () => {
-    const received: CaseHandoffReceived = { files: [{ name: "capture.png", type: "image/png", sizeKb: 120 }], omitted: 0, links: MAIL_LINKS };
+    const received: CaseHandoffReceived = { files: [{ name: "capture.png", type: "image/png", sizeKb: 120 }], omitted: 0, linkTexts: MAIL_TEXTS };
     expect(note("repeated_failure", withTrials("failed"), received).text).toBe([
       "Le client écrit : « Je n'arrive plus à me connecter à mon espace. »",
       "Nous lui avons posé une question ; il nous a répondu.",
       "Nous avons essayé une première solution puis une autre solution ; le problème persiste.",
       "Il nous a envoyé ce lien : https://app.example.invalid/conversation/c-77?lang=fr",
       "Il a joint un fichier à ses messages.",
-      "Les solutions proposées n'ont pas suffi.",
       "Je passe le dossier à l'équipe."].join("\n"));
   });
 
@@ -85,8 +84,8 @@ describe("HubSpot handoff note: a short narrative (exact texts)", () => {
   });
 
   it("no identifier, sheet name, model name, reply text or technical term ever leaks", () => {
-    const received: CaseHandoffReceived = { files: [], omitted: 0, links: MAIL_LINKS };
-    const leaks = [CASE_ID, TICKET, INPUT, "gm-syn", "syn-access", "-v3", "syn-model", "fiche", "modèle", "validateur", "bloc", "V2", "agent", "HO-", "handoff", "token", "abc123",
+    const received: CaseHandoffReceived = { files: [], omitted: 0, linkTexts: MAIL_TEXTS };
+    const leaks = [CASE_ID, TICKET, INPUT, "gm-syn", "syn-access", "-v3", "syn-model", "fiche", "modèle", "validateur", "bloc", "V2", "agent", "HO-", "handoff", "token", "abc123", "utm_source",
       "Toujours bloqué", "Vérifier le compte", "Quel message", "Demande support"];
     for (const reason of ["knowledge_missing", "knowledge_conflict", "decision_refused", "repeated_failure", "evidence_inaccessible", "diagnosis_out_of_tools", "team_part_handoff_unavailable"] as const) {
       const { text, facts } = note(reason, withTrials("failed"), received);
@@ -106,32 +105,44 @@ describe("HubSpot handoff note: a short narrative (exact texts)", () => {
   });
 });
 
-describe("customer links: full https links, cleaned and bounded", () => {
-  it("keeps a clean https link whole, trailing punctuation dropped", () => {
-    expect(customerLinkOf("https://app.example.invalid/conversation/c-77?lang=fr#message-4).")).toBe("https://app.example.invalid/conversation/c-77?lang=fr#message-4");
+describe("customer links: conservative policy (review Astra of 1289893)", () => {
+  const SECRET = "R7mQ2vX9pL4nW8zK";
+  it("Astra's regressions: an authentication link is rejected whole, and the note only says a link was masked", () => {
+    const astra = [`https://app.example.invalid/reset?reset=${SECRET}`, `https://app.example.invalid/login?magic=${SECRET}`,
+      `https://app.example.invalid/reset/${SECRET}`, `https://app.example.invalid/login#${SECRET}`];
+    for (const link of astra) expect({ link, kept: customerLinkOf(link) }).toEqual({ link, kept: null });
+    expect(customerLinkScan([astra.join(" et ")])).toEqual({ links: [], masked: 4 });
+    const { text } = note("knowledge_missing", body(), { files: [], omitted: 0, linkTexts: [`Voici le lien : ${astra[0]}`] });
+    expect(text).toBe(["Le client signale : connexion impossible à la plateforme.", "Il nous a envoyé un lien (masqué par sécurité, voir le mail).",
+      "Je n'ai pas de solution adaptée à cette demande.", "Je passe le dossier à l'équipe."].join("\n"));
+    expect(text).not.toContain(SECRET);
   });
-  it("removes the sensitive parameters and a fragment carrying a value", () => {
-    expect(customerLinkOf("https://app.example.invalid/c/1?token=abc&page=2&api_key=k&code=99&password=p&auth=a&sessionId=s&email=x%40y.invalid"))
-      .toBe("https://app.example.invalid/c/1?page=2");
-    expect(customerLinkOf("https://app.example.invalid/callback#access_token=abc&state=1")).toBe("https://app.example.invalid/callback");
+  it("a legitimate conversation link is kept (fragment always removed); a UUID only right after conversation/chat/thread/share", () => {
+    expect(customerLinkOf("https://app.example.invalid/conversation/c-77?lang=fr#message-4).")).toBe("https://app.example.invalid/conversation/c-77?lang=fr");
+    const uuid = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+    expect(customerLinkOf(`https://app.example.invalid/chat/${uuid}`)).toBe(`https://app.example.invalid/chat/${uuid}`);
+    expect(customerLinkOf(`https://app.example.invalid/files/${uuid}`)).toBeNull();
+    expect(customerLinkOf(`https://app.example.invalid/sso/conversation/${uuid}`)).toBeNull();
   });
-  it("rejects http, credentials, ports, addresses, token-shaped paths and over-long links", () => {
-    expect(customerLinkOf("http://app.example.invalid/conversation/1")).toBeNull();
-    expect(customerLinkOf("https://user:pass@app.example.invalid/conversation/1")).toBeNull();
-    expect(customerLinkOf("https://user@app.example.invalid/conversation/1")).toBeNull();
-    expect(customerLinkOf("https://app.example.invalid:8443/x")).toBeNull();
-    expect(customerLinkOf("https://192.168.0.1/x")).toBeNull();
-    expect(customerLinkOf("https://localhost/x")).toBeNull();
-    expect(customerLinkOf("https://app.example.invalid/reset/eyJhbGciOiJIUzI1NiJ9.e30.sig")).toBeNull();
-    expect(customerLinkOf(`https://app.example.invalid/reset/${"a1".repeat(20)}`)).toBeNull();
-    expect(customerLinkOf(`https://app.example.invalid/${"page/".repeat(70)}`)).toBeNull();
+  it("parameters: only lang, page, tab and a short numeric id with a plain value; a secret-looking value is removed", () => {
+    expect(customerLinkOf("https://app.example.invalid/c/1?page=2&ref=abc&id=42&key=k&code=99&email=x%40y.invalid&utm_source=mail")).toBe("https://app.example.invalid/c/1?page=2&id=42");
+    expect(customerLinkOf(`https://app.example.invalid/c/1?tab=${SECRET}&id=${SECRET}&lang=fr`)).toBe("https://app.example.invalid/c/1?lang=fr");
+    expect(customerLinkOf("https://app.example.invalid/c/1?id=12345678901234")).toBe("https://app.example.invalid/c/1");
   });
-  it("at most five distinct links, http and credentials skipped, idempotent", () => {
+  it("rejects authentication words anywhere, token-shaped segments, http, credentials, ports, addresses and over-long links", () => {
+    for (const link of ["https://app.example.invalid/signin", "https://app.example.invalid/account/verify-email", "https://app.example.invalid/x?invite=1",
+      "https://app.example.invalid/x#otp", "https://app.example.invalid/oauth2/cb", "https://app.example.invalid/unlock", "https://app.example.invalid/activate/1",
+      `https://app.example.invalid/doc/${SECRET}`, "https://app.example.invalid/doc/eyJhbGciOiJIUzI1NiJ9.e30.sig", `https://app.example.invalid/doc/${"a1".repeat(20)}`,
+      "http://app.example.invalid/conversation/1", "https://user:pass@app.example.invalid/conversation/1", "https://user@app.example.invalid/conversation/1",
+      "https://app.example.invalid:8443/x", "https://192.168.0.1/x", "https://localhost/x", `https://app.example.invalid/${"page/".repeat(70)}`])
+      expect({ link, kept: customerLinkOf(link) }).toEqual({ link, kept: null });
+  });
+  it("at most five distinct links, rejected ones counted as masked, idempotent", () => {
     const text = ["http://plain.example.invalid/a", "https://u:p@creds.example.invalid/a",
-      ...Array.from({ length: 7 }, (_, i) => `https://app.example.invalid/c/${i}?token=t${i}`), "https://app.example.invalid/c/0"].join(" et ");
-    const links = customerLinksOf([text]);
-    expect(links).toEqual([0, 1, 2, 3, 4].map(i => `https://app.example.invalid/c/${i}`));
-    expect(links).toHaveLength(CASE_HANDOFF_SUMMARY_LIMITS.links);
-    expect(customerLinksOf(links)).toEqual(links);
+      ...Array.from({ length: 7 }, (_, i) => `https://app.example.invalid/c/${i}?ref=t${i}`), "https://app.example.invalid/c/0"].join(" et ");
+    const scan = customerLinkScan([text]);
+    expect(scan).toEqual({ links: [0, 1, 2, 3, 4].map(i => `https://app.example.invalid/c/${i}`), masked: 2 });
+    expect(scan.links).toHaveLength(CASE_HANDOFF_SUMMARY_LIMITS.links);
+    expect(customerLinksOf(scan.links)).toEqual(scan.links);
   });
 });

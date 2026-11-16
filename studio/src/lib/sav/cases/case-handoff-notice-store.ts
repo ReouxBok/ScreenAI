@@ -33,7 +33,7 @@ import {
   judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, teamPartNoticeTriggers, type HandoffNoticeFacts, type HandoffNoticeTrigger,
 } from "./case-handoff-notice";
 import { createHandoffSlackAdapters, SLACK_NOT_POSTED_PREFIX } from "./case-handoff-slack";
-import { customerLinksOf, type CaseHandoffReceived } from "./case-handoff-summary";
+import type { CaseHandoffReceived } from "./case-handoff-summary";
 import { caseReceivedAttachments, type CaseStoredMailBody } from "./investigation-customer-attachments";
 import { caseCustomerOwnText } from "./investigation-customer-context";
 import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, type CaseNoteCreateIntent } from "./case-effect-intents";
@@ -87,7 +87,7 @@ async function readJournal(caseId: string) {
 
 /**
  * SAV-92 (15/11): the files received on the case's last stored customer mails (names masked, type, size), read only; null when unreadable.
- * SAV-92 (16/11): and the links of the customer's OWN text in those mails (quoted history and our replies left out), cleaned and bounded by `customerLinksOf`.
+ * SAV-92 (16/11): and the customer's OWN text of those mails (quoted history and our replies left out), only scanned for links by the synthesis (never sealed).
  */
 async function readReceivedAttachments(threadIds: readonly string[]): Promise<CaseHandoffReceived | null> {
   if (!threadIds.length) return null;
@@ -95,8 +95,8 @@ async function readReceivedAttachments(threadIds: readonly string[]): Promise<Ca
     const rows = await requireDb().select({ body: savMessages.bodyCiphertext }).from(savMessages)
       .where(and(inArray(savMessages.threadId, [...threadIds]), eq(savMessages.direction, "inbound"))).orderBy(sql`${savMessages.receivedAt} desc`).limit(10);
     const bodies = rows.map(row => { try { return decryptSavPayload<CaseStoredMailBody>(row.body); } catch { return null; } });
-    const links = customerLinksOf(bodies.flatMap(body => { try { return typeof body?.text === "string" ? [caseCustomerOwnText(body.text)] : []; } catch { return []; } }));
-    return { ...caseReceivedAttachments(bodies), ...(links.length ? { links } : {}) };
+    const linkTexts = bodies.flatMap(body => { try { return typeof body?.text === "string" ? [caseCustomerOwnText(body.text)] : []; } catch { return []; } });
+    return { ...caseReceivedAttachments(bodies), ...(linkTexts.length ? { linkTexts } : {}) };
   } catch { return null; }
 }
 

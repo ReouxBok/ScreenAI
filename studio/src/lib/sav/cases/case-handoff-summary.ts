@@ -16,16 +16,22 @@ export const CASE_HANDOFF_SUMMARY_REVISION = "sav-v2-handoff-summary-2026-11-14.
 export const CASE_HANDOFF_SUMMARY_LIMITS = { problemChars: 400, questions: 5, questionChars: 200, answerChars: 240, trials: 5, trialResultChars: 160, linkHosts: 3, receivedFiles: 6, receivedNameChars: 80, totalChars: 2400,
   /** SAV-92 (Ugo 16/11): full links the customer sent, kept for the HubSpot handoff note (https only, cleaned, bounded). */ links: 5, linkChars: 300 } as const;
 
-/** What the reader of the case's stored inbound mails hands the synthesis: the files received and, SAV-92 (16/11), the links found in the customer's own text. */
-export type CaseHandoffReceived = Readonly<{ files: ReadonlyArray<Readonly<{ name: string; type: string; sizeKb: number }>>; omitted: number; links?: readonly string[] }>;
+/**
+ * What the reader of the case's stored inbound mails hands the synthesis: the files received and, SAV-92 (16/11), the customer's own text of those mails
+ * (quoted history left out), only scanned here for links by `customerLinkScan`; never stored (only the cleaned links and the masked count are).
+ */
+export type CaseHandoffReceived = Readonly<{ files: ReadonlyArray<Readonly<{ name: string; type: string; sizeKb: number }>>; omitted: number; linkTexts?: readonly string[] }>;
 
 export type CaseHandoffSummary = Readonly<{
   revision: typeof CASE_HANDOFF_SUMMARY_REVISION;
   problem: Readonly<{ source: "customer_words" | "v1_subject" | "none"; text: string | null }>;
   exchanges: ReadonlyArray<Readonly<{ question: string; answer: string | null; answered: boolean }>>;
   exchangesOmitted: number;
-  /** `urls` (SAV-92, 16/11): the customer's links in full, cleaned by `customerLinkOf`; absent from summaries sealed before it existed or without a safe link. */
-  transmitted: Readonly<{ attachments: number; links: number; linkHosts: readonly string[]; urls?: readonly string[] }>;
+  /**
+   * `urls` (SAV-92, 16/11): the customer's links in full, cleaned by `customerLinkOf`; `urlsMasked`: how many distinct links were rejected (never their text).
+   * Both absent from summaries sealed before they existed, or when zero.
+   */
+  transmitted: Readonly<{ attachments: number; links: number; linkHosts: readonly string[]; urls?: readonly string[]; urlsMasked?: number }>;
   tried: ReadonlyArray<Readonly<{ knowledgeId: string; outcome: CaseTrial["outcome"]; result: string | null }>>;
   triedOmitted: number;
   /** SAV-92 (15/11): the files received on the case's stored mails (masked name, type, size; never content). Absent when not read. */
@@ -38,43 +44,66 @@ const sameSource = (a: SourceRef, b: SourceRef) => a.type === b.type && a.id ===
 const URL_IN_TEXT = /\bhttps?:\/\/([A-Za-z0-9.-]{1,120})(?::\d+)?(?:[/?#][^\s<>"']*)?/gi;
 const KNOWLEDGE_ID = /^[A-Za-z0-9._-]{1,80}$/;
 
-// SAV-92 (Ugo 16/11): the full links a customer gave (a conversation, a page in error), for the team's HubSpot note. No list of allowed domains exists in
-// the repository, so every https link is a candidate, cleaned: never http, never credentials (user:pass@), never a parameter or fragment that may carry a
-// secret, never a path segment shaped like a token, bounded in length and in number. Anything doubtful is dropped, never repaired.
+// SAV-92 (Ugo 16/11; review Astra of 1289893): the full links a customer gave (a conversation, a page in error), for the team's HubSpot note. No list of
+// allowed domains exists in the repository, so the policy is conservative; anything doubtful is dropped whole, never repaired:
+//   - https only, no credentials (user:pass@), no port, a named host (no IP address);
+//   - an AUTHENTICATION link (a path segment, a parameter name or the fragment evokes login, reset, magic, token...) is rejected whole: it may open the account;
+//   - the fragment is always removed;
+//   - a path segment shaped like a token (16+ characters mixing letters and digits, long hex, a provider token, a UUID) rejects the link; a UUID is allowed
+//     only right after conversation / chat / thread / share (a conversation id, what the team wants);
+//   - parameters: only a short safe list is kept (lang, page, tab, a short numeric id), and only with a short plain value; every other one is removed;
+//   - bounded in length (300) and in number (5). A rejected link is counted, so the note can say one was sent and masked.
 const RAW_LINK = /\bhttps?:\/\/[^\s<>"'«»[\]{}|\\^`]+/gi;
-const SENSITIVE_NAME = /token|key|pass|pwd|code|auth|session|secret|sig|otp|jwt|nonce|credential|mail|phone|tel/i;
-const SECRET_SEGMENT = /eyJ[A-Za-z0-9_-]{8,}|(?:sk-|ghp_|gho_|github_pat_|xox[abprs]-|xapp-|AKIA)[A-Za-z0-9_-]{6,}|[0-9a-f]{32,}/i;
-/** One customer link made safe for the team's note, or null when it must not be kept. Idempotent. */
-export function customerLinkOf(raw: string): string | null {
+const AUTH_WORD = /login|log-in|log_in|signin|sign-in|sign_in|auth|callback|reset|password|passwd|magic|verify|verif|confirm|invite|invitation|token|otp|session|sso|activate|activation|unlock/i;
+const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CONVERSATION_SEGMENT = /^(?:conversations?|chats?|threads?|share|shared)$/i;
+const TOKEN_LIKE = (value: string) => /eyJ[A-Za-z0-9_-]{8,}|(?:sk-|ghp_|gho_|github_pat_|xox[abprs]-|xapp-|AKIA)[A-Za-z0-9_-]{6,}|[0-9a-f]{24,}/i.test(value)
+  || value.split(/[^A-Za-z0-9+/=_]+/).some(part => part.length >= 16 && /[A-Za-z]/.test(part) && /[0-9]/.test(part));
+const SAFE_PARAMS: Record<string, RegExp> = { lang: /^[a-z]{2}(?:-[A-Za-z]{2})?$/, page: /^[0-9]{1,4}$/, tab: /^[a-z][a-z-]{0,19}$/i, id: /^[0-9]{1,9}$/ };
+type LinkVerdict = Readonly<{ ok: true; link: string }> | Readonly<{ ok: false }>;
+function judgeCustomerLink(raw: string): LinkVerdict {
+  const no = { ok: false } as const;
   const trimmed = raw.trim().replace(/[.,;:!?)»"'…]+$/u, "");
-  if (!/^https:\/\//i.test(trimmed) || trimmed.length > 2_000) return null;
+  if (!/^https:\/\//i.test(trimmed) || trimmed.length > 2_000) return no;
   let url: InstanceType<typeof globalThis.URL>;
-  try { url = new globalThis.URL(trimmed); } catch { return null; }
-  if (url.protocol !== "https:" || url.username || url.password || url.port) return null;
+  try { url = new globalThis.URL(trimmed); } catch { return no; }
+  if (url.protocol !== "https:" || url.username || url.password || url.port) return no;
   const host = url.hostname.toLowerCase();
-  if (!/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(host) || /^[0-9.]+$/.test(host)) return null;
-  let path: string;
-  try { path = decodeURIComponent(url.pathname); } catch { return null; }
-  if (SECRET_SEGMENT.test(path)) return null;
-  for (const name of [...new Set(url.searchParams.keys())]) {
-    if (SENSITIVE_NAME.test(name) || url.searchParams.getAll(name).some(value => SECRET_SEGMENT.test(value))) url.searchParams.delete(name);
+  if (!/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(host) || /^[0-9.]+$/.test(host)) return no;
+  let segments: string[], fragment: string;
+  try { segments = url.pathname.split("/").filter(Boolean).map(decodeURIComponent); fragment = decodeURIComponent(url.hash); } catch { return no; }
+  if (segments.some(segment => AUTH_WORD.test(segment)) || AUTH_WORD.test(fragment) || [...url.searchParams.keys()].some(name => AUTH_WORD.test(name))) return no;
+  for (const [i, segment] of segments.entries()) {
+    if (UUID_SEGMENT.test(segment)) { if (i > 0 && CONVERSATION_SEGMENT.test(segments[i - 1]!)) continue; return no; }
+    if (TOKEN_LIKE(segment)) return no;
   }
-  if (url.hash && (url.hash.includes("=") || SENSITIVE_NAME.test(url.hash) || SECRET_SEGMENT.test(url.hash))) url.hash = "";
+  url.hash = "";
+  for (const name of [...new Set(url.searchParams.keys())]) {
+    const values = url.searchParams.getAll(name), safe = SAFE_PARAMS[name.toLowerCase()];
+    if (!safe || values.length !== 1 || !safe.test(values[0]!)) url.searchParams.delete(name);
+  }
   const kept = url.toString();
-  return kept.length <= CASE_HANDOFF_SUMMARY_LIMITS.linkChars ? kept : null;
+  return kept.length <= CASE_HANDOFF_SUMMARY_LIMITS.linkChars ? { ok: true, link: kept } : no;
 }
-/** The distinct safe links found in these texts, in order, at most `max`. */
-export function customerLinksOf(texts: readonly string[], max: number = CASE_HANDOFF_SUMMARY_LIMITS.links): string[] {
-  const links: string[] = [];
+/** One customer link made safe for the team's note, or null when it must not be kept (masked). Idempotent. */
+export function customerLinkOf(raw: string): string | null {
+  const verdict = judgeCustomerLink(raw);
+  return verdict.ok ? verdict.link : null;
+}
+/** The distinct safe links found in these texts, in order, at most `max`, and how many distinct links were masked (rejected). */
+export function customerLinkScan(texts: readonly string[], max: number = CASE_HANDOFF_SUMMARY_LIMITS.links): { links: string[]; masked: number } {
+  const links: string[] = [], masked = new Set<string>();
   for (const text of texts) {
     for (const match of String(text ?? "").matchAll(RAW_LINK)) {
-      const link = customerLinkOf(match[0]);
-      if (link && !links.includes(link)) links.push(link);
-      if (links.length >= max) return links;
+      const verdict = judgeCustomerLink(match[0]);
+      if (!verdict.ok) masked.add(match[0].replace(/[.,;:!?)»"'…]+$/u, ""));
+      else if (!links.includes(verdict.link) && links.length < max) links.push(verdict.link);
     }
   }
-  return links;
+  return { links, masked: masked.size };
 }
+/** The distinct safe links found in these texts, in order, at most `max`. */
+export const customerLinksOf = (texts: readonly string[], max: number = CASE_HANDOFF_SUMMARY_LIMITS.links): string[] => customerLinkScan(texts, max).links;
 
 /** The synthesis of the stored case, masked and bounded. Never throws on a valid body. */
 export function buildCaseHandoffSummary(input: Partial<Pick<CaseBody, "openRequests" | "facts" | "questions" | "trials">>,
@@ -102,7 +131,7 @@ export function buildCaseHandoffSummary(input: Partial<Pick<CaseBody, "openReque
   let links = 0;
   const said = byTime(body.facts.filter(row => row.kind === "customer_statement"));
   // SAV-92 (16/11): the links of the stored mails first (the customer's own text), then those the case's statements quote; cleaned again (idempotent), distinct, bounded.
-  const urls = customerLinksOf([...(received?.links ?? []), ...said.map(fact => fact.text)]);
+  const { links: urls, masked: urlsMasked } = customerLinkScan([...(received?.linkTexts ?? []), ...said.map(fact => fact.text)]);
   for (const fact of said) {
     for (const match of fact.text.matchAll(URL_IN_TEXT)) {
       links += 1;
@@ -116,7 +145,7 @@ export function buildCaseHandoffSummary(input: Partial<Pick<CaseBody, "openReque
     result: trial.result ? clean(trial.result.text, L.trialResultChars) : null,
   }));
   return { revision: CASE_HANDOFF_SUMMARY_REVISION, problem, exchanges, exchangesOmitted: Math.max(0, asked.length - exchanges.length),
-    transmitted: { attachments, links, linkHosts: hosts.slice(0, L.linkHosts), ...(urls.length ? { urls } : {}) }, tried, triedOmitted: Math.max(0, body.trials.length - tried.length),
+    transmitted: { attachments, links, linkHosts: hosts.slice(0, L.linkHosts), ...(urls.length ? { urls } : {}), ...(urlsMasked ? { urlsMasked } : {}) }, tried, triedOmitted: Math.max(0, body.trials.length - tried.length),
     ...(received?.files.length ? { received: { files: received.files.slice(0, L.receivedFiles).map(file => ({ name: clean(file.name, L.receivedNameChars), type: file.type, sizeKb: file.sizeKb })),
       omitted: received.omitted + Math.max(0, received.files.length - L.receivedFiles) } } : {}) };
 }

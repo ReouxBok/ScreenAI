@@ -464,11 +464,14 @@ export function handoffNoteText(facts: Pick<HandoffNoticeFacts, "reason" | "need
     const what = tried === 1 ? "une première solution" : tried === 2 ? "une première solution puis une autre solution" : `une première solution puis ${tried - 1} autres solutions`;
     lines.push(`Nous avons essayé ${what} ; ${NOTE_TRIAL_OUTCOMES[last.outcome]}.`);
   }
-  const urls = summary.transmitted.urls ?? [];
+  const urls = summary.transmitted.urls ?? [], masked = summary.transmitted.urlsMasked ?? 0;
   if (urls.length) lines.push(`Il nous a envoyé ${urls.length === 1 ? "ce lien" : "ces liens"} : ${urls.join(" ; ")}`);
+  // A rejected link (authentication, token-shaped, http...) is never written, only said to exist.
+  if (masked) lines.push(`Il nous a ${urls.length ? "aussi " : ""}envoyé ${masked === 1 ? "un lien (masqué" : `${masked} liens (masqués`} par sécurité, voir le mail).`);
   const files = summary.received ? summary.received.files.length + summary.received.omitted : summary.transmitted.attachments;
   if (files) lines.push(`Il a joint ${files === 1 ? "un fichier" : `${files} fichiers`} à ses messages.`);
-  lines.push(NOTE_REASON_SENTENCES[reason]);
+  // Review Astra: « le problème persiste » already says the solutions did not suffice; the reason is not repeated.
+  if (!(reason === "repeated_failure" && last?.outcome === "failed")) lines.push(NOTE_REASON_SENTENCES[reason]);
   lines.push(reason === "outside_active_blocks" ? "Je passe cette partie de la demande à l'équipe." : "Je passe le dossier à l'équipe.");
   return lines.join("\n");
 }
