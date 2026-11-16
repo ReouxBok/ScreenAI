@@ -1,5 +1,5 @@
 import "server-only";
-import { noOwnerHandoverGrace, ownerHandoverGraceOpen } from "./owner-handover";
+import { noOwnerHandoverGrace, ownerHandoverGraceOpen, recoverOwnerHandovers } from "./owner-handover";
 import { savV2QualificationMessageAllowed } from "./qualification-scope";
 import { and, asc, desc, eq, isNotNull, min, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -430,6 +430,7 @@ export async function sweepCaseRelays(options: { limit?: number; deps?: CaseBoun
   if (!savCaseRecordingEnabled(deps.env)) return { skipped: "recording_off" as const };
   const db = requireDb();
   const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
+  await recoverOwnerHandovers({ env: deps.env ?? process.env, limit });
   const noEvent = (caseId: unknown) => sql`not exists (select 1 from sav.case_events ev where ev.case_id = ${caseId} and ev.dedupe_key = 'inbound:' || ${savMessages.gmailMessageId})`;
   const confirmed = await db.select({ id: savIntakeExecutions.messageId }).from(savIntakeExecutions)
     .innerJoin(savMessages, eq(savMessages.id, savIntakeExecutions.messageId)).leftJoin(savCases, eq(savCases.ticketId, savIntakeExecutions.ticketId))

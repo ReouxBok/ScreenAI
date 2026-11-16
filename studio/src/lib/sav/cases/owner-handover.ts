@@ -11,6 +11,8 @@ import { continueCaseAfterCommit, savV2EntryEnabled, v2EntryRelayDeps } from "./
 type Env = Record<string, string | undefined>;
 export type OwnerEvent = { subscriptionType: string; propertyName?: string; propertyValue?: string; portalId?: number; objectId?: string | number; occurredAt?: number; eventId?: number; changeSource?: string };
 export const OWNER_HANDOVER_MARK = { action: "sav_v2_owner_handover", entityType: "sav_hubspot_ticket" } as const;
+const RECOVERY_DELAY_MS = 300_000;
+const MAX_RECOVERY_RETRIES = 3;
 const whereMark = (id: string) => and(eq(auditLogs.action, OWNER_HANDOVER_MARK.action), eq(auditLogs.entityType, OWNER_HANDOVER_MARK.entityType), eq(auditLogs.entityId, id));
 export const ownerHandoverEnabled = (env: Env) => env.SAV_V2_OWNER_HANDOVER === "on" && savV2EntryEnabled(env) && savV2WakeWorkflowsEnabled(env);
 export function isOwnerHandoverEvent(event: OwnerEvent, env: Env) {
@@ -23,7 +25,7 @@ const startDefault: OwnerHandoverStart = async (...args) => {
   const [{ start }, { processSavV2OwnerHandoverWorkflow }] = await Promise.all([import("workflow/api"), import("@/workflows/sav-v2-owner-handover")]);
   return start(processSavV2OwnerHandoverWorkflow, args);
 };
-/** Every owner change invalidates an older handover, including a return through API. Retries of the same receipt never restart a consumed wake. */
+/** Every owner change invalidates an older handover, including a return through API. Retries of the same receipt never reset the recovery budget. */
 export async function requestOwnerHandover(event: OwnerEvent, options: { env: Env; start?: OwnerHandoverStart }) {
   if (!ownerHandoverEnabled(options.env)) return { status: "off" };
   if (event.subscriptionType !== "ticket.propertyChange" || event.propertyName !== "hubspot_owner_id" || String(event.portalId) !== String(SAV_HUBSPOT_SUPPORT.portalId)
@@ -35,14 +37,19 @@ export async function requestOwnerHandover(event: OwnerEvent, options: { env: En
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`owner-handover:${ticketId}`}))`);
     const [row] = await tx.select().from(auditLogs).where(whereMark(ticketId)).for("update");
     const old = row?.technicalMetadata;
-    if (old && (Number(old.occurredAt) > occurredAt || old.token === token && old.state !== "start_failed")) return false;
-    const technicalMetadata = { token, occurredAt, wakeAt, state: eligible ? "starting" : "cancelled" };
+    if (old && (Number(old.occurredAt) > occurredAt || (old.receiptToken ?? old.token) === token)) return false;
+    const technicalMetadata = { token, receiptToken: token, occurredAt, wakeAt, recoverAt: new Date(Math.max(Date.now(), Date.parse(wakeAt)) + RECOVERY_DELAY_MS).toISOString(), retries: 0, state: eligible ? "starting" : "cancelled" };
     if (row) await tx.update(auditLogs).set({ technicalMetadata }).where(eq(auditLogs.id, row.id));
     else await tx.insert(auditLogs).values({ actorEmail: "system", ...OWNER_HANDOVER_MARK, entityId: ticketId, technicalMetadata });
     return eligible;
   });
   if (!reserved) return { status: "not_reserved" };
-  try { await (options.start ?? startDefault)(ticketId, token, wakeAt); }
+  await startReservedHandover(ticketId, token, wakeAt, options.start ?? startDefault);
+  return { status: "scheduled", wakeAt };
+}
+
+async function startReservedHandover(ticketId: string, token: string, wakeAt: string, start: OwnerHandoverStart) {
+  try { await start(ticketId, token, wakeAt); }
   catch {
     await requireDb().transaction(async tx => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`owner-handover:${ticketId}`}))`);
@@ -52,7 +59,41 @@ export async function requestOwnerHandover(event: OwnerEvent, options: { env: En
     });
     throw Error("SAV_OWNER_HANDOVER_START_FAILED");
   }
-  return { status: "scheduled", wakeAt };
+}
+
+/** Called by the periodic relay sweep, independently of processed webhook receipts.
+ * Rotate the attempt token under the same lock as consumption: late workflows and
+ * concurrent sweeps cannot consume or settle a replacement attempt. */
+export async function recoverOwnerHandovers(options: { env: Env; limit: number }) {
+  const now = new Date();
+  const due = sql`technical_metadata->>'state' in ('starting', 'start_failed', 'consumed') and coalesce((technical_metadata->>'recoverAt')::timestamptz, (technical_metadata->>'wakeAt')::timestamptz + interval '5 minutes') <= ${now.toISOString()}::timestamptz`;
+  const rows = await requireDb().select({ ticketId: auditLogs.entityId }).from(auditLogs)
+    .where(and(eq(auditLogs.action, OWNER_HANDOVER_MARK.action), eq(auditLogs.entityType, OWNER_HANDOVER_MARK.entityType), due))
+    .orderBy(sql`coalesce(technical_metadata->>'recoverAt', technical_metadata->>'wakeAt')`, auditLogs.id).limit(options.limit);
+  for (const { ticketId } of rows) {
+    if (!ticketId) continue;
+    const reserved = await requireDb().transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`owner-handover:${ticketId}`}))`);
+      const [row] = await tx.select().from(auditLogs).where(and(whereMark(ticketId), due)).for("update");
+      if (!row) return null;
+      const old = row.technicalMetadata, retries = Number(old.retries ?? 0);
+      if (retries >= MAX_RECOVERY_RETRIES) {
+        await tx.update(auditLogs).set({ technicalMetadata: { ...old, state: "abandoned", outcome: "recovery_exhausted", abandonedAt: now.toISOString() } }).where(eq(auditLogs.id, row.id));
+        console.info("sav_v2_owner_handover", { ticketId, status: "abandoned", retries });
+        return null;
+      }
+      // Switches can be off temporarily: keep the durable block, without spending retries.
+      if (!ownerHandoverEnabled(options.env)) return null;
+      const token = savContentHash({ previous: old.token, retry: retries + 1 });
+      await tx.update(auditLogs).set({ technicalMetadata: { ...old, receiptToken: old.receiptToken ?? old.token, token, retries: retries + 1,
+        state: "starting", recoverAt: new Date(now.getTime() + RECOVERY_DELAY_MS).toISOString() } }).where(eq(auditLogs.id, row.id));
+      return { token, wakeAt: String(old.wakeAt) };
+    });
+    if (reserved) {
+      try { await startReservedHandover(ticketId, reserved.token, reserved.wakeAt, startDefault); }
+      catch { console.info("sav_v2_owner_handover", { ticketId, status: "recovery_start_failed" }); }
+    }
+  }
 }
 
 /** The deadline permits a wake; only a durable outcome releases the sweep. Consumed
@@ -74,7 +115,7 @@ export async function runOwnerHandover(ticketId: string, token: string, options:
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`owner-handover:${ticketId}`}))`);
     const [row] = await tx.select().from(auditLogs).where(whereMark(ticketId)).for("update");
     if (!row || row.technicalMetadata.token !== token || row.technicalMetadata.state !== "starting" || Date.parse(String(row.technicalMetadata.wakeAt)) > now.getTime()) return false;
-    await tx.update(auditLogs).set({ technicalMetadata: { ...row.technicalMetadata, state: "consumed" } }).where(eq(auditLogs.id, row.id));
+    await tx.update(auditLogs).set({ technicalMetadata: { ...row.technicalMetadata, state: "consumed", recoverAt: new Date(now.getTime() + RECOVERY_DELAY_MS).toISOString() } }).where(eq(auditLogs.id, row.id));
     return true;
   });
   const settle = async (state: string, detail: Record<string, string> = {}) => requireDb().transaction(async tx => {

@@ -3,7 +3,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vite
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { auditLogs, savIntakeExecutionPolicies, savIntakeExecutions, savMailboxes, savMessages, savThreads, staffUsers } from "@/db/schema";
-const state = vi.hoisted(() => ({ db: null as unknown }));
+const state = vi.hoisted(() => ({ db: null as unknown, start: vi.fn() }));
+vi.mock("workflow/api", () => ({ start: state.start }));
+vi.mock("@/workflows/sav-v2-owner-handover", () => ({ processSavV2OwnerHandoverWorkflow: vi.fn() }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
 // The real executor must never be loaded here: every test injects its progress reader.
 vi.mock("../intake/executor", () => ({ readIntakeExecutionProgress: () => { throw Error("EXECUTOR_NOT_ALLOWED"); } }));
@@ -38,7 +40,7 @@ beforeAll(async () => {
   mailboxId = mailbox!.id; policyId = policy!.id;
 }, 60_000);
 afterAll(async () => { state.db = null; await f.client.close(); vi.unstubAllEnvs(); });
-beforeEach(() => { vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "intake-boundary-fixture-key-32-characters"); vi.stubEnv("SAV_CASE_RECORDING", "on"); });
+beforeEach(() => { state.start.mockReset(); vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "intake-boundary-fixture-key-32-characters"); vi.stubEnv("SAV_CASE_RECORDING", "on"); });
 afterEach(() => { vi.unstubAllEnvs(); });
 
 
@@ -172,14 +174,84 @@ it("admitted relay continues the agent case once", async () => {
   expect(continuation).toHaveBeenCalledTimes(1);
 });
 
-it("failed workflow start retains durable grace beyond wake time and can be retried by the same receipt", async () => {
-  const e = event(undefined, Date.now() - 600_000), failing = vi.fn(async () => { throw Error("SYNTHETIC_START_FAILED"); });
-  await expect(requestOwnerHandover(e, { env: ENV, start: failing })).rejects.toThrow("SAV_OWNER_HANDOVER_START_FAILED");
-  expect(await marker(e.objectId)).toMatchObject({ state: "start_failed" });
-  expect(await ownerHandoverGraceOpen(e.objectId)).toBe(true);
-  const start = vi.fn(async () => {});
-  expect(await requestOwnerHandover(e, { env: ENV, start })).toMatchObject({ status: "scheduled" });
-  expect(start).toHaveBeenCalledTimes(1);
+async function expire(id: string) {
+  const old = await marker(id);
+  await f.db.update(auditLogs).set({ technicalMetadata: { ...old, recoverAt: new Date(Date.now() - 1).toISOString() } }).where(eq(auditLogs.entityId, id));
+}
+const sweep = (id: string) => sweepCaseRelays({ deps: { env: ENV, ...confirmed(id) } });
+it("periodic sweep recovers a failed start without a webhook replay or duplicate wake", async () => {
+  const source = await intake(), e = event(source.ticketId, Date.now() - 600_000);
+  await expect(requestOwnerHandover(e, { env: ENV, start: async () => { throw Error("START_FAILED"); } })).rejects.toThrow("SAV_OWNER_HANDOVER_START_FAILED");
+  const oldToken = String((await marker(source.ticketId)).token);
+  const relay = vi.fn<typeof recordCaseAfterConfirmedIntake>(async (id, deps) => recordCaseAfterConfirmedIntake(id, { ...deps, ...confirmed(source.ticketId), readAdmissionPolicy: async () => null, readQualification: async () => null }));
+  const continuation = vi.fn();
+  const args = { env: ENV, readTicket: customer, relay, continuation };
+  // Model the workflow service executing the wake it receives from the sweep.
+  state.start.mockImplementation(async (_workflow, [id, token]: string[]) => runOwnerHandover(id!, token!, args));
+  await expire(source.ticketId);
+  await sweep(source.ticketId);
+  const recovered = await marker(source.ticketId);
+  expect(recovered).toMatchObject({ state: "rejected", outcome: "not_admitted", retries: 1 });
+  expect(recovered.token).not.toBe(oldToken);
+  expect(state.start).toHaveBeenCalledTimes(1);
+  expect(state.start.mock.calls[0]![1]).toEqual([source.ticketId, recovered.token, recovered.wakeAt]);
+  expect(await runOwnerHandover(source.ticketId, oldToken, args)).toEqual({ status: "not_consumed" });
+  await runOwnerHandover(source.ticketId, String(recovered.token), args);
+  await sweep(source.ticketId);
+  expect(relay).toHaveBeenCalledTimes(1);
+  expect(continuation).not.toHaveBeenCalled();
+  expect(await requestOwnerHandover(e, { env: ENV, start: vi.fn() })).toEqual({ status: "not_reserved" });
+});
+
+it("sweep retries a consumed CRM failure and fences the interrupted reader", async () => {
+  const source = await intake(), e = event(source.ticketId, Date.now() - 600_000);
+  let token = "";
+  await requestOwnerHandover(e, { env: ENV, start: async (_id, t) => { token = t; } });
+  const relay = vi.fn<typeof recordCaseAfterConfirmedIntake>();
+  const readTicket = async () => {
+    await expire(source.ticketId);
+    await sweep(source.ticketId);
+    expect(await readCaseByTicket(source.ticketId)).toBeNull();
+    return customer();
+  };
+  expect(await runOwnerHandover(source.ticketId, token, { env: ENV, readTicket, relay })).toEqual({ status: "replaced" });
+  expect(relay).not.toHaveBeenCalled();
+  const recovered = await marker(source.ticketId);
+  await expect(runOwnerHandover(source.ticketId, String(recovered.token), { env: ENV, readTicket: async () => { throw Error("CRM_DOWN"); } })).rejects.toThrow("CRM_DOWN");
+  expect(await ownerHandoverGraceOpen(source.ticketId)).toBe(true);
+  state.start.mockImplementation(async (_workflow, [id, nextToken]: string[]) => runOwnerHandover(id!, nextToken!, { env: ENV, readTicket: async () => ({ ...await customer(), lastDirection: "team" }) }));
+  await expire(source.ticketId);
+  await sweep(source.ticketId);
+  expect(await marker(source.ticketId)).toMatchObject({ state: "team_replied_last", retries: 2 });
+  expect(state.start).toHaveBeenCalledTimes(2);
+});
+it("three failed recoveries abandon durably, then the ordinary V1 sweep relays once", async () => {
+  const source = await intake({ classification: "finance" }), e = event(source.ticketId, Date.now() - 600_000);
+  await requestOwnerHandover(e, { env: ENV, start: async () => {} });
+  state.start.mockRejectedValue(Error("START_FAILED"));
+  for (let retries = 1; retries <= 3; retries++) {
+    await expire(source.ticketId);
+    await sweep(source.ticketId);
+    expect(await marker(source.ticketId)).toMatchObject({ state: "start_failed", retries });
+    expect(await readCaseByTicket(source.ticketId)).toBeNull();
+    expect(await ownerHandoverGraceOpen(source.ticketId)).toBe(true);
+  }
+  await expire(source.ticketId);
+  await sweep(source.ticketId);
+  expect(await marker(source.ticketId)).toMatchObject({ state: "abandoned", outcome: "recovery_exhausted", retries: 3 });
+  expect((await marker(source.ticketId)).abandonedAt).toEqual(expect.any(String));
+  expect(await ownerHandoverGraceOpen(source.ticketId)).toBe(false);
+  expect((await readCaseByTicket(source.ticketId))?.owner).toBe("human");
+  expect(state.start).toHaveBeenCalledTimes(3);
+  expect(await sweep(source.ticketId)).toMatchObject({ relayed: 0 });
+  expect(await requestOwnerHandover(e, { env: ENV, start: vi.fn() })).toEqual({ status: "not_reserved" });
+});
+it("concurrent periodic sweeps reserve only one replacement", async () => {
+  const s = await scheduled();
+  await expire(s.e.objectId);
+  await Promise.all([sweep(s.e.objectId), sweep(s.e.objectId)]);
+  expect(state.start).toHaveBeenCalledTimes(1);
+  expect(await marker(s.e.objectId)).toMatchObject({ retries: 1, state: "starting" });
 });
 it("early wake neither consumes the marker nor reads CRM", async () => {
   const s = await scheduled(), readTicket = vi.fn(customer);
@@ -195,4 +267,14 @@ it("new handover received during CRM reading stops the old passage", async () =>
   };
   expect(await runOwnerHandover(source.ticketId, s.token, { env: ENV, now: s.now, readTicket, relay })).toEqual({ status: "replaced" });
   expect(relay).not.toHaveBeenCalled();
+});
+
+it("recovers legacy consumed markers without a recovery deadline", async () => {
+  const s = await scheduled();
+  const old = await marker(s.e.objectId);
+  const { recoverAt: _deadline, ...legacy } = old;
+  await f.db.update(auditLogs).set({ technicalMetadata: { ...legacy, state: "consumed", wakeAt: new Date(Date.now() - 600_000).toISOString() } }).where(eq(auditLogs.entityId, s.e.objectId));
+  await sweep(s.e.objectId);
+  expect(state.start).toHaveBeenCalledTimes(1);
+  expect(await marker(s.e.objectId)).toMatchObject({ state: "starting", retries: 1 });
 });
