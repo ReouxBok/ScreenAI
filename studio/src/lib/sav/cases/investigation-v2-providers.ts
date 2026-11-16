@@ -1,6 +1,6 @@
 import { compactInvestigationContext, INVESTIGATION_CONTEXT_INSTRUCTION } from "./investigation-context-view";
 import { caseDecisionBodyBreakdown, caseGeminiDecisionBody, type CaseDecisionBodyBreakdown } from "./investigation-context-budget";
-import { caseDecisionGenerationConfig, caseDecisionPromptRevision, caseProviderJsonSchema, readCaseDecisionGeneration, type CaseDecisionGenerationConfig } from "./investigation-decision-generation";
+import { caseDecisionGenerationConfig, caseDecisionPromptRevision, caseProviderJsonSchema, readCaseDecisionGeneration, type CaseDecisionGenerationConfig, type CaseDecisionGenerationProblem } from "./investigation-decision-generation";
 import { caseModelFinishReason, type CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
 import { readCaseV2TransportPolicy, assertCaseV2ReservedPolicy } from "./investigation-v2-spend";
 import "server-only";
@@ -181,20 +181,22 @@ const generateResponse = z.object({
 /** Prepare the EXACT existing prompt/body. No source, fact, instruction or reply rule is removed to fit. */
 export function prepareCaseGeminiDecisionRequest(request: CaseInvestigationModelRequest, env: Env):
   | { ok: true; key: string; model: string; body: string; metadata: Pick<CaseModelTransportDiagnostic, "inputBytes" | "maxInputBytes" | "knowledgeCards">; compacted: boolean; generation: CaseDecisionGenerationConfig }
-  | { ok: false; diagnostic: CaseModelTransportDiagnostic; breakdown?: CaseDecisionBodyBreakdown } {
+  | { ok: false; diagnostic: CaseModelTransportDiagnostic; breakdown?: CaseDecisionBodyBreakdown; problem?: CaseDecisionGenerationProblem } {
   const resolved = resolveCaseV2GeminiKey(env), model = env[SAV_V2_MODEL_ENV] ?? "";
   if (!resolved.ok) return { ok: false, diagnostic: { stage: "preflight", code: "key_unavailable", networkAttempted: false } };
   if (!MODEL_ID.test(model)) return { ok: false, diagnostic: { stage: "preflight", code: "model_invalid", networkAttempted: false } };
   let bounds: ReturnType<typeof readCaseV2TransportPolicy>;
   try { bounds = readCaseV2TransportPolicy(env); } catch { return { ok: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false } }; }
   // SAV-92 idée 3: the generation flags. An unknown value, a thinking level on a non-Gemini-3 model or a schema the adapter does not know
-  // is a policy refusal before any reservation (the stored diagnostic keeps main's closed codes). Off: `generation` is empty.
+  // is a policy refusal before any reservation. The stored diagnostic keeps main's closed codes (`policy_invalid`); the precise reason
+  // (`problem`) goes BESIDE it, to the structured log. The factory refuses the same flags earlier, before any knowledge search.
+  // Off: `generation` is empty.
   let generation: CaseDecisionGenerationConfig;
+  const read = readCaseDecisionGeneration(env, model);
+  if (!read.ok) return { ok: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false }, problem: read.problem };
   try {
-    const read = readCaseDecisionGeneration(env, model);
-    if (!read.ok) throw Error(read.problem);
     generation = caseDecisionGenerationConfig(read.generation, () => caseDecisionProviderSchema(request.purpose === "resolution_check" ? "resolution_check" : "decision"));
-  } catch { return { ok: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false } }; }
+  } catch { return { ok: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false }, problem: "v2_provider_schema_unsupported" }; }
   const build = (candidate: CaseInvestigationModelRequest) => {
     const prompt = caseInvestigationPrompt(candidate);
     const serialize = (payload: unknown, decoding = "") => caseGeminiDecisionBody(prompt, payload, bounds.maxOutputTokens, decoding, generation);
@@ -235,6 +237,8 @@ export function caseGeminiDecisionPreflight(env: () => Env) {
     if (prepared.ok) return null;
     // K1: structured log of the breakdown (ids and byte counts only); the returned diagnostic is the one the record may store, unchanged.
     if (prepared.breakdown) console.warn("sav_v2_model_transport", { ...prepared.diagnostic, breakdown: prepared.breakdown });
+    // SAV-92 idée 3: the precise reason of a generation-flag refusal, logged only (closed code names, never a value from the env).
+    if (prepared.problem) console.warn("sav_v2_model_transport", { ...prepared.diagnostic, problem: prepared.problem });
     return prepared.diagnostic;
   };
 }
@@ -249,7 +253,10 @@ export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; net
       return { result: { status: "failed" as const, uncertain, diagnostic }, usage };
     };
     const env = input.env(), prepared = prepareCaseGeminiDecisionRequest(request, env);
-    if (!prepared.ok) return failed(prepared.diagnostic, false, { inputTokens: 0, outputTokens: 0 }, prepared.breakdown);
+    if (!prepared.ok) {
+      if (prepared.problem) console.warn("sav_v2_model_transport", { ...prepared.diagnostic, problem: prepared.problem });
+      return failed(prepared.diagnostic, false, { inputTokens: 0, outputTokens: 0 }, prepared.breakdown);
+    }
     const { key, model, body } = prepared;
     // K1: a stored failure keeps the breakdown of the body it concerns (measured only on failure; the policy was read just above).
     const metadata = prepared.metadata;

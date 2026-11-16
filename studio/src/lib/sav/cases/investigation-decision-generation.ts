@@ -21,9 +21,11 @@ export const SAV_V2_THINKING_DECISION_ENV = "SAV_V2_THINKING_DECISION";
 export const SAV_V2_PROVIDER_SCHEMA_REVISION = "so1";
 export type CaseDecisionThinkingLevel = "low" | "medium" | "high";
 export type CaseDecisionGeneration = Readonly<{ structuredOutput: boolean; thinkingLevel: CaseDecisionThinkingLevel | null }>;
+/** Precise, closed refusal reasons: factory refusals and the preflight's structured log (the stored diagnostic stays `policy_invalid`). */
+export type CaseDecisionGenerationProblem = "v2_structured_output_invalid" | "v2_thinking_decision_invalid" | "v2_thinking_decision_model_unsupported" | "v2_provider_schema_unsupported";
 export type CaseDecisionGenerationRead =
   | Readonly<{ ok: true; generation: CaseDecisionGeneration }>
-  | Readonly<{ ok: false; problem: "v2_structured_output_invalid" | "v2_thinking_decision_invalid" | "v2_thinking_decision_model_unsupported" }>;
+  | Readonly<{ ok: false; problem: Exclude<CaseDecisionGenerationProblem, "v2_provider_schema_unsupported"> }>;
 
 const GEMINI_3 = /^gemini-3(?:[.-])/;
 const blank = (value: string | undefined) => value === undefined || value.trim() === "";

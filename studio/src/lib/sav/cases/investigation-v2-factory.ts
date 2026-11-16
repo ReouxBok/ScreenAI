@@ -6,6 +6,7 @@ import type { AdmissionPolicyRecord, V1AdmissionAdapterPolicy } from "./admissio
 import type { CaseReplyStoreDeps } from "./case-reply-store";
 import type { CaseTicketOwnerPort } from "./case-ticket-owner";
 import { SAV_CASE_DECISION_CONTRACT_REVISION } from "./decision-contract";
+import { readCaseDecisionGeneration } from "./investigation-decision-generation";
 import { caseProvenanceReaders } from "./investigation-pilot-readers";
 import { bindCaseInvestigationToReplyPlan, type CaseReplyPassageDeps, type CaseReplyPlanBinding } from "./investigation-reply-passage";
 import { caseInvestigationReturnAwareQualify, caseReturnContentRule } from "./investigation-return-qualify";
@@ -84,6 +85,10 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
   const spend = readCaseV2SpendPolicy(env);
   if (!spend.ok) refusals.push(spend.reason);
   try { if (spend.ok) readCaseV2TransportPolicy(env, input.now?.() ?? new Date()); } catch { refusals.push("v2_transport_policy_invalid"); }
+  // SAV-92 idée 3: a mistyped generation flag stops the V2 here, with its precise code, before any knowledge search (no embedding paid).
+  // The decision preflight keeps the same check as a second barrier (env read again at each call).
+  const generation = readCaseDecisionGeneration(env, env[SAV_V2_MODEL_ENV] ?? "");
+  if (!generation.ok) refusals.push(generation.problem);
   if (refusals.length) return { ok: false, refusals };
   const now = input.now ?? (() => new Date()), readPolicyRecord = input.readPolicyRecord!, scope = input.scope ?? { locale: "fr-FR", audience: "support" as const };
   const spendDeps = { env: input.env, now }, model = caseV2ModelSpend(spendDeps);

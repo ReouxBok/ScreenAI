@@ -137,6 +137,60 @@ describe("authority and V1 continuity", () => {
   });
 });
 
+describe("review P2-1: a mistyped flag is refused by the factory, with its precise code, before any knowledge search", () => {
+  const cases: Array<[Record<string, string>, string, string]> = [
+    [{ SAV_V2_STRUCTURED_OUTPUT: "On" }, MODEL, "v2_structured_output_invalid"],
+    [{ SAV_V2_THINKING_DECISION: "minimal" }, MODEL, "v2_thinking_decision_invalid"],
+    [{ SAV_V2_THINKING_DECISION: "high" }, "gemini-2.5-flash", "v2_thinking_decision_model_unsupported"],
+  ];
+  for (const [flags, model, code] of cases) it(`${JSON.stringify(flags)} on ${model} -> ${code}`, async () => {
+    const { createCaseInvestigationV2Deps } = await import("./investigation-v2-factory");
+    const network = vi.fn(async () => { throw Error("NETWORK_FORBIDDEN"); });
+    const p = model === MODEL ? policy : { ...policy, transport: { ...policy.transport, model } };
+    const built = createCaseInvestigationV2Deps({ env: () => ({ ...env(flags, p, model), SAV_V2_INVESTIGATION: "observe" }), readPolicyRecord: async () => null, network });
+    expect(built).toEqual({ ok: false, refusals: [code] });
+    expect(network).not.toHaveBeenCalled();
+  });
+
+  it("valid flags build the ports as before (nothing called while building)", async () => {
+    const { createCaseInvestigationV2Deps } = await import("./investigation-v2-factory");
+    const network = vi.fn(async () => { throw Error("NETWORK_FORBIDDEN"); });
+    for (const flags of [{}, { SAV_V2_STRUCTURED_OUTPUT: "on", SAV_V2_THINKING_DECISION: "medium" }] as Array<Record<string, string>>) {
+      const built = createCaseInvestigationV2Deps({ env: () => ({ ...env(flags), SAV_V2_INVESTIGATION: "observe" }), readPolicyRecord: async () => null, network });
+      expect(built.ok).toBe(true);
+    }
+    expect(network).not.toHaveBeenCalled();
+  });
+
+  it("the preflight (second barrier) keeps policy_invalid in the stored diagnostic and logs the precise reason beside it", async () => {
+    const { caseGeminiDecisionPreflight } = await import("./investigation-v2-providers");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const diagnostic = caseGeminiDecisionPreflight(() => env({ SAV_V2_THINKING_DECISION: "HIGH" }))(request());
+      expect(diagnostic).toEqual({ stage: "preflight", code: "policy_invalid", networkAttempted: false });
+      expect(warn).toHaveBeenCalledWith("sav_v2_model_transport", { stage: "preflight", code: "policy_invalid", networkAttempted: false, problem: "v2_thinking_decision_invalid" });
+    } finally { warn.mockRestore(); }
+  });
+});
+
+describe("review P2-2: the K1 measurement tool sees the provider schema", () => {
+  it("on adds exactly the provider schema to the fixed part; off is the previous measure", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { measureCaseContextFixture } = await import("./investigation-context-measure");
+    const fixture = JSON.parse(readFileSync(new URL("./fixtures/syn-context-budget.v1.json", import.meta.url), "utf8"));
+    const off = measureCaseContextFixture(fixture), on = measureCaseContextFixture(fixture, { structuredOutput: true });
+    expect(measureCaseContextFixture(fixture, { structuredOutput: false })).toEqual(off);
+    const added = Buffer.byteLength(`,"responseJsonSchema":${JSON.stringify(caseDecisionProviderSchema("decision"))}`, "utf8");
+    expect(added).toBeGreaterThan(6_000);
+    expect(on.fixedBytes - off.fixedBytes).toBe(added);
+    expect(on.totalBytes - off.totalBytes).toBe(added);
+    expect([on.caseBytes, on.knowledgeBytes]).toEqual([off.caseBytes, off.knowledgeBytes]);
+    expect(on.cardsRoomBytes).toBe(off.cardsRoomBytes - added);
+    const thinking = measureCaseContextFixture(fixture, { thinkingLevel: "high" });
+    expect(thinking.fixedBytes - off.fixedBytes).toBe(Buffer.byteLength(`,"thinkingConfig":{"thinkingLevel":"high"}`, "utf8"));
+  });
+});
+
 describe("refusals before any network (and before any reservation: same preflight)", () => {
   const cases: Array<[Record<string, string>, string]> = [
     [{ SAV_V2_STRUCTURED_OUTPUT: "true" }, MODEL], [{ SAV_V2_STRUCTURED_OUTPUT: "ON" }, MODEL],

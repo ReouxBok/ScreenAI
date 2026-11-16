@@ -1,5 +1,6 @@
 import { caseDecisionBodyBreakdown } from "./investigation-context-budget";
-import { caseInvestigationPrompt } from "./investigation-v2-providers";
+import { caseDecisionGenerationConfig, type CaseDecisionGeneration } from "./investigation-decision-generation";
+import { caseDecisionProviderSchema, caseInvestigationPrompt } from "./investigation-v2-providers";
 import type { CaseInvestigationModelRequest } from "./investigation-runner";
 
 /*
@@ -22,7 +23,11 @@ export type CaseContextFixture = Readonly<{
 export const SAV_CASE_CONTEXT_TARGET_SHARE = 0.85;
 const SENT_CONTENT_CHARACTERS = 6_000; // the decision prompt's existing cut (`caseInvestigationPrompt`), measured as is.
 
-export function measureCaseContextFixture(fixture: CaseContextFixture) {
+/**
+ * SAV-92 idée 3: `generation` measures the body as it would be sent with the V2 flags (`SAV_V2_STRUCTURED_OUTPUT=on` adds the provider schema,
+ * `SAV_V2_THINKING_DECISION` the thinking config). Absent: today's body, the exact previous measure.
+ */
+export function measureCaseContextFixture(fixture: CaseContextFixture, generation: Partial<CaseDecisionGeneration> = {}) {
   const maxInputBytes = fixture.maxInputBytes ?? 26_000, maxOutputTokens = fixture.maxOutputTokens ?? 4_096;
   const cards = fixture.cards.map((row, index) => ({
     id: String(row.id ?? row.knowledgeId ?? row.itemId ?? `card-${index}`), contentVersionId: String(row.contentVersionId ?? row.versionId ?? `card-${index}-v`),
@@ -35,7 +40,8 @@ export function measureCaseContextFixture(fixture: CaseContextFixture) {
     events: [], knowledge: cards, feedback: [], closure: [],
     coverage: open.map(row => ({ requestId: String(row.id ?? "r1"), family: row.family ?? "access", status: "covered", knowledge: cards.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId })), limitations: [] })),
   } as unknown as CaseInvestigationModelRequest;
-  const breakdown = caseDecisionBodyBreakdown(caseInvestigationPrompt(request), maxOutputTokens);
+  const wire = caseDecisionGenerationConfig({ structuredOutput: generation.structuredOutput ?? false, thinkingLevel: generation.thinkingLevel ?? null }, () => caseDecisionProviderSchema("decision"));
+  const breakdown = caseDecisionBodyBreakdown(caseInvestigationPrompt(request), maxOutputTokens, false, wire);
   const targetBytes = Math.floor(maxInputBytes * SAV_CASE_CONTEXT_TARGET_SHARE);
   const cardsRoomBytes = targetBytes - breakdown.fixedBytes - breakdown.caseBytes;
   const perCard = breakdown.cards.map((row, index) => ({ ...row, title: cards[index]!.title, contentCharacters: [...cards[index]!.content].length,
