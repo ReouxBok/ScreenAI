@@ -52,6 +52,8 @@ export const caseDecisionRefusalKinds: Record<CaseDecisionRejectionCode, CaseDec
   // The request has no card of its own: cite one retrieved for it, ask, or hand off with what is missing.
   knowledge_not_linked_to_request: "missing_information",
   repeated_failed_procedure: "missing_information",
+  // SAV-92 review P2-3: an open request left out of the reply: cover it, ask about it, or hand off.
+  proposal_request_uncovered: "missing_information",
   question_already_pending: "missing_information",
   login_procedure_redundant: "missing_information",
   procedure_step_repeated: "missing_information",

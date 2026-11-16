@@ -8,6 +8,7 @@ import { savOutsidePersonalAccessScope, savPersonalAccessIntent } from "../reque
 import { admissionPolicyPort, type AdmissionPolicyRecord } from "./admission-runtime";
 import { SAV_CASE_SENSITIVE_FAMILIES, type CaseAdmissionQualification, type CaseRequestFamily } from "./case-types";
 import { relayQualification } from "./intake-boundary";
+import { SAV_CASE_LOGIN_INFINITIVE, SAV_CASE_SENSITIVE_WORDS } from "./sensitive-words";
 import { loginCustomerStatement, reportsOngoingLoginFailure, reportsRestoredAccess } from "./restored-access";
 import { caseLatestCustomerMail } from "./investigation-runner";
 import type { CaseInvestigationStoreDeps } from "./investigation-store-ports";
@@ -100,17 +101,9 @@ export function caseInvestigationReturnAwareQualify(v1Qualify: CaseInvestigation
 }
 
 const normalize = (value: string) => value.normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase("fr").replace(/[’`]/g, "'");
-// Read on the customer's own new words (quoted history and signature removed). Any sensitive word wins: a sensitive or mixed return stops.
-const SENSITIVE: ReadonlyArray<readonly [CaseRequestFamily, RegExp]> = [
-  ["cancellation", /\b(?:resili\w*|desabonn\w*|annuler (?:mon|l'|notre) (?:abonnement|compte|offre)|supprimer (?:mon|notre) compte|fermer (?:mon|notre) compte)\b/],
-  ["finance", /\b(?:rembours\w*|factur\w*|paiement\w*|pay(?:er|e|ee|es|ees|ant|ante)|prelev\w*|debit\w*|carte bancaire|avoirs?|litige|impaye\w*|tarif\w*|prix)\b/],
-  ["subscription", /\b(?:abonnement|changer d'offre|changement d'offre|upgrade|downgrade|essai gratuit|forfait)\b/],
-  ["rights", /\b(?:rgpd|donnees personnelles|droit d'acces|suppression de (?:mes|nos) donnees)\b/],
-  ["identity", /\b(?:changer (?:le|de) (?:proprietaire|titulaire)|transferer (?:le|mon) compte|usurp\w*|pirat\w*|compte (?:vole|hacke))\b/],
-];
-// Leave ambiguous "avoir" under the financial fence. Only an infinitive with an explicit
-// login object or a reported check is removed from the sensitive scan; other words still count.
-const LOGIN_INFINITIVE = /(?<!\b(?:un |cet |mon |ton |son |notre |votre |leur |l'))\bavoir(?=\s+(?:(?:le|mon|un|ce) (?:bon )?(?:code|lien)|acces|(?:bien |deja )?(?:verifie|consulte|regarde|essaye))\b)/g;
+// SAV-92: the sensitive words and the login infinitive moved to sensitive-words.ts (shared with the block harness), unchanged.
+const SENSITIVE = SAV_CASE_SENSITIVE_WORDS;
+const LOGIN_INFINITIVE = SAV_CASE_LOGIN_INFINITIVE;
 // A mail provider may be the inbox checked for a login code. Remove just that reference
 // before the scope check; a separate request about an integration or an invite still wins.
 const INBOX_PROVIDER = /\b(spams?|courriers indesirables|boite (?:mail|de reception)) (?:de |sur )?(?:mon |ma )?(?:gmail|outlook)\b/g;
@@ -189,6 +182,17 @@ function readAccessStatement(value: string, first = false): StatementReading {
     }
   }
   return { accounted: (restored || trouble) && !(restored && trouble), restored, trouble };
+}
+
+/**
+ * SAV-92 (Ugo 14/11): the safety net of a multi-request mail at entry. Any finance, cancellation, billing, subscription, rights or identity wording in the
+ * customer's own new words (subject, current text and what follows a sign-off; quoted history set aside) keeps the WHOLE mail with the team, whatever
+ * V1 classified: the same words as every other sensitive check of this file.
+ */
+export function savCaseSensitiveWording(text: string, subject: string): boolean {
+  const parts = splitSavMessageText(text);
+  const all = normalize([subject, parts.currentText, parts.signatureText].join("\n")).replace(LOGIN_INFINITIVE, "");
+  return SENSITIVE.some(([, pattern]) => pattern.test(all));
 }
 
 // A title can describe an older topic. Only the inbound customer's own request can admit a new ticket.

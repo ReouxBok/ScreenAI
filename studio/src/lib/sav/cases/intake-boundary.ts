@@ -5,6 +5,7 @@ import { requireDb } from "@/db";
 import { savCaseEvents, savCases, savIntakeEffects, savIntakeExecutions, savIntakeRuns, savMessages } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { redactSavLearningText } from "../learning-extraction";
+import { containsPromptInjection } from "../policy";
 import type { SavIntakeDecision } from "../intake/contract";
 import type { ExecutionPayload } from "../intake/execution-types";
 import type { IntakeRuntimePayload } from "../intake/runtime-contract";
@@ -157,14 +158,65 @@ const openedSummary = (request: CaseRelayRequest, gmailMessageId: string) => `De
 const SUBJECT_MASKS: Array<[RegExp, string]> = [
   [/(?<!\w)\+\d(?:[ .()-]?\d){7,14}\b/g, "[téléphone masqué]"], [/\b[A-Za-z0-9_-]{24,}\b/g, "[valeur masquée]"], [/\b\d{5,}\b/g, "[numéro masqué]"],
 ];
-const searchableSubject = (summary: { title: string; description: string }) => SUBJECT_MASKS
-  .reduce((text, [pattern, mask]) => text.replace(pattern, mask), redactSavLearningText(`${summary.title}. ${summary.description}`))
+const maskSearchText = (value: string) => SUBJECT_MASKS
+  .reduce((text, [pattern, mask]) => text.replace(pattern, mask), redactSavLearningText(value))
   .replace(/\s+/g, " ").trim().slice(0, SAV_CASE_SUBJECT_LENGTH.max).trim();
+const searchableSubject = (summary: { title: string; description: string }) => maskSearchText(`${summary.title}. ${summary.description}`);
+
+type AcceptedAnalysis = { row: { resultHash: string; acceptedAt: string }; analysis: import("../intake/engine-types").MessageAnalysis };
+/** The accepted V1 analyses of one run of this message, each checked against its own hashes; `runId: null` takes the message's latest run (SAV-92: V1's
+ * creation, before any execution names its run). Never the mail itself. */
+async function readAcceptedAnalyses(input: { runId: string | null; runVersion: number | null; messageId: string; latestRun?: boolean }):
+  Promise<{ ok: true; validatorRevision: string; accepted: AcceptedAnalysis[]; quotes: Map<string, string> } | { ok: false; reason: "source_missing" | "source_invalid" }> {
+  if (!input.runId && !input.latestRun) return { ok: false, reason: "source_missing" };
+  const columns = { version: savIntakeRuns.version, messageId: savIntakeRuns.messageId, payloadCiphertext: savIntakeRuns.payloadCiphertext };
+  const [run] = input.runId ? await requireDb().select(columns).from(savIntakeRuns).where(eq(savIntakeRuns.id, input.runId))
+    : await requireDb().select(columns).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, input.messageId)).orderBy(desc(savIntakeRuns.version)).limit(1);
+  if (!run || (input.runVersion !== null && run.version !== input.runVersion) || run.messageId !== input.messageId) return { ok: false, reason: "source_missing" };
+  const payload = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext), semantics = payload.semantics;
+  if (!semantics?.records.some(row => row.method === "analyseMessage")) return { ok: false, reason: "source_missing" };
+  const [records, { savIntakeEvidenceContentHash }, { messageAnalysisSchema }, { SAV_INTAKE_MODEL_REVISION }, { SAV_INTAKE_SIMPLE_REVISION }] = await Promise.all([
+    import("../intake/semantic-records"), import("../intake/engine"), import("../intake/engine-types"), import("../intake/model-readers"), import("../intake/simple-revision")]);
+  if (semantics.revision !== records.SAV_INTAKE_SEMANTIC_RECORD_REVISION || ![SAV_INTAKE_MODEL_REVISION, SAV_INTAKE_SIMPLE_REVISION].includes(semantics.validatorRevision)) return { ok: false, reason: "source_invalid" };
+  const accepted = semantics.records.filter(row => row.method === "analyseMessage").flatMap(row => {
+    const parsed = messageAnalysisSchema.safeParse(row.result);
+    const intact = row.inputHash === records.intakeSemanticInputHash(row.input) && row.resultHash === savIntakeEvidenceContentHash(row.result);
+    return intact && parsed.success && parsed.data.messageId === input.messageId ? [{ row, analysis: parsed.data }] : [];
+  });
+  if (!accepted.length) return { ok: false, reason: "source_invalid" };
+  // SAV-92: the quotes the current reader validated for this message (`requestQuotes`), one per request id; a duplicated id gives none.
+  const captured = payload.requestQuotes?.messageId === input.messageId ? payload.requestQuotes.requests : [];
+  const quotes = new Map<string, string>();
+  for (const row of captured) if (typeof row?.id === "string" && typeof row.quote === "string" && row.quote.trim())
+    quotes.set(row.id, captured.filter(other => other.id === row.id).length === 1 ? row.quote : "");
+  return { ok: true, validatorRevision: semantics.validatorRevision, accepted, quotes };
+}
+
+/** SAV-92: one request's verified quote, only for a request an accepted analysis of the run lists. */
+function requestQuoteOf(read: { accepted: readonly AcceptedAnalysis[]; quotes: ReadonlyMap<string, string> }, id: string): string | null {
+  if (!read.accepted.some(entry => entry.analysis.requests.some(request => request.id === id && request.kind !== "acknowledgement"))) return null;
+  return read.quotes.get(id) || null;
+}
+
+/** SAV-92 (multi-request mails): the verified quote of each request a V1 run lists, keyed by case request id, as V1's current reader captured it beside its
+ * accepted analysis (`requestQuotes`); absent when none is stored (an older run, the single-call reader, an inherited request). The entry's detectors read it. */
+export async function readRequestQuotes(input: { runId: string | null; runVersion: number | null; messageId: string; gmailMessageId: string; requestIds: string[] }): Promise<Map<string, string>> {
+  const quotes = new Map<string, string>();
+  if (!input.requestIds.length) return quotes;
+  const read = await readAcceptedAnalyses({ runId: input.runId, runVersion: input.runVersion, messageId: input.messageId, latestRun: input.runId === null });
+  if (!read.ok) return quotes;
+  for (const id of input.requestIds) {
+    const quote = requestQuoteOf(read, id);
+    if (quote) quotes.set(caseRequestId(input.gmailMessageId, id), quote);
+  }
+  return quotes;
+}
 
 /** v10: the searchable subject of each request a V1 run lists, keyed by case request id. The only
  * source is that run's `ticketSummary`, as V1 accepted and stored it (`semantic-records.ts`), checked
  * against its own hashes; never the mail. A summary covering several requests is none of their
- * subjects, and two accepted analyses that disagree give none either: absent, with the reason. */
+ * subjects, and two accepted analyses that disagree give none either: absent, with the reason.
+ * SAV-92: in a mail of several requests, a request the summary does not describe alone takes its own verified quote, masked the same way. */
 export async function readRequestSubjects(input: { runId: string | null; runVersion: number; messageId: string; gmailMessageId: string; requestIds: string[] }): Promise<Map<string, CaseRequestSubject>> {
   const subjects = new Map<string, CaseRequestSubject>();
   const all = (reason: CaseSubjectAbsence) => {
@@ -172,21 +224,11 @@ export async function readRequestSubjects(input: { runId: string | null; runVers
     return subjects;
   };
   if (!input.requestIds.length) return subjects;
-  if (!input.runId) return all("source_missing");
-  const [run] = await requireDb().select({ version: savIntakeRuns.version, messageId: savIntakeRuns.messageId, payloadCiphertext: savIntakeRuns.payloadCiphertext })
-    .from(savIntakeRuns).where(eq(savIntakeRuns.id, input.runId));
-  if (!run || run.version !== input.runVersion || run.messageId !== input.messageId) return all("source_missing");
-  const semantics = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext).semantics;
-  if (!semantics?.records.some(row => row.method === "analyseMessage")) return all("source_missing");
-  const [records, { savIntakeEvidenceContentHash }, { messageAnalysisSchema }, { SAV_INTAKE_MODEL_REVISION }, { SAV_INTAKE_SIMPLE_REVISION }] = await Promise.all([
-    import("../intake/semantic-records"), import("../intake/engine"), import("../intake/engine-types"), import("../intake/model-readers"), import("../intake/simple-revision")]);
-  if (semantics.revision !== records.SAV_INTAKE_SEMANTIC_RECORD_REVISION || ![SAV_INTAKE_MODEL_REVISION, SAV_INTAKE_SIMPLE_REVISION].includes(semantics.validatorRevision)) return all("source_invalid");
-  const accepted = semantics.records.filter(row => row.method === "analyseMessage").flatMap(row => {
-    const parsed = messageAnalysisSchema.safeParse(row.result);
-    const intact = row.inputHash === records.intakeSemanticInputHash(row.input) && row.resultHash === savIntakeEvidenceContentHash(row.result);
-    return intact && parsed.success && parsed.data.messageId === input.messageId ? [{ row, analysis: parsed.data }] : [];
-  });
-  if (!accepted.length) return all("source_invalid");
+  const read = await readAcceptedAnalyses({ runId: input.runId, runVersion: input.runVersion, messageId: input.messageId });
+  if (!read.ok) return all(read.reason);
+  const { accepted, validatorRevision } = read, several = input.requestIds.length > 1;
+  const available = (text: string, entry: AcceptedAnalysis, field: "ticketSummary" | "requestQuote") => caseRequestSubjectSchema.safeParse({ status: "available", text,
+    provenance: { source: "v1_accepted_analysis", field, runId: input.runId, runVersion: input.runVersion, resultHash: entry.row.resultHash, validatorRevision, acceptedAt: entry.row.acceptedAt } });
   for (const id of input.requestIds) {
     const key = caseRequestId(input.gmailMessageId, id), absent = (reason: CaseSubjectAbsence) => subjects.set(key, { status: "absent", reason });
     const listing = accepted.filter(entry => entry.analysis.requests.some(request => request.id === id));
@@ -194,13 +236,22 @@ export async function readRequestSubjects(input: { runId: string | null; runVers
     const covering = (entry: typeof listing[number]) => entry.analysis.ticketSummary?.requestIds.includes(id) ? entry.analysis.ticketSummary : null;
     if (new Set(listing.map(entry => JSON.stringify(covering(entry)))).size > 1) { absent("source_ambiguous"); continue; }
     const entry = listing.at(-1)!, summary = covering(entry);
-    if (!summary) { absent("not_in_summary"); continue; }
-    if (entry.analysis.requests.filter(request => request.kind !== "acknowledgement" && summary.requestIds.includes(request.id)).length > 1) { absent("summary_shared"); continue; }
+    const shared = summary ? entry.analysis.requests.filter(request => request.kind !== "acknowledgement" && summary.requestIds.includes(request.id)).length > 1 : false;
+    if (!summary || shared) {
+      const quote = several ? requestQuoteOf(read, id) : null;
+      const quoted = quote ? maskSearchText(quote) : "";
+      if (!quoted) { absent(summary ? "summary_shared" : "not_in_summary"); continue; }
+      // Review of batch 2 (finding 5): the customer's own words; one that reads as an instruction is never a search subject nor a prompt field.
+      if (containsPromptInjection(quote!)) { absent("source_invalid"); continue; }
+      if (quoted.replace(/\[[^\]]*masqu[^\]]*\]/g, "").replace(/[^\p{L}\p{N}]+/gu, "").length < SAV_CASE_SUBJECT_LENGTH.min) { absent("redacted_empty"); continue; }
+      const subject = available(quoted, entry, "requestQuote");
+      if (subject.success) subjects.set(key, subject.data); else absent("source_invalid");
+      continue;
+    }
     const text = searchableSubject(summary);
     // Masks alone are nothing to search for.
     if (text.replace(/\[[^\]]*masqu[^\]]*\]/g, "").replace(/[^\p{L}\p{N}]+/gu, "").length < SAV_CASE_SUBJECT_LENGTH.min) { absent("redacted_empty"); continue; }
-    const subject = caseRequestSubjectSchema.safeParse({ status: "available", text, provenance: { source: "v1_accepted_analysis", field: "ticketSummary",
-      runId: input.runId, runVersion: input.runVersion, resultHash: entry.row.resultHash, validatorRevision: semantics.validatorRevision, acceptedAt: entry.row.acceptedAt } });
+    const subject = available(text, entry, "ticketSummary");
     if (subject.success) subjects.set(key, subject.data); else absent("source_invalid");
   }
   return subjects;

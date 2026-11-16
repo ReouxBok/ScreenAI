@@ -10,7 +10,7 @@
 import { createHash } from "node:crypto";
 import { crmRecordUrl } from "../intake/crm-display";
 import type { EffectIntent } from "../intake/execution-types";
-import { caseRequestSearchText, type CaseSnapshot, type CaseTrial } from "./case-types";
+import { caseRequestSearchText, caseTeamPartRequests, SAV_CASE_AGENT_REQUESTS_PER_MAIL, type CaseSnapshot, type CaseTrial } from "./case-types";
 import { SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { buildCaseHandoffSummary, caseHandoffSummaryLines, type CaseHandoffSummary } from "./case-handoff-summary";
 import { investigationHandoffCommand, readCaseInvestigationProgress, SAV_CASE_INVESTIGATION_RECORD_KIND, type CaseInvestigationJournalEvent } from "./investigation-record";
@@ -62,7 +62,13 @@ export function readHandoffNoticeConfig(env: Readonly<Record<string, string | un
 
 export const HANDOFF_REASONS = ["explicit_human_request", "sensitive_request", "knowledge_missing", "knowledge_conflict", "evidence_inaccessible", "diagnosis_out_of_tools", "repeated_failure",
   // Ugo (14/11): not a model reason. The store hands the case over itself when the validator refused the decision of an input twice (`refusalHandoff`).
-  "decision_refused"] as const;
+  "decision_refused",
+  // SAV-92 (Ugo 14/11): not a model reason either. Part of a multi-request mail that no active block covers: the agent keeps the other requests and its one
+  // reply says this part was passed on; the team is told exactly which part is theirs. The case is not transferred.
+  "outside_active_blocks",
+  // SAV-92 review (counter-review of 66e648a): not a model reason. The team part of a mail could not be noticed until the wait's bound, so the agent sent
+  // nothing and the WHOLE mail went to the team (`case-team-part-wait.ts`); its notice says so in fixed words, never the partial "team part" text.
+  "team_part_handoff_unavailable"] as const;
 export type HandoffReason = typeof HANDOFF_REASONS[number];
 export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
   explicit_human_request: "le client demande à parler à une personne",
@@ -73,7 +79,13 @@ export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
   diagnosis_out_of_tools: "le diagnostic dépasse les outils de l'agent",
   repeated_failure: "les essais de l'agent ont échoué à répétition",
   decision_refused: "le validateur a refusé deux fois la décision de l'agent pour ce message",
+  outside_active_blocks: "cette partie du message est laissée à l'équipe : aucun bloc actif de l'agent ne la couvre, ou elle dépasse la limite de demandes d'une réponse",
+  team_part_handoff_unavailable: "la partie équipe du message n'a pas pu être signalée à temps : le mail entier revient à l'équipe",
 };
+/** SAV-92: the fixed next human action of a team part. The agent keeps the rest of the case. */
+export const HANDOFF_TEAM_PART_INTERVENTION = "Reprendre uniquement la partie ci-dessus. L'agent V2 garde les autres demandes du même message ; sa réponse au client indique que cette partie est transmise à l'équipe.";
+/** The fixed next human action after the bound of a team-part wait: the agent sent nothing, the team takes the whole mail. */
+export const HANDOFF_WHOLE_MAIL_INTERVENTION = "Mail entier à reprendre, aucune réponse envoyée : l'agent n'a rien répondu au client. Reprendre toutes les demandes du message.";
 /** The fixed next human action of a refused decision: never model text. */
 export const HANDOFF_REFUSED_INTERVENTION = "Reprendre le dossier : vérifier les faits constatés et la demande, puis répondre au client. Aucune réponse n'a été envoyée par l'agent.";
 
@@ -96,8 +108,72 @@ function refusedHandoffAction(snapshot: Pick<CaseSnapshot, "body">, rejections: 
     missingInformation: [...new Set(rejections.map(row => row.label))].slice(0, 5), expectedIntervention: HANDOFF_REFUSED_INTERVENTION } };
 }
 
+/**
+ * SAV-92: the team's part of a mail as a handoff report: which requests, in their searchable words (never the mail itself), and our fixed intervention.
+ * `recorded` (review of batch 2, finding 1): the ids the decision recorded; without them (a record written before), the parts of the admission in force.
+ */
+function teamPartHandoffAction(snapshot: Pick<CaseSnapshot, "body"> & Partial<Pick<CaseSnapshot, "admission">>, recorded?: readonly string[]) {
+  const parts = recorded ? snapshot.body.openRequests.filter(row => row.status === "handed_off" && recorded.includes(row.id))
+    : caseTeamPartRequests({ admission: snapshot.admission ?? null, body: snapshot.body });
+  if (!parts.length) return null;
+  // Counter-review n°2: a part left for the request limit is covered by a block; the team reads why it is theirs.
+  const overLimit = new Set((snapshot.admission?.qualification.requests ?? []).filter(row => row.provenance.kind === "team_part" && row.provenance.reason === "request_limit").map(row => row.requestId));
+  const quoted = (row: typeof parts[number]) => { const text = caseRequestSearchText(row); return text ? `« ${text} »` : "demande non décrite, voir le mail du client"; };
+  const described = parts.map(row => overLimit.has(row.id) ? `${quoted(row)} (couverte par un bloc, mais au-delà de ${SAV_CASE_AGENT_REQUESTS_PER_MAIL} demandes par réponse)` : quoted(row));
+  const need = `Partie du message à reprendre par l'équipe (${parts.length} demande${parts.length > 1 ? "s" : ""}) : ${described.join(" ; ")}`;
+  return { kind: "handoff" as const, reason: "outside_active_blocks" as const, report: { need, expected: null, observed: null, trialIds: [] as string[], hypotheses: [] as string[],
+    missingInformation: [] as string[], expectedIntervention: HANDOFF_TEAM_PART_INTERVENTION } };
+}
+
+/** The reason of the transfer at the bound of a team-part wait (`SAV_CASE_TEAM_PART_WAIT_CODE` in case-team-part-wait.ts, a server-only module). */
+const TEAM_PART_WAIT_HANDOFF_REASON = "team_part_handoff_unavailable";
+/**
+ * SAV-92 review P2-4: the decision recorded at `version` never reached the customer: its team part could not be noticed, and at the bound of that wait the
+ * WHOLE mail was handed to the team (owner_changed `handoff`, reason above). Its "team part" notice would say the agent replied and keeps the rest: false.
+ */
+export function teamPartWaitHandedOff(events: readonly CaseInvestigationJournalEvent[], version: number) {
+  return teamPartWaitTransfer(events, version) !== undefined;
+}
+/**
+ * Counter-review n°2 (dfd02e0): the bound's transfer belongs to the decision at `version` only if no newer decision was recorded between the two (any
+ * `observation_recorded` is a newer input). Otherwise it is the bound of a LATER mail: this decision's reply did leave, its partial notice stays true.
+ * The send fence (case-handoff-notice-store.ts) applies the same condition.
+ */
+const teamPartWaitTransfer = (events: readonly CaseInvestigationJournalEvent[], version: number) => events.filter(event => event.kind === "owner_changed" && event.caseVersion > version
+  && event.detail?.transition === "handoff" && event.detail.reason === TEAM_PART_WAIT_HANDOFF_REASON
+  && !events.some(other => other.kind === "observation_recorded" && other.caseVersion > version && other.caseVersion < event.caseVersion))
+  .sort((a, b) => a.caseVersion - b.caseVersion)[0];
+/** Its own key, never the partial notice's (that key may already hold a queued partial notice, which the send fence then cancels). */
+const wholeMailInputKey = (inputKey: string) => `${inputKey}+whole-mail`;
+
+/**
+ * Counter-review of 66e648a: at the bound of the team-part wait, the notice of the decision recorded at `version` becomes ONE fixed-text notice "whole mail,
+ * no reply sent", keyed on its input. Dated at the transfer: what follows it like any durable transfer (a person's command, another owner change) makes it stale;
+ * a customer follow-up does not (it belongs to the human case). A person who took the case cancels it.
+ */
+function wholeMailNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ticketId" | "body">, events: readonly CaseInvestigationJournalEvent[], inputKey: string, version: number):
+  Extract<HandoffNoticeTrigger, { ok: true }> | Extract<HandoffNoticeTrigger, { ok: false }> | null {
+  const transfer = teamPartWaitTransfer(events, version);
+  if (!transfer) return null;
+  if (snapshot.body.handoff?.humanSince) return { ok: false, why: "taken_by_person" };
+  const reason = "team_part_handoff_unavailable" as const, key = wholeMailInputKey(inputKey);
+  if (!INPUT_KEY.test(key)) return { ok: false, why: "no_record" };
+  const stale = staleHandoffEventKinds(true, reason);
+  if (events.some(event => event.caseVersion > transfer.caseVersion && stale.includes(event.kind))) return { ok: false, why: "stale_input" };
+  const requests = snapshot.body.openRequests.filter(row => row.status !== "resolved");
+  const described = requests.map(row => caseRequestSearchText(row));
+  const need = `Mail entier à reprendre (${requests.length} demande${requests.length > 1 ? "s" : ""}), aucune réponse envoyée : ${described.map(text => text ? `« ${text} »` : "demande non décrite, voir le mail du client").join(" ; ") || "voir le mail du client"}`;
+  return { ok: true, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey: key, recordedAtVersion: transfer.caseVersion, reason,
+    report: { need, expected: null, observed: null, trialIds: [], hypotheses: [], missingInformation: [], expectedIntervention: HANDOFF_WHOLE_MAIL_INTERVENTION } };
+}
+
 /** Events after the decision that make it no longer the final word: a newer customer mail, a newer investigation, a person's command, an owner change. */
-export function staleHandoffEventKinds(transferred: boolean) {
+export function staleHandoffEventKinds(transferred: boolean, reason?: HandoffReason) {
+  // SAV-92 (review of batch 2, finding 1): the customer was told this part went to the team. Nothing after the decision (a reply of the customer, a new
+  // investigation, a re-admission) makes that promise void: only a person taking the case cancels the notice (`taken_by_person`, checked on its own).
+  if (reason === "outside_active_blocks") return [];
+  // The whole mail went to the team by the wait's own transfer: a customer follow-up belongs to that human case, as after any durable transfer.
+  if (reason === "team_part_handoff_unavailable") transferred = true;
   const kinds = ["observation_recorded", "human_command", "owner_changed"];
   // A customer follow-up belongs to the pending human case after durable transfer.
   if (!transferred) kinds.push("inbound_confirmed");
@@ -113,7 +189,7 @@ export function awaitingHandoff(snapshot: Pick<CaseSnapshot, "owner" | "phase" |
  * next action is a handoff, persisted by the claim that took the case; and nothing may have happened to the case since (a newer mail or investigation re-opens the
  * question, a person already took it). A case a person had from the start, one never taken by V2 and one out of scope have no investigation record, hence no trigger.
  */
-export function handoffNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ticketId" | "body" | "owner" | "phase">, events: readonly CaseInvestigationJournalEvent[]): HandoffNoticeTrigger {
+export function handoffNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ticketId" | "body" | "owner" | "phase"> & Partial<Pick<CaseSnapshot, "admission">>, events: readonly CaseInvestigationJournalEvent[]): HandoffNoticeTrigger {
   const latest = events.filter(event => event.kind === "observation_recorded" && (event.detail?.record as { kind?: unknown } | undefined)?.kind === SAV_CASE_INVESTIGATION_RECORD_KIND)
     .sort((a, b) => b.caseVersion - a.caseVersion)[0];
   const inputKey = (latest?.detail?.record as { inputKey?: unknown } | undefined)?.inputKey;
@@ -126,22 +202,54 @@ export function handoffNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ti
   // facts, trials, requests) and our own fixed refusal labels; never from the refused model output.
   const refused = decision.validation.outcome === "needs_review" && decision.refusalHandoff?.reason === "decision_refused" ? decision.validation : null;
   if (decision.validation.outcome !== "accepted" && !refused) return { ok: false, why: "not_accepted" };
-  const action = refused ? refusedHandoffAction(snapshot, refused.rejections) : decision.validation.outcome === "accepted" ? decision.validation.decision.nextAction : null;
+  const decided = refused ? refusedHandoffAction(snapshot, refused.rejections) : decision.validation.outcome === "accepted" ? decision.validation.decision.nextAction : null;
+  // SAV-92: an accepted decision that keeps the case (an answer, a question...) still owes the team the part of the mail no active block covers: one notice per input,
+  // the same key, fence and channel as a handoff, with nothing transferred. A handoff or a refusal already gives the whole case to the team.
+  const action = decided && decided.kind !== "handoff" ? teamPartHandoffAction(snapshot, decision.teamParts) : decided;
   if (!action || action.kind !== "handoff") return { ok: false, why: "not_handoff" };
   if (snapshot.body.handoff?.humanSince) return { ok: false, why: "taken_by_person" };
+  // Review P2-4 and its counter-review: the whole mail went to the team at the bound of the team-part wait. Never the partial text saying the agent replied:
+  // the fixed "whole mail, no reply sent" notice instead.
   if (latest.detail?.applied === false) return { ok: false, why: "stale_input" };
+  if (action.reason === "outside_active_blocks") { const whole = wholeMailNoticeTrigger(snapshot, events, inputKey, read.caseVersion); if (whole) return whole; }
   // Only a matching, committed transfer lets new mail wait for the human team.
   const transferred = events.find(event => event.caseVersion === read.caseVersion + 1 && event.kind === "owner_changed"
     && event.dedupeKey === "cmd:" + investigationHandoffCommand(read.caseVersion)
     && event.detail?.transition === "handoff" && event.detail.reason === action.reason);
   const recordedAtVersion = transferred?.caseVersion ?? read.caseVersion;
-  const staleKinds = staleHandoffEventKinds(Boolean(transferred) && awaitingHandoff(snapshot, action.reason));
+  const staleKinds = staleHandoffEventKinds(Boolean(transferred) && awaitingHandoff(snapshot, action.reason), action.reason);
   if (events.some(event => event.caseVersion > recordedAtVersion && staleKinds.includes(event.kind))) return { ok: false, why: "stale_input" };
   if (!INPUT_KEY.test(inputKey)) return { ok: false, why: "no_record" };
   const { report } = action;
   return { ok: true, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion, reason: action.reason,
     report: { need: report.need, expected: report.expected, observed: report.observed, trialIds: report.trialIds, hypotheses: report.hypotheses,
       missingInformation: report.missingInformation, expectedIntervention: report.expectedIntervention } };
+}
+
+/**
+ * SAV-92 (review of batch 2, finding 1): every team part the case still owes the team, one per input whose recorded decision (accepted, not a handoff)
+ * left part of the mail to the team: not only the latest input. Each is keyed on ITS input (`handoffNoticeKey`), so the notice sweep recreates nothing twice
+ * and admits one a crash or a later mail left behind. A person who took the case cancels them all (they have the whole case).
+ */
+export function teamPartNoticeTriggers(snapshot: Pick<CaseSnapshot, "caseId" | "ticketId" | "body" | "owner" | "phase"> & Partial<Pick<CaseSnapshot, "admission">>,
+  events: readonly CaseInvestigationJournalEvent[]): Extract<HandoffNoticeTrigger, { ok: true }>[] {
+  if (snapshot.body.handoff?.humanSince) return [];
+  const inputs = [...new Set(events.flatMap(event => {
+    const record = event.kind === "observation_recorded" ? event.detail?.record as { kind?: unknown; inputKey?: unknown } | undefined : undefined;
+    return record?.kind === SAV_CASE_INVESTIGATION_RECORD_KIND && typeof record.inputKey === "string" && INPUT_KEY.test(record.inputKey) ? [record.inputKey] : [];
+  }))];
+  return inputs.flatMap(inputKey => {
+    const read = readCaseInvestigationProgress(events, inputKey);
+    if (read.state !== "found") return [];
+    const decision = read.record.decision, recorded = events.find(event => event.kind === "observation_recorded" && event.caseVersion === read.caseVersion);
+    if (!decision?.teamParts?.length || decision.validation.outcome !== "accepted" || decision.validation.decision.nextAction.kind === "handoff" || recorded?.detail?.applied === false) return [];
+    // Review P2-4 and its counter-review: this input's reply never left and the whole mail went to the team at the wait's bound: the fixed whole-mail notice.
+    const whole = wholeMailNoticeTrigger(snapshot, events, inputKey, read.caseVersion);
+    if (whole) return whole.ok ? [whole] : [];
+    const action = teamPartHandoffAction(snapshot, decision.teamParts);
+    if (!action) return [];
+    return [{ ok: true as const, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion: read.caseVersion, reason: action.reason, report: { ...action.report } }];
+  });
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -201,12 +309,13 @@ export type HandoffNoticeFacts = Readonly<{
 }>;
 
 /** The synthesis never blocks a notice: a body it cannot read gives a notice without it (the template alone, as before SAV-92). */
-function handoffSummaryOf(body: Parameters<typeof buildCaseHandoffSummary>[0]): { summary?: CaseHandoffSummary } {
-  try { return { summary: buildCaseHandoffSummary(body) }; } catch { return {}; }
+function handoffSummaryOf(body: Parameters<typeof buildCaseHandoffSummary>[0], received?: Parameters<typeof buildCaseHandoffSummary>[1]): { summary?: CaseHandoffSummary } {
+  try { return { summary: buildCaseHandoffSummary(body, received) }; } catch { return {}; }
 }
 
 /** The sealed facts of a notice: the decision's report, the trials it cites and the questions already asked, all taken from the stored case and already made safe. */
-export function handoffNoticeFacts(trigger: Extract<HandoffNoticeTrigger, { ok: true }>, body: Pick<CaseSnapshot["body"], "trials" | "questions" | "facts" | "openRequests">): HandoffNoticeFacts {
+export function handoffNoticeFacts(trigger: Extract<HandoffNoticeTrigger, { ok: true }>, body: Pick<CaseSnapshot["body"], "trials" | "questions" | "facts" | "openRequests">,
+  /** SAV-92 (15/11): files received on the case's stored mails (names masked), read by the caller; absent: not listed. */ received?: Parameters<typeof buildCaseHandoffSummary>[1]): HandoffNoticeFacts {
   const cited = new Set(trigger.report.trialIds);
   // A knowledge id is our own structured identifier, not free text: it is kept as is when it has the shape of one, and masked otherwise.
   const knowledgeId = (id: string) => /^[A-Za-z0-9._-]{1,80}$/.test(id) ? id : "[identifiant masqué]";
@@ -218,7 +327,7 @@ export function handoffNoticeFacts(trigger: Extract<HandoffNoticeTrigger, { ok: 
     hypotheses: trigger.report.hypotheses.slice(0, NOTICE_LIMITS.hypotheses).map(item => sanitizeNoticeText(item)).filter(Boolean),
     missingInformation: trigger.report.missingInformation.slice(0, NOTICE_LIMITS.missing).map(item => sanitizeNoticeText(item, 160)).filter(Boolean),
     expectedIntervention: sanitizeNoticeText(trigger.report.expectedIntervention, NOTICE_LIMITS.intervention),
-    trials, questionsAsked: body.questions.length, ...handoffSummaryOf(body),
+    trials, questionsAsked: body.questions.length, ...handoffSummaryOf(body, received),
   };
 }
 

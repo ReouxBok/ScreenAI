@@ -62,7 +62,8 @@ const reply = (text: string) => ({ text, citations: [RESET_REF], impossibilityCl
 const answer = (link: string) => (request: CaseInvestigationModelRequest): CaseInvestigationModelResult => {
   const u = understood(request.snapshot);
   return { status: "ok", output: { caseVersion: request.snapshot.version, understanding: u,
-    nextAction: { kind: "answer", requestIds: [u.requests[0]!.id], steps: [{ text: "Suivre la fiche « Réinitialiser l'accès ».", knowledge: RESET_REF }], expectedResult: "La connexion fonctionne." },
+    // SAV-92 review P2-3: one reply covers every open request (a second mail adds its own).
+    nextAction: { kind: "answer", requestIds: u.requests.map(row => row.id), steps: [{ text: "Suivre la fiche « Réinitialiser l'accès ».", knowledge: RESET_REF }], expectedResult: "La connexion fonctionne." },
     reply: reply(`Bonjour, voici la marche à suivre depuis ${link} : Réinitialiser l'accès.`) } };
 };
 const confirm = (mailId: string, trialId: string, quote: string) => (request: CaseInvestigationModelRequest): CaseInvestigationModelResult => {

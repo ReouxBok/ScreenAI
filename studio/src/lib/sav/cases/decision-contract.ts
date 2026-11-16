@@ -151,7 +151,25 @@ export type CaseDecisionValidationContext = {
    * checked (the runner sets it whenever its scope port is wired). Null: no scope, so nothing is shown from any source.
    */
   accessScope?: CaseBlockScope | null;
+  /**
+   * SAV-92 (Ugo 15/11, multi-block): set only when the open requests belong to SEVERAL blocks (`accessScope` then being one of them, for the pilot flag only).
+   * Every source shown for a request must be an `answer` source of THAT request's block scope (and linked to it), each request keeps its block's family,
+   * and the Access-only compositions (login step, first-reply template) are not applied: they would rewrite the one reply for one request only.
+   */
+  blockScopes?: CaseDecisionBlockScopes;
+  /**
+   * SAV-92 (Ugo 14/11): the requests of this mail the entry left to the team, opened already handed off (`caseTeamPartRequests`). Set and not empty, an accepted
+   * reply to the customer states that the rest of the message was passed to the team (`SAV_CASE_TEAM_PART_MENTION`); the team's notice names those parts.
+   * Absent: no such request, nothing is added.
+   */
+  teamParts?: ReadonlyArray<Readonly<{ id: string }>>;
 };
+
+/** SAV-92 (multi-block): each block's scope in force by block id, and the block of each open request by request id. */
+export type CaseDecisionBlockScopes = Readonly<{ scopes: Readonly<Record<string, CaseBlockScope>>; requestBlocks: Readonly<Record<string, string>> }>;
+
+/** SAV-92: the fixed sentence an accepted reply ends with when part of the customer's message is the team's. Our text, never the model's nor the customer's. */
+export const SAV_CASE_TEAM_PART_MENTION = "Les autres points de votre message ont été transmis à notre équipe, qui reviendra vers vous directement à leur sujet.";
 
 export const SAV_CASE_ACCESS_URL = "https://new.limova.ai";
 
@@ -197,6 +215,7 @@ export const caseDecisionRejectionLabels = {
   access_source_orient_only: "Pilote accès : cette fiche sert seulement à orienter (décision en attente ou sujet sensible) ; pas de réponse autonome.",
   pilot_family_out_of_scope: "Pilote accès : seule la famille accès est admise ; une autre famille ordinaire sort du périmètre (une famille sensible impose la passation).",
   other_requests_open: "Résolution partielle : au moins une autre demande reste ouverte.",
+  proposal_request_uncovered: "La réponse laisse une demande ouverte sans la traiter : chaque demande ouverte doit être traitée, faire l'objet d'une question ou être remise à l'équipe.",
   resolution_evidence_invalid: "La confirmation de résolution ne s'appuie pas sur un retour valable du client indiquant que cela fonctionne.",
   resolution_quote_not_found: "La phrase du client citée comme preuve de résolution ne figure pas dans son message.",
   resolution_quote_unverifiable: "Le texte du message client cité n'a pas pu être lu : la résolution ne peut pas être vérifiée pour l'instant.",

@@ -5,7 +5,7 @@ import { caseDecisionBodyBreakdown } from "./investigation-context-budget";
 import { caseDecisionPromptRevision, caseProviderJsonSchema, readCaseDecisionGeneration } from "./investigation-decision-generation";
 import type { CaseInvestigationModelRequest } from "./investigation-runner";
 import { caseDecisionProviderSchema, caseGeminiDecisionProvider, caseInvestigationPrompt, caseInvestigationPromptRevision, prepareCaseGeminiDecisionRequest,
-  SAV_CASE_INVESTIGATION_PROMPT_REVISION } from "./investigation-v2-providers";
+  SAV_CASE_INVESTIGATION_PROMPT_REVISION, SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS } from "./investigation-v2-providers";
 import { readCaseV2TransportPolicy } from "./investigation-v2-spend";
 
 // Synthetic only: no real key, model call or customer data. The network is a mock.
@@ -45,7 +45,7 @@ describe("SAV-92 idée 3 — flags off: today's request, byte for byte", () => {
     const prompt = caseInvestigationPrompt(request());
     expect(raw).toBe(legacyBody(prompt.instruction, prompt.schema, prompt.payload, 1024));
     expect(body!.generationConfig).toEqual({ responseMimeType: "application/json", temperature: 0, maxOutputTokens: 1024 });
-    expect(caseInvestigationPromptRevision(env(flags))).toBe(SAV_CASE_INVESTIGATION_PROMPT_REVISION);
+    expect(caseInvestigationPromptRevision(false, env(flags))).toBe(SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS);
   });
 });
 
@@ -114,13 +114,16 @@ describe("SAV_V2_THINKING_DECISION", () => {
     expect(body!.generationConfig.maxOutputTokens).toBe(1024);
     // Thoughts are output tokens inside maxOutputTokens: the per-call reserve covers them whatever the level.
     expect(readCaseV2TransportPolicy(env({ SAV_V2_THINKING_DECISION: level }))).toEqual(readCaseV2TransportPolicy(env()));
-    expect(caseInvestigationPromptRevision(env({ SAV_V2_THINKING_DECISION: level }))).toBe(`${SAV_CASE_INVESTIGATION_PROMPT_REVISION}+think-${level}`);
+    expect(caseInvestigationPromptRevision(false, env({ SAV_V2_THINKING_DECISION: level }))).toBe(`${SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS}+think-${level}`);
   });
 
   it("both flags together", async () => {
     const { body } = await send({ SAV_V2_STRUCTURED_OUTPUT: "on", SAV_V2_THINKING_DECISION: "high" });
     expect(Object.keys(body!.generationConfig)).toEqual(["responseMimeType", "temperature", "maxOutputTokens", "responseJsonSchema", "thinkingConfig"]);
-    expect(caseInvestigationPromptRevision(env({ SAV_V2_STRUCTURED_OUTPUT: "on", SAV_V2_THINKING_DECISION: "high" }))).toBe(`${SAV_CASE_INVESTIGATION_PROMPT_REVISION}+so1+think-high`);
+    expect(caseInvestigationPromptRevision(false, env({ SAV_V2_STRUCTURED_OUTPUT: "on", SAV_V2_THINKING_DECISION: "high" }))).toBe(`${SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS}+so1+think-high`);
+    // Composed with main's attachments revision (v5 with the instruction, v4 without): the flags only append.
+    expect(caseInvestigationPromptRevision(true, env({ SAV_V2_STRUCTURED_OUTPUT: "on" }))).toBe(`${SAV_CASE_INVESTIGATION_PROMPT_REVISION}+so1`);
+    expect(caseInvestigationPromptRevision(true, env())).toBe(SAV_CASE_INVESTIGATION_PROMPT_REVISION);
   });
 });
 
@@ -201,7 +204,7 @@ describe("refusals before any network (and before any reservation: same prefligh
     const { result, network } = await send(flags, "decision", model);
     expect(network).not.toHaveBeenCalled();
     expect(result).toMatchObject({ result: { status: "failed", uncertain: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false } }, usage: { inputTokens: 0, outputTokens: 0 } });
-    expect(caseInvestigationPromptRevision(env(flags, policy, model))).toBe(SAV_CASE_INVESTIGATION_PROMPT_REVISION);
+    expect(caseInvestigationPromptRevision(false, env(flags, policy, model))).toBe(SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS);
   });
 
   it("structured output alone works on any model (no thinking pairing to check)", () => {

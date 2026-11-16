@@ -11,12 +11,14 @@ import { analyseSavIntakeRuntime } from "../intake/runtime";
 import type { IntakeRuntimeConfig } from "../intake/runtime-contract";
 import { caseAdmissionStatus } from "./admission-policy";
 import { readCaseBlockHold } from "./case-block-hold";
+import { nextCaseTeamPartWait, readCaseTeamPartWait, SAV_CASE_TEAM_PART_WAIT_BOUNDS } from "./case-team-part-wait";
 import { listCaseEvents, openCaseEvent, readCase, readCaseByTicket, readCaseDiagnostics, reevaluateCaseAdmission, updateCaseRecord } from "./case-store";
 import { caseDedupeKey } from "./case-types";
 import { recordCaseAfterConfirmedIntake, sweepCaseRelays } from "./intake-boundary";
 import { scheduleJ2ForConfirmedQuestion } from "./timer-store";
 import { continueCaseAfterCommit, customerReturnGate, sweepCaseContinuations, v2EntryRelayDeps } from "./v2-entry";
 import { SAV_V2_QUALIFICATION_SCOPE_SCHEMA, savV2QualificationScopeHash } from "./qualification-scope";
+import { caseContinuationReport } from "./v2-entry-binding";
 
 // The real entry of V1's runtime on the real stores (PGlite). Only the network is a double: every mail, ticket, owner and policy is SYNTHETIC, nothing is called for real.
 let f: Awaited<ReturnType<typeof createSavTestDb>>, policyId: string, ticketSeq = 8_600_000;
@@ -520,5 +522,67 @@ describe("qualification scope (15/11) : la reprise n'est plus affamée par des d
     expect(infos).toHaveBeenCalledWith("sav_v2_continuation_skipped", { caseId: w.caseId, reason: "investigation_off" });
     const logged = JSON.stringify(infos.mock.calls.filter((call: unknown[]) => call[0] === "sav_v2_continuation_skipped"));
     expect(logged).not.toMatch(/@|fictive|fictif|Connexion/i);
+  });
+});
+
+describe("SAV-92 (revue batch 3, B1) : une partie équipe dont la notice ne peut pas être mise en file est une attente visible et bornée", () => {
+  const refused = async () => ({ status: "proposal_refused", reason: "team_part_handoff_unavailable", detail: "disabled" });
+  const pass = (caseId: string, continuation: () => Promise<{ status: string; reason?: string; detail?: string }>) => continueCaseAfterCommit(caseId, "sweep", entry({ continuation }));
+
+  it("le code fermé du refus arrive jusqu'à l'entrée (rapport de continuation)", () => {
+    expect(caseContinuationReport("proposal_refused", { code: "team_part_handoff_unavailable", detail: "disabled" }))
+      .toEqual({ status: "proposal_refused", reason: "team_part_handoff_unavailable", detail: "disabled" });
+  });
+
+  it("le refus est marqué et lisible dans les diagnostics ; un passage suivant sans ce refus l'efface (cas transitoire)", async () => {
+    const w = await waitingWithReturn();
+    await customerReturnGate(w.run.id, entry({ continuation: refused }));
+    expect(await readCaseTeamPartWait(w.caseId)).toMatchObject({ code: "team_part_handoff_unavailable", detail: "disabled", passes: 1, handedToTeam: null });
+    expect((await readCaseDiagnostics(w.ticketId))?.teamPartWait).toMatchObject({ code: "team_part_handoff_unavailable", detail: "disabled", passes: 1, handedToTeam: null });
+    expect(await failureMark(w.caseId)).toBeUndefined();
+    expect((await readCase(w.caseId))?.owner).toBe("agent");
+    await pass(w.caseId, async () => ({ status: "queued" }));
+    expect(await readCaseTeamPartWait(w.caseId)).toBeNull();
+    expect((await readCaseDiagnostics(w.ticketId))?.teamPartWait).toBeNull();
+  });
+
+  it(`après ${SAV_CASE_TEAM_PART_WAIT_BOUNDS.maxPasses} passages refusés, le mail entier part à l'équipe (transfert visible), et la reprise ne le retente plus`, async () => {
+    const w = await waitingWithReturn();
+    await customerReturnGate(w.run.id, entry({ continuation: refused }));
+    for (let i = 2; i < SAV_CASE_TEAM_PART_WAIT_BOUNDS.maxPasses; i++) await pass(w.caseId, refused);
+    expect(await readCaseTeamPartWait(w.caseId)).toMatchObject({ passes: SAV_CASE_TEAM_PART_WAIT_BOUNDS.maxPasses - 1, handedToTeam: null });
+    expect((await readCase(w.caseId))?.owner).toBe("agent");
+    await pass(w.caseId, refused);
+    const handed = (await readCase(w.caseId))!;
+    expect(handed).toMatchObject({ owner: "human", phase: "handoff_pending", body: { handoff: { reason: "team_part_handoff_unavailable" } } });
+    const mark = await readCaseTeamPartWait(w.caseId);
+    expect(mark).toMatchObject({ passes: SAV_CASE_TEAM_PART_WAIT_BOUNDS.maxPasses, handedToTeam: expect.any(String) });
+    expect((await readCaseDiagnostics(w.ticketId))?.teamPartWait?.handedToTeam).toBe(mark!.handedToTeam);
+    const transfers = (await listCaseEvents(w.caseId)).filter(event => event.kind === "owner_changed" && (event.detail as { reason?: string } | null)?.reason === "team_part_handoff_unavailable");
+    expect(transfers).toHaveLength(1);
+    // The sweep only takes the agent's queued cases: the handed-off case is not retried any more.
+    const woken: string[] = [];
+    await sweepCaseContinuations(entry({ limit: 20, continuation: async ({ caseId }: { caseId: string }) => { woken.push(caseId); return refused(); } }));
+    expect(woken).not.toContain(w.caseId);
+  });
+
+  it("borne de temps : au-delà de 2 heures depuis le premier refus, le passage refusé suivant remet le mail à l'équipe", async () => {
+    const t0 = new Date("2026-11-15T08:00:00.000Z");
+    const first = nextCaseTeamPartWait(null, "disabled", t0);
+    expect(first).toMatchObject({ bounded: false, wait: { passes: 1, since: t0.toISOString() } });
+    expect(nextCaseTeamPartWait(first.wait, "disabled", new Date(t0.getTime() + SAV_CASE_TEAM_PART_WAIT_BOUNDS.maxWaitMs - 1)).bounded).toBe(false);
+    expect(nextCaseTeamPartWait(first.wait, "disabled", new Date(t0.getTime() + SAV_CASE_TEAM_PART_WAIT_BOUNDS.maxWaitMs)).bounded).toBe(true);
+    // Unknown details are closed; a wait already handed to the team and refused again starts a new bounded wait.
+    expect(nextCaseTeamPartWait(null, "some free text", t0).wait.detail).toBe("other");
+    expect(nextCaseTeamPartWait(null, "no_record", t0).wait.detail).toBe("trigger_refused");
+    expect(nextCaseTeamPartWait({ ...first.wait, passes: 9, handedToTeam: t0.toISOString() }, "disabled", t0).wait).toMatchObject({ passes: 1, handedToTeam: null });
+
+    const w = await waitingWithReturn();
+    await customerReturnGate(w.run.id, entry({ continuation: refused }));
+    const old = { ...(await readCaseTeamPartWait(w.caseId))!, since: new Date(Date.now() - SAV_CASE_TEAM_PART_WAIT_BOUNDS.maxWaitMs - 60_000).toISOString() };
+    await f.db.update(auditLogs).set({ technicalMetadata: old }).where(and(eq(auditLogs.entityId, w.caseId), eq(auditLogs.action, "sav_v2_continuation_team_part_wait")));
+    await pass(w.caseId, refused);
+    expect(await readCase(w.caseId)).toMatchObject({ owner: "human", phase: "handoff_pending" });
+    expect(await readCaseTeamPartWait(w.caseId)).toMatchObject({ passes: 2, handedToTeam: expect.any(String) });
   });
 });

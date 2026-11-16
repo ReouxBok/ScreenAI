@@ -136,10 +136,12 @@ export const SAV_CASE_SUBJECT_ABSENCES = ["not_recorded", "source_missing", "sou
 export type CaseSubjectAbsence = typeof SAV_CASE_SUBJECT_ABSENCES[number];
 export const SAV_CASE_SUBJECT_LENGTH = { min: 3, max: 600 } as const;
 /** What the investigation may search for one request (v10). Only V1's `ticketSummary` of an
- * accepted analysis, masked, and only when it covers this request alone; never the mail itself. */
+ * accepted analysis, masked, and only when it covers this request alone; never the mail itself.
+ * SAV-92 (multi-request mails): when that summary is shared by several requests, the request's own quote V1 verified in the
+ * message (`requestQuote`), masked the same way. A single-request mail keeps the summary only, exactly as before. */
 export const caseRequestSubjectSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("available"), text: z.string().trim().min(SAV_CASE_SUBJECT_LENGTH.min).max(SAV_CASE_SUBJECT_LENGTH.max),
-    provenance: z.object({ source: z.literal("v1_accepted_analysis"), field: z.literal("ticketSummary"), runId: z.string().uuid(), runVersion: z.number().int().min(1),
+    provenance: z.object({ source: z.literal("v1_accepted_analysis"), field: z.enum(["ticketSummary", "requestQuote"]), runId: z.string().uuid(), runVersion: z.number().int().min(1),
       resultHash: ref, validatorRevision: ref, acceptedAt: at }).strict() }).strict(),
   z.object({ status: z.literal("absent"), reason: z.enum(SAV_CASE_SUBJECT_ABSENCES) }).strict(),
 ]);
@@ -246,6 +248,18 @@ export const caseAdmissionPolicySchema = z.object({
 }).strict();
 export type CaseAdmissionPolicy = z.infer<typeof caseAdmissionPolicySchema>;
 
+/** SAV-92: why a request of a multi-request mail is left to the team while the agent handles the others. `no_block_match`: no active block's detector reads
+ * the request's own words as its request; `ambiguous_block`: two blocks (or one configured twice) claim it; `block_scope_unavailable`: its block has no valid scope
+ * for the policy in force; `not_support`: V1 did not classify it as support (commercial, partnership, other...); `request_text_unavailable`: no verified quote of
+ * the request is stored, so no detector can read it. `block_switch_restricted` (SAV-92 multi-block): its block's switch is stricter than another block's
+ * of the same mail (`planCaseMultiBlockModes`), so the one reply is not held back by it: that request is the team's. `request_limit` (counter-review of
+ * 66e648a): the mail holds more requests the agent could answer than one reply covers (`SAV_CASE_AGENT_REQUESTS_PER_MAIL`, the contract's 4 questions):
+ * the first ones stay the agent's, the others are the team's, instead of a decision the validator would refuse for leaving them uncovered. */
+export const SAV_CASE_TEAM_PART_REASONS = ["no_block_match", "ambiguous_block", "block_scope_unavailable", "not_support", "request_text_unavailable", "block_switch_restricted",
+  "request_limit"] as const;
+/** The most requests of one mail the agent keeps: an `ask` carries at most 4 questions (decision-contract), and every open request must be covered. */
+export const SAV_CASE_AGENT_REQUESTS_PER_MAIL = 4;
+export type CaseTeamPartReason = typeof SAV_CASE_TEAM_PART_REASONS[number];
 export const caseAdmissionProvenanceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("human"), staffUserId: staffId, at }).strict(),
   // Admits only when the policy lists this rule and revision for the family. `blockId`: the block the rule names; absent for a
@@ -253,6 +267,9 @@ export const caseAdmissionProvenanceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("qualified_rule"), ruleId: ref, revision: ref, at, blockId: caseBlockIdSchema.optional() }).strict(),
   // An intake category proposed by the model: may exclude, never admits.
   z.object({ kind: z.literal("intake_hint"), source: sourceRefSchema }).strict(),
+  // SAV-92 (Ugo 14/11, multi-request mails): a request of an admitted mail that no active block covers, read by the entry. It never admits by itself:
+  // the request is opened already handed to the team, the agent answers the others in one reply and the team is told exactly which part is theirs.
+  z.object({ kind: z.literal("team_part"), reason: z.enum(SAV_CASE_TEAM_PART_REASONS), at }).strict(),
 ]);
 export const caseAdmissionQualificationSchema = z.object({
   requests: z.array(z.object({ requestId: ref, family: z.enum([...SAV_CASE_REQUEST_FAMILIES, "unknown"]), provenance: caseAdmissionProvenanceSchema }).strict()).max(20),
@@ -519,3 +536,9 @@ export type CaseQualificationDiagnostic = {
   nature: "contract_blocked" | null;
   runtimeCause: "not_recorded";
 };
+
+/** SAV-92: the requests the entry left to the team (`team_part` in the admission in force) and the relay opened already handed off, in case order. */
+export function caseTeamPartRequests<T extends Readonly<{ id: string; status: string }>>(snapshot: Readonly<{ admission: Readonly<{ qualification: CaseAdmissionQualification }> | null; body: Readonly<{ openRequests: readonly T[] }> }>): T[] {
+  const parts = new Set((snapshot.admission?.qualification.requests ?? []).filter(row => row.provenance.kind === "team_part").map(row => row.requestId));
+  return snapshot.body.openRequests.filter(row => row.status === "handed_off" && parts.has(row.id));
+}
