@@ -7,7 +7,7 @@ import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../../test/sav-db";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
-import { savCases, savCaseEvents, savCaseCalls, savCaseEffectExecutions, savIntakeEffects, savIntakeExecutionPolicies, savMailboxes, savMessages, savThreads, savSyncState, staffUsers } from "@/db/schema";
+import { savCases, savCaseEvents, savCaseCalls, savCaseEffectExecutions, savIntakeEffects, savIntakeEffectJournal, savIntakeExecutionPolicies, savMailboxes, savMessages, savThreads, savSyncState, staffUsers } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { emptyCaseBody, SAV_CASE_CONTRACT_REVISION } from "./case-types";
 import { listV2Cases, v2InventoryInput } from "./v2-inventory";
@@ -79,7 +79,7 @@ it("calculates delay from confirmed reply, never ack; note requires association"
 it("exposes closed fields and sanitized handoff codes without customer content", async () => {
   const c = await fixture({ owner: "human", phase: "human_owned", handoff: "private@example.invalid" }); const page = await run();
   expect(page.rows[0]).toMatchObject({ ...c, state: "handed_to_team", handoffReason: "other_internal_reason", validatorRefusals: 0, cost: { confirmedMicroUsd: null, reservedMicroUsd: null, reason: "no_recorded_call" } });
-  expect(Object.keys(page.rows[0]!).sort()).toEqual(["caseId", "threadId", "messageId", "state", "phase", "receivedAt", "replyConfirmedAt", "replyDelaySeconds", "hubspot", "handoffReason", "validatorRefusals", "cost"].sort());
+  expect(Object.keys(page.rows[0]!).sort()).toEqual(["caseId", "threadId", "messageId", "state", "phase", "receivedAt", "replyConfirmedAt", "replyDelaySeconds", "hubspot", "outcomes", "handoffReason", "validatorRefusals", "cost", "questions"].sort());
   expect(JSON.stringify(page)).not.toMatch(/PRIVATE|private@|subject|recipient|customerEmail|body|Ciphertext/);
 });
 it("deduplicates cumulative validator refusals per input and call", async () => {
@@ -210,7 +210,7 @@ it("uses at most 15 queries for 100 cases with histories and keeps cursor below 
 
     console.info(`inventory 100 cases: ${statements.length} SQL queries; cursor: ${Buffer.byteLength(page.nextCursor!)} bytes`);
     expect(statements.length).toBeLessThanOrEqual(15);
-    expect(statements.filter(query => /^\s*(select|with)\b/i.test(query))).toHaveLength(9);
+    expect(statements.filter(query => /^\s*(select|with)\b/i.test(query))).toHaveLength(10);
     expect(page.rows).toHaveLength(100);
     expect(Buffer.byteLength(page.nextCursor!)).toBeLessThan(1024);
   } finally { state.db = f.db; }
@@ -288,4 +288,31 @@ it("accepts postgres-js array results as well as PGlite row envelopes", async ()
   };
   try { expect((await run()).rows[0]).toMatchObject({ caseId: c.caseId, hubspot: { status: "confirmed" }, cost: { reason: "receipt_missing" } }); }
   finally { state.db = f.db; }
+});
+
+it("keeps a confirmed mail visible when its note is refused after an owner change", async () => {
+  const c = await fixture(); const id = await effect(c, "reply_send", "confirmed", at);
+  await f.db.update(savCaseEffectExecutions).set({ state: "refused", reason: "SAV_CASE_EFFECT_CANCELLED_OWNER_CHANGED", payloadCiphertext: encryptSavPayload({ note: { text: "PRIVATE_NOTE" } }) }).where(eq(savCaseEffectExecutions.id, id));
+  expect((await run()).rows[0]!.outcomes).toMatchObject([{ executionId: id, mail: { state: "confirmed", reason: null }, note: { state: "blocked", reason: "owner_changed" }, status: { state: "blocked", reason: "owner_changed" } }]);
+});
+it("exposes a rejected stage mapping even when the mail parent is confirmed", async () => {
+  const c = await fixture(); const id = await effect(c, "reply_send", "confirmed", at);
+  await f.db.update(savCaseEffectExecutions).set({ state: "confirmed" }).where(eq(savCaseEffectExecutions.id, id));
+  await f.db.insert(savIntakeEffectJournal).values({ executionId: id, kind: "case_component_status", payloadCiphertext: encryptSavPayload({ state: "blocked", reason: "stages_stage_invalid" }) });
+  expect((await run()).rows[0]!.outcomes).toMatchObject([{ mail: { state: "confirmed" }, status: { state: "blocked", reason: "mapping_invalid" } }]);
+});
+it("resolves a queued stage to its confirmed ledger and keeps an uncertain note unconfirmed", async () => {
+  const c = await fixture(); const reply = await effect(c, "reply_send", "confirmed", at); const stage = await effect(c, "ticket_stage", "confirmed", at);
+  await f.db.update(savCaseEffectExecutions).set({ replyKey: `case-stage:${c.caseId}:waiting_customer:fixture` }).where(eq(savCaseEffectExecutions.id, stage));
+  await effect(c, "note_create", "uncertain", null, reply);
+  await f.db.insert(savIntakeEffectJournal).values({ executionId: reply, kind: "case_component_status", payloadCiphertext: encryptSavPayload({ state: "queued", executionId: stage }) });
+  expect((await run()).rows[0]!.outcomes.find(o => o.executionId === reply)).toMatchObject({ mail: { state: "confirmed" }, note: { state: "uncertain", reason: "result_uncertain" }, status: { state: "confirmed" } });
+});
+it("projects separate question counts for MCP inventory without leaking their contents", async () => {
+  const c = await fixture();
+  const body = { ...emptyCaseBody(), questions: [1, 2, 3].map(i => ({ id: `q${i}`, text: "PRIVATE_QUESTION", factKeys: [], askedAt: at.toISOString(), askedInEffect: "mail", ...(i === 1 ? { answeredBy: { type: "email", id: "private-answer" } } : {}) })) };
+  await f.db.update(savCases).set({ payloadCiphertext: encryptSavPayload(body) }).where(eq(savCases.id, c.caseId));
+  const page = await run();
+  expect(page.rows.find(row => row.caseId === c.caseId)?.questions).toEqual({ asked: 3, answered: 1, open: 2 });
+  expect(JSON.stringify(page)).not.toContain("PRIVATE_QUESTION");
 });

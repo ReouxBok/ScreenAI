@@ -53,14 +53,15 @@ async function storedMessage(thread = threadId, at = new Date()) {
         }), receivedAt: at
     }).returning())[0];
 }
-async function observed(mid = messageId) {
+async function observed(mid = messageId, registration = false) {
     const runtime = options.runtime, id = (await enqueueSavIntakeMessage(mid, runtime))!, lease = (await claimSavIntakeRun(id, runtime))!;
     const crm = createSavIntakeHubspotReaders({
         network: p.network
     });
     const plan = await planSavIntake(lease.input, {
         ...crm, analyseMessage: async () => ({
-            messageId: mid, requests: [{
+            messageId: mid, ...(registration ? { registration: { address: "registered@example.invalid", sourceMessageId: mid, quote: "registered@example.invalid" } } : {}), requests: [{
+                    ...(registration && lease.input.identificationContinuation ? { originMessageId: lease.input.identificationContinuation.initialMessageId } : {}),
                     id: "r1", kind: "support", currentMessageId: mid
                 }], ticketSummary: {
                 title: "Synthetic connection failure", description: "The synthetic connection fails.", requestIds: ["r1"]
@@ -2364,4 +2365,156 @@ describe("12/11 follow-up scan: new confirmed dossiers are bound promptly, once"
         expect(await bindingsOf(execution.id)).toHaveLength(0);
         expect(await ensureIntakeObservations({ deadlineMs: Date.now() + 60_000 })).toEqual({ created: 1 });
     });
+});
+
+// SAV-92: real stores/executor, synthetic CRM/Gmail only.
+async function originalRequestJourney(setting: string | undefined, originalBody = "La connexion initiale échoue.") {
+    environment.SAV_INTAKE_ORIGINAL_REQUEST_TICKET = setting;
+    await f.db.update(savMessages).set({bodyCiphertext: encryptSavPayload({text: "La connexion initiale échoue.", headers: {"message-id": "<initial@example.invalid>"}, attachments: []})}).where(eq(savMessages.id,messageId));
+    p.setContacts([]);
+    const first = await admission();
+    expect(await executeIntakePass(first.id, options)).toMatchObject({state:"confirmed"});
+    const initialId = messageId;
+    await f.db.update(savMessages).set({bodyCiphertext: encryptSavPayload({text: originalBody, headers: {"message-id": "<initial@example.invalid>"}, attachments: []})}).where(eq(savMessages.id,messageId));
+    const reply = await storedMessage(threadId, new Date());
+    await f.db.update(savMessages).set({subject:"Adresse d'inscription", bodyCiphertext:encryptSavPayload({text:"registered@example.invalid",headers:{"message-id":"<reply@example.invalid>"},attachments:[]})}).where(eq(savMessages.id,reply.id));
+    p.setContacts([{id:"101",emails:["registered@example.invalid"]}]);
+    p.setGmail(reply.gmailMessageId!, "gmail-thread");
+    const nextRun = await observed(reply.id, true);
+    const row = (await admitIntakeExecution(nextRun, options))!;
+    return {initialId, reply, row, nextRun};
+}
+it.each([undefined,"off","on"])("SAV-92 original request journey, switch=%s and replay", async setting => {
+    const j = await originalRequestJourney(setting);
+    expect(await executeIntakePass(j.row.id,options)).toMatchObject({state:"confirmed"});
+    const ticket = Object.values(p.objects.tickets)[0];
+    expect(ticket.properties.content).toContain(setting === "on" ? "La connexion initiale échoue." : "registered@example.invalid");
+    expect(ticket.properties.content).not.toContain("Citation à exclure");
+    expect(Object.values(p.objects.emails)).toHaveLength(setting === "on" ? 2 : 1);
+    const notes = Object.values(p.objects.notes);
+    expect(notes).toHaveLength(setting === "on" ? 1 : 0);
+    if (setting === "on") {
+        const effects = await getExecutionEffects(j.row.id);
+        const emails = effects.filter(e=>e.kind === "email_create");
+        expect(new Set(emails.map(e=>decryptSavPayload<EffectIntent>(e.intentCiphertext).sourceMessageId))).toEqual(new Set([j.initialId,j.reply.id]));
+        for (const e of emails) {
+            const id = decryptSavPayload<EffectAck>(e.ackCiphertext!).id!;
+            expect(p.links.get(`emails:${id}:tickets`)).toEqual([ticket.id]);
+        }
+        const replyEmail = emails.find(e=>decryptSavPayload<EffectIntent>(e.intentCiphertext).sourceMessageId===j.reply.id)!;
+        expect(notes[0].properties.hs_note_body).toContain("registered@example.invalid");
+        expect(notes[0].properties.hs_note_body).toContain(`identifiant du mail HubSpot : ${decryptSavPayload<EffectAck>(replyEmail.ackCiphertext!).id}`);
+        expect((await f.db.select().from(savMessages).where(eq(savMessages.id,j.reply.id)))[0].hubspotEmailId).toBe(decryptSavPayload<EffectAck>(replyEmail.ackCiphertext!).id);
+    }
+    const writes = p.calls.filter(c=>c.method !== "GET").length;
+    environment.SAV_INTAKE_ORIGINAL_REQUEST_TICKET = "on"; // enabling later never retrofits a created ticket
+    await executeIntakePass(j.row.id,options);
+    expect(p.calls.filter(c=>c.method !== "GET")).toHaveLength(writes);
+});
+it.each([["truncated", "x".repeat(100_000)], ["unclosed_html", "<html><body>Source non fermée"], ["quoted_html", '<html><body><p>Demande</p><div class="gmail_quote">Citation</div></body></html>']])("SAV-92 incomplete A retains B: %s", async (_reason, body) => {
+    const j = await originalRequestJourney("on",body);
+    const {readOriginalRequestTicket} = await import("./original-request-ticket");
+    expect(await readOriginalRequestTicket(j.reply.id,environment)).toBeNull();
+    expect(console.info).toHaveBeenCalledWith("sav_intake_original_request_fallback",expect.objectContaining({messageId:j.reply.id}));
+    // V1 already refuses this incomplete history; preserve that refusal.
+    expect(j.row).toBeNull();
+    expect(Object.values(p.objects.tickets)).toHaveLength(0);
+    expect(Object.values(p.objects.emails)).toHaveLength(0);
+});
+
+it.each(["registered@example.invalid. Je veux un remboursement.", "registered@example.invalid\nCordialement\nJe veux un remboursement.", "registered@example.invalid\n--\nCordialement\nJe veux un remboursement."])("SAV-92 admission V2 reads A and refuses a new sensitive request in full B: %s", async body => {
+    const j = await originalRequestJourney("on", "Bonjour, je ne reçois pas le code de connexion à mon compte.");
+    const {firstBlockEvidence} = await import("../cases/v2-entry");
+    const rules = [{ruleId:"synthetic-access",revision:"r1",v1Kind:"support",family:"access",at:new Date().toISOString()}];
+    const env = {...environment,SAV_V2_ADMISSION_RULES_JSON:JSON.stringify(rules)};
+    const requests = [{requestId:"r1",kind:"support"}] as Parameters<typeof firstBlockEvidence>[3];
+    expect(await firstBlockEvidence(env,j.reply.id,j.reply.gmailMessageId!,requests)).toMatchObject([{family:"access"}]);
+    expect(await firstBlockEvidence({...env,SAV_INTAKE_ORIGINAL_REQUEST_TICKET:"off"},j.reply.id,j.reply.gmailMessageId!,requests)).toEqual([]);
+    await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:body,headers:{"message-id":"<reply@example.invalid>"},attachments:[]})}).where(eq(savMessages.id,j.reply.id));
+    expect(await (await import("./original-request-ticket")).readOriginalRequestTicket(j.reply.id, env)).not.toBeNull();
+    expect(await firstBlockEvidence(env,j.reply.id,j.reply.gmailMessageId!,requests)).toEqual([]);
+});
+it.each(["missing","other_thread","other_sender","other_mailbox","uncertain"])("SAV-92 unverified continuation falls back: %s",async reason=>{
+    const j = await originalRequestJourney("on");
+    const {readOriginalRequestTicket} = await import("./original-request-ticket");
+    expect(await readOriginalRequestTicket(j.reply.id,environment)).not.toBeNull();
+    if(reason==="missing") await f.db.delete(savMessages).where(eq(savMessages.id,j.initialId));
+    if(reason==="other_sender") await f.db.update(savMessages).set({fromEmail:"other@example.invalid"}).where(eq(savMessages.id,j.reply.id));
+    if(reason==="other_mailbox") {
+        const [box] = await f.db.insert(savMailboxes).values({email:"other@example.invalid"}).returning();
+        await f.db.update(savMessages).set({mailboxId:box.id}).where(eq(savMessages.id,j.reply.id));
+    }
+    if(reason==="other_thread") {
+        const [thread] = await f.db.insert(savThreads).values({mailboxId,gmailThreadId:"other-thread",customerEmail:"customer@example.invalid"}).returning();
+        await f.db.update(savMessages).set({threadId:thread.id}).where(eq(savMessages.id,j.reply.id));
+    }
+    if(reason==="uncertain") {
+        const [identity] = (await f.db.select().from(savIntakeEffects)).filter(e=>e.kind==="identity_send");
+        await f.db.update(savIntakeEffects).set({state:"uncertain"}).where(eq(savIntakeEffects.id,identity.id));
+    }
+    expect(await readOriginalRequestTicket(j.reply.id,environment)).toBeNull();
+});
+it("SAV-92 reuses an existing original email and associations without writing them again",async()=>{
+    const j = await originalRequestJourney("on");
+    const [initial] = await f.db.select().from(savMessages).where(eq(savMessages.id,j.initialId));
+    const id="800";
+    p.objects.emails[id]={id,properties:{hs_timestamp:initial.receivedAt.toISOString(),hs_email_direction:"INCOMING_EMAIL",hs_email_subject:initial.subject,hs_email_text:"La connexion initiale échoue.",hs_email_headers:JSON.stringify({from:{email:initial.fromEmail},to:initial.toEmails.map(email=>({email})),cc:[],bcc:[]}),hs_email_from_email:initial.fromEmail,hs_email_to_email:initial.toEmails.join(";")}};
+    await f.db.update(savMessages).set({hubspotEmailId:id}).where(eq(savMessages.id,j.initialId));
+    expect(await executeIntakePass(j.row.id,options, {afterAck:async e=>{
+        if(e.kind!=="ticket_create") return;
+        const [created]=Object.values(p.objects.tickets);
+        p.links.set(`emails:${id}:tickets`,[created.id]);
+        p.links.set(`tickets:${created.id}:emails`,[id]);
+    }})).toMatchObject({state:"confirmed"});
+    expect(p.calls.filter(c=>c.method==="POST"&&c.path==="/crm/v3/objects/emails")).toHaveLength(1);
+    expect(p.calls.filter(c=>c.method==="PUT"&&c.path.includes(`/emails/${id}/`))).toHaveLength(0);
+});
+it("SAV-92 a crash after the note acknowledgement reconciles without duplicate",async()=>{
+    const j=await originalRequestJourney("on");
+    await executeIntakePass(j.row.id,options,{afterAck:async e=>{if(e.kind==="note_create") throw Error("SYNTHETIC_CRASH");}});
+    expect(Object.values(p.objects.notes)).toHaveLength(1);
+    await f.db.update(savIntakeEffects).set({nextReconcileAt:null}).where(eq(savIntakeEffects.executionId,j.row.id));
+    await reconcileIntakeEffectsReadOnly(j.row.id,options.adapters);
+    expect(await executeIntakePass(j.row.id,options)).toMatchObject({state:"confirmed"});
+    expect(Object.values(p.objects.notes)).toHaveLength(1);
+    expect(Object.values(p.objects.emails)).toHaveLength(2);
+});
+
+it.each(["confirmed","uncertain"] as const)("SAV-92 respects an earlier original-email receipt before the message ID is projected: %s",async state=>{
+    const j=await originalRequestJourney("on");
+    const [identity]=(await f.db.select().from(savIntakeEffects)).filter(e=>e.kind==="identity_send");
+    const [initial]=await f.db.select().from(savMessages).where(eq(savMessages.id,j.initialId));
+    const id="800", key=`email:synthetic-previous:original:${j.initialId}`;
+    const properties={hs_timestamp:initial.receivedAt.toISOString(),hs_email_direction:"INCOMING_EMAIL",hs_email_subject:initial.subject,hs_email_text:"La connexion initiale échoue.",hs_email_headers:JSON.stringify({from:{email:initial.fromEmail},to:initial.toEmails.map(email=>({email})),cc:[],bcc:[]})};
+    p.objects.emails[id]={id,properties:{...properties,hs_email_from_email:initial.fromEmail,hs_email_to_email:initial.toEmails.join(";")}};
+    const intent:EffectIntent={kind:"email_create",permission:"associate_email",key,sourceMessageId:j.initialId,properties};
+    await f.db.insert(savIntakeEffects).values({executionId:identity.executionId,businessKey:key,kind:"email_create",permission:"associate_email",intentHash:intakeRuntimeHash(intent),intentCiphertext:encryptSavPayload(intent),state,dispatchedAt:new Date(),ackCiphertext:encryptSavPayload({id}),...(state==="confirmed"?{confirmedAt:new Date(),verificationCiphertext:encryptSavPayload({confirmed:true,attributed:true})}:{})});
+    const result=await executeIntakePass(j.row.id,options);
+    expect(result).toMatchObject({state:state==="confirmed"?"confirmed":"waiting"});
+    expect(p.calls.filter(c=>c.method==="POST"&&c.path==="/crm/v3/objects/emails")).toHaveLength(1); // B only
+    expect(Object.values(p.objects.emails)).toHaveLength(2); // pre-existing A + B
+});
+
+
+it("SAV-92 resumes the stored original-email intent after interruption before its marker, without duplicates", async () => {
+    const j = await originalRequestJourney("on");
+    expect(await executeIntakePass(j.row.id, options, { beforeMarker: async effect => {
+        if (effect.kind === "email_create" && decryptSavPayload<EffectIntent>(effect.intentCiphertext).sourceMessageId === j.initialId)
+            throw Error("SYNTHETIC_BEFORE_ORIGINAL_EMAIL_MARKER");
+    } })).toMatchObject({ state: "waiting" });
+    const planned = (await getExecutionEffects(j.row.id)).find(e => e.kind === "email_create" && decryptSavPayload<EffectIntent>(e.intentCiphertext).sourceMessageId === j.initialId)!;
+    expect(planned).toMatchObject({ state: "planned", dispatchedAt: null, dispatchToken: null, ackCiphertext: null });
+    expect(Object.values(p.objects.emails)).toHaveLength(1); // B only; A never dispatched.
+    expect(await executeIntakePass(j.row.id, options)).toMatchObject({ state: "confirmed" });
+    const resumed = (await getExecutionEffects(j.row.id)).find(e => e.id === planned.id)!;
+    expect(resumed).toMatchObject({ state: "confirmed", intentCiphertext: planned.intentCiphertext, intentHash: planned.intentHash });
+    const ticket = Object.values(p.objects.tickets)[0];
+    expect(Object.values(p.objects.tickets)).toHaveLength(1);
+    expect(Object.values(p.objects.emails)).toHaveLength(2);
+    expect(Object.values(p.objects.notes)).toHaveLength(1);
+    for (const effect of (await getExecutionEffects(j.row.id)).filter(e => e.kind === "email_create"))
+        expect(p.links.get(`emails:${decryptSavPayload<EffectAck>(effect.ackCiphertext!).id}:tickets`)).toEqual([ticket.id]);
+    const writes = p.calls.filter(c => c.method !== "GET").length;
+    await executeIntakePass(j.row.id, options);
+    expect(p.calls.filter(c => c.method !== "GET")).toHaveLength(writes);
 });

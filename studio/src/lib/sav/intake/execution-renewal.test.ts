@@ -10,6 +10,8 @@ import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { intakeRuntimeHash } from "./runtime-contract";
 import { approveIntakeExecutionPolicy, revokeIntakeExecutionPolicy, readIntakeExecutionAuthorityState, executionPolicySchema, type ExecutionPolicy } from "./execution-policy";
 import { previewIntakeExecutionRenewal, commitIntakeExecutionRenewal } from "./execution-renewal";
+import { savIntakeMutationSchema } from "./contract";
+import { previewIntakeLaunch } from "./launch-admin";
 
 // Synthetic data only: example.invalid mailbox, fixed fake revisions, no provider/CRM/Gmail.
 let db: Awaited<ReturnType<typeof createSavTestDb>>;
@@ -50,14 +52,25 @@ beforeEach(async () => {
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
-it("renews the configured policy for the deployed revision only: every other field copied, source preserved, receipt and audit, no external effect", async () => {
+it("launch preview preserves all 12 explicitly requested rights without installing authority", async () => {
+  for (const [key, value] of Object.entries(env(OLD))) if (value !== undefined) vi.stubEnv(key, value);
+  const policy = { ...source, mutations: [...savIntakeMutationSchema.options] };
+  const preview = await previewIntakeLaunch(randomUUID(), { runtime: pins, policy });
+  expect(preview.input.policy).toEqual(policy);
+  expect(await policyRows()).toHaveLength(1);
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it.each(["legacy", "all 12 rights"])("renews the configured %s policy for the deployed revision only: every other field copied, source preserved, receipt and audit, no external effect", async kind => {
+  if (kind === "all 12 rights") await approveSource({ mutations: [...savIntakeMutationSchema.options] });
+  const rowCount = (await policyRows()).length;
   const before = await sourceRow(), budgetBefore = await db.db.select().from(savIntakeExecutionBudget);
   const deployed = env(NEW), commandId = randomUUID();
   const preview = await previewIntakeExecutionRenewal(commandId, "", deployed);
   expect(preview).toMatchObject({ previewId: commandId, sourcePolicyId: sourceId, sourcePolicyHash: sourceHash, fromCodeRevision: OLD, toCodeRevision: NEW,
-    summary: { maxDossiers: 7, mutations: ["create_ticket", "append_ticket_note", "associate_email"], admission: { kind: "qualification", runCount: 2 }, expiresAt: source.expiresAt, budgetProfile: null } });
+    summary: { maxDossiers: 7, mutations: source.mutations, admission: { kind: "qualification", runCount: 2 }, expiresAt: source.expiresAt, budgetProfile: null } });
   expect(Date.parse(preview.expiresAt) - Date.now()).toBeLessThanOrEqual(600000);
-  expect(await policyRows()).toHaveLength(1);
+  expect(await policyRows()).toHaveLength(rowCount);
   expect(await previewIntakeExecutionRenewal(commandId, "", deployed)).toEqual(preview);
   const receipt = await commitIntakeExecutionRenewal(commandId, preview.hash, deployed);
   expect(receipt).toMatchObject({ policyId: commandId, sourcePolicyId: sourceId, sourcePolicyHash: sourceHash, fromCodeRevision: OLD, toCodeRevision: NEW });
@@ -70,7 +83,7 @@ it("renews the configured policy for the deployed revision only: every other fie
   expect(await readIntakeExecutionAuthorityState(env(NEW, {}, { SAV_INTAKE_EXECUTION_POLICY_ID: receipt.policyId, SAV_INTAKE_EXECUTION_POLICY_SHA256: receipt.policyHash }))).toBe("valid");
   expect(await readIntakeExecutionAuthorityState(deployed)).toBe("code_revision_changed");
   expect(await commitIntakeExecutionRenewal(commandId, preview.hash, deployed)).toEqual(receipt);
-  expect(await policyRows()).toHaveLength(2);
+  expect(await policyRows()).toHaveLength(rowCount + 1);
   const audit = await db.db.select().from(auditLogs).where(eq(auditLogs.action, "sav_intake_execution_policy_renewed"));
   expect(audit).toHaveLength(1);
   expect(audit[0]).toMatchObject({ entityId: receipt.policyId, technicalMetadata: { sourcePolicyId: sourceId, fromCodeRevision: OLD, toCodeRevision: NEW } });

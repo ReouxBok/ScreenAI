@@ -179,6 +179,7 @@ export function caseInvestigationPrompt(request: CaseInvestigationModelRequest, 
   const instruction = [
     "Tu es l'agent SAV V2 de Limova. Tu proposes UNE décision pour ce dossier, en JSON strictement conforme au schéma fourni.",
     "Réponds en français, uniquement à partir des fiches fournies (citer knowledgeId et contentVersionId exacts) et des faits du dossier.",
+    "Pour ask, pose une à cinq questions dans un seul mail, chacune avec ses propres seeks/factKey. Préserve les faits déjà répondus ; ne repose pas les questions answeredBy. Une réponse partielle conserve les autres questions ouvertes. Pour chaque réponse identifiée, enregistre dans understanding.newFacts la factKey exacte de la question stockée, avec la source du mail client.",
     "N'invente ni lien, ni état de compte, ni paiement, ni droit. Ne demande jamais de mot de passe ni de code. Si les fiches ne suffisent pas, pose une question ciblée ou transmets à l'équipe.",
     ...(request.customerReportedLogin ? ["customerReportedLogin résume les déclarations du client sur la connexion. Un indicateur false signifie non établi. Tiens compte des contrôles confirmés sans les redemander. restoredAccessReported contient la citation et sa source si le dernier mail confirme explicitement le rétablissement. Cite-les pour proposer confirm_resolution si la chronologie le permet. stillBlockedReported demande de poursuivre le diagnostic. Une seconde lecture distincte doit confirmer toute clôture."] : []),
     ...(request.customerContext ? [SAV_CASE_CUSTOMER_CONTEXT_INSTRUCTION] : []),

@@ -359,3 +359,20 @@ describe("revue R03 : une réponse plus ancienne reçue après un mail neuf", ()
     expect((await readCase(reversed.w.caseId))!.version).toBe(version);
   });
 });
+
+
+it("keeps one original J2 and the customer wait when a multi-question customer mail returns", async () => {
+  const w = await waiting();
+  const snapshot = (await readCase(w.caseId))!;
+  const first = snapshot.body.questions[0]!;
+  await updateCaseRecord({ caseId: snapshot.caseId, expectedVersion: snapshot.version, actor: { type: "agent" },
+    body: { ...snapshot.body, questions: [first, { ...first, id: "q2", text: "Seconde question fictive", factKeys: ["second_question"] }] } });
+  const reply = await mail(w.threadId, w.mailboxId, { receivedAt: T1 });
+  const outcome = await routeCustomerReturn(reply.id, ports().deps);
+  expect(outcome).toMatchObject({ route: { route: "continue" }, written: true });
+  const current = (await readCase(w.caseId))!;
+  expect(current.body.waiting).toEqual(snapshot.body.waiting);
+  expect(current.phase).toBe("queued");
+  expect((await timerState(w.timerId)).state).toBe("scheduled");
+  expect(current.body.questions).toHaveLength(2);
+});
