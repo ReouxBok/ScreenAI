@@ -7,7 +7,7 @@ import {
   caseDecisionRejectionLabels, caseDecisionSignalLabels, caseDecisionUnverifiedLabels, SAV_CASE_DECISION_CONTRACT_REVISION,
   type CaseDecisionValidation, type CaseDecisionValidationContext,
 } from "./decision-contract";
-import { requestsCredential, validateCaseDecision } from "./decision-validator";
+import { caseReplyTextSafetyProblems, requestsCredential, validateCaseDecision } from "./decision-validator";
 
 // Synthetic fixtures only. Cases C01–C10 are paraphrased patterns from the private scoping, without any customer content.
 const now = new Date("2026-10-27T12:00:00Z");
@@ -686,5 +686,149 @@ describe("SAV-92 review P2-3: a reply covers every request still open", () => {
     // A team part opened handed off by the admission is not open: the answer on r1 covers the mail (the notice and the fixed sentence carry r2).
     accepted(proposal(answer("k1", [], ["r1"]), { understanding: { requests: [request("r1")], newFacts: [] } }),
       context({ requests: [{ id: "r1", family: "usage", status: "open" }, { id: "r2", family: "usage", status: "handed_off" }] }));
+  });
+});
+
+describe("SAV_V2_SMART_VALIDATOR (synthetic evidence, default OFF)", () => {
+  afterEach(() => vi.unstubAllEnvs());
+  const mode = (on: boolean) => vi.stubEnv("SAV_V2_SMART_VALIDATOR", on ? "true" : "false");
+  const fact = { id: "f1", key: "observed_result", kind: "customer_statement" as const, source: email("m1"), at: "2026-10-20T09:00:00Z" };
+  const original = { id: "q-original", factKeys: ["observed_result"], askedAt: "2026-10-19T09:00:00Z", answeredBy: email("m1") };
+  function clarification(reason = "Fait incomplet selon email:m1, question précédente q-original.", raw = "Je crois que cela fonctionne environ une fois sur deux.") {
+    const action = ask([{ kind: "observed_result", factKey: "observed_result" }]);
+    action.questions[0]!.reducesUncertainty = reason;
+    return { decision: { ...proposal(action), nextAction: action }, ctx: context({ facts: [{ ...fact }], questions: [{ ...original }], customerTexts: { "email:m1": raw } }) };
+  }
+  it.each([true, false])("motivated incomplete confirmation, ON=%s", on => {
+    mode(on);
+    const { decision, ctx } = clarification();
+    expect(run(decision, ctx).outcome).toBe(on ? "accepted" : "needs_review");
+  });
+  it.each([
+    ["Contradiction selon email:m1, question précédente q-original.", "Rectification : en fait cela ne fonctionne plus."],
+    ["Fait ancien selon email:m1, question précédente q-original.", "Cela fonctionnait."],
+  ])("accepts evidenced reason only ON: %s", (reason, raw) => {
+    const { decision, ctx } = clarification(reason, raw);
+    ctx.facts[0]!.at = "2026-09-01T09:00:00Z";
+    ctx.questions[0]!.askedAt = "2026-08-30T09:00:00Z";
+    mode(false); expect(codes(run(decision, ctx))).toContain("question_already_answered");
+    mode(true); accepted(decision, ctx);
+  });
+  it.each(["Fait incomplet.", "Fait incomplet email:invented q-original.", "Fait incomplet email:m1 q-invented.", "Confirmer email:m1 q-original."])("refuses unsupported reason %s", reason => {
+    mode(true); const { decision, ctx } = clarification(reason);
+    expect(codes(run(decision, ctx))).toContain("question_already_answered");
+  });
+  it("refuses invented ambiguity and recent facts called old", () => {
+    mode(true);
+    for (const reason of ["Fait incomplet email:m1 q-original.", "Fait ancien email:m1 q-original."]) {
+      const { decision, ctx } = clarification(reason, "Cela fonctionne.");
+      expect(codes(run(decision, ctx))).toContain("question_already_answered");
+    }
+  });
+  it("refuses second reconfirmation even after an answer, and duplicates in one proposal", () => {
+    mode(true);
+    const { decision, ctx } = clarification();
+    ctx.questions.push({ ...original, id: "q-confirm", askedAt: "2026-10-21T09:00:00Z" });
+    expect(codes(run(decision, ctx))).toContain("question_already_answered");
+    ctx.questions.pop();
+    decision.nextAction.questions.push({ ...decision.nextAction.questions[0]! });
+    expect(codes(run(decision, ctx))).toContain("question_already_answered");
+  });
+  const oldStep = "Vider le cache navigateur", nextStep = "Ouvrir une fenêtre privée";
+  function alternative() {
+    const ctx = context({ knowledge: [card("k1", { steps: [oldStep, nextStep] })],
+      trials: [{ id: "t1", requestId: "r1", knowledge: ref("k1"), askedAt: "2026-10-18T09:00:00Z", outcome: "failed", resultAt: "2026-10-19T09:00:00Z" }],
+      customerTexts: { "email:m1": `J'ai essayé : ${oldStep}. Cela a échoué.\nJe n'ai pas encore essayé : ${nextStep}.` } });
+    const action = answer();
+    action.steps[0]!.text = nextStep;
+    action.expectedResult = "Alternative après t1 selon email:m1 : accès restauré ; si échec, transmettre à l'équipe.";
+    return { ctx, decision: { ...proposal(action), nextAction: action, reply: { text: nextStep, citations: [], impossibilityClaims: [], accountAdvice: "none" } } };
+  }
+  it.each([true, false])("allows an exact untried bounded alternative ON=%s", on => {
+    mode(on); const { decision, ctx } = alternative();
+    expect(run(decision, ctx).outcome).toBe(on ? "accepted" : "needs_review");
+  });
+  it("keeps the alternative under pilot repeated-step checks", () => {
+    mode(true); const { decision, ctx } = alternative();
+    ctx.accessScope = { schema: "sav-case-block-scope-2026-11-11.v1", blockId: "synthetic_usage", policyRevision: "synthetic", revision: "synthetic", family: "usage", sources: [{ ...ref("k1"), use: "answer" }] };
+    accepted(decision, ctx);
+  });
+  it.each(["no evidence", "no reason", "no stop", "wrong version", "pending", "already tried", "third attempt", "other card"])("refuses alternative: %s", failure => {
+    mode(true); const { decision, ctx } = alternative();
+    if (failure === "no evidence") ctx.customerTexts = {};
+    if (failure === "no reason") decision.nextAction.expectedResult = "Accès restauré.";
+    if (failure === "no stop") decision.nextAction.expectedResult = "Alternative après t1 selon email:m1 : accès restauré.";
+    if (failure === "wrong version") ctx.trials[0]!.knowledge.contentVersionId = "old-version";
+    if (failure === "pending") ctx.trials[0]!.outcome = "pending";
+    if (failure === "already tried") decision.nextAction.steps[0]!.text = oldStep;
+    if (failure === "third attempt") ctx.trials.push({ ...ctx.trials[0]!, id: "t2" });
+    if (failure === "other card") ctx.trials[0]!.knowledge = ref("k2");
+    expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+  });
+  it("refuses a failed step hidden in the reply and a later denial of an earlier trial", () => {
+    mode(true);
+    const { decision, ctx } = alternative();
+    decision.reply.text = nextStep + ". Puis " + oldStep;
+    expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+    decision.reply.text = nextStep;
+    ctx.sources.unshift({ ref: email("older"), direction: "customer_inbound", at: "2026-10-17T09:00:00Z", order: 0 });
+    ctx.customerTexts = { ...ctx.customerTexts, "email:older": `J'ai essayé : ${nextStep}. Cela a échoué.` };
+    expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+  });
+  it("never weakens sensitive handling or credential checks ON", () => {
+    mode(true); const { decision, ctx } = clarification();
+    ctx.sensitiveCategories = ["finance"];
+    expect(codes(run(decision, ctx))).toContain("sensitive_requires_human");
+    ctx.sensitiveCategories = [];
+    decision.nextAction.questions[0]!.text = "Envoyez votre mot de passe.";
+    expect(codes(run(decision, ctx))).toContain("credential_request_pattern");
+  });
+  it("new facts do not authorize an already failed step ON; legacy OFF is preserved", () => {
+    const { decision, ctx } = alternative();
+    decision.nextAction.steps[0]!.text = oldStep;
+    decision.nextAction.steps[0]!.newFactIds = ["f1"];
+    ctx.facts = [fact];
+    mode(false); accepted(decision, ctx);
+    mode(true); expect(codes(run(decision, ctx))).toContain("repeated_failed_procedure");
+  });
+  function accessQuestion(text = "Quel navigateur utilisez-vous ?") {
+    return { decision: { ...proposal(ask(), { understanding: { requests: [request("r1", "access")], newFacts: [] } }), reply: { text, citations: [], impossibilityClaims: [], accountAdvice: "none" } },
+      ctx: context({ requests: [{ id: "r1", family: "access", status: "open" }] }) };
+  }
+  it.each([true, false])("clarification needs no link ON=%s", on => {
+    mode(on); const { decision, ctx } = accessQuestion();
+    expect(run(decision, ctx).outcome).toBe(on ? "accepted" : "needs_review");
+  });
+  it("requires the link in the connection paragraph, not another section", () => {
+    const { decision, ctx } = accessQuestion("Connectez-vous à votre espace.\n\nAutre information : https://new.limova.ai");
+    mode(false); accepted(decision, ctx);
+    mode(true); expect(codes(run(decision, ctx))).toContain("access_link_missing");
+    decision.reply.text = "Connectez-vous sur https://new.limova.ai\n\nQuel navigateur utilisez-vous ?";
+    accepted(decision, ctx);
+  });
+  it.each([true, false])("forbidden links remain forbidden ON=%s", on => {
+    mode(on);
+    const { decision, ctx } = accessQuestion("Quel navigateur ? https://new.limova.ai\n\nhttps://evil.example.invalid");
+    expect(codes(run(decision, ctx))).toContain("access_link_invalid");
+  });
+  it("uses the same section rule for corrected replies, preserving destination checks", () => {
+    const options = { accessOpen: true, answersOrAsks: true };
+    mode(true);
+    expect(caseReplyTextSafetyProblems("Quel navigateur utilisez-vous ?", options)).toEqual([]);
+    expect(caseReplyTextSafetyProblems("Connectez-vous.\n\nhttps://new.limova.ai", options)).toEqual([{ code: "access_link_missing" }]);
+    expect(caseReplyTextSafetyProblems("Quel navigateur ? https://evil.example.invalid", options)).toEqual([{ code: "access_link_invalid", detail: "https://evil.example.invalid" }]);
+    mode(false);
+    expect(caseReplyTextSafetyProblems("Quel navigateur utilisez-vous ?", options)).toEqual([{ code: "access_link_missing" }]);
+  });
+  it("still requires independent resolution evidence ON", () => {
+    mode(true);
+    const decision = proposal(confirm([{ requestId: "r1", source: email("m1"), trialId: null, quote: THANKS_TEXT }]));
+    expect(codes(run(decision))).toContain("resolution_evidence_invalid");
+  });
+  it("missing/unknown switch is identical to OFF", () => {
+    const { decision, ctx } = accessQuestion();
+    mode(false); const off = run(decision, ctx);
+    vi.stubEnv("SAV_V2_SMART_VALIDATOR", undefined); expect(run(decision, ctx)).toEqual(off);
+    vi.stubEnv("SAV_V2_SMART_VALIDATOR", "auto"); expect(run(decision, ctx)).toEqual(off);
   });
 });

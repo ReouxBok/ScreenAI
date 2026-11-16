@@ -6,7 +6,7 @@ import {
   isSensitiveCaseFamily, SAV_CASE_ACCESS_URL, SAV_CASE_DECISION_CONTRACT_REVISION, SAV_CASE_TEAM_PART_MENTION,
   type CaseDecisionKnowledgeRef, type CaseDecisionRejection, type CaseDecisionRejectionCode, type CaseDecisionSignal,
   type CaseDecisionSourceRef, type CaseDecisionUnverifiedJudgment, type CaseDecisionValidation,
-  type CaseDecisionValidationContext, type CaseResolutionEvidence, type SavCaseSensitiveFamily,
+  type CaseDecisionProposal, type CaseDecisionValidationContext, type CaseResolutionEvidence, type SavCaseSensitiveFamily,
 } from "./decision-contract";
 import { caseAccessSourceProblem } from "./investigation-access-scope";
 
@@ -191,13 +191,13 @@ const stepOf = (step: string) => {
   return { verb: (words[0] ?? "").slice(0, 4), object: [...new Set(words.slice(1))].filter(word => !STEP_NOISE.has(word)) };
 };
 const overlap = (object: readonly string[], sentence: string) => object.length ? object.filter(word => sentence.includes(word)).length / object.length : 0;
-function repeatedSteps(reply: string, card: SavRetrievalCandidate, context: CaseDecisionValidationContext): number[] {
+function repeatedSteps(reply: string, card: SavRetrievalCandidate, context: CaseDecisionValidationContext, alternative = false): number[] {
   const steps = strings(card.resolution?.steps).map(stepOf), lastMail = Math.max(-Infinity, ...context.sources.filter(row => row.direction === "customer_inbound").map(row => at(row.at)));
   const instructed = sentencesOf(normalize(reply)).filter(sentence => !/^(?:vous avez|merci|comme vous)\b/.test(sentence));
   const restated = steps.flatMap((step, index) => step.object.length >= 2 && step.verb && instructed.some(sentence => sentence.includes(step.verb) && overlap(step.object, sentence) >= 0.7) ? [index] : []);
   if (!restated.length) return [];
   const sent = context.trials.some(trial => trial.knowledge.knowledgeId === card.id && at(trial.askedAt) < lastMail);
-  if (sent && restated.length >= Math.ceil(steps.length / 2)) return restated;
+  if (!alternative && sent && restated.length >= Math.ceil(steps.length / 2)) return restated;
   const customer = context.sources.filter(row => row.direction === "customer_inbound").sort((a, b) => b.order - a.order);
   const done = new Map<number, boolean>();
   for (const row of customer) {
@@ -289,11 +289,77 @@ export function caseReplyTextSafetyProblems(text: string, options: Readonly<{ ac
   if (requestsCredential(text)) problems.push({ code: "credential_request_pattern" });
   if (options.accessOpen && options.answersOrAsks) {
     const links = accessLinks(text);
-    if (!links.present) problems.push({ code: "access_link_missing" });
+    if (accessLinkMissing(text)) problems.push({ code: "access_link_missing" });
     for (const link of links.invalid) problems.push({ code: "access_link_invalid", detail: link.slice(0, 200) });
   }
   return problems;
 }
+// Explicit opt-in only. Missing, false and unrecognised values keep the historical path.
+const smartValidator = () => process.env.SAV_V2_SMART_VALIDATOR === "true";
+
+/** A clarification cites both stored references in its reason. The source itself must explain the doubt;
+ * a model merely calling a fact incomplete is not evidence. One original question plus one reconfirmation,
+ * including duplicates in this proposal. Unknown history fails closed. No new wire/storage fields. */
+function legitimateReconfirmation(question: Extract<CaseDecisionProposal["nextAction"], { kind: "ask" }>["questions"][number], key: string,
+  context: CaseDecisionValidationContext, now: Date) {
+  const previous = context.questions.filter(row => row.factKeys.includes(key));
+  if (previous.length !== 1 || !question.reducesUncertainty.includes(previous[0]!.id)) return false;
+  const facts = context.facts.filter(fact => fact.key === key);
+  return facts.some(fact => {
+    const source = context.sources.find(row => sourceKey(row.ref) === sourceKey(fact.source) && row.direction === "customer_inbound");
+    const raw = source && context.customerTexts[sourceKey(source.ref)];
+    if (!source || !raw || !question.reducesUncertainty.includes(sourceKey(source.ref))
+      || !previous[0]!.answeredBy || sourceKey(previous[0]!.answeredBy) !== sourceKey(fact.source) || at(previous[0]!.askedAt) >= at(fact.at)) return false;
+    const reason = normalize(question.reducesUncertainty), own = ownCustomerWords(raw).replace(QUOTED, " ");
+    const incomplete = /\b(?:incomplet|imprecis|manque)\b/.test(reason) && /\b(?:je ne sais pas|pas sur|pas certain|peut-etre|environ|je crois)\b/.test(own);
+    const contradictory = /\bcontradic\w*\b/.test(reason) && /\b(?:je me suis trompe|contrairement|rectification|en fait)\b/.test(own);
+    const old = /\b(?:ancien|ancienne|obsolete)\b/.test(reason) && now.getTime() - at(fact.at) >= 30 * 24 * 60 * 60 * 1000;
+    return incomplete || contradictory || old;
+  });
+}
+
+/** The current ledger stores a card, not its sent steps. Consequently an alternative needs explicit,
+ * latest customer evidence: one exact failed card step and one exact, explicitly untried step, after
+ * the single recorded failure. Missing/ambiguous history cannot establish an unused branch. The
+ * reason cites the trial and source; expectedResult states a stop/relay condition. Max two trials per
+ * request across ALL cards, even with new facts. Exact version/steps only, never a guessed branch. */
+function unusedAlternative(action: Extract<CaseDecisionProposal["nextAction"], { kind: "answer" }>, context: CaseDecisionValidationContext, reply: string | undefined) {
+  if (action.requestIds.length !== 1 || action.steps.length !== 1) return false;
+  const trials = context.trials.filter(row => row.requestId === action.requestIds[0]);
+  const trial = trials[0], step = action.steps[0]!;
+  if (trials.length !== 1 || !trial || trial.outcome !== "failed" || !trial.resultAt
+    || trial.knowledge.knowledgeId !== step.knowledge.knowledgeId || trial.knowledge.contentVersionId !== step.knowledge.contentVersionId) return false;
+  const card = context.knowledge.find(row => row.id === step.knowledge.knowledgeId && row.contentVersionId === step.knowledge.contentVersionId);
+  const steps = strings(card?.resolution?.steps);
+  if (!steps.includes(step.text) || !reply || !squash(reply).includes(squash(step.text))
+    || steps.some(text => text !== step.text && squash(reply).includes(squash(text)))) return false;
+  // A later claim of "untried" cannot erase an earlier explicit report of having tried this step.
+  if (context.sources.some(row => row.direction === "customer_inbound" &&
+    ownCustomerWords(context.customerTexts[sourceKey(row.ref)] ?? "").replace(QUOTED, " ").split(/[.!?\n]/)
+      .some(sentence => /\bj'ai (?:deja )?essaye\b/.test(sentence) && squash(sentence).includes(squash(step.text))))) return false;
+  const latest = context.sources.filter(row => row.direction === "customer_inbound" || row.direction === "human_outbound").sort((a, b) => b.order - a.order)[0];
+  if (!latest || latest.direction !== "customer_inbound" || at(latest.at) <= at(trial.resultAt)) return false;
+  const raw = context.customerTexts[sourceKey(latest.ref)];
+  if (!raw) return false;
+  const own = ownCustomerWords(raw).replace(QUOTED, " ");
+  const untried = /je n'ai pas (?:encore )?essaye(?: de | d')?\s*:?\s*([^.!?\n]+)/g;
+  const unused = [...own.matchAll(untried)].map(match => squash(match[1]!));
+  const failed = [...own.matchAll(/j'ai (?:deja )?essaye(?: de | d')?\s*:?\s*([^.!?\n]+?)(?:[.!?]|, mais)?\s*(?:cela|ca) a echoue/g)].map(match => squash(match[1]!));
+  const reason = normalize(action.expectedResult);
+  return unused.includes(squash(step.text)) && !failed.includes(squash(step.text))
+    && steps.some(text => text !== step.text && failed.includes(squash(text)))
+    && action.expectedResult.includes(trial.id) && action.expectedResult.includes(sourceKey(latest.ref))
+    && /\balternative\b/.test(reason) && /\bsi\b/.test(reason) && /\b(?:echec|echoue)\b/.test(reason) && /\b(?:equipe|humain)\b/.test(reason);
+}
+
+// Paragraphs are the sections available in the text contract. A link in another paragraph cannot
+// satisfy a connection instruction. Destination checks still run on the WHOLE reply, unchanged.
+function accessLinkMissing(text: string) {
+  if (!smartValidator()) return !accessLinks(text).present;
+  const instruction = /\b(?:connectez-vous|reconnectez-vous|log in|sign in|(?:ouvrez|rendez-vous|allez sur|cliquez|entrez|saisissez|renseignez|utilisez|voici)[^.!?\n]{0,160}(?:connexion|connecter|adresse|code|new\.limova\.ai)|(?:open|visit|enter|click|use)[^.!?\n]{0,160}(?:login|sign-in|sign in|email|code))\b/i;
+  return text.split(/\n\s*\n/).some(section => instruction.test(normalize(section)) && !accessLinks(section).present);
+}
+
 const IMPOSSIBILITY_WORDING = /\b(?:impossible|pas possible|ne permet pas|ne peut pas|n'est pas (?:disponible|prevue?|prise? en charge))\b/;
 const ACCOUNT_WORDING = /\b(?:nouve(?:au|l) (?:compte|abonnement)|souscri\w*|creer un (?:autre |second |nouveau )?compte)\b/;
 
@@ -520,6 +586,9 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
     unverified.add("resolution_semantics");
   }
 
+  const smart = smartValidator();
+  const alternative = smart && action.kind === "answer" && unusedAlternative(action, context, proposal.reply?.text);
+  const reconfirmed = new Set<string>();
   if (action.kind === "ask") {
     unverified.add("question_overlap_semantics");
     action.questions.forEach((question, index) => {
@@ -531,7 +600,11 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
         if (seek.kind === "credential") reject("credential_requested", `${seekPath}.kind`);
         if (!seek.factKey) return;
         const key = seek.factKey;
-        if (context.facts.some(fact => fact.key === key) || proposal.understanding.newFacts.some(fact => fact.key === key)) return reject("question_already_answered", `${seekPath}.factKey`, key);
+        if (context.facts.some(fact => fact.key === key) || proposal.understanding.newFacts.some(fact => fact.key === key)) {
+          if (!smart || reconfirmed.has(key) || proposal.understanding.newFacts.some(fact => fact.key === key)
+            || !legitimateReconfirmation(question, key, context, now)) return reject("question_already_answered", `${seekPath}.factKey`, key);
+          reconfirmed.add(key);
+        }
         const pending = context.questions.find(row => row.answeredBy === null && row.factKeys.includes(key)
           && !context.sources.some(source => source.direction === "customer_inbound" && at(source.at) > at(row.askedAt)));
         if (pending) reject("question_already_pending", `${seekPath}.factKey`, pending.id);
@@ -554,6 +627,9 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
       citeKnowledge(step.knowledge, `${path}.knowledge`);
       requireLink(step.knowledge, action.requestIds, `${path}.knowledge`);
       if (pilot) requireInScope(step.knowledge, `${path}.knowledge`, action.requestIds);
+      const attempts = context.trials.filter(trial => action.requestIds.includes(trial.requestId));
+      if (smart && (attempts.length >= 2 || (attempts.length > 0 && !alternative)))
+        reject("repeated_failed_procedure", `${path}.knowledge`, step.knowledge.knowledgeId);
       const failed = context.trials.filter(trial => trial.outcome === "failed" && action.requestIds.includes(trial.requestId) && trial.knowledge.knowledgeId === step.knowledge.knowledgeId);
       if (!failed.length) return;
       const since = Math.max(...failed.map(trial => at(trial.resultAt ?? trial.askedAt)));
@@ -564,7 +640,7 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
         if (factAt === undefined || factAt <= since) reject("new_fact_reference_invalid", `${path}.newFactIds`, factId);
         else newer += 1;
       }
-      if (!newer) reject("repeated_failed_procedure", `${path}.knowledge`, step.knowledge.knowledgeId);
+      if (!newer && !alternative) reject("repeated_failed_procedure", `${path}.knowledge`, step.knowledge.knowledgeId);
     });
   }
 
@@ -639,7 +715,7 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
   const exchanged = context.trials.length > 0 || context.questions.length > 0 || context.sources.some(row => row.direction === "agent_outbound")
     || context.sources.filter(row => row.direction === "customer_inbound").length > 1;
   const open = context.requests.filter(row => row.status === "open");
-  if (!composed && loginRef && outgoing && restates && aboutLogin && thread.complete && thread.scope === "login" && thread.noCode !== false && (confirmedAny || exchanged)) {
+  if (!composed && !alternative && !reconfirmed.size && loginRef && outgoing && restates && aboutLogin && thread.complete && thread.scope === "login" && thread.noCode !== false && (confirmedAny || exchanged)) {
     const spamCheck = loginSays.spamFolder && thread.spam !== true;
     const tell = { link: thread.link === false || (thread.link === null && !outgoing.pathGiven), address: thread.address === false || (thread.address === null && !outgoing.pathGiven),
       spam: spamCheck && (thread.spam === false || !outgoing.spamGiven) };
@@ -747,13 +823,13 @@ Il vous suffira ensuite de saisir ce code sur la page pour accéder à votre esp
     if (requestsCredential(reply.text)) reject("credential_request_pattern", "reply.text");
     // Pilot: an instruction the case already gave, or a step the customer states they did, is not given again. Our own composition reads the same ledgers and is not re-read.
     if (pilot && !composed && (action.kind === "ask" || action.kind === "answer")) for (const card of context.knowledge) {
-      const repeated = repeatedSteps(reply.text, card, context);
+      const repeated = repeatedSteps(reply.text, card, context, alternative && action.kind === "answer" && action.steps[0]!.knowledge.knowledgeId === card.id);
       if (repeated.length) reject("procedure_step_repeated", "reply.text", `${card.id}:${repeated.join(",")}`);
     }
     const accessOpen = [...status].some(([requestId, value]) => value === "open" && families.get(requestId) === "access");
     if (accessOpen && (action.kind === "ask" || action.kind === "answer")) {
       const links = accessLinks(reply.text);
-      if (!links.present) reject("access_link_missing", "reply.text");
+      if (accessLinkMissing(reply.text)) reject("access_link_missing", "reply.text");
       for (const link of links.invalid) reject("access_link_invalid", "reply.text", link);
     }
     if (!reply.impossibilityClaims.length && IMPOSSIBILITY_WORDING.test(replyText)) signals.add("impossibility_wording_without_claim");
