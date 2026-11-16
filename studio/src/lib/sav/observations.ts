@@ -20,6 +20,7 @@ import { savStoredReviewReasons, type SavReviewReason } from "./review-contract"
 import { reconcileSavDeferredComparisons, processSavLearningResolution, savLearningMaterialText } from "./learning-pipeline";
 import { closeSavLearningReservationTx } from "./learning-admission";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
+import { splitObservationSourceErrors } from "./observation-coverage";
 const DAY = 24 * 60 * 60 * 1000;
 // Keep closed cases observable for late evidence and reopenings until normal
 // terminal-dossier retention removes them. Closing alone is not resolution.
@@ -203,7 +204,10 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
         const [savedCycle] = existing ? await tx.update(savObservationCycles).set(values).where(eq(savObservationCycles.id, existing.id)).returning() : await tx.insert(savObservationCycles).values({ ...values, observationId: id, cycle, ...(cycle > 1 ? { createdAt: new Date(snapshot.updatedAt) } : {}) }).returning();
         const closedCatchupUntil = snapshot.status === "open" ? null : closed ? (row.closedCatchupUntil ?? new Date(now.getTime() + DAY)) : row.closedCatchupUntil;
         release.nextSyncAt = nextDue(now);
-        const state = !row.hubspotTicketId ? "gmail_only" : snapshot.errors.length || snapshot.status === "unknown" ? "sources_incomplete" : closed ? savedCycle.candidateId ? "candidate_ready" : "closed_to_analyze" : "active";
+        // SAV-92 (A): only a real read error makes the follow-up incomplete. A coverage limit (size or count bound) comes
+        // back identically at every re-read: the follow-up goes on as a partial coverage, its codes kept in sourceErrors.
+        const readErrors = splitObservationSourceErrors(snapshot.errors).errors.length;
+        const state = !row.hubspotTicketId ? "gmail_only" : readErrors || snapshot.status === "unknown" ? "sources_incomplete" : closed ? savedCycle.candidateId ? "candidate_ready" : "closed_to_analyze" : "active";
         await tx.update(savResolutionObservations).set({ ...release, state, cycle, closedCatchupUntil, closed: snapshot.status === "unknown" ? row.closed : closed, remoteUpdatedAt: new Date(snapshot.updatedAt), lastSyncAt: now, sourceErrors: snapshot.errors }).where(eq(savResolutionObservations.id, id));
         if(row.hubspotTicketId) await tx.insert(savTicketSnapshots).values({ hubspotTicketId: snapshot.ticketId, subject: snapshot.subject, status, transcriptCiphertext: encryptSavPayload({ transcript: events }), contentHash: hash, humanIntervened: human.length > 0, resolvedAt: closed ? new Date(snapshot.updatedAt) : null, hubspotUpdatedAt: new Date(snapshot.updatedAt), processedAt: now, updatedAt: now }).onConflictDoUpdate({ target: savTicketSnapshots.hubspotTicketId, set: { subject: snapshot.subject, status, transcriptCiphertext: encryptSavPayload({ transcript: events }), contentHash: hash, humanIntervened: human.length > 0, resolvedAt: closed ? new Date(snapshot.updatedAt) : null, hubspotUpdatedAt: new Date(snapshot.updatedAt), processedAt: now, updatedAt: now } });
         return { id, status: state, cycle };

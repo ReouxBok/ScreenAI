@@ -46,6 +46,9 @@ function caseReplyBody(draft: string): string {
   return text;
 }
 
+/** SAV-92: what a person edits in the Studio, the stored text without the help line, the signature and the mention (they are added again, once, by the preparation). */
+export const caseReplyEditableBody = (text: string) => caseReplyBody(text);
+
 /**
  * The final text of a reply, help line and mention included. Idempotent: a text that already carries a known footer (any language or mode, current or historical)
  * is re-rendered with exactly one, so preparing twice, or again in the other language, never stacks. `unknown` reads as French, like the shared format.

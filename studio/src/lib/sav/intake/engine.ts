@@ -231,6 +231,18 @@ export async function planSavIntake(
       }
       return context("history_incomplete", "request_scope_uncertain");
     }
+    // SAV-92: an automatic mail proven by a strong header rule and cleared by every exclusion guard goes to
+    // "Autre" without a model call. Decided before the content-completeness check: a delivery-status report
+    // carries the original message as a part, which is never read. A person's choice or information always wins.
+    const noise = policy.noiseFilter;
+    if (noise && noise.messageId === message.id && !input.humanResolution && !policy.manualSupportOverride && !message.operatorInformation
+      && input.conversation.status === "complete" && input.conversation.data.length === 1 && input.conversation.data[0]?.id === message.id) {
+      const resource = savIntakePrivateResourceSchema.parse(noise.resource);
+      const proof = addEvidence("noise-filter", "automation_headers", message.id, { reason: noise.reason, signals: noise.signals, sourceHash: noise.sourceHash, resource });
+      classification = "other";
+      return finalize({ kind: "no_ticket", reason: "qualified_other", qualifiedInformation: "automated_noise", nextAction: "none", learning: "excluded", evidenceIds: [current, proof] },
+        { kind: "qualified_other", classification: "other", classificationRule: resource, evidenceIds: [current, proof], view: "other" });
+    }
     if (!message.contentComplete) return context("classification_incomplete");
     const conversation = complete(input.conversation, z.array(intakeMessageSchema).max(50), "history_incomplete");
     if (new Set(conversation.map(m => m.id)).size !== conversation.length || conversation.some(m => m.threadId !== message.threadId

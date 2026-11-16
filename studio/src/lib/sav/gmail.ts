@@ -365,6 +365,23 @@ function completeSinglePlainBody(part?: GmailPart) {
   catch { return false; }
 }
 
+/** SAV-92: presence or short keyword of the automatic-mail headers, marked so a missing header means
+ * "absent from Gmail", not "not captured". Reply-To is reduced to same/differs from From. */
+function noiseFilterHeaders(headers: GmailHeader[] | undefined, from: string) {
+  const present = (name: string) => headerValue(headers, name).trim() ? "present" : "";
+  const replyTo = headerValue(headers, "Reply-To").trim();
+  const sameReplyTo = replyTo && !replyTo.includes(",") && normalizeEmailAddress(replyTo) === normalizeEmailAddress(from);
+  return {
+    "x-studio-noise-headers": "v1",
+    precedence: boundedHeader(headerValue(headers, "Precedence"), 50),
+    "list-id": present("List-Id"),
+    "list-unsubscribe": present("List-Unsubscribe"),
+    "x-autoreply": boundedHeader(headerValue(headers, "X-Autoreply"), 50),
+    "x-autorespond": boundedHeader(headerValue(headers, "X-Autorespond"), 50),
+    "x-studio-reply-to": replyTo ? (sameReplyTo ? "same" : "differs") : "",
+  };
+}
+
 export function parseGmailMessage(mailboxEmail: string, message: GmailMessage, now = new Date()) {
   if (!message.id || !message.threadId) throw new Error("GMAIL_MESSAGE_INVALID");
   const providerReceivedAt = new Date(Number(message.internalDate));
@@ -409,6 +426,8 @@ export function parseGmailMessage(mailboxEmail: string, message: GmailMessage, n
       "in-reply-to": boundedHeader(headerValue(headers, "In-Reply-To"), 2_000, true),
       "delivered-to": boundedHeader(headerValue(headers, "Delivered-To"), 2_000),
       "x-original-to": boundedHeader(headerValue(headers, "X-Original-To"), 2_000),
+      // SAV-92 noise filter: only the facts it needs, never a list URL, token or second address.
+      ...noiseFilterHeaders(headers, from),
       ...(futureDate ? { "x-studio-gmail-internal-date": providerReceivedAt.toISOString() } : {}),
     },
     receivedAt,

@@ -125,6 +125,21 @@ describe("Gmail SAV ingestion", () => {
     expect(parsed.bodyText).toContain("Bonjour & merci");
     expect(parsed.bodyText).not.toContain("secret()");
   });
+  it("SAV-92: stores only presence or short keywords of the automatic-mail headers, marked as captured", () => {
+    const parse = (extra: Array<{ name: string; value: string }>) => parseGmailMessage("contact@example.invalid", {
+      id: "gmail-noise", internalDate: "1788170400000", threadId: "thread-noise",
+      payload: { mimeType: "text/plain", body: { data: base64url("Lettre fictive") }, headers: [
+        { name: "From", value: "Lettre <news@lists.example.invalid>" }, { name: "To", value: "contact@example.invalid" }, { name: "Subject", value: "Lettre" }, ...extra] },
+    }).headers;
+    const list = parse([{ name: "List-Id", value: "Lettre fictive <lettre.lists.example.invalid>" },
+      { name: "List-Unsubscribe", value: "<https://lists.example.invalid/u?token=secret-token>, <mailto:u@lists.example.invalid>" },
+      { name: "Precedence", value: "bulk" }, { name: "X-Autoreply", value: "yes" }, { name: "Reply-To", value: "News <NEWS@lists.example.invalid>" }]);
+    expect(list).toMatchObject({ "x-studio-noise-headers": "v1", "list-id": "present", "list-unsubscribe": "present", precedence: "bulk", "x-autoreply": "yes", "x-autorespond": "", "x-studio-reply-to": "same" });
+    expect(JSON.stringify(list)).not.toContain("secret-token");
+    expect(parse([])).toMatchObject({ "x-studio-noise-headers": "v1", "list-id": "", "list-unsubscribe": "", precedence: "", "x-studio-reply-to": "" });
+    expect(parse([{ name: "Reply-To", value: "client@example.invalid" }])["x-studio-reply-to"]).toBe("differs");
+    expect(parse([{ name: "Reply-To", value: "news@lists.example.invalid, client@example.invalid" }])["x-studio-reply-to"]).toBe("differs");
+  });
   it("does not turn an undated historical message into a new arrival", () => {
     expect(() => parseGmailMessage("contact@limova.ai", { id: "undated", threadId: "thread" })).toThrow("GMAIL_MESSAGE_INVALID_INTERNAL_DATE");
     expect(() => parseGmailMessage("contact@limova.ai", { id: "invalid-date", threadId: "thread", internalDate: "not-a-date" })).toThrow("GMAIL_MESSAGE_INVALID_INTERNAL_DATE");

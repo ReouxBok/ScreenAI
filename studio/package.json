@@ -29,6 +29,7 @@
     "training:reconcile": "NODE_OPTIONS=--conditions=react-server tsx scripts/reconcile-trainings.ts --dry-run",
     "training:reconcile:apply": "NODE_OPTIONS=--conditions=react-server tsx scripts/reconcile-trainings.ts --apply",
     "gmail:replay": "NODE_OPTIONS=--conditions=react-server tsx scripts/replay-gmail-receipts.ts --dry-run",
+    "sav:noise-replay": "NODE_OPTIONS=--conditions=react-server tsx scripts/sav-noise-filter-replay.ts",
     "gmail:replay:apply": "NODE_OPTIONS=--conditions=react-server tsx scripts/replay-gmail-receipts.ts --apply",
     "ops:status": "NODE_OPTIONS=--conditions=react-server tsx scripts/operational-status.ts",
     "ops:status:strict": "NODE_OPTIONS=--conditions=react-server tsx scripts/operational-status.ts --strict",

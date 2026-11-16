@@ -2212,3 +2212,64 @@ it("preserves the original request across an operator choice on the automatic re
   expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
   expect(fetch).not.toHaveBeenCalled(); expect(mutationsSent()).toHaveLength(0);
 });
+describe("SAV-92 projection routes (synthetic)", () => {
+  /** Rewrites the current run as a later V1 outcome would leave it; the projection is the code under test. */
+  const rewrite = async (state: string, edit: (payload: IntakeRuntimePayload) => void) => {
+    const [run] = await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId));
+    const payload = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext); edit(payload);
+    await db.db.update(savIntakeRuns).set({ state, payloadCiphertext: encryptSavPayload(payload) }).where(eq(savIntakeRuns.id, runId));
+  };
+  const projected = async () => { await projectIntakeThread(threadId); return (await readIntakeConsoleDetail(threadId))!.projection; };
+  const processingPlan = (payload: IntakeRuntimePayload) => { payload.plan!.progress = { ...payload.plan!.progress, kind: "processing", view: null } as never; };
+  it("B: a V1 request for team context is shown in « À valider » with its action, nothing sent", async () => {
+    await observed();
+    await rewrite("waiting", payload => { processingPlan(payload); payload.plan!.decision.disposition = { kind: "collect_context", reasons: ["history_incomplete"] } as never; });
+    const row = await projected();
+    expect(row).toMatchObject({ view: "to_validate", status: "context_required" });
+    expect(row.reason).toContain("Vérifier l’historique du ticket");
+    expect(mutationsSent()).toHaveLength(0); expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+  });
+  it("C: an execution waiting for a human CRM decision goes to « À valider »", async () => {
+    await observed(); const execution = (await admitIntakeExecution(runId, options))!;
+    const payload = decryptSavPayload<Record<string, unknown>>(execution.payloadCiphertext);
+    await db.db.update(savIntakeExecutions).set({ state: "waiting", leaseToken: null, leaseUntil: null, payloadCiphertext: encryptSavPayload({ ...payload,
+      reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED", crmRecheck: { attempts: 3, max: 3, humanRequired: true, nextAt: null, cause: "business_change" } }) }).where(eq(savIntakeExecutions.id, execution.id));
+    const row = await projected();
+    expect(row).toMatchObject({ view: "to_validate", status: "crm_review_required" });
+    expect(row.reason).toContain("aucune action envoyée");
+    expect(mutationsSent()).toHaveLength(0);
+  });
+  it("sensitive: a finance technical wait goes to the sensitive queue; an uncertain one keeps its status and view", async () => {
+    await observed(false, true);
+    await rewrite("uncertain", processingPlan);
+    expect(await projected()).toMatchObject({ view: null, status: "uncertain" });
+    await rewrite("waiting", processingPlan);
+    const row = await projected();
+    expect(row).toMatchObject({ view: "sensitive", status: "sensitive_team" });
+    expect(row.reason).toMatch(/^Dossier sensible/);
+  });
+  it("sensitive (F4): a version re-created without a plan still goes to the sensitive queue when an earlier version of the mail was finance", async () => {
+    await observed(false, true);
+    const [first] = await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId));
+    await db.db.update(savIntakeRuns).set({ isCurrent: false, state: "superseded" }).where(eq(savIntakeRuns.id, first.id));
+    await db.db.insert(savIntakeRuns).values({ threadId, messageId, version: first.version + 1, state: "waiting", attempts: 0, configHash: "d".repeat(64), policyHash: first.policyHash,
+      sourceHash: first.sourceHash, payloadCiphertext: encryptSavPayload({ revision: SAV_INTAKE_RUNTIME_REVISION, effects: "not_connected", reason: "SAV_INTAKE_SEMANTIC_CONTEXT_CHANGED" }) });
+    expect(await projected()).toMatchObject({ view: "sensitive", status: "sensitive_team" });
+  });
+  it("A: coverage limits give a partial follow-up (learning view, named reason); a real read error keeps it pending, never blocked", async () => {
+    await observed(); const execution = (await admitIntakeExecution(runId, options))!; await executeIntakePass(execution.id, options);
+    expect(await ensureIntakeObservations()).toEqual({ created: 1 });
+    const [observation] = await db.db.select().from(savResolutionObservations);
+    await syncSavObservation(observation.id, async ticketId => ({ ticketId, subject: "Synthetic", status: "open", updatedAt: new Date().toISOString(), events: [], errors: ["emails:association_limit_100"] }));
+    expect((await db.db.select().from(savResolutionObservations))[0].state).toBe("active");
+    const partial = await projected();
+    expect(partial).toMatchObject({ view: "learning", status: "followup_partial" });
+    expect(partial.reason).toMatch(/^Suivi partiel : plus de 100 éléments associés/);
+    await db.db.update(savResolutionObservations).set({ leaseUntil: null }).where(eq(savResolutionObservations.id, observation.id));
+    await syncSavObservation(observation.id, async ticketId => ({ ticketId, subject: "Synthetic", status: "open", updatedAt: new Date(Date.now() + 1000).toISOString(), events: [], errors: ["pipeline:HUBSPOT_HTTP_503"] }));
+    const pending = await projected();
+    expect(pending).toMatchObject({ view: null, status: "followup_pending" });
+    expect(pending.reason).toContain("Collecte du suivi incomplète (hubspot_pipeline_unavailable)");
+    expect((await listIntakeConsole({ view: "processing" })).counts.blocked ?? 0).toBe(0);
+  });
+});
