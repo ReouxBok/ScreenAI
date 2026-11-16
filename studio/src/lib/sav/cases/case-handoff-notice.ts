@@ -416,6 +416,63 @@ export function renderHandoffNotice(sealed: HandoffNoticeFacts, crm: HandoffCrmV
   return { text, marker, key };
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------
+// The HubSpot handoff note (SAV-92, Ugo 16/11): a short narrative for the team, never the structured list
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+/** Why the case goes to the team, in plain words: no internal term (sheet, validator, block, model), no identifier. */
+const NOTE_REASON_SENTENCES: Record<HandoffReason, string> = {
+  explicit_human_request: "Le client souhaite échanger avec une personne.",
+  sensitive_request: "La demande est sensible et relève de l'équipe.",
+  knowledge_missing: "Je n'ai pas de solution adaptée à cette demande.",
+  knowledge_conflict: "Les solutions dont je dispose ne concordent pas pour cette demande.",
+  evidence_inaccessible: "Il me manque un élément pour aller plus loin.",
+  diagnosis_out_of_tools: "La suite du diagnostic demande une intervention de l'équipe.",
+  repeated_failure: "Les solutions proposées n'ont pas suffi.",
+  decision_refused: "Je préfère laisser l'équipe reprendre ce message.",
+  outside_active_blocks: "Cette partie de la demande relève de l'équipe ; je continue de traiter le reste du message.",
+  team_part_handoff_unavailable: "Aucune réponse ne lui a été envoyée : tout le message est à reprendre.",
+};
+const NOTE_TRIAL_OUTCOMES: Record<CaseTrial["outcome"], string> = {
+  failed: "le problème persiste", pending: "nous attendons son retour", succeeded: "le client indique que cela a fonctionné", unknown: "nous ne savons pas encore si cela a suffi",
+};
+const NOTE_LIMITS = { problem: 240, part: 300 } as const;
+const endSentence = (value: string) => /[.!?…»]$/.test(value) ? value : `${value}.`;
+const lowerFirst = (value: string) => value.charAt(0).toLocaleLowerCase("fr") + value.slice(1);
+
+/**
+ * The text of the team's HubSpot note: what the customer reports, what was asked and tried (never which sheet: a first solution, another one), the links and
+ * files the customer sent, why the case goes to the team. Built from the sealed facts only; never the agent's reply, never an identifier (case, ticket, sheet,
+ * model), free text cleaned again. One sentence per line; a link stands last on its line so HubSpot reads it whole. Deterministic for its input.
+ */
+export function handoffNoteText(facts: Pick<HandoffNoticeFacts, "reason" | "need"> & Readonly<{ summary: CaseHandoffSummary }>): string {
+  const { summary, reason } = facts;
+  const lines: string[] = [];
+  const problem = summary.problem.text ? sanitizeNoticeText(summary.problem.text, NOTE_LIMITS.problem) : "";
+  if (problem && summary.problem.source === "customer_words") lines.push(`Le client écrit : « ${problem} »`);
+  else if (problem) lines.push(endSentence(`Le client signale : ${lowerFirst(problem)}`));
+  else lines.push("Le client nous a contactés.");
+  // A team part says which part is the team's (the fixed prefix of its `need` is dropped, the described requests are kept).
+  if (reason === "outside_active_blocks") {
+    const part = sanitizeNoticeText(facts.need.replace(/^[^:]*:\s*/, ""), NOTE_LIMITS.part);
+    if (part) lines.push(endSentence(`La partie à reprendre : ${part}`));
+  }
+  const asked = summary.exchanges.length + summary.exchangesOmitted;
+  if (asked) lines.push(`Nous lui avons posé ${asked === 1 ? "une question" : `${asked} questions`} ; ${summary.exchanges.at(-1)?.answered ? "il nous a répondu." : "nous attendons encore sa réponse."}`);
+  const tried = summary.tried.length + summary.triedOmitted, last = summary.tried.at(-1);
+  if (tried && last) {
+    const what = tried === 1 ? "une première solution" : tried === 2 ? "une première solution puis une autre solution" : `une première solution puis ${tried - 1} autres solutions`;
+    lines.push(`Nous avons essayé ${what} ; ${NOTE_TRIAL_OUTCOMES[last.outcome]}.`);
+  }
+  const urls = summary.transmitted.urls ?? [];
+  if (urls.length) lines.push(`Il nous a envoyé ${urls.length === 1 ? "ce lien" : "ces liens"} : ${urls.join(" ; ")}`);
+  const files = summary.received ? summary.received.files.length + summary.received.omitted : summary.transmitted.attachments;
+  if (files) lines.push(`Il a joint ${files === 1 ? "un fichier" : `${files} fichiers`} à ses messages.`);
+  lines.push(NOTE_REASON_SENTENCES[reason]);
+  lines.push(reason === "outside_active_blocks" ? "Je passe cette partie de la demande à l'équipe." : "Je passe le dossier à l'équipe.");
+  return lines.join("\n");
+}
+
 // The lines of the notice that carry free text, and the only links that may stay in it (the ones `renderHandoffNotice` builds from a CRM-verified id and the portal id).
 const FREE_TEXT_LINE = /^(\*Problème :\* |• (?:Attendu|Constaté|Hypothèse|Question|Réponse) : |• Problème, [a-zA-ZÀ-ÿ' ]{1,40} : |• Essai [A-Za-z0-9._[\] -]{1,80} : |\*Prochaine action proposée :\* )(.*)$/;
 const INTERNAL_LINK = /<https:\/\/app\.hubspot\.com\/contacts\/[0-9]{1,20}\/record\/0-[15]\/[0-9]{1,30}\|[^<>|\n]{1,80}>/g;

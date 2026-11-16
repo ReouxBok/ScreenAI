@@ -36,7 +36,7 @@ describe("handoff synthesis (stored case only, masked, bounded)", () => {
       { question: "Depuis quel navigateur ?", answered: false, answer: null },
     ]);
     expect(summary.exchanges[0]!.answer).not.toContain("token=xyz");
-    expect(summary.transmitted).toEqual({ attachments: 1, links: 1, linkHosts: ["app.example.invalid"] });
+    expect(summary.transmitted).toEqual({ attachments: 1, links: 1, linkHosts: ["app.example.invalid"], urls: ["https://app.example.invalid/chat/abc"] });
     expect(summary.tried).toEqual([{ knowledgeId: "syn-login", outcome: "failed", result: "Toujours verrouillé après réinitialisation." }]);
     const lines = caseHandoffSummaryLines(summary, "le client demande à parler à une personne");
     expect(lines).toContain("• Réponse : aucune pour l'instant");
