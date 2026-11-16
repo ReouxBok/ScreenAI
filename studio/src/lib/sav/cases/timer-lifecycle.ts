@@ -72,7 +72,7 @@ export type J2CaseView = Readonly<{
   }>;
 }>;
 // `detail` is read only for owner_changed (its `transition`). An unreadable or unknown transition fails closed: it makes the follow-up obsolete.
-export type J2CaseEventView = Readonly<{ kind: string; direction: string; occurredAt: string; detail?: Readonly<{ transition?: unknown }> | null }>;
+export type J2CaseEventView = Readonly<{ kind: string; direction: string; occurredAt: string; caseVersion?: number; detail?: Readonly<{ transition?: unknown }> | null }>;
 
 // Q9 (Ugo, 2026-10-28): a technical or organisational hold keeps J2; a person taking the case over cancels it. Only these two transitions are
 // organisational (they never mean "a person took it"). A hold release that hands the case to a human ends in owner "human" and is obsolete by owner.
@@ -382,9 +382,10 @@ export function revalidateFiredJ2(input: Readonly<{
   else for (const event of input.events) {
     const occurredMs = Date.parse(event.occurredAt);
     if (Number.isNaN(occurredMs)) { obsolete.add("invalid_time"); continue; }
-    if (event.kind === "inbound_confirmed" && event.direction === "customer_inbound" && occurredMs >= sentMs) obsolete.add("inbound_after_question");
-    else if (event.kind === "owner_changed" && occurredMs >= sentMs && !isOrganizationalTransition(event)) obsolete.add("owner_changed_since");
-    else if (event.kind === "outbound_observed" && event.direction === "human_outbound" && occurredMs >= sentMs) obsolete.add("human_outbound_since");
+    const recordedAfterWait = event.caseVersion !== undefined && event.caseVersion > timer.scheduledAtCaseVersion;
+    if (event.kind === "inbound_confirmed" && event.direction === "customer_inbound" && (occurredMs >= sentMs || recordedAfterWait)) obsolete.add("inbound_after_question");
+    else if (event.kind === "owner_changed" && (occurredMs >= sentMs || recordedAfterWait) && !isOrganizationalTransition(event)) obsolete.add("owner_changed_since");
+    else if (event.kind === "outbound_observed" && event.direction === "human_outbound" && (occurredMs >= sentMs || recordedAfterWait)) obsolete.add("human_outbound_since");
     // The question's own outbound event sits at sentAt: only a strictly later agent message makes it obsolete.
     else if (event.kind === "outbound_observed" && event.direction === "agent_outbound" && occurredMs > sentMs) obsolete.add("newer_agent_message");
   }

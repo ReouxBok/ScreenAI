@@ -4,7 +4,7 @@ vi.mock("../shared-spend",()=>({savSharedSpendAvailable:f.shared}));
 vi.mock("@/db",()=>({requireDb:f.db}));
 vi.mock("./investigation-v2-spend",()=>({readCaseV2SpendPolicy:f.policy,readCaseV2SpendDay:f.day}));
 const store=vi.hoisted(()=>({enqueue:vi.fn()}));
-vi.mock("./case-reply-store",()=>({enqueueApprovedCaseReply:store.enqueue}));
+vi.mock("./case-runtime-effects",()=>({queueValidatedCaseReply:store.enqueue}));
 vi.mock("../crypto",async importOriginal=>({...await importOriginal<typeof import("../crypto")>(),decryptSavPayload:(value:unknown)=>value}));
 import { enqueueApprovedJ2, j2BudgetAvailable, readJ2ReminderEffect, reconcileCaseJ2, sendQueuedJ2Now } from "./v2-j2-binding";
 
@@ -13,13 +13,14 @@ function rows(...results:unknown[][]) {
   f.db.mockReturnValue({select:()=>({from:()=>({where:()=>Promise.resolve(results.shift())})})});
 }
 describe("J2 wake binding",()=>{
-  const on={SAV_V2_ENTRY:"on",SAV_CASE_RECORDING:"on",SAV_CASE_EFFECTS:"supervised",SAV_V2_J2:"on"};
+  const on={SAV_V2_ENTRY:"on",SAV_CASE_RECORDING:"on",SAV_CASE_EFFECTS:"supervised",SAV_V2_J2:"on",SAV_V2_J2_AUTO:"on"};
   it("leaves an unconfigured or expired wake outside the database",async()=>{
     f.db.mockClear();
     expect(await reconcileCaseJ2({env:{},deadlineMs:Date.now()+5000})).toEqual({skipped:"j2_off"});
     expect(await reconcileCaseJ2({env:on,deadlineMs:NaN})).toEqual({skipped:"deadline"});
     expect(await reconcileCaseJ2({env:on,deadlineMs:Date.now()+5000})).toEqual({skipped:"j2_batch_unconfigured"});
     expect(await reconcileCaseJ2({env:{...on,SAV_V2_J2_BATCH:"2"},deadlineMs:Date.now()+5000})).toEqual({skipped:"execution_off"});
+    expect(await reconcileCaseJ2({env:{...on,SAV_V2_J2_AUTO:undefined},deadlineMs:Date.now()+5000})).toEqual({skipped:"j2_auto_off"});
     expect(f.db).not.toHaveBeenCalled();
   });
   it.each([["acked","uncertain"],["uncertain","uncertain"],["unexpected","uncertain"],["confirmed","confirmed"],["planned","planned"],["dispatched","dispatched"],["failed","failed"]])("reads %s without issuing a new reminder",async(state,expected)=>{
