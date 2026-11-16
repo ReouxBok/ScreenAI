@@ -6,7 +6,7 @@ const wait = (status: string, reason: string | null) => ({ blockedCause: "techni
 describe("technical wait sub-cause", () => {
   it.each([
     ["followup_pending", "Actions confirmées, premier suivi en attente", "followup_queued", "Premier suivi en file : le rattrapage le traitera au prochain passage"],
-    ["followup_pending", "Collecte du suivi incomplète", "followup_incomplete", "Suivi incomplet : une source n’a pas été lue, le rattrapage la relira"],
+    ["followup_pending", "Collecte du suivi incomplète", "followup_incomplete", "Suivi incomplet : la lecture d’une source a échoué ; nouvelle lecture au suivi quotidien"],
     ["waiting", "Les sources locales ont changé depuis le résultat confirmé", "sources_changed", "Sources modifiées : nouvelle vérification nécessaire"],
     ["context_changed", "Les sources locales doivent être réinvestiguées", "sources_changed", "Sources modifiées : nouvelle vérification nécessaire"],
     ["waiting", "SAV_INTAKE_CRM_READ_INCOMPLETE", "verification_pending", "Vérification HubSpot/Gmail en attente"],
