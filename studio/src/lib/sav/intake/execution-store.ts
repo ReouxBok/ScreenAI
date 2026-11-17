@@ -123,26 +123,32 @@ export async function assertNoLegacyConflict(tx: ExecutionTx, keys: string[]) {
             return fault("LEGACY_SCOPE_OCCUPIED");
     }
 }
+/** The new-message handoff rule for ONE execution superseded by `messageId` (a newer inbound of its thread).
+ * Shared unchanged by the admission of a new message and by the administrative reconciliation of the last
+ * uncertain effect of a superseded execution (effect-reconciliation.ts). Returns whether it handed off. */
+export async function handOffSupersededExecution(tx: ExecutionTx, execution: typeof savIntakeExecutions.$inferSelect, messageId: string, origin?: "effect_reconciliation") {
+    // A new message cannot rewrite the historical outcome of a terminal
+    // execution. Its receipts remain available for review and lot3.
+    if (execution.state === "confirmed" || execution.state === "refused" || execution.messageId === messageId)
+        return false;
+    const effects = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, execution.id));
+    if (effects.some(e => !["planned", "confirmed"].includes(e.state)))
+        return false;
+    // Fence the older worker before transferring scopes. No uncertain result is
+    // ever inferred absent, and no effect receipt is copied into the new plan.
+    await tx.update(savIntakeExecutions).set({
+        state: "refused", leaseToken: null, leaseUntil: null, updatedAt: new Date()
+    }).where(eq(savIntakeExecutions.id, execution.id));
+    await releaseKeys(tx, execution.id);
+    await executionJournal(tx, execution.id, "new_message_handoff", {
+        nextMessageId: messageId, confirmedEffects: effects.filter(e => e.state === "confirmed").map(e => e.id), ...(origin ? { origin } : {})
+    });
+    return true;
+}
 async function handoffObsoleteExecutions(tx: ExecutionTx, threadId: string, messageId: string) {
     const old = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.threadId, threadId)).for("update");
-    for (const execution of old) {
-        // A new message cannot rewrite the historical outcome of a terminal
-        // execution. Its receipts remain available for review and lot3.
-        if (execution.state === "confirmed" || execution.state === "refused" || execution.messageId === messageId)
-            continue;
-        const effects = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, execution.id));
-        if (effects.some(e => !["planned", "confirmed"].includes(e.state)))
-            continue;
-        // Fence the older worker before transferring scopes. No uncertain result is
-        // ever inferred absent, and no effect receipt is copied into the new plan.
-        await tx.update(savIntakeExecutions).set({
-            state: "refused", leaseToken: null, leaseUntil: null, updatedAt: new Date()
-        }).where(eq(savIntakeExecutions.id, execution.id));
-        await releaseKeys(tx, execution.id);
-        await executionJournal(tx, execution.id, "new_message_handoff", {
-            nextMessageId: messageId, confirmedEffects: effects.filter(e => e.state === "confirmed").map(e => e.id)
-        });
-    }
+    for (const execution of old)
+        await handOffSupersededExecution(tx, execution, messageId);
 }
 export async function admitIntakeExecution(runId: string, options: ExecutionOptions) {
     const currentRun = await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId));
@@ -282,16 +288,25 @@ export type EffectRecoveryLease = { executionId: string; token: string };
 /** Reserve the existing execution lease without changing its business state.
  * No admission lock is held across a provider read. The same token is checked
  * again under lock before any recovered result or retry can be persisted. */
-export async function claimEffectRecovery(executionId: string, now = new Date()): Promise<EffectRecoveryLease | null> {
+export async function claimEffectRecovery(executionId: string, now = new Date(), fence?: EffectRecoveryClaimFence): Promise<EffectRecoveryLease | null> {
     return requireDb().transaction(async tx => {
         await admissionLock(tx);
         const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, executionId)).for("no key update");
         if (!row || row.leaseUntil && row.leaseUntil > now) return null;
+        if (fence) await fence.beforeLease(tx, row);
         const token = randomUUID();
         await tx.update(savIntakeExecutions).set({ leaseToken: token, leaseUntil: new Date(now.getTime() + 80000) }).where(eq(savIntakeExecutions.id, row.id));
+        if (fence) await fence.afterLease(tx, row);
         return { executionId, token };
     });
 }
+/** Optional, same transaction as the lease write (after the admission and execution locks): lets a caller
+ * check its own precondition just before the lease and observe what the lease write itself changed (the
+ * console projection triggers on sav.intake_executions), with nothing else interleaved. Throwing rolls back. */
+export type EffectRecoveryClaimFence = {
+    beforeLease(tx: ExecutionTx, row: typeof savIntakeExecutions.$inferSelect): Promise<void>;
+    afterLease(tx: ExecutionTx, row: typeof savIntakeExecutions.$inferSelect): Promise<void>;
+};
 export async function withEffectRecoveryLease<T>(lease: EffectRecoveryLease, work: (tx: ExecutionTx) => Promise<T>): Promise<{ owned: false } | { owned: true; value: T }> {
     return requireDb().transaction(async tx => {
         await admissionLock(tx);

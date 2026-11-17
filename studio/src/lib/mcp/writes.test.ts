@@ -204,6 +204,18 @@ it("SAV-92 reconcile_effect passes only the dossier's own message and version, n
   expect(await call("reconcile_effect", { threadId, versionToken: "x" })).toMatchObject({ code: "SAV_MCP_VERSION_TOKEN_INVALID" });
   expect(state.effect).toHaveBeenCalledTimes(3);
 });
+it("reconcile_effect is offered for an older message's blocking effect and reports it as historical, same inputs", async () => {
+  const offered = async () => ((await call("get_dossier", { threadId }) as { data: { availableActions: { tool: string; available: boolean }[] } }).data.availableActions)
+    .find(a => a.tool === "reconcile_effect")?.available;
+  Object.assign(detail, { progress: null, completionBlockers: [] });
+  expect(await offered()).toBe(false);
+  Object.assign(detail, { completionBlockers: ["intake_effect"] });
+  expect(await offered()).toBe(true);
+  state.effect.mockResolvedValueOnce({ reconciled: true, kind: "email_associate", objectId: "401", historical: true, handedOff: true });
+  expect(await call("reconcile_effect", { threadId, versionToken: token() })).toMatchObject({ outcome: "done", data: { kind: "email_associate", historical: true, handedOff: true } });
+  // Still only the current message and the dossier version: the server picks the older execution itself.
+  expect(state.effect).toHaveBeenCalledWith({ threadId, messageId }, { threadId, messageId, runId, version: 7, sourceHash, epoch: 4 });
+});
 it("continue_dossier follows the operator panel's allowances and binding", async () => {
   state.panel.mockResolvedValue({ allowResume: false, allowReanalysis: true, allowInformation: true, unavailableReason: "Protégé (synthétique).", information: { id: "10000000-0000-4000-8000-000000000050" } });
   state.operator.mockResolvedValue({ status: "recorded" });

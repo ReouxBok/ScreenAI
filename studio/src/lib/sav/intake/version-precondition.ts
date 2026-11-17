@@ -13,6 +13,11 @@ export async function intakeVersionStillCurrent(tx: Tx, threadId: string, expect
   const [run] = await tx.select({ id: savIntakeRuns.id, version: savIntakeRuns.version, sourceHash: savIntakeRuns.sourceHash }).from(savIntakeRuns)
     .where(and(eq(savIntakeRuns.threadId, threadId), eq(savIntakeRuns.isCurrent, true))).for("update");
   if ((run?.id ?? null) !== expected.runId || (run?.version ?? null) !== expected.version || (run?.sourceHash ?? null) !== expected.sourceHash) return false;
+  return await lockedIntakeConsoleEpoch(tx, threadId) === expected.epoch;
+}
+/** The console projection epoch of one thread, row-locked until the caller's commit (null without projection).
+ * Every write to runs, executions, effects, messages, threads... moves it through the 0042/0043 triggers. */
+export async function lockedIntakeConsoleEpoch(tx: Tx, threadId: string) {
   const [projection] = await tx.select({ epoch: savIntakeConsole.epoch }).from(savIntakeConsole).where(eq(savIntakeConsole.threadId, threadId)).for("update");
-  return projection?.epoch === expected.epoch;
+  return projection?.epoch ?? null;
 }
