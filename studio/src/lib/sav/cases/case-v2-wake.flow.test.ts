@@ -338,7 +338,7 @@ describe("closing and handoff customer acknowledgements", () => {
     expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true, created: true } });
     await wake(); await wake();
     expect(sends).toBe(1);
-    expect(mimeText(sentBodies[0]!)).toContain("Votre demande est transmise à un conseiller.");
+    expect(mimeText(sentBodies[0]!)).toContain("Un conseiller reprend votre demande.");
     expect((await stageRows(made.caseId))).toHaveLength(0);
     expect((await readCase(made.caseId))!.phase).toBe("handoff_pending");
     const effects = await f.db.select().from(savIntakeEffects).where(eq(savIntakeEffects.kind, "reply_send"));

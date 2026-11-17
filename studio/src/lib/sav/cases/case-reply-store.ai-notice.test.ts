@@ -75,7 +75,7 @@ describe("C's store and the UX outbound contract: refused before creation or has
       const unsafe = finalizeCaseReplyProposal({ ...s.proposal("Voir https://evil.invalid"), purpose }, { language: "fr", validation: "human" });
       expect(await submitCaseReplyProposal(unsafe, terminalDeps)).toEqual({ ok: false, code: "proposal_invalid", detail: "terminal_text" });
       expect(await submitCaseReplyProposal(unsafe, deps)).toEqual({ ok: false, code: "effects_off" });
-      const text = purpose === "closing" ? "Merci pour votre confirmation, nous sommes ravis que le problème soit résolu. Si le problème revient, vous pouvez répondre à ce message." : "Votre demande est transmise à un conseiller.";
+      const text = purpose === "closing" ? "Merci pour votre confirmation, nous sommes ravis que le problème soit résolu. Si le problème revient, vous pouvez répondre à ce message." : "Un conseiller reprend votre demande.";
       const fixed = finalizeCaseReplyProposal({ ...unsafe, text }, { language: "fr", validation: "human" });
       expect(await submitCaseReplyProposal(fixed, terminalDeps)).toMatchObject({ ok: false, code: "not_admitted", detail: "terminal_proof_missing" });
     }

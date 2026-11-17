@@ -221,7 +221,7 @@ describe("passage to the send plan (B): C's store, A's rule, nothing short of ev
     const rows = await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, mail.caseId));
     expect(rows).toHaveLength(1);
     const text = decryptSavPayload<{ text: string }>(rows[0]!.proposalCiphertext).text;
-    expect(text).toContain("Votre demande est transmise à un conseiller.");
+    expect(text).toContain("Un conseiller reprend votre demande.");
     expect(readCaseReplyDisclosure(text)?.mode).toBe("automated");
   });
 
