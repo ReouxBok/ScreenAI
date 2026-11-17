@@ -661,7 +661,7 @@ describe("SAV-6 purity", () => {
     // `../message-context`: the shared, pure split of a mail into the customer's own words and what they quote (nothing behind it but the schema library).
     expect(imports("decision-validator.ts")).toEqual(["../message-context", "../request-retrieval", "./ask-before-handoff", "./decision-contract", "./investigation-access-scope", "./restored-access"]);
     // SAV-92 ask-before-handoff (17/11): a pure composition over the contract, nothing else behind it.
-    expect(imports("ask-before-handoff.ts")).toEqual(["./decision-contract"]);
+    expect(imports("ask-before-handoff.ts")).toEqual(["../message-context", "./decision-contract", "./restored-access"]);
     expect(imports("restored-access.ts")).toEqual(["../message-context"]);
     expect(imports("../message-context.ts")).toEqual(["zod"]);
     expect(imports("decision-contract.ts")).toEqual(["../playbook-contract", "../request-retrieval", "./admission-policy", "./case-types", "./investigation-access-scope", "zod"]);

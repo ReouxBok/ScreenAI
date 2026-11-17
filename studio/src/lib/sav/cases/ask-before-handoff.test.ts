@@ -105,6 +105,47 @@ describe("SAV_V2_ASK_BEFORE_HANDOFF: one re-ask before a premature hand-over", (
     expect(decision(run(handoff(), ctx({ sensitiveCategories: ["finance"] }))).decision.nextAction.kind).toBe("handoff");
   });
 
+  // Review Astra P1 (17/11): only a mail bringing nothing new is re-asked.
+  it.each([
+    "Je veux parler à un conseiller.",
+    "Bonjour, je n'arrive toujours pas à me connecter. Pouvez-vous me mettre en relation avec un humain ?",
+    "Rappelez-moi s'il vous plaît, je n'arrive pas à me connecter.",
+  ])("on: a request for a person in the latest mail keeps the hand-over, never a re-ask (%s)", latest => {
+    on();
+    const base = ctx();
+    const result = decision(run(handoff(), ctx({ customerTexts: { ...base.customerTexts, "email:m3": latest } })));
+    expect(result.decision.nextAction).toMatchObject({ kind: "handoff", reason: "repeated_failure" });
+    expect(result.signals).not.toContain("handoff_reask_composed");
+  });
+
+  it("on: an advisor request recorded as a new fact keeps the hand-over", () => {
+    on();
+    const proposal = handoff();
+    proposal.understanding.newFacts = [{ id: "f1", key: null, statement: "Le client demande à parler à un conseiller.", kind: "customer_statement", source: email("m3") }];
+    expect(decision(run(proposal)).decision.nextAction.kind).toBe("handoff");
+  });
+
+  it("on: a new diagnostic fact under another key (not an open question) produces no re-ask", () => {
+    on();
+    const proposal = handoff();
+    proposal.understanding.newFacts = [{ id: "f1", key: "login_browser", statement: "Le client utilise un autre navigateur depuis hier.", kind: "customer_statement", source: email("m3") }];
+    expect(decision(run(proposal)).decision.nextAction.kind).toBe("handoff");
+    const base = ctx();
+    const stored = ctx({ facts: [{ id: "f0", key: null, kind: "customer_statement", source: email("m3"), at: "2026-11-17T06:30:00Z" }], customerTexts: base.customerTexts });
+    expect(decision(run(handoff(), stored)).decision.nextAction.kind).toBe("handoff");
+  });
+
+  it("on: an unreadable latest mail proves nothing, the hand-over stands", () => {
+    on();
+    const { "email:m3": _dropped, ...rest } = ctx().customerTexts;
+    expect(decision(run(handoff(), ctx({ customerTexts: rest }))).decision.nextAction.kind).toBe("handoff");
+  });
+
+  it("on: Ugo's empty repeat still gets exactly one re-ask", () => {
+    on();
+    expect(decision(run(handoff())).decision.nextAction.kind).toBe("ask");
+  });
+
   it("on: the latest mail answers an open question, the hand-over stands", () => {
     on();
     const proposal = handoff();

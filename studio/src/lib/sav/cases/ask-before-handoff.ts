@@ -1,3 +1,5 @@
+import { splitSavMessageText } from "../message-context";
+import { loginCustomerStatement } from "./restored-access";
 import {
   caseDecisionAttachmentMail, isSensitiveCaseFamily, SAV_CASE_ACCESS_URL,
   type CaseDecisionProposal, type CaseDecisionSourceRef, type CaseDecisionValidationContext,
@@ -20,12 +22,13 @@ export const SAV_CASE_REASK_SCREENSHOT_QUESTION = "Pouvez-vous aussi m’envoyer
 export const SAV_CASE_REASK_ADVISOR_NOTICE = "Sans ces éléments, si la situation reste bloquée, je transmettrai votre demande à un conseiller de notre équipe, qui reviendra vers vous.";
 
 /** Sent to the model only when the switch is on, so the off prompt keeps its exact bytes. */
-export const SAV_CASE_ASK_BEFORE_HANDOFF_INSTRUCTION = "Relance avant transfert : si le dernier mail du client répète seulement sa demande, sans répondre aux questions encore ouvertes ni apporter de fait nouveau, le transfert repeated_failure ou diagnosis_out_of_tools n'est pas encore accepté. Ne rédige pas toi-même cette relance : propose le transfert, le serveur le remplace par UNE relance (questions ouvertes reprises mot pour mot, capture d'écran de l'erreur, annonce du passage à un conseiller). Après cette relance, un nouveau message sans fait nouveau permet le transfert. Les autres motifs de transfert sont inchangés.";
+export const SAV_CASE_ASK_BEFORE_HANDOFF_INSTRUCTION = "Relance avant transfert : si le dernier mail du client répète seulement sa demande, sans répondre aux questions encore ouvertes ni apporter de fait nouveau, le transfert repeated_failure ou diagnosis_out_of_tools n'est pas encore accepté. Une simple répétition n'apporte aucun fait : n'enregistre pas de newFacts pour elle. Ne rédige pas toi-même cette relance : propose le transfert, le serveur le remplace par UNE relance (questions ouvertes reprises mot pour mot, capture d'écran de l'erreur, annonce du passage à un conseiller). Après cette relance, un nouveau message sans fait nouveau permet le transfert. Les autres motifs de transfert sont inchangés.";
 
 const REASK_REASONS = new Set(["repeated_failure", "diagnosis_out_of_tools"]);
 const normalize = (value: string) => value.normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase("fr").replace(/[’`]/g, "'");
 const SCREEN_TEXT = /\b(?:captures? d'ecran|copies? d'ecran|screenshots?|message d'erreur|quel(?:le)? (?:message|erreur)|ce qui s'affiche)\b/;
 const SCREEN_KEY = /screenshot|capture|error_message|erreur/;
+const HUMAN_REQUEST = /\b(?:parler|echanger|discuter|etre (?:mise? en relation|rappelee?|contactee?)|joindre|contacter|avoir)\b[^.!?\n]{0,40}\b(?:conseill\w+|humains?|personnes?|quelqu'un|agents?|techniciens?|responsables?|interlocut\w+|vrai\w*)\b|\b(?:rappelez|appelez|contactez)[- ]moi\b|\bun (?:conseiller|humain|etre humain)\b/;
 const at = (value: string) => Date.parse(value);
 const keyOf = (ref: CaseDecisionSourceRef) => `${ref.type}:${ref.id}`;
 
@@ -66,8 +69,13 @@ export function caseReaskBeforeHandoff(proposal: CaseDecisionProposal, context: 
   const fromLatest = (ref: CaseDecisionSourceRef) => keyOf(ref) === keyOf(latest.ref) || (ref.type === "attachment" && caseDecisionAttachmentMail(ref) === latest.ref.id);
   // Our questions, not the procedure follow-up the case records after an answer (`procedure:<effect>`), asked before the latest mail.
   const asked = context.questions.map((row, index) => ({ row, index })).filter(({ row }) => !row.id.startsWith("procedure:") && at(row.askedAt) < at(latest.at));
-  // The latest mail answers one of our questions: it brings a new fact, the model's hand-over stands.
-  if (facts.some(fact => fact.key !== null && fromLatest(fact.source) && asked.some(({ row }) => row.factKeys.includes(fact.key!)))) return null;
+  // Review Astra P1 (17/11): only a mail that brings NOTHING new is re-asked. Any fact read from it (an answer, a new diagnostic detail, a request for a
+  // person), recorded before or proposed now, leaves the model's decision unchanged.
+  if (facts.some(fact => fromLatest(fact.source))) return null;
+  // A request for a person or an advisor in the customer's own words (quoted history and signature set aside) keeps the hand-over, whatever reason the model gave.
+  // The V2 path has no other detector than the model's own `explicit_human_request`: this narrow reading backs it up. An unreadable mail proves nothing: no re-ask.
+  const raw = context.customerTexts[keyOf(latest.ref)];
+  if (!raw || HUMAN_REQUEST.test(normalize(loginCustomerStatement(splitSavMessageText(raw))))) return null;
 
   const answered = (row: CaseDecisionValidationContext["questions"][number]) => row.answeredBy !== null
     || (row.factKeys.length ? row.factKeys.some(key => facts.some(fact => fact.key === key && fact.at > at(row.askedAt))) : false);
