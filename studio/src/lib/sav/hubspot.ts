@@ -1347,12 +1347,22 @@ export async function continueHubspotBackfill(maxPages = 1, pageSize = 25) {
   }
 }
 
-async function processHubspotReceiptGroup(receiptIds: string[]) {
+export async function processHubspotReceiptGroup(receiptIds: string[]) {
   const claimed = [];
   for (const id of receiptIds) { const receipt = await claimWebhookReceipt(id, "hubspot"); if (receipt) claimed.push(receipt); }
   if (!claimed.length) return [] as string[];
   try {
     const events = claimed.map(receipt => hubspotEventSchema.parse(receipt.payload));
+    // Each receipt can carry an owner change even when the latest one is a stage change.
+    const { requestOwnerHandover } = await import("./cases/owner-handover");
+    for (const item of [...events].sort((a, b) => (a.occurredAt ?? 0) - (b.occurredAt ?? 0))) {
+      try { await requestOwnerHandover(item, { env: process.env }); }
+      catch {
+        // Workflow start has its own durable start_failed marker. Keep ordinary
+        // snapshot/stage receipts independent; never log CRM payloads or errors.
+        console.error("sav_v2_owner_handover_request_failed", { ticketId: String(item.objectId ?? ""), code: "SAV_OWNER_HANDOVER_REQUEST_FAILED" });
+      }
+    }
     const event = events.sort((a, b) => (b.occurredAt ?? 0) - (a.occurredAt ?? 0))[0];
     // Every raw receipt remains durable; one fresh snapshot covers this bounded
     // group for the same object. Mark each claimed event only after it succeeds.
@@ -1398,4 +1408,20 @@ export async function processPendingHubspotReceipts(limit = 20) {
     }
   }
   return results;
+}
+
+/** Read-only, complete bounded email history; ambiguous or incomplete history never triggers a reply. */
+export async function readOwnerHandoverTicket(ticketId: string) {
+  if (!/^\d{1,30}$/.test(ticketId)) throw Error("SAV_OWNER_HANDOVER_TICKET_INVALID");
+  const ticket = await hubspotFetch<HubspotRecord & { archived?: boolean }>(`/crm/v3/objects/tickets/${ticketId}?properties=hubspot_owner_id,hs_pipeline`);
+  if (ticket.id !== ticketId || ticket.archived) throw Error("SAV_OWNER_HANDOVER_TICKET_INVALID");
+  const links = await hubspotFetch<{ results: Array<{ toObjectId: number | string }>; paging?: { next?: unknown } }>(`/crm/v4/objects/tickets/${ticketId}/associations/emails?limit=200`);
+  if (!Array.isArray(links.results) || links.paging?.next) throw Error("SAV_OWNER_HANDOVER_HISTORY_INCOMPLETE");
+  const emails = await loadSavHubspotTicketEmails({ ...ticket, associations: { emails: { results: links.results.map(row => ({ id: String(row.toObjectId) })) } } });
+  const rows = emails.map(row => ({ at: /^\d+$/.test(row.properties.hs_timestamp ?? "") ? Number(row.properties.hs_timestamp) : Date.parse(row.properties.hs_timestamp ?? ""), direction: row.properties.hs_email_direction }));
+  if (rows.some(row => !Number.isFinite(row.at))) throw Error("SAV_OWNER_HANDOVER_HISTORY_INCOMPLETE");
+  const lastEmailAt = Math.max(0, ...rows.map(row => row.at)), last = rows.filter(row => row.at === lastEmailAt);
+  const lastDirection = last.some(row => isHubspotOutboundDirection(row.direction ?? "")) ? "team" as const
+    : last.length && last.every(row => row.direction === "INCOMING_EMAIL") ? "customer" as const : "unknown" as const;
+  return { owner: ticket.properties.hubspot_owner_id ?? null, pipeline: ticket.properties.hs_pipeline ?? null, lastEmailAt, lastDirection };
 }
