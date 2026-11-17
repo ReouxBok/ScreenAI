@@ -6,7 +6,7 @@ import { readCaseInvestigationProgress } from "./investigation-record";
 export const closingHandoffReplyEnabled = (env: Readonly<Record<string, string | undefined>>) => env.SAV_V2_CLOSING_HANDOFF_REPLY === "on";
 export const isTerminalReply = (purpose: string) => purpose === "closing" || purpose === "handoff";
 export const CLOSING_REPLY = "Merci pour votre confirmation, nous sommes ravis que le problème soit résolu. Si le problème revient, vous pouvez répondre à ce message.";
-export const HANDOFF_REPLY = "Votre demande est transmise à un conseiller.";
+export const HANDOFF_REPLY = "Un conseiller reprend votre demande.";
 
 /** Only the agent's own durable transfer, before any person takes over. CRM ownership is still checked separately. */
 export function pendingHandoffReply(snapshot: CaseSnapshot, events: readonly CaseEvent[], triggerEventId: string) {
