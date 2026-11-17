@@ -1,7 +1,9 @@
 // V2 ticket states (local, OFF): the PURE part that turns A's rules (`customer-return.ts`: plan, gate, verification) into an effect of the EXISTING executor.
 //   « waiting for the customer »  after a CONFIRMED V2 reply        key `case-stage:<case>:waiting_customer:<reply key>`
 //   « closed »                    after a PROVEN resolution          key `case-stage:<case>:closed:cycle-<n>`
-// Nothing here reads, writes or sends. The write is the ticket's pipeline stage and nothing else (never the owner, never a property of the customer's data).
+//   « handoff »                   after the V2 hand-over (SAV-92)    key `case-stage:<case>:handoff:handoff-v<n>`
+// Nothing here reads, writes or sends. The write is the ticket's pipeline stage and nothing else (never a property of the customer's data); the owner is never set, and
+// only the hand-over clears it (Ugo 17/11: « Nouveau », no owner, so the team picks the ticket up).
 import type { EffectIntent } from "../intake/execution-types";
 import { SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import type { CaseTicketStageIntent, CaseTicketStageTarget, CaseTicketStageTrigger } from "./customer-return";
@@ -30,9 +32,10 @@ export function buildTicketStageIntent(plan: CaseTicketStageIntent, v2OwnerId: s
   if (!TICKET.test(plan.ticketId) || !OWNER.test(v2OwnerId) || !plan.key.startsWith(TICKET_STAGE_KEY_PREFIX) || !/^[A-Za-z0-9_-]{1,40}$/.test(plan.stageId)) return fault("INTENT_INVALID");
   return {
     kind: "ticket_stage", permission: SAV_CASE_EFFECT_PERMISSIONS.stage, key: plan.key, ticketId: plan.ticketId, sourceMessageId: plan.caseId,
-    properties: { hs_pipeline_stage: plan.stageId }, expectedOwnerId: v2OwnerId,
+    properties: plan.target === "handoff" ? { hs_pipeline_stage: plan.stageId, hubspot_owner_id: "" } : { hs_pipeline_stage: plan.stageId }, expectedOwnerId: v2OwnerId,
   };
 }
 
 export const ticketStageTarget = (intent: Pick<EffectIntent, "key">): CaseTicketStageTarget | null =>
-  /^case-stage:[^:]+:waiting_customer:/.test(intent.key) ? "waiting_customer" : /^case-stage:[^:]+:closed:/.test(intent.key) ? "closed" : null;
+  /^case-stage:[^:]+:waiting_customer:/.test(intent.key) ? "waiting_customer" : /^case-stage:[^:]+:closed:/.test(intent.key) ? "closed"
+    : /^case-stage:[^:]+:handoff:/.test(intent.key) ? "handoff" : null;

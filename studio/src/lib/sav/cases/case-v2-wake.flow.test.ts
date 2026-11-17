@@ -28,6 +28,7 @@ import { TICKET_STAGE_KEY_PREFIX } from "./case-ticket-stage";
 import { createCaseTicketOwnerPort, createCaseV2WakeDeps } from "./case-v2-wake-ports";
 import { runCaseV2Wake, type CaseV2WakeDeps } from "./case-v2-wake";
 import { enqueueHandoffNotices } from "./case-handoff-notice-store";
+import { enqueueHandoffStages } from "./case-handoff-stage";
 import { recordConfirmedCaseReply } from "./case-effect-outcomes";
 import { applyProvenResolution, applyProvenResolutions } from "./case-resolution";
 import { HANDOFF_NOTICE_KEY_PREFIX, type HandoffCrmReading } from "./case-handoff-notice";
@@ -338,7 +339,7 @@ describe("closing and handoff customer acknowledgements", () => {
     expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true, created: true } });
     await wake(); await wake();
     expect(sends).toBe(1);
-    expect(mimeText(sentBodies[0]!)).toContain("Votre demande est transmise à un conseiller.");
+    expect(mimeText(sentBodies[0]!)).toContain("Un conseiller reprend votre demande.");
     expect((await stageRows(made.caseId))).toHaveLength(0);
     expect((await readCase(made.caseId))!.phase).toBe("handoff_pending");
     const effects = await f.db.select().from(savIntakeEffects).where(eq(savIntakeEffects.kind, "reply_send"));
@@ -999,5 +1000,88 @@ describe("SAV-92 (16/11): the closure note, written once after a CONFIRMED « cl
     expect(closedPatches()).toHaveLength(1);
     expect(closureNotes()).toHaveLength(1);
     expect((await closingRows(made.caseId))[0]).toMatchObject({ state: "confirmed" });
+  });
+});
+
+describe("SAV-92 (Ugo 17/11): a V2 hand-over gives the ticket back to the team, « Nouveau » and no owner, once", () => {
+  const handoffStages = (caseId: string) => stageRows(caseId).then(rows => rows.filter(row => row.replyKey.includes(":handoff:")));
+  const ticketPatches = (ticketId: string) => patches().filter(call => call.path === `/crm/v3/objects/tickets/${ticketId}`);
+  const sensitiveHandoff: Answer = request => {
+    const u = understood(request.snapshot);
+    return { status: "ok", output: { caseVersion: request.snapshot.version, understanding: { ...u, requests: u.requests.map(row => ({ ...row, family: "finance" })) },
+      nextAction: { kind: "handoff", reason: "sensitive_request", requestIds: [u.requests[0]!.id], report: { need: "Une question de facturation.", expected: null, observed: null,
+        trialIds: [], hypotheses: [], missingInformation: [], expectedIntervention: "Traiter la demande de facturation.", knowledge: [] } } } };
+  };
+  beforeEach(() => { environment = { ...environment, SAV_V2_CLOSING_HANDOFF_REPLY: "on", SAV_HANDOFF_NOTICE: undefined }; kb.cards = []; });
+
+  it("OFF (switch absent): the hand-over reply is sent and the ticket is not touched (owner and stage unchanged), as before", async () => {
+    const made = await newCase("gm-ho-stage-off");
+    expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
+    expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true } });
+    const result = await wake(); await wake();
+    expect(result).not.toHaveProperty("handoffStages");
+    expect(sends).toBe(1);
+    expect(await stageRows(made.caseId)).toHaveLength(0);
+    expect(ticketPatches(made.ticketId)).toHaveLength(0);
+    expect(ticketProps(made.ticketId)).toMatchObject({ hs_pipeline_stage: "1", hubspot_owner_id: V2_OWNER });
+  });
+
+  it("ON with the hand-over reply: the reply leaves first (the V2 owner is still there), then ONE stage: « 1 », owner cleared; replays add nothing", async () => {
+    environment.SAV_V2_HANDOFF_STAGE = "on";
+    const made = await newCase("gm-ho-stage-reply", "waiting");
+    expect(ticketProps(made.ticketId).hs_pipeline_stage).toBe("2");
+    expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
+    // The reply is still to come: the sweep waits for it (clearing the owner first would hold that reply for good).
+    expect((await wake()).handoffStages).toMatchObject({ refused: { handoff_reply_pending: 1 } });
+    expect(await handoffStages(made.caseId)).toHaveLength(0);
+    expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true } });
+    await wake(); await wake(); await wake();
+    expect(sends).toBe(1);
+    expect(mimeText(sentBodies[0]!)).toContain("Un conseiller reprend votre demande.");
+    expect(await handoffStages(made.caseId)).toMatchObject([{ state: "confirmed" }]);
+    expect(await stageRows(made.caseId)).toHaveLength(1); // no « waiting » stage for a terminal reply
+    expect(ticketPatches(made.ticketId)).toEqual([expect.objectContaining({ body: { properties: { hs_pipeline_stage: "1", hubspot_owner_id: "" } } })]);
+    expect(ticketProps(made.ticketId)).toMatchObject({ hs_pipeline_stage: "1" });
+    expect(ticketProps(made.ticketId).hubspot_owner_id || null).toBeNull();
+    // Replay: the sweep, a fresh window and more wakes queue and write nothing more.
+    await f.client.exec("DELETE FROM sav.sync_state WHERE key LIKE 'sav-v2-sweep.v1:%'");
+    expect(await enqueueHandoffStages({ policy: { id: policyId, hash: policyHash }, env: () => environment, since })).toMatchObject({ created: 0 });
+    await wake(); await wake();
+    expect(await handoffStages(made.caseId)).toHaveLength(1);
+    expect(ticketPatches(made.ticketId)).toHaveLength(1);
+    expect(await readCase(made.caseId)).toMatchObject({ owner: "human", phase: "handoff_pending" });
+  });
+
+  it("ON, sensitive hand-over: NO customer message, and still ONE stage « 1 » with the owner cleared; replays add nothing", async () => {
+    environment.SAV_V2_HANDOFF_STAGE = "on";
+    const made = await newCase("gm-ho-stage-sensitive");
+    expect(await investigate(made.caseId, [sensitiveHandoff])).toMatchObject({ outcome: "accepted" });
+    expect(await readCase(made.caseId)).toMatchObject({ owner: "human", phase: "handoff_pending" });
+    for (let n = 0; n < 3; n++) await wake();
+    expect(sends).toBe(0);
+    expect(await replyRows(made.caseId)).toHaveLength(0);
+    expect(await handoffStages(made.caseId)).toMatchObject([{ state: "confirmed" }]);
+    expect(ticketPatches(made.ticketId)).toEqual([expect.objectContaining({ body: { properties: { hs_pipeline_stage: "1", hubspot_owner_id: "" } } })]);
+    expect(ticketProps(made.ticketId).hubspot_owner_id || null).toBeNull();
+    await f.client.exec("DELETE FROM sav.sync_state WHERE key LIKE 'sav-v2-sweep.v1:%'");
+    await wake(); await wake();
+    expect(await handoffStages(made.caseId)).toHaveLength(1);
+    expect(ticketPatches(made.ticketId)).toHaveLength(1);
+  });
+
+  it("ON but a person took the case first, or the ticket is closed (stage 4): no owner cleared, no stage written", async () => {
+    environment.SAV_V2_HANDOFF_STAGE = "on";
+    const taken = await newCase("gm-ho-stage-taken");
+    expect(await investigate(taken.caseId, [sensitiveHandoff])).toMatchObject({ outcome: "accepted" });
+    const current = (await readCase(taken.caseId))!;
+    await transitionCaseOwner({ caseId: taken.caseId, expectedVersion: current.version, transition: "human_takeover", actor: { type: "human", staffUserId: RULE }, commandKey: "ho-stage-takeover", reason: "human_requested" });
+    const closed = await newCase("gm-ho-stage-closed");
+    p.objects.tickets[closed.ticketId]!.properties.hs_pipeline_stage = "4";
+    expect(await investigate(closed.caseId, [sensitiveHandoff])).toMatchObject({ outcome: "accepted" });
+    for (let n = 0; n < 3; n++) { await wake(); await letReconcile(); }
+    expect(await handoffStages(taken.caseId)).toHaveLength(0);
+    expect(ticketPatches(taken.ticketId)).toHaveLength(0);
+    expect(ticketPatches(closed.ticketId)).toHaveLength(0);
+    expect(ticketProps(closed.ticketId)).toMatchObject({ hs_pipeline_stage: "4", hubspot_owner_id: V2_OWNER });
   });
 });
