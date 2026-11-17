@@ -32,7 +32,7 @@ const keyOf = (ref: CaseDecisionSourceRef) => `${ref.type}:${ref.id}`;
 type Question = Extract<CaseDecisionProposal["nextAction"], { kind: "ask" }>["questions"][number];
 
 /**
- * The single re-ask that replaces a premature hand-over, or null when the hand-over stands (another reason, a sensitive or multi-request case,
+ * The single re-ask that replaces a premature hand-over, or null when the hand-over stands (another reason, a sensitive case, open requests on different topics,
  * new facts in the latest mail, the re-ask already sent, or a record we cannot read). Null always means: main's behaviour.
  */
 export function caseReaskBeforeHandoff(proposal: CaseDecisionProposal, context: CaseDecisionValidationContext): CaseDecisionProposal | null {
@@ -40,7 +40,11 @@ export function caseReaskBeforeHandoff(proposal: CaseDecisionProposal, context: 
   if (action.kind !== "handoff" || !REASK_REASONS.has(action.reason)) return null;
   if (context.sensitiveCategories.length || [...context.requests, ...proposal.understanding.requests].some(row => isSensitiveCaseFamily(row.family))) return null;
   const open = context.requests.filter(row => row.status === "open");
-  if (open.length !== 1 || action.requestIds.length !== 1 || action.requestIds[0] !== open[0]!.id) return null;
+  // Several open requests are one problem told again (Ugo's real case: the same login trouble relayed from 3 mails) only when they share one family
+  // and, in a multi-block case, one block. Different topics keep main's hand-over.
+  if (!open.length || open.length > 5 || new Set(open.map(row => row.family)).size !== 1) return null;
+  if (context.blockScopes && new Set(open.map(row => context.blockScopes!.requestBlocks[row.id] ?? null)).size !== 1) return null;
+  if (!action.requestIds.length || action.requestIds.some(requestId => !open.some(row => row.id === requestId))) return null;
 
   // A repeat needs an earlier exchange: at least two customer mails, and something we already sent (a procedure or a question).
   const inbound = context.sources.filter(row => row.direction === "customer_inbound" && row.ref.type === "email").sort((a, b) => a.order - b.order);
@@ -73,6 +77,7 @@ export function caseReaskBeforeHandoff(proposal: CaseDecisionProposal, context: 
   const screenshotAsked = context.questions.some(row => SCREEN_TEXT.test(normalize(row.text ?? "")) || row.factKeys.some(key => SCREEN_KEY.test(key)));
   if (!stillOpen.length && screenshotAsked) return null;
 
+  // Every open request must be named by a question (validator rule `proposal_request_uncovered`), assigned below; the mail shows each question once.
   const requestId = open[0]!.id;
   const restated = stillOpen.slice(0, 4);
   const screenIn = restated.findIndex(row => SCREEN_TEXT.test(normalize(row.text!)) && /\b(?:captures?|copies? d'ecran|screenshots?)\b/.test(normalize(row.text!)));
@@ -83,10 +88,15 @@ export function caseReaskBeforeHandoff(proposal: CaseDecisionProposal, context: 
   }));
   if (screenIn < 0) questions.push({ text: SAV_CASE_REASK_SCREENSHOT_QUESTION, requestId, reducesUncertainty: "Relance unique avant transfert : une capture de l’erreur permet à l’équipe de diagnostiquer.",
     seeks: [{ kind: "screenshot", factKey: SAV_CASE_REASK_SCREENSHOT_KEY }] });
+  // One request per question, in order, the last question taking the rest; a request left over gets the screenshot question again (metadata only).
+  questions.forEach((question, index) => { question.requestId = open[Math.min(index, open.length - 1)]!.id; });
+  const screenshotQuestion = questions.find(question => question.seeks.some(seek => seek.factKey === SAV_CASE_REASK_SCREENSHOT_KEY))!;
+  for (const row of open.slice(questions.length)) questions.push({ ...screenshotQuestion, requestId: row.id });
+  if (questions.length > 5) return null;
 
   const intro = restated.length ? (restated.length === 1 ? "Pour pouvoir avancer, j’ai besoin de votre réponse à cette question, restée sans réponse :" : "Pour pouvoir avancer, j’ai besoin de votre réponse à ces questions, restées sans réponse :")
     : "Pour pouvoir avancer, j’ai besoin d’un élément de votre part :";
-  const asks = questions.map(question => question.text);
+  const asks = [...new Set(questions.map(question => question.text))];
   const body = ["Bonjour,", `Merci pour votre message. ${intro}`, ...asks];
   // The Access path always recalls the official link (validator rule `access_link_missing`); the restated wording may already carry it.
   if (open[0]!.family === "access" && ![...body].join("\n").includes(SAV_CASE_ACCESS_URL)) body.push(`La page de connexion reste ${SAV_CASE_ACCESS_URL}.`);

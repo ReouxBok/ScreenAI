@@ -27,8 +27,9 @@ const on = () => vi.stubEnv("SAV_V2_ASK_BEFORE_HANDOFF", "on");
 
 const codes = (result: CaseDecisionValidation) => result.outcome === "needs_review" ? result.rejections.map(row => row.code) : [];
 const decision = (result: CaseDecisionValidation) => { expect(codes(result)).toEqual([]); if (result.outcome !== "accepted") throw new Error("not accepted"); return result; };
-const handoff = (reason = "repeated_failure", caseVersion = 9) => ({ caseVersion, understanding: { requests: [{ id: "r1", summary: "Connexion impossible.", family: "access", status: "open" }], newFacts: [] as unknown[] },
-  nextAction: { kind: "handoff", reason, requestIds: ["r1"], report: { need: "Connexion impossible.", expected: null, observed: null, trialIds: [], hypotheses: [], missingInformation: [], expectedIntervention: "Vérifier côté équipe.", knowledge: [] } } });
+const handoff = (reason = "repeated_failure", caseVersion = 9, ids = ["r1"], families: string[] = ids.map(() => "access")) => ({ caseVersion,
+  understanding: { requests: ids.map((id, index) => ({ id, summary: "Connexion impossible.", family: families[index]!, status: "open" })), newFacts: [] as unknown[] },
+  nextAction: { kind: "handoff", reason, requestIds: ids, report: { need: "Connexion impossible.", expected: null, observed: null, trialIds: [], hypotheses: [], missingInformation: [], expectedIntervention: "Vérifier côté équipe.", knowledge: [] } } });
 
 /* ---------- Unit: the rule on a hand-built validation context ---------- */
 
@@ -91,6 +92,12 @@ describe("SAV_V2_ASK_BEFORE_HANDOFF: one re-ask before a premature hand-over", (
   it.each(["explicit_human_request", "knowledge_missing", "evidence_inaccessible"])("on: the other hand-over reasons are unchanged (%s)", reason => {
     on();
     expect(decision(run(handoff(reason))).decision.nextAction).toMatchObject({ kind: "handoff", reason });
+  });
+
+  it("on: several open requests on different topics keep the hand-over", () => {
+    on();
+    const context = ctx({ requests: [{ id: "r1", family: "access", status: "open" }, { id: "r2", family: "usage", status: "open" }] });
+    expect(decision(run(handoff("repeated_failure", 9, ["r1", "r2"], ["access", "usage"]), context)).decision.nextAction.kind).toBe("handoff");
   });
 
   it("on: a sensitive case keeps its hand-over", () => {
@@ -174,11 +181,11 @@ describe("flow: 16/11 card steps → empty repeat → 2 questions → empty repe
   const outbound = (id: string, at: string) => event("outbound_observed", "agent_outbound", at, id);
 
   /** The case as the store leaves it after the 22:50 questions and the 17/11 repeat. */
-  function initial() {
+  function initial(ids = ["r1"]) {
     seq = 0;
     const events = [inbound("m1", "2026-11-16T12:00:00Z"), outbound("a1", "2026-11-16T12:30:00Z"), inbound("m2", "2026-11-16T20:00:00Z"),
       outbound("a2", "2026-11-16T22:50:00Z"), inbound("m3", "2026-11-17T06:30:00Z")];
-    const body: CaseBody = { ...emptyCaseBody(), openRequests: [{ id: "r1", summary: "Connexion impossible.", family: "access", status: "open", openedAt: "2026-11-16T12:00:00Z" }],
+    const body: CaseBody = { ...emptyCaseBody(), openRequests: ids.map(id => ({ id, summary: "Connexion impossible.", family: "access" as const, status: "open" as const, openedAt: "2026-11-16T12:00:00Z" })),
       trials: [{ id: "t1", requestId: "r1", procedure: { knowledgeId: "k-login", contentVersionId: "k-login-v1" }, askedAt: "2026-11-16T12:30:00Z", outcome: "pending", resultAt: null }],
       questions: [
         { id: "procedure:eff-1", text: "Avez-vous pu essayer la procédure proposée ?", factKeys: [], askedAt: "2026-11-16T12:30:00Z", askedInEffect: "eff-1" },
@@ -229,6 +236,33 @@ describe("flow: 16/11 card steps → empty repeat → 2 questions → empty repe
     const second = decide(state, handoff());
     expect(decision(second.validation).decision.nextAction).toMatchObject({ kind: "handoff", reason: "repeated_failure" });
     expect(second.validation.outcome === "accepted" && second.validation.signals).not.toContain("handoff_reask_composed");
+    expect(second.draft?.reply ?? null).toBeNull();
+  });
+
+  it("on, Ugo's real case: 3 open Access requests relayed from 3 repeated mails, 2 open questions → 1 re-ask, then hand-over on the next empty repeat", () => {
+    on();
+    const ids = ["r1", "r2", "r3"];
+    const state = initial(ids);
+    const first = decide(state, handoff("repeated_failure", 9, ids));
+    const accepted = decision(first.validation);
+    expect(accepted.signals).toContain("handoff_reask_composed");
+    const action = accepted.decision.nextAction;
+    if (action.kind !== "ask") throw new Error("expected an ask");
+    // Every open request is named by a question; the mail shows each question once, in send order.
+    expect(new Set(action.questions.map(question => question.requestId))).toEqual(new Set(ids));
+    const reply = first.draft!.reply!;
+    expect(reply.purpose).toBe("question");
+    for (const asked of [Q_ERROR, Q_PAGE, SAV_CASE_REASK_SCREENSHOT_QUESTION]) expect(reply.text.split(asked).length - 1).toBe(1);
+    expect(reply.text.indexOf(Q_PAGE)).toBeGreaterThan(reply.text.indexOf(Q_ERROR));
+    expect(reply.text.indexOf(SAV_CASE_REASK_SCREENSHOT_QUESTION)).toBeGreaterThan(reply.text.indexOf(Q_PAGE));
+    expect(reply.text).toContain(SAV_CASE_REASK_ADVISOR_NOTICE);
+    expect(decide(state, handoff("repeated_failure", 9, ids)).draft).toEqual(first.draft);
+
+    const sentAt = "2026-11-17T07:05:00Z";
+    state.body = { ...state.body, questions: [...state.body.questions, ...reply.questions!.map(question => ({ id: question.id, text: question.text, factKeys: [...question.factKeys], askedAt: sentAt, askedInEffect: "eff-3" }))] };
+    state.events.push(outbound("a3", sentAt), inbound("m4", "2026-11-17T10:00:00Z"));
+    const second = decide(state, handoff("repeated_failure", 9, ids));
+    expect(decision(second.validation).decision.nextAction).toMatchObject({ kind: "handoff", reason: "repeated_failure", requestIds: ids });
     expect(second.draft?.reply ?? null).toBeNull();
   });
 });
