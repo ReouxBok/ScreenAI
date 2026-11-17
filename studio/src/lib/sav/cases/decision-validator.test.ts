@@ -659,13 +659,15 @@ describe("SAV-6 purity", () => {
     const dir = path.dirname(fileURLToPath(import.meta.url));
     const imports = (file: string) => [...readFileSync(path.join(dir, file), "utf8").matchAll(/from "([^"]+)"/g)].map(match => match[1]).sort();
     // `../message-context`: the shared, pure split of a mail into the customer's own words and what they quote (nothing behind it but the schema library).
-    expect(imports("decision-validator.ts")).toEqual(["../message-context", "../request-retrieval", "./decision-contract", "./investigation-access-scope", "./restored-access"]);
+    expect(imports("decision-validator.ts")).toEqual(["../message-context", "../request-retrieval", "./ask-before-handoff", "./decision-contract", "./investigation-access-scope", "./restored-access"]);
+    // SAV-92 ask-before-handoff (17/11): a pure composition over the contract, nothing else behind it.
+    expect(imports("ask-before-handoff.ts")).toEqual(["./decision-contract"]);
     expect(imports("restored-access.ts")).toEqual(["../message-context"]);
     expect(imports("../message-context.ts")).toEqual(["zod"]);
     expect(imports("decision-contract.ts")).toEqual(["../playbook-contract", "../request-retrieval", "./admission-policy", "./case-types", "./investigation-access-scope", "zod"]);
     // Pilot ACCÈS scope (3/11): a pure datum check, nothing behind it but the schema library.
     expect(imports("investigation-access-scope.ts")).toEqual(["zod"]);
-    expect(imports("decision-context.ts")).toEqual(["../request-retrieval", "./admission-policy", "./case-types", "./decision-contract"]);
+    expect(imports("decision-context.ts")).toEqual(["../request-retrieval", "./admission-policy", "./ask-before-handoff", "./case-types", "./decision-contract"]);
     // Pole A's admission rule is pure: no store, database or clock behind it.
     expect(imports("admission-policy.ts")).toEqual(["./case-types"]);
   });

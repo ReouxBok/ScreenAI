@@ -1,3 +1,4 @@
+import { caseAskBeforeHandoffEnabled } from "./ask-before-handoff";
 import type { SavRetrievalCandidate } from "../request-retrieval";
 import {
   caseBodySchema, caseTeamPartRequests, currentCaseFacts, SAV_CASE_CONTRACT_REVISION, SAV_CASE_EVENT_KIND_DIRECTIONS,
@@ -83,7 +84,7 @@ export function buildCaseDecisionContext(input: CaseDecisionContextInput): CaseD
     sources: [...sources.values()], customerTexts: { ...input.customerTexts },
     // Facts still in force only (pole A v5 §7.1): a corrected fact is replaced, its history kept for audit.
     facts: currentCaseFacts(body.data).map(row => ({ id: row.id, key: row.key, kind: row.kind, source: row.source, at: row.at })),
-    questions: body.data.questions.map(row => ({ id: row.id, factKeys: row.factKeys, askedAt: row.askedAt, answeredBy: row.answeredBy ?? null })),
+    questions: body.data.questions.map(row => ({ id: row.id, factKeys: row.factKeys, askedAt: row.askedAt, answeredBy: row.answeredBy ?? null, ...(caseAskBeforeHandoffEnabled() ? { text: row.text } : {}) })),
     trials: body.data.trials.map(row => ({ id: row.id, requestId: row.requestId, knowledge: row.procedure, askedAt: row.askedAt, outcome: row.outcome, resultAt: row.resultAt })),
     handoffs,
     knowledge: input.knowledge,

@@ -9,6 +9,7 @@ import {
   type CaseDecisionProposal, type CaseDecisionValidationContext, type CaseResolutionEvidence, type SavCaseSensitiveFamily,
 } from "./decision-contract";
 import { caseAccessSourceProblem } from "./investigation-access-scope";
+import { caseAskBeforeHandoffEnabled, caseReaskBeforeHandoff } from "./ask-before-handoff";
 
 /*
  * Pure and deterministic: no model, network, database, clock or effect. `now` is an argument.
@@ -457,6 +458,13 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
     return needsReview();
   }
   const proposal = parsed.data, action = proposal.nextAction;
+  // SAV-92 (Ugo 17/11): a repeat without new facts is not handed over before ONE re-ask, composed from the case's records and checked like any other
+  // proposal. Anything that keeps it from being accepted leaves the hand-over to the rules below, exactly as on main.
+  if (action.kind === "handoff" && caseAskBeforeHandoffEnabled()) {
+    const reask = caseReaskBeforeHandoff(proposal, context);
+    const composedAsk = reask ? validate(reask, context, now, true) : null;
+    if (composedAsk?.outcome === "accepted") return { ...composedAsk, signals: ordered(new Set<CaseDecisionSignal>([...composedAsk.signals, "handoff_reask_composed"]), caseDecisionSignalLabels) };
+  }
 
   if (proposal.caseVersion !== context.caseVersion) reject("case_version_stale", "caseVersion", `${proposal.caseVersion}<>${context.caseVersion}`);
   if (context.owner !== "agent" && action.kind !== "observe_only") reject("case_not_agent_owned", "nextAction.kind", context.owner);
@@ -773,7 +781,7 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
           trialIds: context.trials.filter(trial => trial.requestId === open[0]!.id).map(trial => trial.id), hypotheses: [], missingInformation: [],
           expectedIntervention: "Vérifier côté équipe pourquoi la connexion reste bloquée : l’agent n’a établi aucune cause.", knowledge: [loginRef],
         } } }, context, now, true);
-        return routed.outcome === "accepted" ? { ...routed, signals: ordered(new Set<CaseDecisionSignal>([...routed.signals, "login_procedure_refused_routed"]), caseDecisionSignalLabels) } : routed;
+        return routed.outcome === "accepted" && routed.decision.nextAction.kind === "handoff" ? { ...routed, signals: ordered(new Set<CaseDecisionSignal>([...routed.signals, "login_procedure_refused_routed"]), caseDecisionSignalLabels) } : routed;
       }
       reject("login_procedure_redundant", "nextAction.kind");
     } else if (loginSays.officialLink && open.length === 1 && families.get(open[0]!.id) === "access" && !sensitive.size && !proposal.reply?.impossibilityClaims.length) {
