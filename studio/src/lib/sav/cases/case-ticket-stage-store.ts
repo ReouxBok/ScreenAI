@@ -22,12 +22,12 @@ import { savIntakeRuntimeConfig } from "../intake/runtime-contract";
 import { ownedExecution, settleVerification } from "./case-effect-driver";
 import { caseEffectSchemaInstalled } from "./case-effect-recovery";
 import { buildTicketStageIntent, TICKET_STAGE_KEY_PREFIX, type TicketStagePayload } from "./case-ticket-stage";
-import { caseTeamPartPending, lastCustomerInboundAt } from "./case-ticket-stage-queue";
+import { caseTeamPartPending, lastCustomerInboundAt, openHandoffVersion } from "./case-ticket-stage-queue";
 import { createCaseTicketStageAdapters, TICKET_STAGE_NOT_APPLIED_PREFIX } from "./case-ticket-stage-hubspot";
 import { v2HubspotOwnerId } from "./intake-boundary";
 import { lockCaseForWrite } from "./case-store";
 import { readCaseTicketId, type CaseTicketOwnerPort } from "./case-ticket-owner";
-import { decideCaseTicketStage, planCaseTicketStage, readCaseTicketStageConfig, type CustomerReturnOwnerNow } from "./customer-return";
+import { caseHandoffStageEnabled, decideCaseTicketStage, planCaseTicketStage, readCaseTicketStageConfig, type CustomerReturnOwnerNow } from "./customer-return";
 import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, type CaseNoteCreateIntent } from "./case-effect-intents";
 import { caseNoteAssociationKey, caseNoteKey, SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { caseClosureNoteInteractionId, caseClosureNoteText, caseReplyNoteEnabled } from "./case-reply-summary-note";
@@ -89,13 +89,17 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
     const snapshot = await lockCaseForWrite(tx, caseId);
     const { intent } = payload;
     if (payload.trigger.kind === "j2_confirmed" && deps.env().SAV_V2_J2_CONTEXTUAL !== "on") return fault("HOLD_J2_CONTEXTUAL_OFF");
+    // SAV-92 (17/11): the hand-over stage's own switch, turned off since the plan: held, nothing lost (never cancelled by the switch alone).
+    const handoff = payload.trigger.kind === "handoff_recorded";
+    if (handoff && !caseHandoffStageEnabled(deps.env())) return fault("HOLD_HANDOFF_STAGE_OFF");
     // What the execution was sealed for must still be what A's rule plans now (same ticket, same key, same stage): otherwise the case or the configuration moved.
     let still = false;
     try {
+      const handoffVersion = handoff ? await openHandoffVersion(tx, snapshot) : undefined;
       const planned = planCaseTicketStage({
         config, caseId, ticketId: snapshot.ticketId, case: { owner: snapshot.owner, phase: snapshot.phase, sensitivity: snapshot.sensitivity, cycle: snapshot.body.cycle,
-        ...(await caseTeamPartPending(tx, snapshot) ? { teamPartPending: true } : {}) },
-        trigger: payload.trigger, lastCustomerInboundAt: null,
+        ...(!handoff && await caseTeamPartPending(tx, snapshot) ? { teamPartPending: true } : {}), ...(handoffVersion === undefined ? {} : { handoffVersion }) },
+        trigger: payload.trigger, lastCustomerInboundAt: null, ...(handoff ? { handoffStage: true } : {}),
       });
       still = planned.plan && planned.intent.key === intent.key && planned.intent.stageId === intent.stageId && planned.intent.ticketId === intent.ticketId;
     } catch { still = false; }
@@ -222,6 +226,7 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
       // A ledger row that exists is what was planned: its stored intent is returned, never a rebuilt one.
       if (existing) return existing.state === "confirmed" ? nextClosureNoteIntent(lease, effects, existing, options) : effectIntent(existing);
       if (readCaseTicketStageConfig(deps.env()).mode !== "on") return fault("HOLD_STAGES_OFF");
+      if (payload.trigger.kind === "handoff_recorded" && !caseHandoffStageEnabled(deps.env())) return fault("HOLD_HANDOFF_STAGE_OFF");
       const owner = v2HubspotOwnerId(deps.env());
       if (!owner) return fault("HOLD_OWNER_ID_MISSING");
       return buildTicketStageIntent(payload.intent, owner);

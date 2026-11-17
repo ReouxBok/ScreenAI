@@ -5,7 +5,7 @@
 // behind). HubSpot offers no conditional write, so the read-then-write gap is the residual limit, declared in the report. Anything unclear AFTER the PATCH may have applied:
 // it stays uncertain and is only verified. The token comes from the injected environment and appears nowhere else.
 import type { EffectAck, EffectIntent, ExecutorAdapters } from "../intake/execution-types";
-import { readCaseTicketStageConfig, verifyCaseTicketStage, type CaseTicketStageIntent } from "./customer-return";
+import { caseHandoffStageEnabled, readCaseTicketStageConfig, verifyCaseTicketStage, type CaseTicketStageIntent } from "./customer-return";
 import { ticketStageTarget } from "./case-ticket-stage";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 
@@ -63,7 +63,10 @@ export function createCaseTicketStageAdapters(deps: CaseTicketStageDeps): Pick<E
       const config = readCaseTicketStageConfig(deps.env());
       if (config.mode !== "on") return fault(`${TICKET_STAGE_NOT_APPLIED_PREFIX}STAGES_OFF`);
       // The stage sealed in the intent must still be the one the configuration names for this target: a configuration changed since the plan writes nothing.
-      if (stage.stageId !== (stage.target === "waiting_customer" ? config.waitingCustomer : config.closed)) return fault(`${TICKET_STAGE_NOT_APPLIED_PREFIX}STAGE_CONFIG_CHANGED`);
+      // SAV-92 (17/11): the hand-over writes V1's own « Nouveau » stage, under its own switch.
+      if (stage.target === "handoff" && !caseHandoffStageEnabled(deps.env())) return fault(`${TICKET_STAGE_NOT_APPLIED_PREFIX}HANDOFF_STAGE_OFF`);
+      const expectedStage = stage.target === "waiting_customer" ? config.waitingCustomer : stage.target === "closed" ? config.closed : SAV_HUBSPOT_SUPPORT.stages.new;
+      if (stage.stageId !== expectedStage) return fault(`${TICKET_STAGE_NOT_APPLIED_PREFIX}STAGE_CONFIG_CHANGED`);
       // The last look at the ticket itself, before the only write.
       let current: Awaited<ReturnType<typeof readTicket>>;
       try { current = await readTicket(stage.ticketId, signal); } catch (error) { if (error instanceof Error && error.message === "SAV_TICKET_STAGE_TOKEN_MISSING") throw error; current = null; }
@@ -72,9 +75,13 @@ export function createCaseTicketStageAdapters(deps: CaseTicketStageDeps): Pick<E
       if (current.pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId) return fault(`${TICKET_STAGE_NOT_APPLIED_PREFIX}PIPELINE_NOT_SUPPORT`);
       if (current.ownerId !== intent.expectedOwnerId) return fault(`${TICKET_STAGE_NOT_APPLIED_PREFIX}OWNER_CHANGED`);
       if (stage.target === "waiting_customer" && current.stage === config.closed) return fault(`${TICKET_STAGE_NOT_APPLIED_PREFIX}TICKET_CLOSED`);
+      // SAV-92 (17/11): a closed ticket (stage 4, or the configured closed stage) is never reopened by a hand-over.
+      if (stage.target === "handoff" && (current.stage === config.closed || current.stage === SAV_HUBSPOT_SUPPORT.stages.closed)) return fault(`${TICKET_STAGE_NOT_APPLIED_PREFIX}TICKET_CLOSED`);
+      // The hand-over is the only write that also clears the owner (empty value = no owner in HubSpot); every other target writes the stage alone.
+      const properties = stage.target === "handoff" ? { hs_pipeline_stage: stage.stageId, hubspot_owner_id: "" } : { hs_pipeline_stage: stage.stageId };
       let response: Response;
       try {
-        response = await call("PATCH", stage.ticketId, signal, { properties: { hs_pipeline_stage: stage.stageId } });
+        response = await call("PATCH", stage.ticketId, signal, { properties });
       } catch (error) {
         if (error instanceof Error && error.message === "SAV_TICKET_STAGE_TOKEN_MISSING") throw error;
         return fault("SAV_TICKET_STAGE_RESULT_UNKNOWN");

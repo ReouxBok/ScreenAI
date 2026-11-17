@@ -10,17 +10,23 @@ export const HANDOFF_REPLY = "Votre demande est transmise à un conseiller.";
 
 /** Only the agent's own durable transfer, before any person takes over. CRM ownership is still checked separately. */
 export function pendingHandoffReply(snapshot: CaseSnapshot, events: readonly CaseEvent[], triggerEventId: string) {
-  if (snapshot.sensitivity !== "none" || snapshot.body.openRequests.some(row => isSensitiveCaseFamily(row.family)) || !snapshot.body.handoff || !(snapshot.owner === "human" && snapshot.phase === "handoff_pending" && !snapshot.body.handoff.humanSince)) return false;
+  const trigger = handoffReplyTrigger(snapshot, events);
+  return trigger !== null && triggerEventId === trigger;
+}
+
+/** The trigger of the hand-over reply the agent may still send (`inbound:<mail>`), or null when no hand-over reply is allowed now. SAV-92 (17/11): also read by the hand-over stage. */
+export function handoffReplyTrigger(snapshot: CaseSnapshot, events: readonly CaseEvent[]): string | null {
+  if (snapshot.sensitivity !== "none" || snapshot.body.openRequests.some(row => isSensitiveCaseFamily(row.family)) || !snapshot.body.handoff || !(snapshot.owner === "human" && snapshot.phase === "handoff_pending" && !snapshot.body.handoff.humanSince)) return null;
   const trigger = handoffNoticeTrigger(snapshot, events);
-  if (!trigger.ok) return false;
+  if (!trigger.ok) return null;
   const read = readCaseInvestigationProgress(events, trigger.inputKey);
-  if (read.state !== "found" || read.record.decision?.validation.outcome !== "accepted" || read.record.decision.validation.decision.nextAction.kind !== "handoff") return false;
-  if (read.record.decision.actionsPaused || read.record.decision.validation.decision.nextAction.reason === "sensitive_request") return false;
-  if (events.some(e => e.caseVersion > read.caseVersion && (e.direction === "human_outbound" || e.kind === "inbound_confirmed"))) return false;
+  if (read.state !== "found" || read.record.decision?.validation.outcome !== "accepted" || read.record.decision.validation.decision.nextAction.kind !== "handoff") return null;
+  if (read.record.decision.actionsPaused || read.record.decision.validation.decision.nextAction.reason === "sensitive_request") return null;
+  if (events.some(e => e.caseVersion > read.caseVersion && (e.direction === "human_outbound" || e.kind === "inbound_confirmed"))) return null;
   const id = trigger.inputKey.slice(trigger.inputKey.indexOf(":") + 1), at = events.findIndex(e => e.id === id);
-  if (at < 0) return false;
+  if (at < 0) return null;
   const mail = trigger.inputKey.startsWith("back:") ? events.slice(0, at).findLast(e => e.direction === "customer_inbound" && e.sourceRef.type === "email") : events[at];
-  return mail?.direction === "customer_inbound" && mail.sourceRef.type === "email" && triggerEventId === `inbound:${mail.sourceRef.id}`;
+  return mail?.direction === "customer_inbound" && mail.sourceRef.type === "email" ? `inbound:${mail.sourceRef.id}` : null;
 }
 
 /** An automatic transfer is a consequence of the decision, not a new customer input for its acknowledgement. */

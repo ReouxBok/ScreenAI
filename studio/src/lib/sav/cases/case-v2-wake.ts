@@ -2,6 +2,7 @@
 //   1. handoff    sweep (`enqueueHandoffNotices`: an exhausted, accepted plan only) then the Slack pass (`runHandoffNoticePass`)
 //   2. replies    `runCaseEffectsPass` (read-only verification of engaged effects first, then the supervised sends) on the existing executor
 //   3. stages     `runCaseTicketStagePass` (« waiting for the customer » queued by the confirmed reply, « closed » queued by step 4)
+//   2b. hand-over stages (SAV-92, only under `SAV_V2_HANDOFF_STAGE=on`) `enqueueHandoffStages`: « Nouveau », no owner, once per V2 hand-over
 //   4. closures   `applyProvenResolutions`: a proven resolution ends the case `resolved` and queues the « closed » stage for the next wake
 // Every port is REQUIRED: there is no default transport, so nothing can reach a provider by omission. A step that throws is reported in `failures`, never swallowed, and the
 // next step still runs (the steps are independent; each one re-reads its own guards: pause, mode, lease, owner).
@@ -10,6 +11,8 @@ import { applyProvenResolutions, type ProvenResolutionSweepResult } from "./case
 import { enqueueHandoffNotices, runHandoffNoticePass, type HandoffNoticePassResult, type HandoffNoticeRuntimeDeps, type HandoffNoticeSweepResult } from "./case-handoff-notice-store";
 import { runCaseEffectsPass, type CaseRuntimeDeps, type CaseRuntimePassResult } from "./case-runtime-effects";
 import { runCaseTicketStagePass, type TicketStagePassResult, type TicketStageRuntimeDeps } from "./case-ticket-stage-store";
+import { enqueueHandoffStages, type HandoffStageSweepResult } from "./case-handoff-stage";
+import { caseHandoffStageEnabled } from "./customer-return";
 
 export type CaseV2WakeDeps = Readonly<{
   /** The approved execution policy `{ id, hash }` the sweeps queue under (the same the replies were queued under). */
@@ -28,12 +31,14 @@ export type CaseV2WakeResult = Readonly<{
   handoffSweep: HandoffNoticeSweepResult | null;
   handoff: HandoffNoticePassResult | null;
   replies: CaseRuntimePassResult | null;
+  /** SAV-92 (17/11): present only under `SAV_V2_HANDOFF_STAGE=on`. */
+  handoffStages?: HandoffStageSweepResult | null;
   stages: TicketStagePassResult | null;
   closures: ProvenResolutionSweepResult | null;
   /** Steps that threw: the step name and a closed error code. Nothing is erased. */
-  failures: ReadonlyArray<Readonly<{ step: "handoff_sweep" | "handoff" | "replies" | "stages" | "closures"; code: string }>>;
+  failures: ReadonlyArray<Readonly<{ step: "handoff_sweep" | "handoff" | "replies" | "handoff_stages" | "stages" | "closures"; code: string }>>;
   /** Steps not started because `deadlineMs` was reached first. Nothing durable is lost: the next wake does them. */
-  skippedByDeadline: ReadonlyArray<"handoff_sweep" | "handoff" | "replies" | "stages" | "closures">;
+  skippedByDeadline: ReadonlyArray<"handoff_sweep" | "handoff" | "replies" | "handoff_stages" | "stages" | "closures">;
 }>;
 
 const codeOf = (error: unknown) => (error instanceof Error ? error.message : "UNKNOWN_ERROR").replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 160);
@@ -49,7 +54,10 @@ export async function runCaseV2Wake(deps: CaseV2WakeDeps): Promise<CaseV2WakeRes
   const handoffSweep = await step("handoff_sweep", () => enqueueHandoffNotices({ policy: deps.policy, env, since: deps.since, deadlineMs }));
   const handoff = await step("handoff", () => runHandoffNoticePass({ ...deps.handoff, env, deadlineMs }));
   const replies = await step("replies", () => runCaseEffectsPass(deps.replies));
+  // SAV-92 (17/11): only under `SAV_V2_HANDOFF_STAGE=on` (off: the step does not exist, the wake is the same as before). After the replies (a hand-over reply sent in this
+  // wake queues its stage from its receipt), before the stages pass (which moves it in this same wake).
+  const handoffStages = caseHandoffStageEnabled(env()) ? await step("handoff_stages", () => enqueueHandoffStages({ policy: deps.policy, env, since: deps.since, deadlineMs })) : undefined;
   const stages = await step("stages", () => runCaseTicketStagePass({ ...deps.stages, env, deadlineMs, readTicketOwner }));
   const closures = await step("closures", () => applyProvenResolutions({ policy: deps.policy, env, since: deps.since, deadlineMs, currentPolicyRevision: deps.replies.currentPolicyRevision, readTicketOwner }));
-  return { handoffSweep, handoff, replies, stages, closures, failures, skippedByDeadline: skipped };
+  return { handoffSweep, handoff, replies, ...(handoffStages === undefined ? {} : { handoffStages }), stages, closures, failures, skippedByDeadline: skipped };
 }

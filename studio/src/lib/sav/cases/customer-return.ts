@@ -8,6 +8,7 @@ import { closingHandoffReplyEnabled, isTerminalReply } from "./case-terminal-rep
 // (an open case, with its context) or to V1's normal intake (a closed case, a new subject), never to a keyword.
 import type { CaseEffectLedgerState } from "./case-effects";
 import type { CaseOwner, CasePhase, CaseSensitivity } from "./case-types";
+import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 
 export const CUSTOMER_RETURN_REVISION = "sav-v2-customer-return.v1";
 
@@ -101,7 +102,10 @@ export const customerReturnNeedsOwner = (route: CustomerReturnRoute) => route.ro
 // Ticket stages: « attente client » after a confirmed V2 reply, « fermé » after a proven resolution
 // ---------------------------------------------------------------------------------------------------------------------------------
 
-export type CaseTicketStageTarget = "waiting_customer" | "closed";
+/** SAV-92 (Ugo 17/11): « handoff » = the V2 hand-over gives the ticket back to the team: stage « Nouveau » (V1's new stage) and NO owner. */
+export type CaseTicketStageTarget = "waiting_customer" | "closed" | "handoff";
+/** SAV-92 (Ugo 17/11): the hand-over stage has its own switch (exact `on`), on top of `SAV_V2_TICKET_STAGES=on`. Off: nothing differs from before. */
+export const caseHandoffStageEnabled = (env: Readonly<Record<string, string | undefined>>) => env.SAV_V2_HANDOFF_STAGE === "on";
 export type CaseTicketStageConfig =
   | Readonly<{ mode: "off"; why: "disabled" | "stage_missing" | "stage_invalid" | "stages_equal" }>
   | Readonly<{ mode: "on"; waitingCustomer: string; closed: string }>;
@@ -130,15 +134,21 @@ export type CaseTicketStageTrigger =
   | Readonly<{ kind: "reply_confirmed"; replyKey: string; sentAt: string }>
   /** The case cycle `cycle` ended `resolved` on an accepted `confirm_resolution` (evidence checked by the decision validator). */
   | Readonly<{ kind: "resolution_recorded"; cycle: number }>
-  | Readonly<{ kind: "j2_confirmed"; replyKey: string; sentAt: string; cycle: number; caseVersion: number }>;
+  | Readonly<{ kind: "j2_confirmed"; replyKey: string; sentAt: string; cycle: number; caseVersion: number }>
+  /** SAV-92 (17/11): the V2 hand-over recorded at `caseVersion` (its `owner_changed` event): one « Nouveau, no owner » per hand-over. */
+  | Readonly<{ kind: "handoff_recorded"; caseVersion: number }>;
 export type CaseTicketStagePlanInput = Readonly<{
   config: CaseTicketStageConfig;
   caseId: string;
   ticketId: string;
   case: Readonly<{ owner: CaseOwner; phase: CasePhase; sensitivity: CaseSensitivity; cycle: Readonly<{ number: number; endedBy?: "resolved" | "closed_no_reply" | "handoff" }>;
     /** SAV-92: a request of the case is the team's (handed off by the entry): the team works the ticket too, V2 moves no stage. Absent: none. */
-    teamPartPending?: boolean }>;
+    teamPartPending?: boolean;
+    /** SAV-92 (17/11): the version of the V2 hand-over still in force (the case with the team, nobody took it yet). Absent: none. */
+    handoffVersion?: number }>;
   trigger: CaseTicketStageTrigger;
+  /** SAV-92 (17/11): `SAV_V2_HANDOFF_STAGE=on`. Read only for a hand-over trigger. */
+  handoffStage?: boolean;
   /** Date of the latest customer mail of the case, if any: one received after the reply makes « attente client » stale. */
   lastCustomerInboundAt: string | null;
 }>;
@@ -148,6 +158,13 @@ export type CaseTicketStagePlan = Readonly<{ plan: true; intent: CaseTicketStage
 export function planCaseTicketStage(input: CaseTicketStagePlanInput): CaseTicketStagePlan {
   const { config, trigger } = input, current = input.case;
   if (config.mode !== "on") return { plan: false, reason: `stages_${config.why}` };
+  // SAV-92 (Ugo 17/11): the hand-over gives the ticket to the team, sensitive or not (a sensitive topic sends no message, the ticket still goes back), for the hand-over
+  // still in force only (nobody took the case since). The team's ticket is the point here, so neither the agent's ownership nor the team part is asked.
+  if (trigger.kind === "handoff_recorded") {
+    if (!input.handoffStage) return { plan: false, reason: "handoff_stage_off" };
+    if (current.owner !== "human" || current.phase !== "handoff_pending" || current.handoffVersion !== trigger.caseVersion) return { plan: false, reason: "handoff_not_current" };
+    return { plan: true, intent: { key: caseTicketStageKey(input.caseId, "handoff", `handoff-v${trigger.caseVersion}`), target: "handoff", stageId: SAV_HUBSPOT_SUPPORT.stages.new, ticketId: input.ticketId, caseId: input.caseId } };
+  }
   // A person's or the team's ticket is never moved by V2, whatever its stage.
   if (current.owner !== "agent") return { plan: false, reason: "owner_not_agent" };
   if (current.sensitivity !== "none") return { plan: false, reason: "sensitive" };
@@ -201,6 +218,8 @@ export function decideCaseTicketStage(state: CaseEffectLedgerState, target: Case
 /** Reading back after a marker. Only the stage asked AND the V2 owner kept confirm; a failed read proves nothing (still uncertain, verify again, never resend). */
 export function verifyCaseTicketStage(intent: CaseTicketStageIntent, observed: Readonly<{ stage: string | null; ownerId: string | null }> | undefined, v2OwnerId: string): "confirmed" | "not_applied" | "unreadable" {
   if (!observed) return "unreadable";
+  // SAV-92 (17/11): a hand-over is confirmed by « Nouveau » AND no owner (the V2 owner it was written from is precisely what must be gone).
+  if (intent.target === "handoff") return observed.stage === intent.stageId && observed.ownerId === null ? "confirmed" : "not_applied";
   return observed.stage === intent.stageId && observed.ownerId === v2OwnerId ? "confirmed" : "not_applied";
 }
 

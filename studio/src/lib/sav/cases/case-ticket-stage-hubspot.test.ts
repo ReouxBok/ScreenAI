@@ -20,7 +20,9 @@ function hubspot(ticket: { pipeline: string; stage: string; owner: string | null
     if (method === "PATCH") {
       if (mode === "reject") return new Response("{}", { status: 403 });
       if (mode === "lose") throw Error("SOCKET_CLOSED");
-      state.stage = JSON.parse(String(init!.body)).properties.hs_pipeline_stage;
+      const written = JSON.parse(String(init!.body)).properties;
+      state.stage = written.hs_pipeline_stage;
+      if (written.hubspot_owner_id !== undefined) state.owner = written.hubspot_owner_id || null;
       return Response.json({ id: TICKET });
     }
     return Response.json({ id: TICKET, properties: { hs_pipeline: state.pipeline, hs_pipeline_stage: state.stage, hubspot_owner_id: state.owner } });
@@ -93,5 +95,43 @@ describe("the stage write: the last look before the only PATCH", () => {
       await expect(adapters(h).verify(intentOf(), null, new Date(), signal())).resolves.toMatchObject({ confirmed: false, attributed: false });
       expect(h.calls.every(call => call.method === "GET")).toBe(true);
     }
+  });
+});
+
+describe("SAV-92 (17/11): the hand-over stage, « Nouveau » and no owner", () => {
+  const HANDOFF_ENV = { ...ENV, SAV_V2_HANDOFF_STAGE: "on" };
+  const handoffIntent = (stageId = "1") => buildTicketStageIntent({ key: caseTicketStageKey(CASE, "handoff", "handoff-v7"), target: "handoff", stageId, ticketId: TICKET, caseId: CASE }, PILOT);
+
+  it("the pilot's Support ticket: ONE PATCH of the stage « 1 » and an empty owner, verified by « 1 » AND no owner", async () => {
+    expect(handoffIntent().properties).toEqual({ hs_pipeline_stage: "1", hubspot_owner_id: "" });
+    const h = hubspot({ pipeline: "0", stage: "2", owner: PILOT });
+    const ack = await adapters(h, HANDOFF_ENV).dispatch(handoffIntent(), signal());
+    expect(ack).toEqual({ id: TICKET });
+    expect(h.patches()).toEqual([{ method: "PATCH", path: `/crm/v3/objects/tickets/${TICKET}`, body: { properties: { hs_pipeline_stage: "1", hubspot_owner_id: "" } } }]);
+    expect(h.state).toMatchObject({ stage: "1", owner: null });
+    await expect(adapters(h, HANDOFF_ENV).verify(handoffIntent(), ack, new Date(), signal())).resolves.toMatchObject({ confirmed: true });
+    // Still owned by the pilot, taken by a person, or another stage: not confirmed.
+    for (const state of [{ pipeline: "0", stage: "1", owner: PILOT }, { pipeline: "0", stage: "1", owner: TEAM }, { pipeline: "0", stage: "2", owner: null }])
+      await expect(adapters(hubspot(state), HANDOFF_ENV).verify(handoffIntent(), null, new Date(), signal())).resolves.toMatchObject({ confirmed: false });
+  });
+
+  it("COUNTER-TEST: a closed ticket (stage 4 or the configured closed stage), a person's ticket, the switch off or another stage sealed: ZERO PATCH", async () => {
+    const closed = hubspot({ pipeline: "0", stage: "4", owner: PILOT });
+    expect(await refusal(adapters(closed, HANDOFF_ENV).dispatch(handoffIntent(), signal()))).toBe(`${TICKET_STAGE_NOT_APPLIED_PREFIX}TICKET_CLOSED`);
+    const configuredClosed = hubspot({ pipeline: "0", stage: "5", owner: PILOT });
+    expect(await refusal(adapters(configuredClosed, { ...HANDOFF_ENV, SAV_V2_STAGE_CLOSED: "5" }).dispatch(handoffIntent(), signal()))).toBe(`${TICKET_STAGE_NOT_APPLIED_PREFIX}TICKET_CLOSED`);
+    const taken = hubspot({ pipeline: "0", stage: "2", owner: TEAM });
+    expect(await refusal(adapters(taken, HANDOFF_ENV).dispatch(handoffIntent(), signal()))).toBe(`${TICKET_STAGE_NOT_APPLIED_PREFIX}OWNER_CHANGED`);
+    const off = hubspot({ pipeline: "0", stage: "2", owner: PILOT });
+    expect(await refusal(adapters(off, ENV).dispatch(handoffIntent(), signal()))).toBe(`${TICKET_STAGE_NOT_APPLIED_PREFIX}HANDOFF_STAGE_OFF`);
+    expect(off.calls).toHaveLength(0);
+    const other = hubspot({ pipeline: "0", stage: "2", owner: PILOT });
+    expect(await refusal(adapters(other, HANDOFF_ENV).dispatch(handoffIntent("2"), signal()))).toBe(`${TICKET_STAGE_NOT_APPLIED_PREFIX}STAGE_CONFIG_CHANGED`);
+    expect([closed, configuredClosed, taken, off, other].flatMap(h => h.patches())).toHaveLength(0);
+  });
+
+  it("the other targets never touch the owner", () => {
+    expect(intentOf("waiting_customer").properties).toEqual({ hs_pipeline_stage: "2" });
+    expect(intentOf("closed").properties).toEqual({ hs_pipeline_stage: "4" });
   });
 });
