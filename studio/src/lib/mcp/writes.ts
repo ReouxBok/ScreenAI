@@ -246,12 +246,13 @@ const reconcileNote = studioMcpWrite("reconcile_note", "Vérifier la note déjà
     return done("Note existante et rattachement vérifiés. Aucune note créée ni aucun mail envoyé.");
   }, { idempotent: false });
 const reconcileEffect = studioMcpWrite("reconcile_effect", "Rapprocher l’action incertaine depuis son reçu",
-  "Vérifie dans HubSpot, en lecture seule, l’unique action incertaine du message courant (note ou email : création avec reçu, ou rattachement au ticket) à partir du reçu déjà enregistré. Aucun identifiant n’est accepté de l’appelant ; rien n’est recréé ni renvoyé ; un résultat non prouvé est refusé sans rien changer. Administrateurs.",
+  "Vérifie dans HubSpot, en lecture seule, l’unique action incertaine du message courant (note ou email : création avec reçu, ou rattachement au ticket) à partir du reçu déjà enregistré. Si le message courant n’a pas d’exécution en cours, vise l’unique exécution incertaine d’un message précédent du même fil, sans toucher au message courant. Aucun identifiant n’est accepté de l’appelant ; rien n’est recréé ni renvoyé ; un résultat non prouvé est refusé sans rien changer. Administrateurs.",
   { threadId: z.uuid(), versionToken: dossierInput.versionToken }, async (context, input) => {
     const found = await currentDossier({ ...input, idempotencyKey: "" }); if (!found.ok) return found.result;
     if (!intakeDossierActions(found.data, intakeDossierView(found.data), context.staff).administratorVerifications || !found.version.messageId) return unavailable("Le rapprochement");
     const result = await reconcileIntakeUncertainEffect({ threadId: input.threadId, messageId: found.version.messageId }, found.version);
     if (!result.reconciled) return alreadyDone("Aucune action incertaine : déjà rapprochée. Rien n’a été modifié.");
+    if ("historical" in result && result.historical) return done(`Action existante d’un message précédent vérifiée et attribuée à son reçu.${result.handedOff ? " Cette ancienne exécution est close comme remplacée par le message courant." : ""} Rien n’a été recréé ni envoyé ; le message courant est inchangé.`, { kind: result.kind, historical: true, handedOff: result.handedOff });
     return done("Action existante vérifiée et attribuée à son reçu. Rien n’a été recréé ni envoyé ; le traitement normal reprendra s’il le peut.", { kind: result.kind });
   }, { idempotent: false });
 const reconcileIdentification = studioMcpWrite("reconcile_identification", "Rapprocher les envois d’identification",

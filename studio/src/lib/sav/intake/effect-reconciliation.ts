@@ -9,11 +9,11 @@ import { decryptSavPayload } from "../crypto";
 import { hasUnsettledSavHumanAction, readSavExternalCompletion } from "../external-completion";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 import { executionAdministrator } from "./execution-policy";
-import { activeExecutionEffects, admissionLock, claimEffectRecovery, confirmExecutionEffect, releaseEffectRecovery, withEffectRecoveryLease, type ExecutionTx } from "./execution-store";
+import { activeExecutionEffects, admissionLock, claimEffectRecovery, confirmExecutionEffect, handOffSupersededExecution, releaseEffectRecovery, withEffectRecoveryLease, type ExecutionTx } from "./execution-store";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
 import { readSavAgentPause, savAgentPauseCode } from "./agent-pause";
 import { intakeRuntimeHash } from "./runtime-contract";
-import { intakeVersionStillCurrent, type IntakeVersionPrecondition } from "./version-precondition";
+import { intakeVersionStillCurrent, lockedIntakeConsoleEpoch, type IntakeVersionPrecondition } from "./version-precondition";
 import type { Effect, EffectAck, EffectIntent, Execution, ExecutorAdapters } from "./execution-types";
 
 /** Strict: no caller-supplied object id, ack or effect id is ever accepted. */
@@ -32,6 +32,7 @@ const intentOf = (e: Effect) => decryptSavPayload<EffectIntent>(e.intentCipherte
 
 type Actor = Awaited<ReturnType<typeof executionAdministrator>>;
 type Selected = { effect: Effect; intent: EffectIntent; ack: EffectAck | null; expectedId: string };
+const terminal = (row: Execution) => row.state === "confirmed" || row.state === "refused";
 
 /** The unique unsettled effect, its stored receipt and its confirmed dependencies. Null when every
  * effect is already confirmed (idempotent no-op). Never reads anything the caller supplied. */
@@ -81,6 +82,8 @@ function selectEffect(execution: Execution, effects: Effect[], messageId: string
  * pause committed by setSavAgentPause either precedes this read or waits for this transaction's
  * commit, so no effect is confirmed under a pause recorded in between. */
 async function assertLocal(tx: ExecutionTx, actor: Actor, input: z.infer<typeof request>, snapshot: Execution, expected: IntakeVersionPrecondition | undefined, token?: string) {
+  // Historical target: the execution of an OLDER inbound of the same thread, superseded by the current message.
+  const historical = snapshot.messageId !== input.messageId;
   const now = new Date();
   await admissionLock(tx);
   const [current] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, snapshot.id)).for("no key update");
@@ -103,52 +106,96 @@ async function assertLocal(tx: ExecutionTx, actor: Actor, input: z.infer<typeof 
   if (!thread || thread.aiPaused || latest?.id !== input.messageId || commands.length || hasUnsettledSavHumanAction(actions)
     || runs.some(row => row.leaseUntil && row.leaseUntil > now) || !lease) return refuse("LOCKED");
   if (await readSavExternalCompletion(latest, tx)) return refuse("LOCKED");
-  if (!current || current.state !== "uncertain" || current.threadId !== input.threadId || current.messageId !== input.messageId
+  if (!current || current.state !== "uncertain" || current.threadId !== input.threadId || current.messageId !== snapshot.messageId
     || current.payloadCiphertext !== snapshot.payloadCiphertext || current.runId !== snapshot.runId || current.runVersion !== snapshot.runVersion
     || current.policyId !== snapshot.policyId || current.ticketId !== snapshot.ticketId
-    || !run?.isCurrent || run.state !== "observed" || run.messageId !== input.messageId || run.version !== current.runVersion) return refuse("CHANGED");
+    || !run || run.messageId !== snapshot.messageId || run.version !== current.runVersion) return refuse("CHANGED");
+  if (!historical && (!run.isCurrent || run.state !== "observed")) return refuse("CHANGED");
+  if (historical) {
+    // The superseded execution must stay the ONLY non-terminal execution of the thread (admissions take the
+    // admission lock held here), its run must not be current, and its message must be an inbound of this thread.
+    // The current message itself is pinned by `latest` above and by the caller's version (current run + epoch).
+    if (!expected) return refuse("CHANGED");
+    const rows = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.threadId, input.threadId));
+    const [source] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, snapshot.messageId),
+      eq(savMessages.threadId, input.threadId), eq(savMessages.direction, "inbound")));
+    if (run.isCurrent || !source || rows.some(row => row.id !== snapshot.id && !terminal(row))) return refuse("CHANGED");
+  }
   if (expected && !await intakeVersionStillCurrent(tx, input.threadId, expected)) return refuse("CHANGED");
 }
 
-/** Administrative, read-only reconciliation of the ONE unsettled effect of the current message's
- * uncertain V1 execution, from its existing receipt. Never dispatches, never accepts an id from the
- * caller, never resets attempts, budget or leases. It writes only a verified, attributed proof for
- * the very receipt already stored; any other outcome refuses and changes nothing. A fully confirmed
- * execution is then left to the normal worker (no closure, no send is forced here). */
+/** The execution whose single uncertain effect this call may reconcile, chosen by the server alone:
+ * - the current message's execution when it has a non-terminal one (unchanged path; refused when not uncertain);
+ * - otherwise (none, or terminal) the ONLY non-terminal execution of an older inbound of the same thread, which
+ *   the worker never resumes once superseded (executor: no newer inbound) and the admission handoff skips while
+ *   an effect is uncertain. Never an id from the caller. */
+async function targetExecution(threadId: string, messageId: string) {
+  const rows = await requireDb().select().from(savIntakeExecutions).where(eq(savIntakeExecutions.threadId, threadId));
+  const own = rows.find(row => row.messageId === messageId);
+  if (own && !terminal(own)) return own;
+  const older = rows.filter(row => row.messageId !== messageId && !terminal(row));
+  if (!older.length) return refuse("NOT_UNCERTAIN");
+  if (older.length !== 1) return refuse("MULTIPLE_UNSETTLED");
+  return older[0];
+}
+
+/** Administrative, read-only reconciliation of the ONE unsettled effect of an uncertain V1 execution, from its
+ * existing receipt: the current message's execution, or else the single superseded execution of an older inbound
+ * of the same thread (historical). Never dispatches, never accepts an id from the caller, never resets attempts,
+ * budget or leases. It writes only a verified, attributed proof for the very receipt already stored; any other
+ * outcome refuses and changes nothing. A fully confirmed current execution is then left to the normal worker (no
+ * closure, no send is forced here). A historical execution left with only confirmed or never-dispatched effects
+ * is handed off exactly as the admission of its newer message would have done (refused, scope released, journal). */
 export async function reconcileIntakeUncertainEffect(raw: unknown, expected?: IntakeVersionPrecondition,
   adapters: Pick<ExecutorAdapters, "verify"> = createIntakeExecutorAdapters()) {
   const actor = await executionAdministrator(), input = request.parse(raw), db = requireDb();
-  const [execution] = await db.select().from(savIntakeExecutions).where(and(
-    eq(savIntakeExecutions.threadId, input.threadId), eq(savIntakeExecutions.messageId, input.messageId)));
-  if (!execution) return refuse("NOT_UNCERTAIN");
+  const execution = await targetExecution(input.threadId, input.messageId);
   if (execution.state !== "uncertain") return refuse("NOT_UNCERTAIN");
+  const historical = execution.messageId !== input.messageId;
+  // A historical target is only reachable with the dossier version the operator decided on.
+  if (historical && !expected) return refuse("CHANGED");
   // Read-only pre-check: a refusal here holds no lease and writes nothing.
   const planned = await db.transaction(async tx => {
     await assertLocal(tx, actor, input, execution, expected);
-    return selectEffect(execution, await activeExecutionEffects(execution.id, tx), input.messageId);
+    return selectEffect(execution, await activeExecutionEffects(execution.id, tx), execution.messageId);
   });
   if (!planned) return { reconciled: false as const, alreadyConfirmed: true as const };
-  const lease = await claimEffectRecovery(execution.id);
+  // The lease write itself moves the console epoch (trigger on sav.intake_executions). In the SAME transaction,
+  // under the console row lock, the caller's epoch is required just before the lease and the epoch produced by
+  // this lease alone is recorded: the confirmation then accepts exactly that value, and any other change, before
+  // or after the lease, still refuses (no tolerance on the epoch, every other fence unchanged).
+  let leaseEpoch: number | null = null;
+  const lease = await claimEffectRecovery(execution.id, undefined, expected && {
+    beforeLease: async tx => { if (await lockedIntakeConsoleEpoch(tx, input.threadId) !== expected.epoch) refuse("CHANGED"); },
+    afterLease: async tx => { leaseEpoch = await lockedIntakeConsoleEpoch(tx, input.threadId); },
+  });
   if (!lease) return refuse("BUSY");
   try {
     const { effect, intent, ack, expectedId } = planned;
     const proof = await adapters.verify(intent, ack, effect.dispatchedAt!, AbortSignal.timeout(15000));
     if (!proof.confirmed || !proof.attributed || proof.ack?.id !== expectedId) return refuse("NOT_PROVEN");
+    const leased = expected && { ...expected, epoch: leaseEpoch ?? Number.NaN };
     const persisted = await withEffectRecoveryLease(lease, async tx => {
-      await assertLocal(tx, actor, input, execution, expected, lease.token);
-      const again = selectEffect(execution, await activeExecutionEffects(execution.id, tx), input.messageId);
+      await assertLocal(tx, actor, input, execution, leased, lease.token);
+      const again = selectEffect(execution, await activeExecutionEffects(execution.id, tx), execution.messageId);
       if (!again) return refuse("CHANGED");
       const latest = again.effect;
       if (latest.id !== effect.id || latest.attemptId !== effect.attemptId || latest.state !== effect.state
         || latest.intentCiphertext !== effect.intentCiphertext || latest.ackCiphertext !== effect.ackCiphertext || again.expectedId !== expectedId) return refuse("CHANGED");
       await confirmExecutionEffect(latest, proof, proof.ack, tx);
+      let handedOff = false;
+      if (historical) {
+        const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, execution.id));
+        handedOff = await handOffSupersededExecution(tx, row, input.messageId, "effect_reconciliation");
+      }
       await tx.insert(auditLogs).values({ actorEmail: actor.email, action: "sav_intake_effect_reconciled_from_receipt",
         entityType: "sav_thread", entityId: input.threadId, technicalMetadata: {
-          version: 1, messageId: input.messageId, executionId: execution.id, effectId: effect.id, kind: effect.kind, objectId: expectedId,
+          version: 1, messageId: execution.messageId, executionId: execution.id, effectId: effect.id, kind: effect.kind, objectId: expectedId,
           receipt: ack?.id ? "stored_ack" : "stored_object_id", previousState: effect.state, reconcileAttemptsPreserved: effect.reconcileAttempts,
-          dispatch: false, executionStatePreserved: "uncertain",
+          dispatch: false, executionStatePreserved: handedOff ? "superseded_handoff" : "uncertain",
+          ...(historical ? { historical: true, currentMessageId: input.messageId } : {}),
         } });
-      return { kind: effect.kind, objectId: expectedId };
+      return { kind: effect.kind, objectId: expectedId, ...(historical ? { historical: true as const, handedOff } : {}) };
     });
     if (!persisted.owned) return refuse("BUSY");
     return { reconciled: true as const, ...persisted.value };

@@ -89,8 +89,10 @@ export async function intakeAvailableActions(data: IntakeConsoleDetail, staff: S
       kinds: panel ? { resume: panel.allowResume, reanalyse: panel.allowReanalysis, information: panel.allowInformation } : null, unavailableReason: panel?.unavailableReason ?? null },
     { tool: "request_reinvestigation", available: actions.administratorVerifications, requires: "reason" },
     { tool: "reconcile_note", available: actions.administratorVerifications && actions.noteReceipt },
-    { tool: "reconcile_effect", available: actions.administratorVerifications && data.progress?.state === "uncertain"
-      && (data.progress?.effects ?? []).filter(effect => effect.state !== "confirmed").length === 1 },
+    { tool: "reconcile_effect", available: actions.administratorVerifications && (data.progress?.state === "uncertain"
+      && (data.progress?.effects ?? []).filter(effect => effect.state !== "confirmed").length === 1
+      // Historical: no live execution on the current message while an older one of the thread still blocks completion.
+      || (!data.progress || ["confirmed", "refused"].includes(data.progress.state)) && actions.completionBlockers.includes("intake_effect")) },
     { tool: "reconcile_identification", available: actions.administratorVerifications },
   ];
 }
