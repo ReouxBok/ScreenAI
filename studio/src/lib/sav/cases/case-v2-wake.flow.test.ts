@@ -1037,7 +1037,7 @@ describe("SAV-92 (Ugo 17/11): a V2 hand-over gives the ticket back to the team, 
     expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true } });
     await wake(); await wake(); await wake();
     expect(sends).toBe(1);
-    expect(mimeText(sentBodies[0]!)).toContain("Votre demande est transmise à un conseiller.");
+    expect(mimeText(sentBodies[0]!)).toContain("Un conseiller reprend votre demande.");
     expect(await handoffStages(made.caseId)).toMatchObject([{ state: "confirmed" }]);
     expect(await stageRows(made.caseId)).toHaveLength(1); // no « waiting » stage for a terminal reply
     expect(ticketPatches(made.ticketId)).toEqual([expect.objectContaining({ body: { properties: { hs_pipeline_stage: "1", hubspot_owner_id: "" } } })]);
