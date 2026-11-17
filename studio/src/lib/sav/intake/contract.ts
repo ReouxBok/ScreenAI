@@ -80,6 +80,7 @@ export const savIntakeMutationSchema = z.enum([
   // V2 (human handoff notice): the one Slack post of a final handoff decision; granted by no existing policy.
   "notify_case_handoff",
   // V2 (ticket states): the ticket's pipeline stage only (waiting for the customer after a confirmed reply, closed after a proven resolution); granted by no existing policy.
+  // SAV-92 (Ugo 17/11, behind `SAV_V2_HANDOFF_STAGE=on`): on a V2 hand-over, the same right moves the ticket to « Nouveau » and clears its owner (and nothing else).
   "set_case_ticket_stage",
 ]);
 export type SavIntakeMutation = z.infer<typeof savIntakeMutationSchema>;

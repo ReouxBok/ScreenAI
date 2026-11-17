@@ -85,6 +85,22 @@ describe("ticket stages: « attente client » after a confirmed reply, « fermé
     expect(() => caseTicketStageKey("not-a-case", "closed", "cycle-1")).toThrow("SAV_CASE_STAGE_KEY_INVALID");
   });
 
+  it("SAV-92 (17/11): the hand-over plans « Nouveau » (V1's stage 1) once per hand-over, sensitive or not, only under its switch and while it is still in force", () => {
+    const team = { owner: "human" as const, phase: "handoff_pending" as const, sensitivity: "none" as const, cycle: { number: 1 }, handoffVersion: 7 };
+    const trigger = { kind: "handoff_recorded" as const, caseVersion: 7 };
+    expect(plan({ case: team, trigger, handoffStage: true }))
+      .toEqual({ plan: true, intent: { key: `case-stage:${CASE}:handoff:handoff-v7`, target: "handoff", stageId: "1", ticketId: "8400001", caseId: CASE } });
+    // A sensitive topic sends no message, but the ticket still goes back to the team; a team part pending changes nothing either.
+    expect(plan({ case: { ...team, sensitivity: "finance", teamPartPending: true }, trigger, handoffStage: true }).plan).toBe(true);
+    expect(plan({ case: team, trigger })).toEqual({ plan: false, reason: "handoff_stage_off" });
+    expect(plan({ case: team, trigger, handoffStage: true, config: readCaseTicketStageConfig({}) })).toEqual({ plan: false, reason: "stages_disabled" });
+    for (const moved of [{ ...team, handoffVersion: 9 }, { ...team, handoffVersion: undefined }, { ...team, phase: "human_owned" as const }, { ...team, owner: "agent" as const, phase: "acting" as const }])
+      expect(plan({ case: moved, trigger, handoffStage: true })).toEqual({ plan: false, reason: "handoff_not_current" });
+    const intent = { key: `case-stage:${CASE}:handoff:handoff-v7`, target: "handoff" as const, stageId: "1", ticketId: "8400001", caseId: CASE };
+    expect(verifyCaseTicketStage(intent, { stage: "1", ownerId: null }, "424242")).toBe("confirmed");
+    expect(verifyCaseTicketStage(intent, { stage: "1", ownerId: "424242" }, "424242")).toBe("not_applied");
+  });
+
   it("confirmed J2 closes administratively only on its own closed cycle and without a newer client mail", () => {
     const c = { owner: "agent" as const, phase: "closed_no_reply" as const, sensitivity: "none" as const, cycle: { number: 2, endedBy: "closed_no_reply" as const } };
     const trigger = { kind: "j2_confirmed" as const, replyKey: `reply:${CASE}:timer:syn-j2`, sentAt: "2026-11-03T10:00:00Z", cycle: 2, caseVersion: 10 };
