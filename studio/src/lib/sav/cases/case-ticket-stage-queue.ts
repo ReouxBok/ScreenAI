@@ -2,13 +2,13 @@
 // « Waiting for the customer » is queued INSIDE the transaction that records a confirmed reply (so a confirmed reply without its stage cannot exist, and a replay or a
 // recovery returns the same row); « closed » is queued by `case-resolution.ts`. This file depends on no driver: the reply driver calls it from its receipt.
 import "server-only";
-import { and, eq, gt, max } from "drizzle-orm";
+import { and, desc, eq, gt, max } from "drizzle-orm";
 import { savCaseEffectExecutions, savCaseEvents } from "@/db/schema";
 import { encryptSavPayload } from "../crypto";
 import { executionJournal, type ExecutionTx } from "../intake/execution-store";
 import { TICKET_STAGE_CONTRACT, type TicketStagePayload } from "./case-ticket-stage";
-import { caseTeamPartRequests, type CaseSnapshot } from "./case-types";
-import { planCaseTicketStage, readCaseTicketStageConfig, type CaseTicketStageTrigger } from "./customer-return";
+import { caseTeamPartRequests, SAV_CASE_AWAITING_V2_ATTRIBUTION, type CaseSnapshot } from "./case-types";
+import { caseHandoffStageEnabled, planCaseTicketStage, readCaseTicketStageConfig, type CaseTicketStageTrigger } from "./customer-return";
 
 
 export type EnqueueTicketStageResult =
@@ -34,18 +34,34 @@ export async function lastCustomerInboundAt(tx: ExecutionTx, caseId: string): Pr
   return row?.at ? new Date(row.at).toISOString() : null;
 }
 
+/**
+ * SAV-92 (17/11): the version of the V2 hand-over still in force, read in the caller's transaction: the case is with the team on a hand-over nobody took yet
+ * (`human_takeover` sets `humanSince`; a case waiting for its V2 attribution is not a hand-over). The latest `owner_changed` is then that hand-over.
+ */
+export async function openHandoffVersion(tx: ExecutionTx, snapshot: Pick<CaseSnapshot, "caseId" | "owner" | "phase" | "body">): Promise<number | undefined> {
+  const handoff = snapshot.body.handoff;
+  if (snapshot.owner !== "human" || snapshot.phase !== "handoff_pending" || !handoff || handoff.humanSince || handoff.reason === SAV_CASE_AWAITING_V2_ATTRIBUTION) return undefined;
+  const [row] = await tx.select({ version: savCaseEvents.caseVersion }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, snapshot.caseId), eq(savCaseEvents.kind, "owner_changed")))
+    .orderBy(desc(savCaseEvents.caseVersion)).limit(1);
+  return row?.version;
+}
+
 /** A's rule on the facts read in the caller's transaction, exactly as the queue applies it (also read by the reply's summary note, SAV-92 16/11, so the
  * note names only a stage this very rule plans). Null: the key could not be built. Writes nothing. */
 export async function planCaseTicketStageNow(tx: ExecutionTx, input: Readonly<{ snapshot: StageCase; trigger: CaseTicketStageTrigger; env: () => Record<string, string | undefined> }>) {
   const { snapshot } = input;
   // Read outside the catch, as before: an unreadable configuration fails the caller's transaction, it is never taken for « no stage ».
   const config = readCaseTicketStageConfig(input.env());
+  const handoff = input.trigger.kind === "handoff_recorded";
   try {
+    // SAV-92 (17/11): a hand-over trigger reads only what its rule needs (its switch, the hand-over in force); the other triggers read exactly what they read before.
+    const handoffVersion = handoff ? await openHandoffVersion(tx, snapshot) : undefined;
     return planCaseTicketStage({
       config, caseId: snapshot.caseId, ticketId: snapshot.ticketId,
       case: { owner: snapshot.owner, phase: snapshot.phase, sensitivity: snapshot.sensitivity, cycle: snapshot.body.cycle,
-        ...(await caseTeamPartPending(tx, snapshot) ? { teamPartPending: true } : {}) },
-      trigger: input.trigger, lastCustomerInboundAt: await lastCustomerInboundAt(tx, snapshot.caseId),
+        ...(!handoff && await caseTeamPartPending(tx, snapshot) ? { teamPartPending: true } : {}), ...(handoffVersion === undefined ? {} : { handoffVersion }) },
+      trigger: input.trigger, lastCustomerInboundAt: handoff ? null : await lastCustomerInboundAt(tx, snapshot.caseId),
+      ...(handoff ? { handoffStage: caseHandoffStageEnabled(input.env()) } : {}),
     });
   } catch { return null; }
 }

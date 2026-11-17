@@ -135,7 +135,8 @@ export type CaseDecisionValidationContext = {
    */
   customerTexts: Readonly<Record<string, string>>;
   facts: Array<{ id: string; key: string | null; kind: "observed" | "customer_statement"; source: CaseDecisionSourceRef; at: string }>;
-  questions: Array<{ id: string; factKeys: string[]; askedAt: string; answeredBy: CaseDecisionSourceRef | null }>;
+  /** `text`: the wording we sent, carried only with `SAV_V2_ASK_BEFORE_HANDOFF` on (the single re-ask restates it verbatim); absent, main's shape. */
+  questions: Array<{ id: string; factKeys: string[]; askedAt: string; answeredBy: CaseDecisionSourceRef | null; text?: string }>;
   trials: Array<{ id: string; requestId: string; knowledge: CaseDecisionKnowledgeRef; askedAt: string; outcome: CaseTrial["outcome"]; resultAt: string | null }>;
   /** `order` null: known only by its date (body handoff), so it cannot be placed safely against a message. */
   handoffs: Array<{ at: string; order: number | null }>;
@@ -242,6 +243,7 @@ export const caseDecisionSignalLabels = {
   account_wording_without_advice: "La réponse évoque un compte ou un abonnement sans conseil déclaré.",
   login_procedure_refused_routed: "Proposition redondante sur la connexion refusée : le dossier suit le relais prévu par la fiche, sans nouvel appel au modèle.",
   handoff_knowledge_missing_with_cards: "Transfert pour connaissance manquante alors que des fiches applicables ont été retrouvées pour chaque demande transférée (transfert peut-être injustifié, Q11).",
+  handoff_reask_composed: "Transfert prématuré remplacé par une relance unique : questions encore ouvertes reprises, capture d’écran demandée, passage à un conseiller annoncé.",
 } as const;
 export type CaseDecisionSignal = keyof typeof caseDecisionSignalLabels;
 

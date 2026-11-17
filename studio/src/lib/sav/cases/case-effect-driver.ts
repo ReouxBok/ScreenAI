@@ -21,7 +21,8 @@ import { HANDOFF_NOTICE_KEY_PREFIX } from "./case-handoff-notice";
 import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, buildReplySendIntent, type CaseNoteCreateIntent } from "./case-effect-intents";
 import { recordConfirmedCaseReply } from "./case-effect-outcomes";
 import { enqueueCaseTicketStage } from "./case-ticket-stage-queue";
-import { caseTicketStageKey } from "./customer-return";
+import { enqueueCaseHandoffStage } from "./case-handoff-stage";
+import { caseHandoffStageEnabled, caseTicketStageKey } from "./customer-return";
 import { TICKET_STAGE_KEY_PREFIX } from "./case-ticket-stage";
 import { lockCaseForWrite } from "./case-store";
 import { caseReplyNoteEnabled, caseReplySummaryWithStage, isCaseReplySummary, type CaseReplySummaryStage } from "./case-reply-summary-note";
@@ -115,6 +116,10 @@ async function commitReceipt(
         const stage = await enqueueCaseTicketStage(tx, { snapshot: closure?.snapshot ?? locked, trigger: closure?.trigger ?? { kind: "reply_confirmed", replyKey: key, sentAt: sentAt.toISOString() }, policy: { id: owned.row.policyId, hash: owned.row.policyHash }, env, threadId: owned.row.threadId });
         await recordCaseComponentOutcome(tx, lease.row.id, "status", stage.ok ? { state: "queued", executionId: stage.executionId } : { state: stage.reason === "stages_disabled" ? "skipped" : "blocked", reason: stage.reason });
       }
+      // SAV-92 (Ugo 17/11): the hand-over reply is confirmed, so the ticket may now go back to the team (« Nouveau », no owner), queued in THIS transaction under the reply's
+      // policy. Only under `SAV_V2_HANDOFF_STAGE=on` (off: nothing is read or written here); the same key as the sweep's, so the hand-over is moved once.
+      if (proposal.purpose === "handoff" && caseHandoffStageEnabled(env()))
+        await enqueueCaseHandoffStage(tx, { snapshot: locked, policy: { id: owned.row.policyId, hash: owned.row.policyHash }, env, threadId: owned.row.threadId });
       await conclude(tx, reply);
       return reply;
     });
