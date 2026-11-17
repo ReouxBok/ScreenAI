@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import { buildSavInboundContext, splitSavMessageText } from "../message-context";
-import { intakeQuotesMailbox, prepareSavIntakeMessage } from "./message";
+import { intakeQuotesMailbox, intakeQuotesTeamAddress, prepareSavIntakeMessage } from "./message";
 import { createSavIntakeSemanticReaders, type IntakeGeminiCall } from "./model-readers";
 import { normalizeSavEvidenceText } from "../evidence-text";
 
@@ -133,4 +133,22 @@ it("recognises a quote header naming the support mailbox, and nothing else", () 
   expect(quoted("Re.\n\nLe lun. 10 nov. 2026, X <support@example.invalid.evil> a écrit :\n> a")).toBe(false);
   expect(quoted("Message automatique : je suis absent jusqu'au 12 novembre.")).toBe(false);
   expect(intakeQuotesMailbox(prepareSavIntakeMessage({ ...input, body: "Le lun., <support@example.invalid> a écrit :\n> a" }).provenance, "")).toBe(false);
+});
+
+// Orientation (17/11): a reply to a colleague's offer is recognised from a quote header naming an address of the
+// mailbox's own team domain. Synthetic addresses.
+it("recognises a quote header naming a colleague of the team domain, and nothing else", () => {
+  const box = "support@example.invalid";
+  const quoted = (body: string, mailbox = box) => intakeQuotesTeamAddress(prepareSavIntakeMessage({ ...input, body }).provenance, mailbox);
+  expect(quoted("D'accord pour lundi.\n\nLe mer. 1 oct. 2026 à 10:00, Conseiller <conseiller@example.invalid> a écrit :\n> Voici notre proposition")).toBe(true);
+  expect(quoted("OK.\n\nDe : Conseiller <CONSEILLER@example.invalid>\nEnvoyé : mercredi\nObjet : Proposition")).toBe(true);
+  expect(quoted("Merci.\n\nLe lun. 10 nov. 2026, Support <support@example.invalid> a écrit :\n> Bonjour")).toBe(true);
+  // Another organisation, a look-alike domain, a team address in prose or signature only, no quote, or a public webmail mailbox.
+  expect(quoted("Re.\n\nLe lun. 10 nov. 2026, Fournisseur <vente@other.invalid> a écrit :\n> Offre")).toBe(false);
+  expect(quoted("Re.\n\nLe lun. 10 nov. 2026, X <conseiller@example.invalid.evil> a écrit :\n> a")).toBe(false);
+  expect(quoted("Re.\n\nLe lun. 10 nov. 2026, X <conseiller@notexample.invalid> a écrit :\n> a")).toBe(false);
+  expect(quoted("Écrivez à conseiller@example.invalid pour un devis.")).toBe(false);
+  expect(quoted("Offre.\n--\nContact : conseiller@example.invalid")).toBe(false);
+  expect(quoted("Re.\n\nLe lun. 10 nov. 2026, Ami <ami@gmail.com> a écrit :\n> a", "support@gmail.com")).toBe(false);
+  expect(quoted("Re.\n\nLe lun. 10 nov. 2026, X <conseiller@example.invalid> a écrit :\n> a", "")).toBe(false);
 });

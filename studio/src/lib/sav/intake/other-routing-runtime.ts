@@ -7,7 +7,7 @@ import { savAttachmentInventorySchema } from "../attachment-contract";
 import { readSavOtherConfiguration } from "../other-observation";
 import { readIntakeOtherRules, qualifyIntakeOther, type IntakeOtherQualification } from "./other-routing";
 import type { IntakeLease } from "./runtime-store";
-import { intakeQuotesMailbox } from "./message";
+import { intakeQuotesMailbox, intakeQuotesTeamAddress } from "./message";
 
 type OtherEvaluation =
   | { state: "catalogue_unavailable" | "not_applicable" | "evidence_unavailable" }
@@ -57,4 +57,12 @@ export async function intakeQuotedMailboxReply(lease:Pick<IntakeLease,"run"|"pro
   const provenance=lease.provenance.get(lease.run.messageId);if(!provenance)return false;
   const [mailbox]=await requireDb().select({email:savMailboxes.email}).from(savMailboxes).where(eq(savMailboxes.id,mailboxId));
   return Boolean(mailbox&&intakeQuotesMailbox(provenance,mailbox.email));
+}
+/** Orientation (17/11): per-mail evidence that the current mail answers the mailbox (SAV-90) or another address of
+ * the team's own domain (a colleague's offer or follow-up). Read only; a read failure is « no evidence ». */
+export async function intakeQuotedReplyEvidence(lease:Pick<IntakeLease,"run"|"provenance">,mailboxId:string) {
+  const provenance=lease.provenance.get(lease.run.messageId);if(!provenance)return {mailbox:false,team:false};
+  const [mailbox]=await requireDb().select({email:savMailboxes.email}).from(savMailboxes).where(eq(savMailboxes.id,mailboxId));
+  if(!mailbox)return {mailbox:false,team:false};
+  return {mailbox:intakeQuotesMailbox(provenance,mailbox.email),team:intakeQuotesTeamAddress(provenance,mailbox.email)};
 }

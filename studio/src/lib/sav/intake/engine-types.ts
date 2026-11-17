@@ -85,6 +85,9 @@ export type EnginePolicy = {
   /** SAV-90: per-mail runtime evidence, never configuration. The stored quoted part of the current mail
    * opens with a quote header naming the support mailbox's own address: a reply in a support thread. */
   quotedMailboxReply?: true;
+  /** Orientation (17/11): per-mail runtime evidence, never configuration. A quote header names another address of the
+   * mailbox's own team domain (a colleague's offer or follow-up): continuity of an existing exchange, not a new lead. */
+  quotedTeamReply?: true;
   qualifiedOther?: { family?: "authenticated_newsletter"; resource: PrivateResource; evidenceSource: "private_rule" | "human_override" };
   manualSupportOverride?: PrivateResource;
   /** Set by the stored-message automation gate, never read from model output. */

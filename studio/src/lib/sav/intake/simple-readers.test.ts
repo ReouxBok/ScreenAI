@@ -384,6 +384,33 @@ it("retains all twenty ticket verdicts and all current requests with concise ins
   expect(b.judgements[0].tickets.map(ticket => ticket.ticketId)).toEqual(tickets.map(ticket => ticket.id));
 });
 
+// Orientation (17/11): prompt contract (model behaviour itself is NOT verified here) and the deterministic engine guard
+// behind the real single-call reader. Synthetic data only.
+describe("Orientation commercial vs customer follow-up through the simple reader", () => {
+  const supportAnswer = { id: "10000000-0000-4000-8000-000000000005", threadId: "20000000-0000-4000-8000-000000000001", fromEmail: "support@example.test", toEmails: ["sender@example.test"],
+    currentText: "Cette option fonctionne par utilisateur.", contentComplete: true, direction: "outbound" as const, receivedAt: days(3) };
+  it("states the nature/relationship/follow-up separation and never invents a capability or price", async () => {
+    const b = bench();
+    await b.run(d => judgement(d));
+    for (const text of ["Nature, relationship and follow-up are separate", "commercial is only a new pre-sale inquiry", "a reply to an offer or call a team member already sent",
+      "keep a price question as its own request", "never commercial to fill a gap", "Never invent a capability, endpoint or price"])
+      expect(b.systems[0]).toContain(text);
+  });
+  it("scenario 5: a price question labelled commercial in a support thread goes to the team's choice with its request kept", async () => {
+    const b = bench({ text: "Merci. Quel est le coût en plus pour cette option ?", conversation: [supportAnswer] });
+    const plan = await b.run(d => judgement(d, { requests: [{ id: "r1", kind: "commercial", summary: "Coût d'une option supplémentaire.", sourceIds: ["current"] }] }));
+    expect(plan.decision.classification).toBe("unknown");
+    expect(plan.decision.requests.map(r => r.id)).toEqual(["r1"]);
+    expect(plan.progress).toMatchObject({ kind: "human_choice", questionCode: "request_scope_uncertain" });
+    expect(plan.decision.disposition).not.toMatchObject({ nextAction: "supervised_commercial" });
+  });
+  it("scenario 6: the same label without any exchange stays a supervised commercial hand-off", async () => {
+    const b = bench({ text: "Pouvez-vous me proposer une démonstration et un devis ?" });
+    const plan = await b.run(d => judgement(d, { requests: [{ id: "r1", kind: "commercial", summary: "Démonstration et devis.", sourceIds: ["current"] }] }));
+    expect(plan.decision.disposition).toMatchObject({ kind: "no_ticket", nextAction: "supervised_commercial" });
+  });
+});
+
 describe("SAV-46 validated evidence before the reader merges its requests", () => {
   const two = (data: Data) => judgement(data, { requests: [{ id: "r1", kind: "support", summary: "SYN agenda en panne.", sourceIds: ["current"] },
     { id: "r2", kind: "support", summary: "SYN export en échec.", sourceIds: ["current"] }], ticketDescription: undefined, tickets: same(data, ["201"]) });
