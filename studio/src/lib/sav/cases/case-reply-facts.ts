@@ -9,7 +9,9 @@ import type { ExecutionTx } from "../intake/execution-store";
 import { caseAdmissionStatus } from "./admission-policy";
 import { revalidateFiredJ2, type J2CaseView, type J2CaseEventView } from "./timer-lifecycle";
 import type { CaseTimer } from "./case-types";
-import type { CaseReplyProposal } from "./case-effects";
+import { caseEffectHash, type CaseReplyProposal } from "./case-effects";
+import { readCaseThreadlessSource } from "./case-store";
+import { threadlessReplyShape, threadlessReplySubject } from "./threadless-config";
 
 export type CaseReplyFacts = Readonly<{
   /** `caseAdmissionStatus` of the case now; a customer message recorded after the version the person saw is `input_newer` even though the case was re-admitted for it. */
@@ -51,6 +53,18 @@ export async function readCaseReplyFacts(tx: ExecutionTx, proposal: CaseReplyPro
       pauses: [], activeHolds: [], reminderEffect: "none", now: new Date(),
     }) : null;
     if (result?.status !== "timer_conditions_met") admission = { admitted: false, reason: "j2_obsolete_or_deferred" };
+  }
+  if (proposal.ticketSource || proposal.inboundMessageId === null) {
+    const source = threadlessReplyShape(proposal) && row && !row.threadIds.length
+      ? await readCaseThreadlessSource(tx, row.id, proposal.triggerEventId) : null;
+    const valid = source?.source.contact && caseEffectHash(source.source) === proposal.ticketSource?.version
+      && row?.sensitivity === "none" && row.version === proposal.caseVersion
+      && row.phase === "queued" && proposal.subject === threadlessReplySubject(row.ticketId);
+    return {
+      admission: valid ? admission : { admitted: false, reason: "ticket_source_changed" },
+      storedSender: valid ? source!.source.contact!.email : null,
+      caseVersion: row?.version ?? null, owner: row?.owner ?? null,
+    };
   }
   const [stored] = await tx.select({ from: savMessages.fromEmail }).from(savMessages).where(eq(savMessages.id, proposal.inboundMessageId));
   return { admission, storedSender: stored?.from ?? null, caseVersion: row?.version ?? null, owner: pending ? "agent" : row?.owner ?? null };

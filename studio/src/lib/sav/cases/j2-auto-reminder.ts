@@ -77,6 +77,7 @@ export function j2ReminderText(origin: J2Origin, env: Record<string, string | un
 /** Missing or ambiguous provenance means a neutral reminder, never a guessed subject. */
 async function readJ2Context(origin: CaseReplyProposal): Promise<J2Origin["j2Context"]> {
   const snapshot = await readCase(origin.caseId);
+  if (!origin.inboundMessageId) return undefined;
   const [mail] = await requireDb().select().from(savMessages).where(eq(savMessages.id, origin.inboundMessageId));
   if (!snapshot || !mail || !mail.gmailMessageId || mail.direction !== "inbound" || !snapshot.threadIds.includes(mail.threadId)) return undefined;
   const requests = snapshot.body.openRequests.filter(r => r.id.startsWith(`${mail.gmailMessageId}/`) && r.status === "open");

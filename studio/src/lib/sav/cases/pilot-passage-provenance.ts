@@ -18,6 +18,7 @@ import { latestInvestigationInput } from "./investigation-runner";
 import { parseIncidentContext, revalidateIncidentContext } from "./investigation-incidents";
 import type { IncidentReader } from "./investigation-incidents-contract";
 import { unprovenFixClaim } from "@/lib/knowledge/temporary-incident-schema";
+import { readThreadlessReplyProvenance } from "./threadless-provenance";
 import { CASE_REPLY_STUDIO_CORRECTION_BASIS } from "./case-reply-validation";
 
 export const SAV_PILOT_PROVENANCE_REVISION = "sav-pilot-provenance-2026-11-04.v1";
@@ -124,7 +125,9 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
 export function pilotProvenanceGate(deps: PilotProvenanceDeps) {
   return async (proposal: CaseReplyProposal, context?: Readonly<{ basis?: string | null }>): Promise<string | null> => {
     try {
-      const read = await readPilotReplyProvenance(proposal, deps, { humanCorrection: context?.basis === CASE_REPLY_STUDIO_CORRECTION_BASIS });
+      const humanCorrection = context?.basis === CASE_REPLY_STUDIO_CORRECTION_BASIS;
+      if (proposal.ticketSource) return await readThreadlessReplyProvenance(proposal, deps.env?.() ?? process.env, humanCorrection);
+      const read = await readPilotReplyProvenance(proposal, deps, { humanCorrection });
       return read.status === "proven" ? null : [...read.reasons].sort().join(",");
     } catch { return "decision_unreadable"; }
   };

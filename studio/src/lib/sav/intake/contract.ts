@@ -77,6 +77,7 @@ export const savIntakeMutationSchema = z.enum([
   "create_ticket_v2_owner",
   // V2 (SAV-10): each case effect has its own permission; granted by no existing policy.
   "send_case_reply", "append_case_note",
+  "admit_case_hubspot_ticket", "send_case_new_thread", "log_case_threadless_email",
   // V2 (human handoff notice): the one Slack post of a final handoff decision; granted by no existing policy.
   "notify_case_handoff",
   // V2 (ticket states): the ticket's pipeline stage only (waiting for the customer after a confirmed reply, closed after a proven resolution); granted by no existing policy.

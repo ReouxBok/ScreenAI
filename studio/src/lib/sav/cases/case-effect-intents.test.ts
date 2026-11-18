@@ -18,7 +18,7 @@ describe("reply_send intent", () => {
   it("is keyed reply:<caseId>:<trigger>, carries its own permission and the approval it ran under", () => {
     const intent = buildReplySendIntent(proposal, approval, context);
     expect(intent).toMatchObject({
-      kind: "reply_send", permission: "send_case_reply", key: caseReplyKey(CASE, "inbound:gmail-1"), sourceMessageId: proposal.inboundMessageId,
+      kind: "reply_send", permission: "send_case_reply", key: caseReplyKey(CASE, "inbound:gmail-1"), sourceMessageId: proposal.inboundMessageId!,
       mailbox: "support@example.invalid", threadId: "gmail-thread", recipient: "customer@example.invalid", text: proposal.text,
       caseEffect: { caseId: CASE, caseVersion: 7, triggerEventId: "inbound:gmail-1", purpose: "answer", payloadHash: approval.payloadHash, approvedBy: "staff@example.invalid" },
     });
@@ -94,7 +94,7 @@ describe("reply_send intent", () => {
 });
 
 describe("case_note intents: one note per interaction", () => {
-  const note = (interactionId: string) => buildCaseNoteIntent({ caseId: CASE, interactionId, ticketId: "12345", sourceMessageId: proposal.inboundMessageId, text: "Synthetic interaction note.", at: "2026-10-30T10:00:00.000Z" });
+  const note = (interactionId: string) => buildCaseNoteIntent({ caseId: CASE, interactionId, ticketId: "12345", sourceMessageId: proposal.inboundMessageId!, text: "Synthetic interaction note.", at: "2026-10-30T10:00:00.000Z" });
 
   it("the key is the interaction's: the same interaction is the same note whatever the retry, another interaction is another note", () => {
     const first = note(inboundInteractionId("gmail-1"));
