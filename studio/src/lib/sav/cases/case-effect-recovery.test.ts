@@ -557,7 +557,7 @@ describe("R1: a verification read that outlived its lease, or whose effect moved
 
   it("a kind that cannot belong to a case execution cannot be written at all: the schema refuses it, so the matrix does not need (and cannot have) that change", async () => {
     const { id } = await crashAfterMarker("answer");
-    await expect(f.client.exec(`UPDATE sav.intake_effects SET kind = 'case_note' WHERE execution_id = '${id}'`)).rejects.toThrow(/cannot belong to a case execution/);
+    await expect(f.client.exec(`UPDATE sav.intake_effects SET kind = 'case_note' WHERE execution_id = '${id}'`)).rejects.toThrow("effect kind case_note cannot belong to this case execution");
     expect(await effectsOf(id)).toMatchObject([{ kind: "reply_send" }]);
   });
 

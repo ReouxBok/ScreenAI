@@ -388,11 +388,12 @@ describe("the two parents of the effect ledger, and what each may host", () => {
     await effect(ids.caseEffect, "t-case-note", "note_create");
     await effect(ids.caseEffect, "t-case-assoc", "note_associate");
     // wrong type
-    for (const kind of ["ticket_create", "email_create", "email_associate", "stage_new", "identity_send", "owner_assign"]) {
-      await expect(effect(ids.caseEffect, `t-case-${kind}`, kind)).rejects.toThrow(/cannot belong to a case execution/);
+    // Migration 0054 (SAV-96): a case execution WITH a thread hosts reply kinds only; the new-thread kinds belong to a threadless one (message names « this »).
+    for (const kind of ["ticket_create", "email_create", "email_associate", "stage_new", "identity_send", "owner_assign", "new_thread_send", "new_thread_crm_email"]) {
+      await expect(effect(ids.caseEffect, `t-case-${kind}`, kind)).rejects.toThrow(`effect kind ${kind} cannot belong to this case execution`);
     }
     await expect(effect(ids.intake, "t-v1-reply", "reply_send", "send_case_reply")).rejects.toThrow("reply_send can only belong to a case execution");
-    await expect(f.client.query("UPDATE sav.intake_effects SET execution_id = $1 WHERE business_key = 't-v1-identity'", [ids.caseEffect])).rejects.toThrow(/cannot belong to a case execution/);
+    await expect(f.client.query("UPDATE sav.intake_effects SET execution_id = $1 WHERE business_key = 't-v1-identity'", [ids.caseEffect])).rejects.toThrow("effect kind identity_send cannot belong to this case execution");
     await expect(f.client.query("UPDATE sav.intake_effects SET execution_id = $1 WHERE business_key = 't-case-reply'", [ids.intake])).rejects.toThrow("reply_send can only belong to a case execution");
     // orphans
     await expect(effect(ids.orphan, "t-orphan", "note_create", "append_ticket_note")).rejects.toThrow("effect parent execution missing");
