@@ -15,7 +15,7 @@ beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 60_000)
 afterAll(async () => { await f?.client.close(); });
 beforeEach(async () => {
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "synthetic-ack-closure-encryption-key-000");
-  await f.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE public.audit_logs");
+  await f.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.cases CASCADE; TRUNCATE public.audit_logs");
   const [mailbox] = await f.db.insert(savMailboxes).values({ email: "support@example.invalid" }).returning(); mailboxId = mailbox.id;
 });
 afterEach(() => vi.unstubAllEnvs());
@@ -65,6 +65,33 @@ describe("facts from the stored thread", () => {
   });
 });
 
+describe("review Astra (8c2891d): the ticket, not only the thread", () => {
+  it("a V2 case on the same ticket through ANOTHER thread excludes the close: zero PATCH end to end", async () => {
+    const mine = await thread("8002"), other = await thread("8002");
+    const ours = await message(mine.id, "outbound", "C'est corrigé.", t(60));
+    const mail = await message(mine.id, "inbound", "Ok merci", t(30));
+    await f.db.insert(savCases).values({ ticketId: "8002", threadIds: [other.id], owner: "human", phase: "human_owned", contractRevision: "synthetic", payloadCiphertext: "not-read" });
+    const read = await readAckClosureFacts(mail.id);
+    expect(read?.v2Case).toBe(true);
+    const writes: string[] = [];
+    const result = await closeAcknowledgedTicket(mail.id, { env: () => ({ SAV_ACK_CLOSE: "on" }), authority: async () => {}, store: ackClosureAuditStore,
+      readFacts: async id => ({ ...(await readAckClosureFacts(id))!, v1Acknowledgement: true, model: { decision: "close", confidence: "high", lastOutboundMessageId: ours.id,
+        lastOutboundState: "conclusive", customerMessage: "pure_ack", justification: "Réponse conclusive.", evidenceQuote: "C'est corrigé." } }),
+      hubspot: { readTicket: async () => ({ pipeline: "0", stage: "2" }), setClosed: async () => { writes.push("stage"); return "applied"; },
+        createNote: async () => { writes.push("note"); return "1"; }, readNote: async () => null } });
+    expect(result).toMatchObject({ final: "not_applied", reason: "v2_case" });
+    expect(writes).toEqual([]);
+  });
+  it("a newer customer mail on another thread of the same ticket is a newer message", async () => {
+    const mine = await thread("8003"), other = await thread("8003");
+    await message(mine.id, "outbound", "C'est corrigé.", t(60));
+    const mail = await message(mine.id, "inbound", "Ok merci", t(30));
+    expect((await readAckClosureFacts(mail.id))?.newerMessage).toBe(false);
+    await message(other.id, "inbound", "Autre chose", t(10));
+    expect((await readAckClosureFacts(mail.id))?.newerMessage).toBe(true);
+  });
+});
+
 describe("recovery sweep", () => {
   it("off: nothing read or written", async () => {
     vi.stubEnv("SAV_ACK_CLOSE", "off");
@@ -103,5 +130,5 @@ it("end to end on the real receipts: one close, then nothing on retry", async ()
   expect(await closeAcknowledgedTicket(mail.id, deps)).toEqual({ final: "confirmed", basis: "conclusive_reply_acknowledged", noteId: "77" });
   expect(await closeAcknowledgedTicket(mail.id, deps)).toEqual({ skipped: "already_done" });
   expect(writes).toEqual(["stage", "note"]);
-  expect(await ackClosureAuditStore.steps(mail.id)).toEqual(["claimed", "stage_confirmed", "note_dispatched", "confirmed"]);
+  expect(await ackClosureAuditStore.steps(mail.id)).toEqual(["claimed", "stage_dispatched", "stage_confirmed", "note_dispatched", "confirmed"]);
 });

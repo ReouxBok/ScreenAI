@@ -6,7 +6,7 @@ import { and, asc, desc, eq, gt, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { auditLogs, savCases, savIntakeRuns, savMessages, savThreads } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
-import { savEffectiveReceivedAt } from "../message-order";
+import { savEffectiveReceivedAt, savEffectiveReceivedAtOfRow } from "../message-order";
 import { closeAcknowledgedTicket, createAckClosureHubspot, ACK_CLOSURE_FINAL_STEPS, type AckClosureDeps, type AckClosureStep, type AckClosureStore } from "./ack-closure";
 import { savAckClosureAnalysisSchema, savAckClosureEnabled, SAV_ACK_CLOSURE_PERMISSION, type AckClosureFacts } from "./ack-closure-rules";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./execution-policy";
@@ -16,7 +16,7 @@ import type { IntakeRuntimePayload } from "./runtime-contract";
 const ACTOR = "studio-intake";
 const ENTITY = "sav_message";
 const actionOf = (step: AckClosureStep) => `sav_ack_close_${step}`;
-const STEPS: readonly AckClosureStep[] = ["claimed", "stage_confirmed", "note_dispatched", "confirmed", "already_closed", "not_applied", "uncertain"];
+const STEPS: readonly AckClosureStep[] = ["claimed", "stage_dispatched", "stage_confirmed", "note_dispatched", "confirmed", "already_closed", "not_applied", "uncertain"];
 
 /** Receipts as audit rows, one per (message, step): a transaction-scoped advisory lock serializes concurrent writers of the same step. */
 export const ackClosureAuditStore: AckClosureStore = {
@@ -80,11 +80,17 @@ export async function readAckClosureFacts(messageId: string): Promise<AckClosure
   const index = thread_.findIndex(row => row.id === messageId);
   const previous = index > 0 ? thread_[index - 1]! : null;
   const { intakeDossierSensitive } = await import("./observation-binding");
-  const [v2] = await db.select({ id: savCases.id }).from(savCases).where(sql`${message.threadId}::uuid = any(${savCases.threadIds})`).limit(1);
+  // Review Astra (8c2891d, finding 1): a V2 case on the TICKET (any owner, any phase, whatever thread it holds) excludes the close, not only one on this thread.
+  const [v2] = await db.select({ id: savCases.id }).from(savCases)
+    .where(ticketId ? sql`${savCases.ticketId} = ${ticketId} or ${message.threadId}::uuid = any(${savCases.threadIds})` : sql`${message.threadId}::uuid = any(${savCases.threadIds})`).limit(1);
+  // Review Astra (finding 2): a newer customer mail on ANOTHER thread of the same ticket also stops the close.
+  const [siblingInbound] = ticketId ? await db.select({ id: savMessages.id }).from(savMessages).innerJoin(savThreads, eq(savThreads.id, savMessages.threadId))
+    .where(and(eq(savThreads.hubspotTicketId, ticketId), sql`${savMessages.threadId} <> ${message.threadId}`, eq(savMessages.direction, "inbound"),
+      sql`least(${savMessages.receivedAt}, ${savMessages.createdAt}) >= ${savEffectiveReceivedAtOfRow(message)}`)).limit(1) : [];
   return {
     v1Acknowledgement, customerMessageId: messageId, ticketId, model,
     previous: previous ? { messageId: previous.id, direction: previous.direction } : null,
-    newerMessage: index < 0 || index < thread_.length - 1,
+    newerMessage: index < 0 || index < thread_.length - 1 || Boolean(siblingInbound),
     sensitiveDossier: await intakeDossierSensitive(message.threadId, ticketId, db),
     v2Case: Boolean(v2),
   };

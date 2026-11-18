@@ -1,15 +1,17 @@
 // SAV-95 (18/11, OFF by default): the effect. After V1 classified a customer mail as an acknowledgement and the model judged a confident close
 // (`ack-closure-rules.ts`), move the thread's Support ticket to « Fermé » and add ONE short note. No customer email, no owner change, nothing else.
 // Protocol (receipts are durable rows, one per step and message; the DB store is `ack-closure-store.ts`):
-//   claimed → (GET ticket, PATCH stage, GET read-back) → stage_confirmed → note_dispatched (claimed once, atomically) → POST note → GET read-back → confirmed
+//   claimed → GET ticket → facts re-read → stage_dispatched → PATCH stage → GET read-back → stage_confirmed → note_dispatched (claimed once) → POST note → GET read-back → confirmed
 //   Final receipts: confirmed | already_closed | not_applied | uncertain. A final receipt ends the message for good (no second stage, no second note).
 // The stage write is idempotent by value (writing « Fermé » twice changes nothing), so it may be retried until read back. The note is not: once
 // `note_dispatched` exists it is never posted again; an unknown outcome becomes `uncertain` for a person. Switch, pause and authority are re-checked
-// right before the stage write.
+// right before the stage write, and the facts (newer mail on the thread or the ticket, a V2 case on the ticket) are read again just before it.
+// Review Astra (8c2891d, finding 3): `stage_dispatched` is recorded BEFORE the PATCH, so a later pass that finds the ticket closed knows the close may be
+// ours and continues to the note (exactly once); « already closed » is only a ticket we never wrote.
 import { decideAckClosure, savAckClosureEnabled, SAV_ACK_CLOSURE_NOTE, SAV_ACK_CLOSURE_REVISION, type AckClosureBasis, type AckClosureFacts } from "./ack-closure-rules";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 
-export type AckClosureStep = "claimed" | "stage_confirmed" | "note_dispatched" | "confirmed" | "already_closed" | "not_applied" | "uncertain";
+export type AckClosureStep = "claimed" | "stage_dispatched" | "stage_confirmed" | "note_dispatched" | "confirmed" | "already_closed" | "not_applied" | "uncertain";
 export const ACK_CLOSURE_FINAL_STEPS: readonly AckClosureStep[] = ["confirmed", "already_closed", "not_applied", "uncertain"];
 export type AckClosureMetadata = Record<string, string | number | boolean | null>;
 
@@ -68,25 +70,41 @@ export async function closeAcknowledgedTicket(messageId: string, deps: AckClosur
   // The wake runs after every V1 mail: a mail V1 did not classify as an acknowledgement leaves no row at all.
   if (!decision.close && decision.reason === "v1_not_acknowledgement" && !steps.length) return { skipped: "not_acknowledgement" };
   // A refusal is final for this mail only when nothing was written yet; after a claim the stage may already be « Fermé » and stays for a person to see.
-  if (!decision.close) return final(steps.includes("stage_confirmed") ? "uncertain" : "not_applied", { reason: decision.reason, ...(steps.includes("stage_confirmed") ? { stageClosed: true } : {}) });
+  const touched = steps.includes("stage_confirmed") || steps.includes("stage_dispatched");
+  if (!decision.close) return final(touched ? "uncertain" : "not_applied", { reason: decision.reason, ...(touched ? { stageMayBeClosed: true } : {}) });
   const { ticketId, basis } = decision;
   await deps.store.record(messageId, "claimed", { revision: SAV_ACK_CLOSURE_REVISION, ticketId, basis });
 
   if (!steps.includes("stage_confirmed")) {
+    const dispatchedBefore = steps.includes("stage_dispatched");
     const ticket = await deps.hubspot.readTicket(ticketId, signal).catch(() => null);
+    // Unreadable: retried by the sweep (`stage_dispatched` or `claimed` stays as the durable trace), never taken for « closed » or « open ».
     if (!ticket) return { retry: "ticket_unreadable" };
-    if (ticket.pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId) return final("not_applied", { reason: "pipeline_not_support", ticketId, basis });
-    // Closed by someone else: nothing to add, no note.
-    if (ticket.stage === SAV_HUBSPOT_SUPPORT.stages.closed) return final("already_closed", { ticketId, basis });
-    if (!ticket.stage || !OPEN_STAGES.has(ticket.stage)) return final("not_applied", { reason: "stage_unexpected", ticketId, basis });
-    // The last look before the only stage write: switch, pause and authority still hold.
-    if (!savAckClosureEnabled(deps.env())) return { skipped: "off" };
-    try { await deps.authority(); } catch { return { retry: "authority_changed" }; }
-    const written = await deps.hubspot.setClosed(ticketId, signal).catch(() => "unknown" as const);
-    if (written === "rejected") return final("not_applied", { reason: "stage_rejected", ticketId, basis });
-    const back = await deps.hubspot.readTicket(ticketId, signal).catch(() => null);
-    if (back?.pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId || back.stage !== SAV_HUBSPOT_SUPPORT.stages.closed) return { retry: "stage_unconfirmed" };
-    await deps.store.record(messageId, "stage_confirmed", { revision: SAV_ACK_CLOSURE_REVISION, ticketId, basis, stage: back.stage });
+    if (ticket.pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId)
+      return final(dispatchedBefore ? "uncertain" : "not_applied", { reason: "pipeline_not_support", ticketId, basis });
+    if (ticket.stage === SAV_HUBSPOT_SUPPORT.stages.closed) {
+      // Closed and we never wrote: closed by someone else, nothing to add. Closed after OUR dispatched PATCH: our close, the note follows.
+      if (!dispatchedBefore) return final("already_closed", { ticketId, basis });
+      await deps.store.record(messageId, "stage_confirmed", { revision: SAV_ACK_CLOSURE_REVISION, ticketId, basis, stage: ticket.stage, resumed: true });
+    } else {
+      if (!ticket.stage || !OPEN_STAGES.has(ticket.stage)) return final(dispatchedBefore ? "uncertain" : "not_applied", { reason: "stage_unexpected", ticketId, basis });
+      // The last look before the only stage write: switch, pause and authority still hold...
+      if (!savAckClosureEnabled(deps.env())) return { skipped: "off" };
+      try { await deps.authority(); } catch { return { retry: "authority_changed" }; }
+      // ...and the facts read again (review Astra, findings 1 and 2): a mail stored on the thread or on the ticket since the first read, or a V2 case
+      // attached to the ticket meanwhile, stops the write. HubSpot has no conditional write: the remaining window is this re-read to the PATCH.
+      const again = await deps.readFacts(messageId);
+      const recheck = again ? decideAckClosure(again) : null;
+      if (!recheck?.close || recheck.ticketId !== ticketId)
+        return final("not_applied", { reason: `recheck_${recheck && !recheck.close ? recheck.reason : "facts_changed"}`, ticketId, basis, ...(dispatchedBefore ? { stageObserved: ticket.stage } : {}) });
+      await deps.store.record(messageId, "stage_dispatched", { revision: SAV_ACK_CLOSURE_REVISION, ticketId, basis, previousStage: ticket.stage });
+      const written = await deps.hubspot.setClosed(ticketId, signal).catch(() => "unknown" as const);
+      if (written === "rejected") return final("not_applied", { reason: "stage_rejected", ticketId, basis });
+      const back = await deps.hubspot.readTicket(ticketId, signal).catch(() => null);
+      // Not read back: the next pass reads the stage again and, closed, continues to the note (`stage_dispatched` is recorded).
+      if (back?.pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId || back.stage !== SAV_HUBSPOT_SUPPORT.stages.closed) return { retry: "stage_unconfirmed" };
+      await deps.store.record(messageId, "stage_confirmed", { revision: SAV_ACK_CLOSURE_REVISION, ticketId, basis, stage: back.stage });
+    }
   }
 
   // The note: claimed once, so a concurrent or repeated pass can never post a second one.
