@@ -27,6 +27,7 @@ import { readSavAgentPause } from "./agent-pause";
 import { requireDb } from "@/db";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { createSavIntakeSemanticReaders, type IntakeValidatedEvidence } from "./model-readers";
+import { savAckClosureEnabled } from "./ack-closure-rules";
 import { createSavIntakeSimpleReaders, memoizeIntakeCrmReaders, SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
 import { withSavAiBudget } from "../gemini-transport";
 import { observeSavOther, readSavOtherConfiguration } from "../other-observation";
@@ -202,7 +203,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
       payload.attachments = attachments.state;
       checkpoint();
-    } } } : {}), model: config.model, call, provenance: lease.provenance, onValidatedEvidence: evidence => captureRequestQuotes(payload, evidence), onTrace: trace => {
+    } } } : {}), ...(savAckClosureEnabled(env()) ? { ackClosure: true } : {}), model: config.model, call, provenance: lease.provenance, onValidatedEvidence: evidence => captureRequestQuotes(payload, evidence), onTrace: trace => {
       semanticFailureReason = trace.errorCode ?? undefined;
       if (trace.budgetLimit) readerBudgetLimit = trace.budgetLimit;
       traces.push(trace); checkpoint();

@@ -73,6 +73,13 @@ describe("J2 warm follow-up and administrative closure", () => {
     expect(text).toContain("en vous proposant la marche à suivre suivante :\n" + procedure.text.split("\n\n")[1]);
     expectFormat(text);
   });
+  it("SAV-94: the same procedure laid out one step per paragraph is recalled exactly as the compact one", () => {
+    const spaced = { ...procedure, text: procedure.text.replace(".\n2. ", ".\n\n2. ") };
+    expect(spaced.text).not.toBe(procedure.text);
+    expect(j2ReminderText(spaced, on)).toBe(j2ReminderText(procedure, on));
+    expect(j2ReminderText(spaced, on)).not.toBe(J2_REMINDER_TEXT);
+    expect(j2ReminderText({ ...spaced, text: `${spaced.text}\n\nSi cela bloque encore, répondez à ce message.` }, on)).toBe(J2_REMINDER_TEXT);
+  });
   it.each([
     `Bonjour,\n\nVous devez disposer des droits administrateur avant de commencer.\n\n${procedure.text.split("\n\n")[1]}`,
     `${procedure.text}\n\nCette procédure nécessite une session administrateur active.`,

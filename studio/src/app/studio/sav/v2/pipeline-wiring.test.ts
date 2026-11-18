@@ -68,9 +68,13 @@ describe("V2 wiring panel = what the sources wire (production caller vs injectab
     }
   });
 
-  it("entry is wired through V1 and the qualification-only manual operator route", () => {
+  it("entry is wired through V1, the qualification-only manual operator route and the SAV-96 owner handover (behind its own switch)", () => {
     expect(sources.get("lib/sav/intake/event-pipeline.ts")).toMatch(/if \(env\.SAV_CASE_RECORDING !== "on"\) return;[\s\S]{0,200}recordCaseAfterConfirmedIntake/);
-    expect(classifyEntryPoint("recordCaseAfterConfirmedIntake", ["lib/sav/cases/intake-boundary.ts"]).production).toEqual(["lib/sav/cases/manual-qualification-runtime.ts", "lib/sav/intake/event-pipeline.ts"]);
+    expect(classifyEntryPoint("recordCaseAfterConfirmedIntake", ["lib/sav/cases/intake-boundary.ts"]).production).toEqual(["lib/sav/cases/manual-qualification-runtime.ts", "lib/sav/cases/owner-handover.ts", "lib/sav/intake/event-pipeline.ts"]);
+    // SAV-96: the handover reaches the relay only from the reconcile pass, behind SAV_V2_OWNER_HANDOVER (production, recording and entry on too).
+    expect(sources.get("lib/sav/reconcile-pass.ts")).toMatch(/savV2OwnerHandoverEnabled\(\) \? await runStep\("v2_owner_handovers"/);
+    expect(sources.get("lib/sav/cases/owner-handover-config.ts")).toMatch(/env\.SAV_V2_OWNER_HANDOVER === "on"/);
+    expect(V2_PIPELINE_WIRING.find(step => step.step === "entry")?.detail).toContain("SAV_V2_OWNER_HANDOVER");
     expect(reachable.has("app/api/internal/sav/v2/manual/route.ts")).toBe(true);
     expect(sources.get("lib/sav/cases/manual-qualification.ts")).toMatch(/scope\.mode !== "qualification"/);
     expect(V2_PIPELINE_WIRING.find(step => step.step === "entry")?.detail).toContain("qualification");

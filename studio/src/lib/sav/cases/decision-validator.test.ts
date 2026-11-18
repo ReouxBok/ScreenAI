@@ -659,7 +659,11 @@ describe("SAV-6 purity", () => {
     const dir = path.dirname(fileURLToPath(import.meta.url));
     const imports = (file: string) => [...readFileSync(path.join(dir, file), "utf8").matchAll(/from "([^"]+)"/g)].map(match => match[1]).sort();
     // `../message-context`: the shared, pure split of a mail into the customer's own words and what they quote (nothing behind it but the schema library).
-    expect(imports("decision-validator.ts")).toEqual(["../message-context", "../request-retrieval", "./ask-before-handoff", "./decision-contract", "./investigation-access-scope", "./restored-access"]);
+    // SAV-97: the exclude-only kernel (pure phrases on OUR reply text) and the switch (pure env read), nothing else behind them but the sensitive word list.
+    expect(imports("decision-validator.ts")).toEqual(["../message-context", "../request-retrieval", "./access-skill/access-skill-kernel", "./access-skill/access-skill-mode", "./ask-before-handoff", "./decision-contract", "./investigation-access-scope", "./restored-access"]);
+    expect(imports("access-skill/access-skill-kernel.ts")).toEqual(["../sensitive-words"]);
+    expect(imports("access-skill/access-skill-mode.ts")).toEqual([]);
+    expect(imports("sensitive-words.ts")).toEqual(["./case-types"]);
     // SAV-92 ask-before-handoff (17/11): a pure composition over the contract, nothing else behind it.
     expect(imports("ask-before-handoff.ts")).toEqual(["../message-context", "./decision-contract", "./restored-access"]);
     expect(imports("restored-access.ts")).toEqual(["../message-context"]);

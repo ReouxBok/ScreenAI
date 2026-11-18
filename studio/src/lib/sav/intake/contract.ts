@@ -77,11 +77,17 @@ export const savIntakeMutationSchema = z.enum([
   "create_ticket_v2_owner",
   // V2 (SAV-10): each case effect has its own permission; granted by no existing policy.
   "send_case_reply", "append_case_note",
+  "admit_case_hubspot_ticket", "send_case_new_thread", "log_case_threadless_email",
   // V2 (human handoff notice): the one Slack post of a final handoff decision; granted by no existing policy.
   "notify_case_handoff",
   // V2 (ticket states): the ticket's pipeline stage only (waiting for the customer after a confirmed reply, closed after a proven resolution); granted by no existing policy.
   // SAV-92 (Ugo 17/11, behind `SAV_V2_HANDOFF_STAGE=on`): on a V2 hand-over, the same right moves the ticket to « Nouveau » and clears its owner (and nothing else).
   "set_case_ticket_stage",
+  // SAV-96: start V2 from a confirmed manual HubSpot owner transition.
+  "start_case_owner_handover",
+  // SAV-95 (behind `SAV_ACK_CLOSE=on`): V1 moves the thread's Support ticket to « Fermé » with one note after a customer's acknowledgement the model judged
+  // a confident close (`ack-closure.ts`); granted by no existing policy, so a renewal must add it explicitly.
+  "close_acknowledged_ticket",
 ]);
 export type SavIntakeMutation = z.infer<typeof savIntakeMutationSchema>;
 

@@ -31,6 +31,7 @@ import { getCaseReplyEffect, listCaseReplyEffects } from "./case-reply-registry"
 import { decideCaseReply, enqueueApprovedCaseReply, revokeCaseReply, submitCaseReplyProposal, type CaseEffectNote } from "./case-reply-store";
 import { readFileSync } from "node:fs";
 import type { CaseReplyAuthorizer } from "./case-reply-validation";
+import { SAV_ACCESS_SKILL_REVISION, SAV_ACCESS_SKILL_RULE_ID } from "./access-skill/access-skill-guidelines";
 
 // SAV-10 durable validation on the REAL executor and the real SAV-5 store (PGlite, A's migrations through 0051): `executeIntakePass` with the case driver, the real ledger (sav.intake_effects), the real Gmail/HubSpot adapters on the
 // synthetic provider (no socket), the real SAV-5 case store. Nothing here reaches a provider.
@@ -51,14 +52,14 @@ const setV2Pause = async (level: "actions_paused" | "fully_paused" | null) => {
     cursor: encryptSavPayload({ revision: "sav-agent-pause.v1", agent: "v2", level, setBy: "fixture@example.invalid", setAt: AT, reason: "release fictive" }) });
 };
 
-async function scenario(purpose: CaseReplyProposal["purpose"] = "question", extra: { note?: boolean; text?: string } = {}) {
+async function scenario(purpose: CaseReplyProposal["purpose"] = "question", extra: { note?: boolean; text?: string; admission?: typeof ADMITTED } = {}) {
   const gmailThreadId = `gmail-thread-${randomUUID()}`, gmailMessageId = `gm-${randomUUID()}`, ticketId = String(++ticketSeq);
   const thread = (await f.db.insert(savThreads).values({ mailboxId, gmailThreadId, customerEmail: "customer@example.invalid" }).returning())[0]!;
   const message = (await f.db.insert(savMessages).values({
     threadId: thread.id, mailboxId, direction: "inbound", gmailMessageId, fromEmail: "customer@example.invalid", toEmails: ["support@example.invalid"], subject: "Synthetic connection failure",
     bodyCiphertext: encryptSavPayload({ text: "The synthetic connection fails.", headers: { "message-id": "<incoming@example.invalid>" }, attachments: [] }), receivedAt: new Date("2026-10-28T07:00:00.000Z"),
   }).returning())[0]!;
-  const { case: opened } = await openCaseEvent({ ticketId, threadId: thread.id, admission: ADMITTED, kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(gmailMessageId), sourceRef: { type: "email", id: gmailMessageId }, occurredAt: "2026-10-28T07:00:00.000Z" });
+  const { case: opened } = await openCaseEvent({ ticketId, threadId: thread.id, admission: extra.admission ?? ADMITTED, kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(gmailMessageId), sourceRef: { type: "email", id: gmailMessageId }, occurredAt: "2026-10-28T07:00:00.000Z" });
   p = executionProvider(); p.setGmail(gmailMessageId, gmailThreadId); p.seedTicket({ id: ticketId });
   sends = 0; loseAck = false;
   const gmail: GmailRequest = async <T>(mailbox: string, path: string, init?: RequestInit) => {
@@ -387,11 +388,12 @@ describe("the two parents of the effect ledger, and what each may host", () => {
     await effect(ids.caseEffect, "t-case-note", "note_create");
     await effect(ids.caseEffect, "t-case-assoc", "note_associate");
     // wrong type
-    for (const kind of ["ticket_create", "email_create", "email_associate", "stage_new", "identity_send", "owner_assign"]) {
-      await expect(effect(ids.caseEffect, `t-case-${kind}`, kind)).rejects.toThrow(/cannot belong to a case execution/);
+    // Migration 0054 (SAV-96): a case execution WITH a thread hosts reply kinds only; the new-thread kinds belong to a threadless one (message names « this »).
+    for (const kind of ["ticket_create", "email_create", "email_associate", "stage_new", "identity_send", "owner_assign", "new_thread_send", "new_thread_crm_email"]) {
+      await expect(effect(ids.caseEffect, `t-case-${kind}`, kind)).rejects.toThrow(`effect kind ${kind} cannot belong to this case execution`);
     }
     await expect(effect(ids.intake, "t-v1-reply", "reply_send", "send_case_reply")).rejects.toThrow("reply_send can only belong to a case execution");
-    await expect(f.client.query("UPDATE sav.intake_effects SET execution_id = $1 WHERE business_key = 't-v1-identity'", [ids.caseEffect])).rejects.toThrow(/cannot belong to a case execution/);
+    await expect(f.client.query("UPDATE sav.intake_effects SET execution_id = $1 WHERE business_key = 't-v1-identity'", [ids.caseEffect])).rejects.toThrow("effect kind identity_send cannot belong to this case execution");
     await expect(f.client.query("UPDATE sav.intake_effects SET execution_id = $1 WHERE business_key = 't-case-reply'", [ids.intake])).rejects.toThrow("reply_send can only belong to a case execution");
     // orphans
     await expect(effect(ids.orphan, "t-orphan", "note_create", "append_ticket_note")).rejects.toThrow("effect parent execution missing");
@@ -703,5 +705,59 @@ describe("lock order: the case is locked before the validation on every path of 
     expect(finalLook.indexOf("await deps.currentPolicyRevision()")).toBeLessThan(finalLook.indexOf("transaction(async tx"));
     const local = text.slice(text.indexOf("async function assertLocal("), text.indexOf("async function withdraw("));
     expect(local.indexOf('.for("update")')).toBeLessThan(local.indexOf("await gate("));
+  });
+});
+
+/*
+ * SAV-97: the last fence before a reply leaves, for a case the Access skill admitted (provenance `qualified_rule` access-entry-skill at this revision), on the
+ * real executor: the reply leaves only while the switch is still `on`; a customer mail recorded after the approval (a refund asked while the reply is queued)
+ * cancels it; our own text carrying a kernel phrase is cancelled. Nothing is sent in any of those.
+ */
+describe("SAV-97 : dernier contrôle avant envoi d'un dossier admis par le skill Accès", () => {
+  const SKILL = { ...ADMITTED,
+    policy: { ...ADMITTED.policy, qualifiedRules: [{ ruleId: SAV_ACCESS_SKILL_RULE_ID, revision: SAV_ACCESS_SKILL_REVISION, families: ["access"] }] },
+    qualification: { ...ADMITTED.qualification, requests: [{ requestId: "r1", family: "access" as const,
+      provenance: { kind: "qualified_rule" as const, ruleId: SAV_ACCESS_SKILL_RULE_ID, revision: SAV_ACCESS_SKILL_REVISION, at: AT } }] } } as unknown as typeof ADMITTED;
+  const ON = () => { environment = { ...environment, SAV_V2_ACCESS_SKILL: "on" }; };
+
+  it("on : la réponse préparée part une fois", async () => {
+    ON();
+    const s = await scenario("answer", { admission: SKILL });
+    expect((await readCase(s.caseId))!.owner).toBe("agent");
+    const { id } = await admit(s);
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+  });
+  it("un mail « remboursez-moi » arrivé pendant la mise en file annule la réponse : rien n'est envoyé", async () => {
+    ON();
+    const s = await scenario("answer", { admission: SKILL });
+    const { id } = await admit(s);
+    await newInbound(s);
+    expect(await run(id)).toMatchObject({ reason: "SAV_CASE_EFFECT_CANCELLED_NEW_INPUT" });
+    expect(await effectsOf(id)).toEqual([]);
+    expect(sends).toBe(0);
+  });
+  it("interrupteur repassé à shadow ou off après l'approbation : annulé, rien n'est envoyé", async () => {
+    for (const mode of ["shadow", "off"]) {
+      ON();
+      const s = await scenario("answer", { admission: SKILL });
+      const { id } = await admit(s);
+      environment = { ...environment, SAV_V2_ACCESS_SKILL: mode };
+      expect(await run(id)).toMatchObject({ reason: "SAV_CASE_EFFECT_CANCELLED_ACCESS_SKILL_CHANGED" });
+      expect(sends).toBe(0);
+    }
+  });
+  it("on : notre réponse qui contient une phrase du noyau est annulée, jamais envoyée", async () => {
+    ON();
+    const s = await scenario("answer", { admission: SKILL, text: "Pour résilier votre abonnement, rendez-vous dans les paramètres." });
+    const { id } = await admit(s);
+    expect(await run(id)).toMatchObject({ reason: "SAV_CASE_EFFECT_CANCELLED_REPLY_SENSITIVE_WORDING" });
+    expect(sends).toBe(0);
+  });
+  it("off (production d'aujourd'hui) : un dossier admis autrement n'est pas touché par ce contrôle", async () => {
+    const s = await scenario("answer", { text: "Pour résilier votre abonnement, rendez-vous dans les paramètres." });
+    const { id } = await admit(s);
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
   });
 });

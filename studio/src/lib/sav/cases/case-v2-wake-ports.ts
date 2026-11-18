@@ -15,6 +15,7 @@ import { caseTicketOwnerPortFromTransport, type CaseOwnerReadTransport } from ".
 import { createHandoffCrmReader } from "./case-handoff-crm";
 import type { CaseTicketOwnerPort } from "./case-ticket-owner";
 import type { CaseV2WakeDeps } from "./case-v2-wake";
+import { createThreadlessTransport } from "./threadless-transport";
 
 const TIMEOUT_MS = 10_000;
 
@@ -57,13 +58,18 @@ export type CaseV2WakeCompositionInput = Readonly<{
 /** The wake's dependencies with the canonical adapter on every port. Nothing here runs anything. */
 export function createCaseV2WakeDeps(input: CaseV2WakeCompositionInput): CaseV2WakeDeps {
   const network = input.network ?? fetch, now = input.now ?? (() => new Date());
+  const adapters = createIntakeExecutorAdapters({
+    network, env: input.env, ...(input.gmail?.request ? { gmailRequest: input.gmail.request } : {}), ...(input.gmail?.permissions ? { gmailPermissions: input.gmail.permissions } : {}),
+  });
   return {
     policy: input.policy, since: input.since,
     replies: {
       env: input.env, deadlineMs: input.deadlineMs, ...(input.limit === undefined ? {} : { limit: input.limit }),
-      adapters: createIntakeExecutorAdapters({
-        network, env: input.env, ...(input.gmail?.request ? { gmailRequest: input.gmail.request } : {}), ...(input.gmail?.permissions ? { gmailPermissions: input.gmail.permissions } : {}),
-      }),
+      adapters,
+      threadless: {
+        transport: createThreadlessTransport({ env: input.env, network, ...(input.gmail?.request ? { gmailRequest: input.gmail.request } : {}) }),
+        gmailPermissions: adapters.gmailPermissions,
+      },
       readTicketOwner: createCaseTicketOwnerPort({ env: input.env, network }),
       currentPolicyRevision: admissionPolicyRevisionPort({ read: input.readPolicyRecord, now }),
     },

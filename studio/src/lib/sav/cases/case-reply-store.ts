@@ -1,4 +1,4 @@
-import { caseReplyEditableBody } from "./case-reply-outbound";
+import { caseReplyEditableBody, prepareCaseReplyText, readCaseReplyDisclosure } from "./case-reply-outbound";
 // SAV-10 (pole C): the DURABLE human validation of a prepared reply, and its idempotent hand-off to the executor's queue.
 //   submit  -> `proposed`   what the agent prepared, stored exactly as the person will read it (B produces the proposal, this stores it, it never sends it)
 //   decide  -> `approved` | `declined`   a person, authorized by an INJECTED port that refuses by default, for THIS payload, case version and recipient
@@ -17,6 +17,8 @@ import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { executionJournal, type ExecutionTx } from "../intake/execution-store";
 import { assertSavOutboundRecipientAllowed } from "../policy";
 import type { CaseReplyContext } from "./case-effect-intents";
+import { caseReplyModeForBasis } from "./case-reply-mode";
+import { savV2NewThreadEnabled, threadlessReplyShape } from "./threadless-config";
 import { caseReplyKey, caseReplyPayloadHash, caseReplyQuestions, readCaseEffectsMode, type CaseReplyProposal } from "./case-effects";
 import { readCaseReplyFacts } from "./case-reply-facts";
 import { caseReplyStoredTextProblem, caseReplyTextProblemForBasis } from "./case-reply-mode";
@@ -89,7 +91,9 @@ function proposalProblem(proposal: CaseReplyProposal): string | null {
     if (isTerminalReply(proposal.purpose) && caseReplyEditableBody(proposal.text) !== (proposal.purpose === "closing" ? CLOSING_REPLY : HANDOFF_REPLY)) return "terminal_text";
     if (typeof proposal.subject !== "string" || !proposal.subject.trim() || /[\r\n]/.test(proposal.subject)) return "subject";
     if (typeof proposal.recipient !== "string" || !ADDRESS.test(proposal.recipient.trim())) return "recipient";
-    if (typeof proposal.inboundMessageId !== "string" || !proposal.inboundMessageId) return "inbound";
+    if (proposal.ticketSource || proposal.inboundMessageId === null) {
+      if (!threadlessReplyShape(proposal)) return "ticket_source";
+    } else if (typeof proposal.inboundMessageId !== "string" || !proposal.inboundMessageId) return "inbound";
     const questions = caseReplyQuestions(proposal);
     if (proposal.question && proposal.questions !== undefined) return "question";
     if (proposal.questions !== undefined && (!Array.isArray(proposal.questions) || proposal.questions.length < 2 || proposal.questions.length > 5)) return "question";
@@ -101,7 +105,30 @@ function proposalProblem(proposal: CaseReplyProposal): string | null {
   } catch { return "invalid"; }
 }
 
-export type SubmitCaseReplyResult = Readonly<{ ok: true; id: string; created: boolean; state: CaseReplyValidationState }> | CaseReplyRefusal;
+export type SubmitCaseReplyResult = Readonly<{ ok: true; id: string; created: boolean; state: CaseReplyValidationState;
+  /** SAV-94: set only when the row found is one stored before the layout pass (its text kept as stored): the hash of THAT row, which the caller must use. */
+  storedPayloadHash?: string }> | CaseReplyRefusal;
+
+/**
+ * SAV-94: a proposal stored (and maybe approved, hashed, queued) BEFORE the layout pass, that the same decision prepared again now would only lay out
+ * (blank lines, "1)" -> "1.", Markdown markers). That row is the reply: its text is kept and sent exactly as stored, never re-formatted, so a resumed
+ * decision finds its approval instead of being refused as a second text (`trigger_already_approved`). Same trigger, same fields, same mention: only the
+ * layout of the stored text may differ. Approved rows first, like the exact lookup otherwise returns the one row with that hash.
+ */
+async function findCaseReplyStoredBeforeLayout(tx: Pick<ExecutionTx, "select">, replyKey: string, payloadHash: string) {
+  const t = savCaseReplyValidations;
+  const rows = await tx.select({ id: t.id, state: t.state, payloadHash: t.payloadHash, proposalCiphertext: t.proposalCiphertext }).from(t).where(eq(t.replyKey, replyKey));
+  for (const row of [...rows].sort((a, b) => Number(b.state === "approved") - Number(a.state === "approved"))) {
+    let stored: CaseReplyProposal;
+    try { stored = decryptSavPayload<CaseReplyProposal>(row.proposalCiphertext); } catch { continue; }
+    const disclosure = readCaseReplyDisclosure(stored.text);
+    if (!disclosure) continue;
+    let relaid: string;
+    try { relaid = prepareCaseReplyText(stored.text, disclosure.language, disclosure.mode, stored.purpose); } catch { continue; }
+    if (relaid !== stored.text && caseReplyPayloadHash({ ...stored, text: relaid }) === payloadHash) return row;
+  }
+  return null;
+}
 
 /**
  * Stores what the agent prepared. Idempotent on (trigger, payload): the same proposal is the same row. A new proposal for the case replaces the proposals
@@ -116,6 +143,7 @@ export async function submitCaseReplyProposal(requested: CaseReplyProposal, deps
 }> = {}): Promise<SubmitCaseReplyResult> {
   if (!isSupervised(deps)) return refuse("effects_off");
   if (isTerminalReply(requested.purpose) && !closingHandoffReplyEnabled(deps.env())) return refuse("effects_off");
+  if (requested.ticketSource && !savV2NewThreadEnabled(deps.env())) return refuse("effects_off");
   const problem = proposalProblem(requested);
   if (problem) return refuse("proposal_invalid", problem);
   // The CRM owner NOW, before anything is stored: asked outside the transaction, about the ticket of this very case (minimal read, nothing decrypted). The local facts are judged under the case lock afterwards.
@@ -128,17 +156,23 @@ export async function submitCaseReplyProposal(requested: CaseReplyProposal, deps
     const facts = await readCaseReplyFacts(tx, requested, revision, { lockCase: true });
     if (facts.caseVersion === null) return refuse("case_unknown");
     if (requested.caseVersion > facts.caseVersion) return refuse("version_unknown");
-    const [inbound] = await tx.select({ threadId: savMessages.threadId }).from(savMessages).where(eq(savMessages.id, requested.inboundMessageId));
-    if (!inbound) return refuse("inbound_unknown");
-    const [owner] = await tx.select({ threadIds: savCases.threadIds }).from(savCases).where(eq(savCases.id, requested.caseId));
-    if (!owner?.threadIds.includes(inbound.threadId)) return refuse("inbound_not_in_case");
-    // The trigger is the stored fact the reply answers, under ONE canonical name; the proposal is stored (and hashed, and approved) under that name.
-    const trigger = await resolveCaseReplyTrigger(tx, requested);
-    if (!trigger.ok) return refuse(trigger.code, trigger.detail);
-    const proposal: CaseReplyProposal = { ...requested, triggerEventId: trigger.triggerEventId };
+    let proposal = requested;
+    if (!requested.ticketSource) {
+      if (!requested.inboundMessageId) return refuse("inbound_unknown");
+      const [inbound] = await tx.select({ threadId: savMessages.threadId }).from(savMessages).where(eq(savMessages.id, requested.inboundMessageId));
+      if (!inbound) return refuse("inbound_unknown");
+      const [owner] = await tx.select({ threadIds: savCases.threadIds }).from(savCases).where(eq(savCases.id, requested.caseId));
+      if (!owner?.threadIds.includes(inbound.threadId)) return refuse("inbound_not_in_case");
+      const trigger = await resolveCaseReplyTrigger(tx, requested);
+      if (!trigger.ok) return refuse(trigger.code, trigger.detail);
+      proposal = { ...requested, triggerEventId: trigger.triggerEventId };
+    }
     const replyKey = caseReplyKey(proposal.caseId, proposal.triggerEventId), payloadHash = caseReplyPayloadHash(proposal);
     const [existing] = await tx.select().from(savCaseReplyValidations).where(and(eq(savCaseReplyValidations.replyKey, replyKey), eq(savCaseReplyValidations.payloadHash, payloadHash)));
     if (existing) return { ok: true, id: existing.id, created: false, state: existing.state as CaseReplyValidationState };
+    // SAV-94: the same reply stored before the layout pass is found as it is (a Studio correction is a new text and keeps its own path).
+    const kept = options.supersedes ? null : await findCaseReplyStoredBeforeLayout(tx, replyKey, payloadHash);
+    if (kept) return { ok: true, id: kept.id, created: false, state: kept.state as CaseReplyValidationState, storedPayloadHash: kept.payloadHash };
     if (options.supersedes) {
       // Case first (above), validation second: the lock order of this file.
       const [prior] = await tx.select({ caseId: savCaseReplyValidations.caseId, replyKey: savCaseReplyValidations.replyKey, payloadHash: savCaseReplyValidations.payloadHash, state: savCaseReplyValidations.state })
@@ -185,6 +219,7 @@ export async function decideCaseReply(input: Readonly<{
   const seenCheck = checkCaseReplySeen({ payloadHash: row.payloadHash, caseVersion: row.caseVersion, recipient: row.recipient }, seen);
   if (seenCheck !== "ok") return refuse(seenCheck);
   const proposal = proposalOf(row);
+  if (action === "approve" && proposal.ticketSource && !savV2NewThreadEnabled(deps.env())) return refuse("effects_off");
   if (action === "approve" && isTerminalReply(proposal.purpose) && !closingHandoffReplyEnabled(deps.env())) return refuse("effects_off");
   // A row stored before the contract can still be declined, never approved: nobody validates a text that cannot be sent as written.
   if (action === "approve") { const notFinal = caseReplyStoredTextProblem(proposal.text); if (notFinal) return refuse("proposal_invalid", notFinal); }
@@ -204,6 +239,7 @@ export async function decideCaseReply(input: Readonly<{
   }
   const authorization = early ?? await authorizeCaseReplyDecision(authorizer, request);
   if (!authorization.allowed) return refuse(authorization.code);
+  if (action === "approve" && proposal.ticketSource && caseReplyModeForBasis(authorization.basis) !== "manual_reviewed") return refuse("proposal_invalid", "ticket_review_required");
   // The mention the text carries must be the one THIS authority allows: the automated mention only under the automatic rule's basis, the reviewed one only under a human's.
   if (action === "approve") { const wrongMode = caseReplyTextProblemForBasis(proposal.text, authorization.basis); if (wrongMode) return refuse("proposal_invalid", wrongMode); }
   const revision = action === "approve" ? await deps.currentPolicyRevision() : null;
@@ -315,6 +351,20 @@ export async function enqueueApprovedCaseReply(input: Readonly<{
     // B-7: the last fence before an execution exists. A situation that another approved reply already queued (or sent) is never queued a second time, even if a database
     // written before the guard holds two approvals for it.
     if (await findCaseReplySituationTaker(tx, { caseId: row.caseId, replyKey: row.replyKey, triggerEventId: proposal.triggerEventId, scope: "queue" })) return refuse("situation_already_answered");
+    if (proposal.ticketSource) {
+      if (!savV2NewThreadEnabled(deps.env()) || note) return refuse("effects_off");
+      const facts = await readCaseReplyFacts(tx, proposal, await deps.currentPolicyRevision(), { lockCase: false });
+      if (!facts.admission.admitted || facts.storedSender !== row.recipient) return refuse("not_admitted");
+      const [created] = await tx.insert(savCaseEffectExecutions).values({
+        caseId: row.caseId, replyKey: row.replyKey, threadId: null, policyId: policy.id, policyHash: policy.hash,
+        payloadCiphertext: encryptSavPayload({ validationId, proposal }),
+      }).onConflictDoNothing().returning({ id: savCaseEffectExecutions.id });
+      if (!created) return refuse("trigger_already_planned");
+      await tx.update(savCaseReplyValidations).set({ executionId: created.id }).where(eq(savCaseReplyValidations.id, validationId));
+      await executionJournal(tx, created.id, "case_effect_admitted", { replyKey: row.replyKey, validationId, payloadHash: row.payloadHash, approvedBy: row.decidedBy, caseVersion: row.caseVersion });
+      return { ok: true, executionId: created.id, created: true };
+    }
+    if (!proposal.inboundMessageId) return refuse("inbound_unknown");
     const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, proposal.inboundMessageId));
     const [thread] = message ? await tx.select().from(savThreads).where(eq(savThreads.id, message.threadId)) : [undefined];
     const [mailbox] = thread ? await tx.select({ email: savMailboxes.email }).from(savMailboxes).where(eq(savMailboxes.id, thread.mailboxId)) : [undefined];

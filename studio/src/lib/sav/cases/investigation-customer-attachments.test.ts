@@ -76,8 +76,8 @@ describe("evidence and the screenshot-or-link rule", () => {
     expect(caseInvestigationPrompt(request()).instruction).not.toContain("capture d'écran de l'erreur");
   });
   it("review P2-2: with SAV_V2_ATTACHMENT_MEDIA off the decision is recorded under main's v4 prompt revision; v5 only when the feature is on", () => {
-    expect(caseInvestigationPromptRevision(caseAttachmentMediaMode({}) !== "off")).toBe("sav-v2-investigation-prompt-2026-11-14.v4");
-    expect(caseInvestigationPromptRevision(caseAttachmentMediaMode({ SAV_V2_ATTACHMENT_MEDIA: "unknown" }) !== "off")).toBe("sav-v2-investigation-prompt-2026-11-14.v4");
+    expect(caseInvestigationPromptRevision(caseAttachmentMediaMode({}) !== "off")).toBe("sav-v2-investigation-prompt-2026-11-18.v6");
+    expect(caseInvestigationPromptRevision(caseAttachmentMediaMode({ SAV_V2_ATTACHMENT_MEDIA: "unknown" }) !== "off")).toBe("sav-v2-investigation-prompt-2026-11-18.v6");
     expect(caseInvestigationPromptRevision(caseAttachmentMediaMode({ SAV_V2_ATTACHMENT_MEDIA: "images" }) !== "off")).toBe(SAV_CASE_INVESTIGATION_PROMPT_REVISION);
   });
   it("counter-review of 66e648a: the « cover every open request » instruction is sent from 2 open requests only; with 1 the instruction is the v4 one, unchanged", () => {

@@ -55,6 +55,7 @@ export async function pendingCaseEffectRecoveries(limit = CASE_RECOVERY_LIST_LIM
     .from(savCaseEffectExecutions).innerJoin(savIntakeEffects, eq(savIntakeEffects.executionId, savCaseEffectExecutions.id))
     .where(and(
       notInArray(savCaseEffectExecutions.state, ["confirmed", "refused"]),
+      isNotNull(savCaseEffectExecutions.threadId),
       // A handoff notice is verified by its own pass (`case-handoff-notice-store.ts`): this recovery reads a reply proposal in every sealed payload.
       notLike(savCaseEffectExecutions.replyKey, `${HANDOFF_NOTICE_KEY_PREFIX}%`), notLike(savCaseEffectExecutions.replyKey, `${TICKET_STAGE_KEY_PREFIX}%`), // a ticket stage has its own pass
       or(isNull(savCaseEffectExecutions.leaseUntil), lte(savCaseEffectExecutions.leaseUntil, now)),

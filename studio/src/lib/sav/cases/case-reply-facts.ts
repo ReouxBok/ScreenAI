@@ -9,7 +9,9 @@ import type { ExecutionTx } from "../intake/execution-store";
 import { caseAdmissionStatus } from "./admission-policy";
 import { revalidateFiredJ2, type J2CaseView, type J2CaseEventView } from "./timer-lifecycle";
 import type { CaseTimer } from "./case-types";
-import type { CaseReplyProposal } from "./case-effects";
+import { caseEffectHash, type CaseReplyProposal } from "./case-effects";
+import { readCaseThreadlessSource } from "./case-store";
+import { threadlessReplyShape, threadlessReplySubject } from "./threadless-config";
 
 export type CaseReplyFacts = Readonly<{
   /** `caseAdmissionStatus` of the case now; a customer message recorded after the version the person saw is `input_newer` even though the case was re-admitted for it. */
@@ -19,6 +21,8 @@ export type CaseReplyFacts = Readonly<{
   caseVersion: number | null;
   /** The case's LOCAL owner now (`sav.cases.owner`), null when the case row is missing. */
   owner: string | null;
+  /** SAV-97: the case's stored admission, as decrypted for `admission` above (no second read or decrypt for the Access skill's send fence). */
+  admissionRecord?: unknown;
 }>;
 
 export async function readCaseReplyFacts(tx: ExecutionTx, proposal: CaseReplyProposal, policyRevision: string | null, options: Readonly<{ lockCase: boolean }>): Promise<CaseReplyFacts> {
@@ -34,8 +38,9 @@ export async function readCaseReplyFacts(tx: ExecutionTx, proposal: CaseReplyPro
   const snapshot = row && isTerminalReply(proposal.purpose) ? { caseId: row.id, ticketId: row.ticketId, owner: row.owner, phase: row.phase, sensitivity: row.sensitivity, body: decryptSavPayload(row.payloadCiphertext) } as CaseSnapshot : null;
   const pending = snapshot && terminalRows.length <= 5000 && proposal.purpose === "handoff" && pendingHandoffReply(snapshot, terminalEvents, proposal.triggerEventId);
   const closing = snapshot && terminalRows.length <= 5000 && proposal.purpose === "closing" && provenClosingReply(snapshot, terminalEvents, proposal.triggerEventId);
+  const admissionRecord: unknown = row?.admissionCiphertext ? decryptSavPayload(row.admissionCiphertext) : null;
   const status = !row ? { admitted: false as const, reason: "no_admission" }
-    : caseAdmissionStatus({ owner: pending ? "agent" : row.owner as "agent", admission: row.admissionCiphertext ? decryptSavPayload(row.admissionCiphertext) : null, admissionInputVersion: row.admissionInputVersion }, policyRevision);
+    : caseAdmissionStatus({ owner: pending ? "agent" : row.owner as "agent", admission: admissionRecord as never, admissionInputVersion: row.admissionInputVersion }, policyRevision);
   let admission = status.admitted ? newer ? { admitted: false as const, reason: "input_newer" } : status
     : { admitted: false as const, reason: status.reason === "policy_missing" ? "policy_changed" : status.reason };
   if (isTerminalReply(proposal.purpose) && !(pending || closing)) admission = { admitted: false, reason: "terminal_proof_missing" };
@@ -52,6 +57,18 @@ export async function readCaseReplyFacts(tx: ExecutionTx, proposal: CaseReplyPro
     }) : null;
     if (result?.status !== "timer_conditions_met") admission = { admitted: false, reason: "j2_obsolete_or_deferred" };
   }
+  if (proposal.ticketSource || proposal.inboundMessageId === null) {
+    const source = threadlessReplyShape(proposal) && row && !row.threadIds.length
+      ? await readCaseThreadlessSource(tx, row.id, proposal.triggerEventId) : null;
+    const valid = source?.source.contact && caseEffectHash(source.source) === proposal.ticketSource?.version
+      && row?.sensitivity === "none" && row.version === proposal.caseVersion
+      && row.phase === "queued" && proposal.subject === threadlessReplySubject(row.ticketId);
+    return {
+      admission: valid ? admission : { admitted: false, reason: "ticket_source_changed" },
+      storedSender: valid ? source!.source.contact!.email : null,
+      caseVersion: row?.version ?? null, owner: row?.owner ?? null, admissionRecord,
+    };
+  }
   const [stored] = await tx.select({ from: savMessages.fromEmail }).from(savMessages).where(eq(savMessages.id, proposal.inboundMessageId));
-  return { admission, storedSender: stored?.from ?? null, caseVersion: row?.version ?? null, owner: pending ? "agent" : row?.owner ?? null };
+  return { admission, storedSender: stored?.from ?? null, caseVersion: row?.version ?? null, owner: pending ? "agent" : row?.owner ?? null, admissionRecord };
 }

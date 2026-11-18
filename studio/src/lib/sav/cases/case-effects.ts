@@ -52,7 +52,8 @@ export type CaseReplyProposal = Readonly<{
   caseId: string;
   caseVersion: number;
   triggerEventId: string;
-  inboundMessageId: string;
+  inboundMessageId: string | null;
+  ticketSource?: Readonly<{ kind: "hubspot_ticket"; version: string }>;
   purpose: CaseReplyPurpose;
   recipient: string;
   subject: string;
@@ -76,6 +77,7 @@ export const caseReplyPayloadHash = (proposal: CaseReplyProposal) => caseEffectH
   caseId: caseIdPart(proposal.caseId), caseVersion: proposal.caseVersion, triggerEventId: proposal.triggerEventId, inboundMessageId: proposal.inboundMessageId,
   purpose: proposal.purpose, recipient: lower(proposal.recipient), subject: proposal.subject, text: proposal.text, question: proposal.question ?? null,
   questions: proposal.questions,
+  ticketSource: proposal.ticketSource,
   // Absent from the hash when there is none: a reply sealed without procedures keeps the hash it was approved under.
   procedures: proposal.procedures?.length ? proposal.procedures : undefined,
 });

@@ -19,6 +19,8 @@ import { boundIntakeTicketHistories, intakeHistoryNotice } from "./history-budge
 import { intakeContextBreakdown, type IntakeContextBreakdown } from "./model-context";
 import { compactIntakeContextView, INTAKE_CONTEXT_VIEW_INSTRUCTION } from "./model-context-view";
 import type { IntakeEvidenceAnchor } from "./model-evidence";
+import { savAckClosureAnalysisSchema, type SavAckClosureAnalysis } from "./ack-closure-rules";
+import { savAckClosureGuideline } from "./ack-closure-guidelines";
 import { addIntakeOutputNormalization, emptyIntakeOutputNormalization, intakeOutputNormalized, normalizeIntakeAnalysisOutput, INTAKE_OUTPUT_LIMITS_INSTRUCTION, INTAKE_VISUAL_LIMITS_INSTRUCTION, type IntakeOutputNormalization, type IntakeOutputStage } from "./output-normalization";
 
 export const SAV_INTAKE_MODEL_REVISION = "sav-intake-semantic-2026-10-31.v11";
@@ -128,6 +130,8 @@ export function createSavIntakeSemanticReaders(options: {
   onValidatedEvidence?: (evidence: IntakeValidatedEvidence) => void;
   /** SAV-92: tickets already tied to the dossier (thread ticket, human choice) whose history is bounded last. */
   historyPriorityTicketIds?: readonly (string | null | undefined)[];
+  /** SAV-95: `SAV_ACK_CLOSE=on` only. Adds the closure guideline and the optional `ackClosure` field to the understanding call; absent, the request is unchanged. */
+  ackClosure?: boolean;
 }): SavIntakeSemanticReaders {
   if (!/^gemini-[A-Za-z0-9._-]{1,100}$/.test(options.model)) throw Error("SAV_INTAKE_CONFIGURED_MODEL_REQUIRED");
   let calls = 0;
@@ -259,7 +263,16 @@ export function createSavIntakeSemanticReaders(options: {
         sourceMessageId: referenceIds([message, ...conversation].filter(m => m.direction === "inbound" && m.fromEmail.toLowerCase() === message.fromEmail.toLowerCase()).map(m => m.id)),
         quoteId: catalogue.quoteIds(),
       });
-      const baseWireSchema = analysisSchema.omit({ attachmentObservations: true, imageRequirements: true }).extend({ messageId: referenceIds([message.id]),
+      // SAV-95: OUR latest reply before the current mail, the one the closure guideline judges (only with the switch on and a citable text).
+      const lastOutbound = options.ackClosure ? conversation.filter(m => m.direction === "outbound" && m.id !== message.id && Date.parse(m.receivedAt) <= Date.parse(message.receivedAt))
+        .sort((a, b) => Date.parse(a.receivedAt) - Date.parse(b.receivedAt)).at(-1) : undefined;
+      const ackSource = lastOutbound ? `message-${lastOutbound.id}` : null;
+      const ackClosure = ackSource && catalogue.entries.some(e => e.sourceId === ackSource) ? { id: lastOutbound!.id, sourceId: ackSource } : null;
+      if (ackClosure) Object.assign(data, { lastOutboundSourceId: ackClosure.sourceId });
+      const ackWireSchema = ackClosure ? savAckClosureAnalysisSchema.omit({ evidenceQuote: true }).extend({ lastOutboundMessageId: referenceIds([ackClosure.id]),
+        evidenceQuoteId: catalogue.quoteIds(ackClosure.sourceId) }) : null;
+      const baseWireSchema = analysisSchema.omit({ attachmentObservations: true, imageRequirements: true, ackClosure: true }).extend({ messageId: referenceIds([message.id]),
+        ...(ackWireSchema ? { ackClosure: ackWireSchema.optional() } : {}),
         requests: z.array(analysisSchema.shape.requests.element.omit({ quote: true, originMessageId: true }).extend({ currentMessageId: referenceIds([message.id]),
           ...(identificationContinuation ? { originMessageId: referenceIds([identificationContinuation.initialMessageId]).optional() } : {}),
           quoteId: identificationContinuation ? catalogue.quoteIds() : catalogue.quoteIds("current") })).max(15),
@@ -297,7 +310,16 @@ export function createSavIntakeSemanticReaders(options: {
           return decoded;
         }
       };
-      const result = await generate("understanding", "Report message nature separately as request/newsletter/information/indeterminate. A newsletter with zero requests must omit ticketSummary. A newsletter may contain zero requests, but empty requests, unknown or low confidence never authorize Other. An original subject saying ça ne fonctionne pas is support even with an empty body. Preserve every customer question in a forwarded newsletter; signatures and unsubscribe links alone are not newsletter authority. Classify each CURRENT authored request, including a non-inherited initial subject in sourceId=current. Inherited reply/forward subjects, quotations, signatures and other participants are historical/context only. A positive acknowledgement, coordination or resolved improvement is not a new support request. Distinguish financial operations/billing/cancellation from product usage. Extract a registration email only from an attributed inbound declaration by the current sender, with exact sourceMessageId and a quoteId bound to that message; never from a signature or third party. Only when the sender explicitly states that this address is the email of their own Limova account (registration or login), e.g. mon compte Limova est <address>. An address the customer wants to connect, synchronize, share or forward (Outlook, Gmail, calendar, mailbox), a colleague's or third party's address, or a negated or quoted one is never a registration, even when it is the only address written. Asking how to connect a mailbox to find invoices is a support how-to, not a finance request. Commercial means a pre-use or purchase/compatibility inquiry asking whether the product can meet a need, without reporting an actual failure or established ongoing usage. Support means an actual malfunction or a how-to question about existing product usage; a paying customer can still ask a commercial question, and a contact record alone does not prove active usage. Examples: asking whether the product integrates with sector software before use is commercial; an already configured integration failing to synchronize is support; asking how to add calling credits is support; requesting a refund or invoice is finance. Neither the word compatible nor a CRM status alone determines the class. Nature, relationship and follow-up are separate: commercial is only a new pre-sale inquiry with no existing exchange. A question by an existing customer about their offer, an option, its price or API access, a reply to our support, or a reply to an offer or call a team member already sent, continues that exchange: classify its usage, access or capability part as support, keep a price question as its own request, and preserve unknown when unsure; never commercial to fill a gap. Never invent a capability, endpoint or price. If the authored context cannot distinguish these, preserve unknown instead of inventing usage or a malfunction. Supply a concise title (at most six words) and factual description in the language of the current authored message, covering every request when a ticket could be needed. Do not translate a French ticket into English. " + INTAKE_OUTPUT_LIMITS_INSTRUCTION + " " + (identificationContinuation ? "Current requests must cite current. Only the server-authorized continuation may set originMessageId to initialMessageId and cite message-initialMessageId, with a separate registration declaration from current; never label historical words as current." : "Every request quoteId must belong to sourceId=current."), data, analysisSchema, signal, (value, note) => {
+      // SAV-95: the closure decision never fails the analysis. A missing, malformed or wrongly cited decision is dropped (no closure), never repaired.
+      const decodeAckClosure = (raw: Record<string, unknown>): { ackClosure?: SavAckClosureAnalysis } => {
+        const value = raw.ackClosure;
+        if (!ackClosure || !value || typeof value !== "object" || Array.isArray(value)) return {};
+        const { evidenceQuoteId, ...rest } = value as Record<string, unknown>;
+        const entry = catalogue.entries.find(e => e.id === evidenceQuoteId && e.sourceId === ackClosure.sourceId);
+        const parsed = entry ? savAckClosureAnalysisSchema.safeParse({ ...rest, evidenceQuote: entry.text }) : null;
+        return parsed?.success && parsed.data.lastOutboundMessageId === ackClosure.id ? { ackClosure: parsed.data } : {};
+      };
+      const result = await generate("understanding", "Report message nature separately as request/newsletter/information/indeterminate. A newsletter with zero requests must omit ticketSummary. A newsletter may contain zero requests, but empty requests, unknown or low confidence never authorize Other. An original subject saying ça ne fonctionne pas is support even with an empty body. Preserve every customer question in a forwarded newsletter; signatures and unsubscribe links alone are not newsletter authority. Classify each CURRENT authored request, including a non-inherited initial subject in sourceId=current. Inherited reply/forward subjects, quotations, signatures and other participants are historical/context only. A positive acknowledgement, coordination or resolved improvement is not a new support request. Distinguish financial operations/billing/cancellation from product usage. Extract a registration email only from an attributed inbound declaration by the current sender, with exact sourceMessageId and a quoteId bound to that message; never from a signature or third party. Only when the sender explicitly states that this address is the email of their own Limova account (registration or login), e.g. mon compte Limova est <address>. An address the customer wants to connect, synchronize, share or forward (Outlook, Gmail, calendar, mailbox), a colleague's or third party's address, or a negated or quoted one is never a registration, even when it is the only address written. Asking how to connect a mailbox to find invoices is a support how-to, not a finance request. Commercial means a pre-use or purchase/compatibility inquiry asking whether the product can meet a need, without reporting an actual failure or established ongoing usage. Support means an actual malfunction or a how-to question about existing product usage; a paying customer can still ask a commercial question, and a contact record alone does not prove active usage. Examples: asking whether the product integrates with sector software before use is commercial; an already configured integration failing to synchronize is support; asking how to add calling credits is support; requesting a refund or invoice is finance. Neither the word compatible nor a CRM status alone determines the class. Nature, relationship and follow-up are separate: commercial is only a new pre-sale inquiry with no existing exchange. A question by an existing customer about their offer, an option, its price or API access, a reply to our support, or a reply to an offer or call a team member already sent, continues that exchange: classify its usage, access or capability part as support, keep a price question as its own request, and preserve unknown when unsure; never commercial to fill a gap. Never invent a capability, endpoint or price. If the authored context cannot distinguish these, preserve unknown instead of inventing usage or a malfunction. Supply a concise title (at most six words) and factual description in the language of the current authored message, covering every request when a ticket could be needed. Do not translate a French ticket into English. " + INTAKE_OUTPUT_LIMITS_INSTRUCTION + " " + (identificationContinuation ? "Current requests must cite current. Only the server-authorized continuation may set originMessageId to initialMessageId and cite message-initialMessageId, with a separate registration declaration from current; never label historical words as current." : "Every request quoteId must belong to sourceId=current.") + (ackClosure ? "\n" + savAckClosureGuideline() : ""), data, analysisSchema, signal, (value, note) => {
         if (value.messageId !== message.id) rejectIntakeEvidence("message_id_mismatch", "messageId");
         for (const [index, request] of value.requests.entries()) {
           if (request.currentMessageId !== message.id) rejectIntakeEvidence("message_id_mismatch", `requests.${index}.currentMessageId`);
@@ -324,6 +346,11 @@ export function createSavIntakeSemanticReaders(options: {
         }
       }, { schema: wireSchema, normalize: raw => {
         const normalized = normalizeIntakeAnalysisOutput(raw, { visual: Boolean(visual) });
+        // SAV-95: an ackClosure the wire contract refuses (or one never asked for) is dropped here, so it can never fail the analysis.
+        const own = normalized.value as Record<string, unknown> | null;
+        if (own && typeof own === "object" && !Array.isArray(own) && Object.hasOwn(own, "ackClosure") && !(ackWireSchema?.safeParse(own.ackClosure).success)) {
+          const { ackClosure: dropped, ...kept } = own; void dropped; normalized.value = kept;
+        }
         // Before any wire schema (the visual sanitizer parses it first): an optional registration
         // whose anchor does not resolve to its own source is dropped under the discard rule.
         // Every other field, including request quoteIds, keeps its strict enum validation.
@@ -340,7 +367,9 @@ export function createSavIntakeSemanticReaders(options: {
       }, decode: raw => {
         if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
         if (Object.hasOwn(raw, "attachmentObservations")) rejectIntakeEvidence("unknown_source", "attachmentObservations");
-        const { unreadAttachmentRequirements, ...withoutUnread } = raw as Record<string, unknown>;
+        const { ackClosure: rawAck, ...withoutAck } = raw as Record<string, unknown>;
+        const ack = decodeAckClosure({ ackClosure: rawAck });
+        const { unreadAttachmentRequirements, ...withoutUnread } = withoutAck;
         if (unreadAttachmentRequirements !== undefined && !unread) rejectIntakeEvidence("unknown_source", "unreadAttachmentRequirements");
         const unreadDecoded = unreadAttachmentRequirements === undefined ? {} : { unreadAttachmentRequirements: Array.isArray(unreadAttachmentRequirements) ? unreadAttachmentRequirements.map(row => {
           const { textQuoteId, ...rest } = row as Record<string, unknown>;
@@ -349,7 +378,7 @@ export function createSavIntakeSemanticReaders(options: {
           if (!entry) rejectIntakeEvidence("wrong_anchor_source", "unreadAttachmentRequirements");
           return { ...rest, textQuote: entry.text };
         }) : unreadAttachmentRequirements };
-        if (!visual) return { ...decodeAnalysis(withoutUnread), ...unreadDecoded };
+        if (!visual) return { ...decodeAnalysis(withoutUnread), ...unreadDecoded, ...ack };
         const { images, imageRequirements, ...analysis } = withoutUnread;
         const requirements = Array.isArray(imageRequirements) ? imageRequirements.map(row => {
           const r = row as Record<string, unknown>, { textQuoteId, ...rest } = r;
@@ -361,7 +390,7 @@ export function createSavIntakeSemanticReaders(options: {
         visualObservations = applySavAttachmentVisualResult(visual.prepared, { images });
         visual.onRead(visualObservations);
         const read = visualObservations.filter(o => visualSources.some(v => v.sourceId === o.sourceId));
-        return { ...decodeAnalysis(analysis), ...unreadDecoded, attachmentObservations: read, ...(requirements === undefined ? {} : { imageRequirements: requirements }) };
+        return { ...decodeAnalysis(analysis), ...unreadDecoded, attachmentObservations: read, ...(requirements === undefined ? {} : { imageRequirements: requirements }), ...ack };
       } }, visual?.prepared.uniqueImages);
       observeIntakeValidatedEvidence(options.onValidatedEvidence, { reader: "current", phase: "understanding", kind: "analysis", callIndex: calls, value: result });
       return messageAnalysisSchema.parse({ ...result, requests: result.requests.map(({ quote: excerpt, ...request }) => { void excerpt; return request; }) });

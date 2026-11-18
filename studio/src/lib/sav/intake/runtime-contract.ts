@@ -8,6 +8,8 @@ import type { EnginePolicy, IntakePlan } from "./engine-types";
 import { intakeReadRecoveryPolicySchema } from "./read-recovery";
 import { SAV_ATTACHMENT_PDF_REVISION } from "../attachment-contract";
 import { SAV_INTAKE_NOISE_FILTER_REVISION, savIntakeNoiseFilterMode } from "./noise-filter";
+import { savAckClosureEnabled } from "./ack-closure-rules";
+import { SAV_ACK_CLOSURE_REVISION } from "./ack-closure-guidelines";
 
 export const SAV_INTAKE_RUNTIME_REVISION = "sav-intake-runtime-2026-10-21.v1";
 export const intakeRuntimeHash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -59,6 +61,8 @@ export function intakeRuntimeConfigurationHash(p: z.infer<typeof savIntakeRuntim
     ...(savIntakePdfReading(env) ? { pdfReading: SAV_ATTACHMENT_PDF_REVISION } : {}),
     // Only routing changes the launch: off and observe keep the previous hash.
     ...(savIntakeNoiseFilterMode(env) === "on" ? { noiseFilter: SAV_INTAKE_NOISE_FILTER_REVISION } : {}),
+    // SAV-95: the closure guideline changes the understanding prompt, so `SAV_ACK_CLOSE=on` is a new launch configuration; off keeps the previous hash.
+    ...(savAckClosureEnabled(env) ? { ackClosure: SAV_ACK_CLOSURE_REVISION } : {}),
     accessBinding: intakeRuntimeHash({ model: env.SAV_GEMINI_API_KEY, crm: env.HUBSPOT_ACCESS_TOKEN }) });
 }
 /** No permissive defaults, campaign resets or hidden reuse of another budget. */

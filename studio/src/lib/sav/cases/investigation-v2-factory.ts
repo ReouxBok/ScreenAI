@@ -10,6 +10,7 @@ import { readCaseDecisionGeneration } from "./investigation-decision-generation"
 import { caseProvenanceReaders } from "./investigation-pilot-readers";
 import { bindCaseInvestigationToReplyPlan, type CaseReplyPassageDeps, type CaseReplyPlanBinding } from "./investigation-reply-passage";
 import { caseInvestigationReturnAwareQualify, caseReturnContentRule } from "./investigation-return-qualify";
+import { caseReturnRulesForAccessSkill } from "./access-skill/access-skill-return";
 import { caseCallLedgerOnStore, type CaseInvestigationRuntimeDeps } from "./investigation-runtime";
 import {
   caseCustomerTextsReader, caseGeminiDecisionPreflight, caseGeminiDecisionProvider, caseGeminiEmbeddingTransport, caseHubspotOwnerReadTransport, caseKnowledgeVectorSearch,
@@ -103,7 +104,9 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
     temporaryIncidents: readRuntimeTemporaryIncidents,
     mode: "observe", holder: input.holder ?? "sav-v2-investigation", scope, now, leaseSeconds: input.leaseSeconds ?? 90,
     pauseState: casePauseState(caseV2PauseState(), input.env, now, input.caseAllowed), readTicketOwner, accessScope: provenance.accessScope, admissionPolicyRevision: provenance.currentPolicyRevision,
-    qualify: caseInvestigationReturnAwareQualify(v1Qualify, { readPolicyRecord, now, ...(input.returnRule ? { returnRules: caseReturnContentRule(input.returnRule, now) } : {}) }),
+    // SAV-97: `SAV_V2_ACCESS_SKILL=on` requalifies a return with the Access skill, `shadow` compares it in the logs; `off`: exactly the legacy rule, or none.
+    qualify: caseInvestigationReturnAwareQualify(v1Qualify, { readPolicyRecord, now, ...((rules => rules ? { returnRules: rules } : {})(
+      caseReturnRulesForAccessSkill(input.env, now, input.returnRule ? caseReturnContentRule(input.returnRule, now) : undefined))) }),
     customerTexts: caseCustomerTextsReader(),
     // SAV-92: the customer's mails and V1's CRM snapshot, read only from the database (no HubSpot call), masked and bounded.
     customerContext: caseCustomerContextReader({ env: input.env }),

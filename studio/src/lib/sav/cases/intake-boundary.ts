@@ -11,10 +11,11 @@ import type { ExecutionPayload } from "../intake/execution-types";
 import type { IntakeRuntimePayload } from "../intake/runtime-contract";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { decideCaseAdmission } from "./admission-policy";
+import { savV2OwnerHandoverEnabled } from "./owner-handover-config";
 import { listCaseEvents, openCaseEvent, readCaseByTicket, savCaseRecordingEnabled, transitionCaseOwner, v1IntentHash, type CaseTx } from "./case-store";
 import {
   SAV_CASE_SENSITIVE_FAMILIES, SAV_CASE_SUBJECT_LENGTH, caseDedupeKey, caseRequestId, caseRequestSubjectSchema,
-  type CaseAdmissionQualification, type CaseAttributionProof, type CaseOwnerAtCreationProof, type CaseRelayProof, caseAwaitsV2Attribution, type CaseRequestSubject, type CaseSensitivity, type CaseSnapshot,
+  SAV_CASE_ACCESS_BLOCK_ID, type CaseAdmissionQualification, type CaseAttributionProof, type CaseOwnerAtCreationProof, type CaseRelayProof, caseAwaitsV2Attribution, type CaseRequestSubject, type CaseSensitivity, type CaseSnapshot,
   type CaseSubjectAbsence,
 } from "./case-types";
 
@@ -41,6 +42,7 @@ export type CaseBoundaryDeps = {
    * `write: false` checks V1's proofs and the exact scope without writing anything (before any owner read); `write: true` binds atomically, asked only
    * after the fresh reading of the V2 owner. False refuses: the mail is recorded, never attributed. Not injected: no other way to bind than at creation. */
   bindQualificationThread?: (input: { messageId: string; ticketId: string; executionId: string; runId: string | null; runVersion: number; write: boolean }) => Promise<boolean>;
+  ownerHandover?: { ticketId: string; awaitCustomer: boolean; assertFresh: (tx: CaseTx) => Promise<void> };
 };
 export type CaseRelayRequest = { requestId: string; kind: string };
 /** What the relay is about to record, from its own V1 proof: a qualification port compares its
@@ -98,7 +100,8 @@ async function ownerReadProof(input: { ticketId: string; messageId: string; admi
   if (current && !caseAwaitsV2Attribution(current)) return "pending";
   if (decideCaseAdmission({ policy: input.admission.policy, qualification: input.admission.qualification, caseSensitivity: current?.sensitivity ?? "none" }).target !== "agent") return "pending";
   let reading: string | null | undefined;
-  try { reading = await deps.readCreatedTicketOwner(ticketId); } catch { return "pending"; }
+  try { reading = await deps.readCreatedTicketOwner(ticketId); }
+  catch (error) { if (deps.ownerHandover) throw error; return "pending"; }
   input.onReading?.(reading);
   return reading === ownerId ? { kind: "hubspot_owner_read", messageId: input.messageId, ticketId, ownerId } : "pending";
 }
@@ -300,7 +303,8 @@ export async function readIntakeAcknowledgement(messageId: string): Promise<Inta
 }
 
 export type CaseRelayResult =
-  | { skipped: "recording_off" | "intake_not_confirmed" | "source_missing" | "no_case_for_thread" | "thread_case_ambiguous" | "before_case" | "customer_return_wait" | "customer_return_not_consumed" }
+  | { skipped: "recording_off" | "intake_not_confirmed" | "source_missing" | "no_case_for_thread" | "thread_case_ambiguous" | "before_case" | "customer_return_wait" | "customer_return_not_consumed"
+      | "owner_handover_off" | "owner_handover_out_of_scope" | "owner_handover_not_attributed" }
   | { caseId: string; version: number; created: boolean; appended: boolean; owner: string; relay: CaseRelayProof["kind"] | "v2_customer_return";
       admission: { target: string; reasons: string[] } | null; existingTicket?: SavV2ExistingTicketOwnerRule };
 
@@ -313,8 +317,12 @@ export type CaseRelayResult =
  * throws for an unconfirmed intake: it returns `skipped` and writes nothing. */
 export async function recordCaseAfterConfirmedIntake(messageId: string, deps: CaseBoundaryDeps = {}): Promise<CaseRelayResult> {
   if (!savCaseRecordingEnabled(deps.env)) return { skipped: "recording_off" };
+  if (deps.ownerHandover && !savV2OwnerHandoverEnabled(deps.env)) return { skipped: "owner_handover_off" };
   const readProgress = deps.readProgress ?? (await import("../intake/executor")).readIntakeExecutionProgress;
   const progress = await readProgress(messageId);
+  if (deps.ownerHandover) {
+    return progress?.ticketId === deps.ownerHandover.ticketId ? relayConfirmedEffects(messageId, progress, deps) : { skipped: "intake_not_confirmed" };
+  }
   // An execution with effects is the only proof for this message: confirmed or nothing.
   const engaged = progress && (progress.ticketId || progress.effects === undefined || progress.effects.length > 0);
   if (deps.routeReturn && (!engaged || (progress.confirmed && progress.state === "confirmed" && progress.ticketId))) {
@@ -335,13 +343,24 @@ async function relayConfirmedEffects(messageId: string, progress: NonNullable<In
   const decision = decryptSavPayload<ExecutionPayload>(source.execution.payloadCiphertext).plan.decision;
   const target = decision.disposition?.kind === "ticket" ? decision.disposition.target : null, existingTicket = target?.operation === "link" || target?.operation === "reopen";
   const relay: CaseRelayProof = { kind: "intake_effects_confirmed", messageId, executionId, intakeRunId: source.execution.runId, intakeRunVersion: source.execution.runVersion };
-  const attribution = await readAttributionProof({ executionId, messageId, ticketId, env: deps.env }) ?? "pending";
+  const attribution = deps.ownerHandover ? "pending" : await readAttributionProof({ executionId, messageId, ticketId, env: deps.env }) ?? "pending";
   return relayToCase({ ticketId, threadId: source.threadId, gmailMessageId: source.gmailMessageId, receivedAt: source.receivedAt, decision, relay, deps, confirmedTicket: true, attribution, existingTicket,
     assertFresh: async tx => {
       const [row] = await tx.select({ state: savIntakeExecutions.state, ticketId: savIntakeExecutions.ticketId }).from(savIntakeExecutions)
         .where(eq(savIntakeExecutions.id, executionId)).for("share");
       if (row?.state !== "confirmed" || row.ticketId !== ticketId) throw Error("SAV_CASE_INTAKE_NOT_CONFIRMED");
     } });
+}
+
+/** When the handover is enabled, V1's existing shortcut still accepts an integration's owner
+ * assignment. A CRM/mobile assignment requires its own aged webhook marker, even before delivery. */
+async function readOwnerForOrdinaryRelay(ticketId: string, env: CaseBoundaryDeps["env"]) {
+  const { readSavOwnerHandoverTicket } = await import("../hubspot");
+  const ticket = await readSavOwnerHandoverTicket(ticketId);
+  if (ticket.archived) return undefined;
+  const current = ticket.properties.hubspot_owner_id || null;
+  if (current !== v2HubspotOwnerId(env)) return current;
+  return ticket.latestOwner?.sourceType === "INTEGRATION" && ticket.latestOwner.value === current ? current : undefined;
 }
 
 async function relayAcknowledgement(messageId: string, deps: CaseBoundaryDeps): Promise<CaseRelayResult> {
@@ -376,6 +395,13 @@ async function relayToCase(input: {
   const target: CaseQualificationTarget = { ticketId: input.ticketId, executionId: input.relay.kind === "intake_effects_confirmed" ? input.relay.executionId : null,
     runId: input.relay.intakeRunId, runVersion: input.relay.intakeRunVersion };
   const { admission, requests } = await relayAdmissionInput({ messageId: input.relay.messageId, gmailMessageId: input.gmailMessageId, decision: input.decision, confirmedTicket: input.confirmedTicket, deps: input.deps, target });
+  const handover = input.deps.ownerHandover;
+  if (handover && (!admission.qualification.requests.every(request => request.family === "access"
+    && (request.provenance.kind === "human" || (request.provenance.kind === "qualified_rule" && (request.provenance.blockId ?? SAV_CASE_ACCESS_BLOCK_ID) === SAV_CASE_ACCESS_BLOCK_ID)))
+    || decideCaseAdmission({ ...admission, caseSensitivity: caseSensitivityOf(input.decision) }).target !== "agent")) return { skipped: "owner_handover_out_of_scope" };
+  const guardOrdinaryAttribution = !handover && savV2OwnerHandoverEnabled(input.deps.env)
+    && (!!input.deps.readCreatedTicketOwner || input.attribution !== "pending");
+  const deps = guardOrdinaryAttribution ? { ...input.deps, readCreatedTicketOwner: (ticketId: string) => readOwnerForOrdinaryRelay(ticketId, input.deps.env) } : input.deps;
   // No attribution while paused (and no CRM read for it). The creation route reads the CRM owner only for a
   // mail admitted for the agent: a sensitive, mixed or unqualified one is never read. The store decides the
   // admission again under its lock.
@@ -384,9 +410,11 @@ async function relayToCase(input: {
   // 16/11: set only on the binding path of an existing ticket, once its owner was read.
   let ownerRule = undefined as SavV2ExistingTicketOwnerRule | undefined;
   let attribution = !inScope || (input.attribution !== "pending" && await relayPaused(requireDb())) ? "pending" as const : input.attribution;
-  if (attribution !== "pending" && attribution.kind === "hubspot_owner_at_creation")
+  if (attribution !== "pending" && attribution.kind === "hubspot_owner_verified" && guardOrdinaryAttribution) {
+    if (await deps.readCreatedTicketOwner!(input.ticketId).catch(() => undefined) !== attribution.ownerId) attribution = "pending";
+  } else if (attribution !== "pending" && attribution.kind === "hubspot_owner_at_creation")
     attribution = decideCaseAdmission({ policy: admission.policy, qualification: admission.qualification, caseSensitivity: "none" }).target === "agent"
-      ? await confirmCreatedOwner(attribution, input.deps) : "pending";
+      ? await confirmCreatedOwner(attribution, deps).catch(error => { if (guardOrdinaryAttribution) return "pending" as const; throw error; }) : "pending";
   // No V1 owner effect for this mail: the owner as it reads now is enough. An acknowledgement opens nothing and proves no ticket: it never takes this route.
   else if (input.attribution === "pending" && input.relay.kind === "intake_effects_confirmed") {
     // SAV-81: a mail V1 confirmed while no thread was bound (its subject did not match at the creation) is otherwise never attributed. Only through the
@@ -394,17 +422,19 @@ async function relayToCase(input: {
     const relay = input.relay, bind = !inScope && !scope.allowed && scope.reason === "qualification_thread_unbound" ? input.deps.bindQualificationThread : undefined;
     const proofs = bind && { messageId: relay.messageId, ticketId: input.ticketId, executionId: relay.executionId, runId: relay.intakeRunId, runVersion: relay.intakeRunVersion };
     if (inScope || (bind && proofs && await bind({ ...proofs, write: false }))) {
-      attribution = await ownerReadProof({ ticketId: input.ticketId, messageId: relay.messageId, admission, deps: input.deps,
+      attribution = await ownerReadProof({ ticketId: input.ticketId, messageId: relay.messageId, admission, deps,
         ...(bind && input.existingTicket ? { onReading: (reading: string | null | undefined) => { ownerRule = savV2ExistingTicketOwnerRule(reading, v2HubspotOwnerId(input.deps.env)); } } : {}) });
       // Bound, then read back: the attribution stands only on a thread the scope now covers.
       if (attribution !== "pending" && bind && proofs && (!await bind({ ...proofs, write: true })
         || !(await savV2QualificationMessageAllowed(input.deps.env ?? process.env, relay.messageId)).allowed)) attribution = "pending";
     }
   }
+  if (handover && attribution === "pending") return { skipped: "owner_handover_not_attributed" };
   const subjects = requests.length ? await readRequestSubjects({ runId: input.relay.intakeRunId, runVersion: input.relay.intakeRunVersion, messageId: input.relay.messageId,
     gmailMessageId: input.gmailMessageId, requestIds: input.decision.requests.filter(request => request.kind !== "acknowledgement").map(request => request.id) }) : new Map<string, CaseRequestSubject>();
   const result = await openCaseEvent({
     ticketId: input.ticketId, threadId: input.threadId, admissionMode: "exclusions_only", attribution, admission,
+    ...(handover?.awaitCustomer ? { attributionPhase: "awaiting_customer" } : {}),
     opens: requests.map(request => ({ id: request.requestId, summary: openedSummary(request, input.gmailMessageId),
       // The `message` stand-in of a mail whose analysis listed no request has no V1 summary of its own.
       subject: subjects.get(request.requestId) ?? { status: "absent" as const, reason: "not_in_summary" as const } })),
@@ -415,6 +445,7 @@ async function relayToCase(input: {
     // mail again, without attribution while the pause lasts.
     assertFresh: async tx => {
       if (attribution !== "pending" && await relayPaused(tx)) throw Error("SAV_CASE_RELAY_PAUSED");
+      await handover?.assertFresh(tx);
       await input.assertFresh(tx);
     },
   });

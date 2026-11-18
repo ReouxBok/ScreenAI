@@ -18,6 +18,7 @@ import { processPendingSavContextRefreshes, dispatchPendingSavEmailOpenings } fr
 import { refreshSavDashboardProjection, savSqlDashboardEnabled } from "@/lib/sav/dashboard-projection";
 import { randomUUID } from "node:crypto";
 import { recordSavWorkerPulse } from "@/lib/sav/monitor";
+import { savV2OwnerHandoverEnabled } from "@/lib/sav/cases/owner-handover-config";
 
 export type SavReconcileTrigger = "vercel_cron" | "gmail_webhook" | "heartbeat_workflow";
 export type SavReconcilePassOptions = { trigger: SavReconcileTrigger; pulseId?: string; budgetMs?: number };
@@ -66,6 +67,8 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     runStep("gmail_receipts", () => processPendingGmailReceipts(50)),
     runStep("hubspot_receipts", () => processPendingHubspotReceipts(50)),
   ]);
+  const ownerHandovers = savV2OwnerHandoverEnabled() ? await runStep("v2_owner_handovers", async () =>
+    (await import("@/lib/sav/cases/owner-handover")).sweepDueOwnerHandovers(derivedDeadline)) : undefined;
   const emailOpenings = await runStep("email_openings", () => dispatchPendingSavEmailOpenings(10));
   const contextRefreshes = await runStep("context_refreshes", () => processPendingSavContextRefreshes(5));
   const [trainings, evaluations] = await Promise.all([
@@ -85,6 +88,12 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
   const caseRelays = await runStep<Awaited<ReturnType<typeof sweepMissedCaseRelays>> | { skipped: string }>("case_relays", () => Date.now()+20_000>derivedDeadline ? Promise.resolve({skipped:"deadline"}) : sweepMissedCaseRelays());
   const intakeTracking = await runStep("intake_tracking", () => ensureIntakeObservations({ deadlineMs: derivedDeadline }));
   const intakeConsole = await runStep("intake_console", () => refreshIntakeConsole(20));
+  // SAV-95: recovery of acknowledgement closures (off unless SAV_ACK_CLOSE=on; the wake after the projection is the fast path).
+  const ackClosures = await runStep<Awaited<ReturnType<typeof import("@/lib/sav/intake/ack-closure-store").reconcileAckClosures>> | { skipped: string }>("intake_ack_closure", async () => {
+    if (process.env.SAV_ACK_CLOSE !== "on") return { skipped: "off" };
+    if (Date.now() + 20_000 > derivedDeadline) return { skipped: "deadline" };
+    return (await import("@/lib/sav/intake/ack-closure-store")).reconcileAckClosures(3, Math.min(derivedDeadline, Date.now() + 20_000));
+  });
   const intakeRead = await runStep<Awaited<ReturnType<typeof reconcileHandledIntakeGmailRead>> | { skipped: string }>("intake_gmail_read", () => Date.now()+1000>=derivedDeadline ? Promise.resolve({skipped:"deadline"}) : reconcileHandledIntakeGmailRead(3,Math.min(derivedDeadline,Date.now()+30000)));
   // Four model runs leave enough headroom for the 45 s grounded-agent budget,
   // a guarded legacy fallback and the remaining integrations inside the 300 s
@@ -110,8 +119,15 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     const { reconcileCaseJ2 } = await import("@/lib/sav/cases/v2-j2-binding");
     return reconcileCaseJ2({ env: process.env, deadlineMs: derivedDeadline });
   });
+  // SAV-97 production self-test of the Access skill on the FICTIONAL corpus (Ugo 18/11): only when SAV_V2_ACCESS_SKILL_SELFTEST=run, independent of the
+  // skill's own switch; a small batch per pass, its own capped ledger, no case, ticket, mail, HubSpot or Gmail. Off: absent from the payload, nothing loaded.
+  const accessSkillSelfTest = process.env.SAV_V2_ACCESS_SKILL_SELFTEST === "run" ? await runStep("v2_access_skill_selftest", async () => {
+    if (Date.now() + 90_000 > derivedDeadline) return { skipped: "deadline" };
+    const { runAccessSkillSelfTestPass } = await import("@/lib/sav/cases/access-skill/access-skill-selftest");
+    return runAccessSkillSelfTestPass({ env: () => process.env, now: () => new Date(), deadlineMs: derivedDeadline });
+  }) : undefined;
   // V2 effects (replies, handoff notices, ticket stages, closures) have their own worker: /api/cron/sav-v2-effects (11/11).
-  const payload = { caseReminders, ticketSafetyNet, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { ...(ownerHandovers ? { ownerHandovers } : {}), ...(accessSkillSelfTest ? { accessSkillSelfTest } : {}), caseReminders, ticketSafetyNet, ackClosures, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return { payload, hasStepFailure, pulseId };

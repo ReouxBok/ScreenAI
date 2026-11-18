@@ -12,8 +12,13 @@ import { migrate } from "drizzle-orm/pglite/migrator";
 // is greater than the last one recorded, so a V2 `when` before MCP's would be skipped silently.
 type Entry = { idx: number; when: number; tag: string };
 const MIGRATIONS = new URL("../../../../drizzle/", import.meta.url);
-const MCP = "0045_studio_mcp_tokens", V2 = ["0046_sav_cases", "0047_sav_case_admission", "0048_sav_case_relay_claim_timers", "0049_sav_case_calls", "0050_sav_case_effects", "0051_sav_case_reply_validations", "0052_sav_case_handoff_notice", "0053_sav_case_ticket_stage"];
+const MCP = "0045_studio_mcp_tokens", TICKET_STAGE = "0053_sav_case_ticket_stage";
+const V2 = [
+  "0046_sav_cases", "0047_sav_case_admission", "0048_sav_case_relay_claim_timers", "0049_sav_case_calls",
+  "0050_sav_case_effects", "0051_sav_case_reply_validations", "0052_sav_case_handoff_notice", TICKET_STAGE, "0054_sav_case_new_thread",
+];
 const LAST = V2.at(-1)!;
+const MCP_MIGRATION_COUNT = 40, FULL_MIGRATION_COUNT = MCP_MIGRATION_COUNT + V2.length;
 const STAFF = "30000000-0000-4000-8000-000000000001", TOKEN = "30000000-0000-4000-8000-000000000002", CASE = "30000000-0000-4000-8000-000000000003";
 /** Same pins as test/sav73-native-migration.ts: tags and whens of 0000..0045 as applied in production, 0045 as drizzle hashes it. */
 const HISTORY_PREFIX_SHA256 = "83a4c3e1c41adfc94332bf7211600e05e3626324efc76e0b101a9feec4a2417e", MCP0045_SHA256 = "48df7d72bdad68140488aad3c5fb22fefd5b556bef63be39e82600e3950879e9";
@@ -66,21 +71,21 @@ describe("V2 case migrations after MCP 0045", () => {
     await withDb(async (client, root) => {
       const db = drizzle(client);
       await migrate(db, { migrationsFolder: await folderUpTo(root, "0044_sav_operator_command_indexes") });
-      expect(await applied(client)).toBe(39);
+      expect(await applied(client)).toBe(MCP_MIGRATION_COUNT - 1);
       await client.query(`INSERT INTO public.staff_users(id, clerk_id, email) VALUES ('${STAFF}', 'fixture-clerk', 'fixture@example.invalid')`);
 
       await migrate(db, { migrationsFolder: await folderUpTo(root, MCP) });
-      expect(await applied(client)).toBe(40);
+      expect(await applied(client)).toBe(MCP_MIGRATION_COUNT);
       expect(await exists(client, "sav.cases")).toBe(false);
       expect(await one<{ hash: string }>(client, "SELECT hash FROM drizzle.__drizzle_migrations ORDER BY created_at DESC LIMIT 1")).toEqual({ hash: MCP0045_SHA256 });
       await client.query(`INSERT INTO public.studio_mcp_tokens(id, staff_id, name, token_hash, prefix, expires_at) VALUES ('${TOKEN}', '${STAFF}', 'fixture', 'fixture-hash', 'fx', now() + interval '1 day')`);
 
       const full = await folderUpTo(root, LAST);
       await migrate(db, { migrationsFolder: full });
-      expect(await applied(client)).toBe(48);
+      expect(await applied(client)).toBe(FULL_MIGRATION_COUNT);
       for (const table of ["sav.cases", "sav.case_events", "sav.case_timers", "sav.case_calls", "sav.case_effect_executions", "sav.case_reply_validations"]) expect(await exists(client, table)).toBe(true);
       expect((await client.query("SELECT key FROM sav.sync_state WHERE key LIKE 'sav-case-schema-%' AND status = 'installed' ORDER BY key")).rows)
-        .toEqual([{ key: "sav-case-schema-v2" }, { key: "sav-case-schema-v3" }, { key: "sav-case-schema-v4" }, { key: "sav-case-schema-v5" }, { key: "sav-case-schema-v6" }, { key: "sav-case-schema-v7" }, { key: "sav-case-schema-v8" }, { key: "sav-case-schema-v9" }]);
+        .toEqual([10, 2, 3, 4, 5, 6, 7, 8, 9].map(version => ({ key: `sav-case-schema-v${version}` })));
       expect((await client.query("SELECT tgname FROM pg_trigger WHERE tgname LIKE 'sav\\_%' AND NOT tgisinternal AND tgname IN ('sav_case_events_append_only', 'sav_case_timers_guard', 'sav_case_calls_guard', 'sav_intake_effects_parent', 'sav_intake_effect_journal_parent', 'sav_intake_executions_effect_children', 'sav_case_effect_executions_effect_children', 'sav_case_reply_validations_guard', 'sav_intake_effects_parent_kind') ORDER BY tgname")).rows.map(r => (r as { tgname: string }).tgname))
         .toEqual(["sav_case_calls_guard", "sav_case_effect_executions_effect_children", "sav_case_events_append_only", "sav_case_reply_validations_guard", "sav_case_timers_guard", "sav_intake_effect_journal_parent", "sav_intake_effects_parent", "sav_intake_effects_parent_kind", "sav_intake_executions_effect_children"]);
       await client.query(`INSERT INTO sav.cases(id, ticket_id, owner, phase, contract_revision, payload_ciphertext) VALUES ('${CASE}', '42', 'human', 'human_owned', 'fixture', 'fixture')`);
@@ -90,8 +95,50 @@ describe("V2 case migrations after MCP 0045", () => {
       const before = await state(client);
       await migrate(db, { migrationsFolder: full });
       await migrate(db, { migrationsFolder: full });
-      expect(await applied(client)).toBe(48);
+      expect(await applied(client)).toBe(FULL_MIGRATION_COUNT);
       expect(await state(client)).toBe(before);
+    });
+  }, 60_000);
+
+  it("0054 preserves existing thread effects and isolates the new ticket-origin execution kinds", async () => {
+    await withDb(async (client, root) => {
+      const db = drizzle(client);
+      await migrate(db, { migrationsFolder: await folderUpTo(root, TICKET_STAGE) });
+      expect(await applied(client)).toBe(FULL_MIGRATION_COUNT - 1);
+      const ids = {
+        policy: "30000000-0000-4000-8000-000000000031", thread: "30000000-0000-4000-8000-000000000032",
+        oldExecution: "30000000-0000-4000-8000-000000000033", newExecution: "30000000-0000-4000-8000-000000000034",
+        event: "30000000-0000-4000-8000-000000000035",
+      };
+      await client.query(`INSERT INTO public.staff_users(id, clerk_id, email, role) VALUES ('${STAFF}', 'fixture-clerk', 'fixture@example.invalid', 'admin')`);
+      await client.query(`INSERT INTO sav.intake_execution_policies(id, revision, state, administrator_id, policy_hash, payload_ciphertext) VALUES ('${ids.policy}', 'fixture', 'approved', '${STAFF}', 'h', 'c')`);
+      await client.query(`INSERT INTO sav.cases(id, ticket_id, owner, phase, contract_revision, payload_ciphertext) VALUES ('${CASE}', '42', 'human', 'human_owned', 'fixture', 'fixture')`);
+      const insertExecution = (id: string, key: string, threadId: string | null) => client.query(
+        "INSERT INTO sav.case_effect_executions(id, case_id, reply_key, thread_id, policy_id, policy_hash, payload_ciphertext) VALUES ($1, $2, $3, $4, $5, 'h', 'c')",
+        [id, CASE, key, threadId, ids.policy],
+      );
+      const insertEffect = (execution: string, key: string, kind: string) => client.query(
+        "INSERT INTO sav.intake_effects(business_key, execution_id, kind, permission, intent_hash, intent_ciphertext) VALUES ($1, $2, $3, 'fixture', 'h', 'c')",
+        [key, execution, kind],
+      );
+      const inboundKey = `reply:${CASE}:inbound:fixture-mail`;
+      const ticketKey = `reply:${CASE}:ticket:${ids.event}`;
+      await insertExecution(ids.oldExecution, inboundKey, ids.thread);
+      await insertEffect(ids.oldExecution, inboundKey, "reply_send");
+
+      await migrate(db, { migrationsFolder: await folderUpTo(root, LAST) });
+      expect(await applied(client)).toBe(FULL_MIGRATION_COUNT);
+      expect(await one(client, `SELECT thread_id, reply_key FROM sav.case_effect_executions WHERE id = '${ids.oldExecution}'`))
+        .toEqual({ thread_id: ids.thread, reply_key: inboundKey });
+      expect(await one(client, `SELECT execution_id, kind FROM sav.intake_effects WHERE business_key = '${inboundKey}'`))
+        .toEqual({ execution_id: ids.oldExecution, kind: "reply_send" });
+      await expect(insertExecution(ids.newExecution, ticketKey, ids.thread)).rejects.toThrow("case_effect_executions_source_thread");
+      await expect(insertExecution(ids.newExecution, `reply:${CASE}:inbound:other-fixture-mail`, null)).rejects.toThrow("case_effect_executions_source_thread");
+      await insertExecution(ids.newExecution, ticketKey, null);
+      await insertEffect(ids.newExecution, ticketKey, "new_thread_send");
+      await insertEffect(ids.newExecution, `crm-email:${ticketKey}`, "new_thread_crm_email");
+      await expect(insertEffect(ids.newExecution, "wrong-ticket-effect", "reply_send")).rejects.toThrow("cannot belong to this case execution");
+      await expect(insertEffect(ids.oldExecution, "wrong-thread-effect", "new_thread_send")).rejects.toThrow("cannot belong to this case execution");
     });
   }, 60_000);
 
@@ -123,7 +170,7 @@ describe("V2 case migrations after MCP 0045", () => {
       const kinded = (execution: string, key: string, kind: string) => client.query(`INSERT INTO sav.intake_effects(business_key, execution_id, kind, permission, intent_hash, intent_ciphertext) VALUES ('${key}', '${execution}', '${kind}', 'fixture', 'h', 'c')`);
       for (const kind of ["reply_send", "note_associate", "handoff_notify", "ticket_stage"]) await kinded(ids.caseEffect, `case-${kind}`, kind);
       for (const kind of ["ticket_create", "email_create", "email_associate", "stage_new", "identity_send", "owner_assign"]) {
-        await expect(kinded(ids.caseEffect, `case-${kind}`, kind)).rejects.toThrow(`effect kind ${kind} cannot belong to a case execution`);
+        await expect(kinded(ids.caseEffect, `case-${kind}`, kind)).rejects.toThrow(`effect kind ${kind} cannot belong to this case execution`);
         await kinded(ids.intake, `v1-${kind}`, kind);
       }
       await expect(kinded(ids.intake, "v1-reply", "reply_send")).rejects.toThrow("reply_send can only belong to a case execution");
@@ -134,10 +181,12 @@ describe("V2 case migrations after MCP 0045", () => {
       // 0053: the ticket stage is a case-side kind too, and the V1 side is unchanged.
       await expect(kinded(ids.intake, "v1-stage", "ticket_stage")).rejects.toThrow("ticket_stage can only belong to a case execution");
       await expect(client.query(`UPDATE sav.intake_effects SET kind = 'ticket_stage' WHERE business_key = 'v1-effect'`)).rejects.toThrow("ticket_stage can only belong to a case execution");
+      for (const kind of ["new_thread_send", "new_thread_crm_email"])
+        await expect(kinded(ids.intake, `v1-${kind}`, kind)).rejects.toThrow(`${kind} can only belong to a case execution`);
       // Moving an effect or changing its kind is checked the same way; an orphan stays the parent check's refusal.
       await expect(client.query(`UPDATE sav.intake_effects SET execution_id = '${ids.intake}' WHERE business_key = 'case-reply_send'`)).rejects.toThrow("reply_send can only belong to a case execution");
-      await expect(client.query(`UPDATE sav.intake_effects SET execution_id = '${ids.caseEffect}' WHERE business_key = 'v1-ticket_create'`)).rejects.toThrow("cannot belong to a case execution");
-      await expect(client.query(`UPDATE sav.intake_effects SET kind = 'stage_new' WHERE business_key = 'case-effect'`)).rejects.toThrow("effect kind stage_new cannot belong to a case execution");
+      await expect(client.query(`UPDATE sav.intake_effects SET execution_id = '${ids.caseEffect}' WHERE business_key = 'v1-ticket_create'`)).rejects.toThrow("cannot belong to this case execution");
+      await expect(client.query(`UPDATE sav.intake_effects SET kind = 'stage_new' WHERE business_key = 'case-effect'`)).rejects.toThrow("effect kind stage_new cannot belong to this case execution");
       await expect(client.query(`UPDATE sav.intake_effects SET kind = 'reply_send' WHERE business_key = 'v1-effect'`)).rejects.toThrow("reply_send can only belong to a case execution");
       await expect(kinded("30000000-0000-4000-8000-0000000000ff", "orphan-reply", "reply_send")).rejects.toThrow("effect parent execution missing");
     });
@@ -147,7 +196,7 @@ describe("V2 case migrations after MCP 0045", () => {
     await withDb(async (client, root) => {
       // An empty database, straight to the last migration.
       await migrate(drizzle(client), { migrationsFolder: await folderUpTo(root, LAST) });
-      expect(await applied(client)).toBe(48);
+      expect(await applied(client)).toBe(FULL_MIGRATION_COUNT);
       const ids = { policy: "30000000-0000-4000-8000-000000000021", exec1: "30000000-0000-4000-8000-000000000022", exec2: "30000000-0000-4000-8000-000000000023" };
       const [k1, k2] = [`sav-case-reply:${CASE}:event-1`, `sav-case-reply:${CASE}:event-2`], h = (c: string) => c.repeat(64), APPROVER = STAFF;
       await client.query(`INSERT INTO public.staff_users(id, clerk_id, email, role) VALUES ('${STAFF}', 'fixture-clerk', 'fixture@example.invalid', 'admin')`);
@@ -206,7 +255,7 @@ describe("V2 case migrations after MCP 0045", () => {
       const db = drizzle(client);
       await migrate(db, { migrationsFolder: await folderUpTo(root, "0044_sav_operator_command_indexes") });
       await migrate(db, { migrationsFolder: await folderUpTo(root, LAST) });
-      expect(await applied(client)).toBe(48);
+      expect(await applied(client)).toBe(FULL_MIGRATION_COUNT);
       expect(await exists(client, "public.studio_mcp_tokens")).toBe(true);
       expect(await exists(client, "sav.case_calls")).toBe(true);
     });
@@ -218,7 +267,7 @@ describe("V2 case migrations after MCP 0045", () => {
       await migrate(db, { migrationsFolder: await folderUpTo(root, MCP) });
       const former = { [V2[0]]: 1793044800000, [V2[1]]: 1793131200000, [V2[2]]: 1793134800000 };
       await migrate(db, { migrationsFolder: await folderUpTo(root, V2[2], former) });
-      expect(await applied(client)).toBe(40);
+      expect(await applied(client)).toBe(MCP_MIGRATION_COUNT);
       expect(await exists(client, "sav.cases")).toBe(false);
     });
   }, 60_000);

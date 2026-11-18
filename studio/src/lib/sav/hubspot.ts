@@ -52,6 +52,7 @@ import { phoneMatchesHint, type SavIdentityCandidate, type SavIdentityHints } fr
 import { assertSavActor } from "./access";
 import { resolveSavCustomerIdentity, resolveSavCustomerMessage } from "./forwarded-identity";
 import { hasSavTicketObservation, refreshSavTicketObservations } from "./observations";
+import { savV2OwnerHandoverEnabled } from "./cases/owner-handover-config";
 
 const hubspotEventSchema = z.object({
   eventId: z.number().optional(),
@@ -175,6 +176,120 @@ async function hubspotFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return requestSavHubspot<T>(path, {
     ...init, headers: { Authorization: `Bearer ${requiredEnv("HUBSPOT_ACCESS_TOKEN")}`, "Content-Type": "application/json", Accept: "application/json", ...(init?.headers ?? {}) },
   }, summarizeHubspotError);
+}
+
+const ownerHandoverTicketSchema = z.object({
+  id: z.string(), archived: z.boolean(),
+  properties: z.object({
+    hubspot_owner_id: z.string().nullable(), hs_pipeline: z.string(), hs_pipeline_stage: z.string(),
+    hs_ticket_category: z.string().nullish(),
+  }),
+  propertiesWithHistory: z.object({ hubspot_owner_id: z.array(z.object({
+    value: z.string().nullish(), timestamp: z.iso.datetime({ offset: true }), sourceType: z.string(),
+  })) }).optional(),
+});
+
+/** Fresh owner, stage, category and last owner change, with no ticket body or contact data. */
+export async function readSavOwnerHandoverTicket(ticketId: string) {
+  if (!/^\d{1,30}$/.test(ticketId)) throw Error("SAV_OWNER_HANDOVER_TICKET_INVALID");
+  const properties = "hubspot_owner_id,hs_pipeline,hs_pipeline_stage,hs_ticket_category";
+  const ticket = ownerHandoverTicketSchema.parse(await hubspotFetch<unknown>(
+    `/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}?properties=${properties}&propertiesWithHistory=hubspot_owner_id`,
+  ));
+  if (ticket.id !== ticketId) throw Error("SAV_OWNER_HANDOVER_TICKET_MISMATCH");
+  const history = ticket.propertiesWithHistory?.hubspot_owner_id ?? [];
+  const latestAt = Math.max(...history.map(row => Date.parse(row.timestamp)));
+  const latest = history.filter(row => Date.parse(row.timestamp) === latestAt);
+  return { ...ticket, latestOwner: latest.length === 1 ? latest[0] : null };
+}
+
+const handoverObjectId = z.union([z.string().regex(/^\d{1,30}$/), z.int().nonnegative()]).transform(String);
+const handoverTimestamp = z.iso.datetime({ offset: true }).transform(Date.parse);
+const handoverEmailTimestamp = z.union([handoverTimestamp, z.string().regex(/^\d{1,16}$/).transform(Number)])
+  .refine(Number.isSafeInteger);
+const handoverEmailBatchSchema = z.object({
+  status: z.literal("COMPLETE"),
+  errors: z.array(z.unknown()).optional(),
+  numErrors: z.number().optional(),
+  results: z.array(z.object({
+    id: handoverObjectId, archived: z.boolean().optional(),
+    properties: z.object({ hs_timestamp: handoverEmailTimestamp, hs_email_direction: z.string() }),
+  })),
+});
+const handoverConversationSchema = z.object({
+  archived: z.boolean(),
+  threadAssociations: z.object({ associatedTicketId: handoverObjectId }),
+  latestMessageTimestamp: handoverTimestamp,
+  latestMessageSentTimestamp: handoverTimestamp.nullish(),
+  latestMessageReceivedTimestamp: handoverTimestamp.nullish(),
+});
+
+async function readHandoverActivityPages<T>(path: string, row: z.ZodType<T>, signal: AbortSignal) {
+  const schema = z.object({
+    results: z.array(row),
+    paging: z.object({ next: z.object({
+      after: z.union([z.string().min(1), z.int().nonnegative()]).transform(String),
+    }).optional() }).optional(),
+  });
+  const results: T[] = [], seen = new Set<string>();
+  let after: string | undefined;
+  do {
+    const page = schema.parse(await hubspotFetch<unknown>(after ? `${path}&after=${encodeURIComponent(after)}` : path, { signal }));
+    results.push(...page.results);
+    after = page.paging?.next?.after;
+    if (after && seen.has(after)) throw Error("SAV_OWNER_HANDOVER_CRM_PAGING_INCOMPLETE");
+    if (after) seen.add(after);
+  } while (after);
+  return results;
+}
+
+async function handoverEmailsAllowReply(ticketId: string, inboundAt: number, signal: AbortSignal) {
+  const links = await readHandoverActivityPages(
+    `/crm/v4/objects/tickets/${ticketId}/associations/emails?limit=100`, z.object({ toObjectId: handoverObjectId }), signal,
+  );
+  const ids = [...new Set(links.map(link => link.toObjectId))];
+  for (let offset = 0; offset < ids.length; offset += 100) {
+    const inputs = ids.slice(offset, offset + 100).map(id => ({ id }));
+    const batch = handoverEmailBatchSchema.parse(await hubspotFetch<unknown>("/crm/v3/objects/emails/batch/read", {
+      method: "POST", signal, body: JSON.stringify({ inputs, properties: ["hs_timestamp", "hs_email_direction"] }),
+    }));
+    const missing = new Set(inputs.map(input => input.id));
+    if (batch.errors?.length || batch.numErrors || batch.results.length !== missing.size
+      || batch.results.some(email => !missing.delete(email.id))) return false;
+    const safe = batch.results.every(({ archived, properties }) => {
+      if (archived) return false;
+      const at = properties.hs_timestamp, direction = properties.hs_email_direction.trim().toUpperCase();
+      return direction === "INCOMING_EMAIL" ? at <= inboundAt : isHubspotOutboundDirection(direction) && at < inboundAt;
+    });
+    if (!safe) return false;
+  }
+  return true;
+}
+
+async function handoverConversationsAllowReply(ticketId: string, inboundAt: number, archived: boolean, signal: AbortSignal) {
+  const threads = await readHandoverActivityPages(
+    `/conversations/v3/conversations/threads?associatedTicketId=${ticketId}&association=TICKET&archived=${archived}&limit=100`,
+    handoverConversationSchema, signal,
+  );
+  return threads.every(thread => {
+    const sent = thread.latestMessageSentTimestamp ?? -Infinity, received = thread.latestMessageReceivedTimestamp ?? -Infinity;
+    return thread.archived === archived && thread.threadAssociations.associatedTicketId === ticketId
+      && thread.latestMessageTimestamp === Math.max(sent, received)
+      && sent < inboundAt && received <= inboundAt;
+  });
+}
+
+/** Require complete CRM evidence for the Gmail inbound. A tied outbound or a
+ * newer inbound seen only in CRM is enough to hold the case. */
+export async function crmAllowsLinkedOwnerHandoverReply(ticketId: string, inboundAt: number) {
+  if (!/^\d{1,30}$/.test(ticketId) || !Number.isSafeInteger(inboundAt)) return false;
+  const signal = AbortSignal.timeout(20_000);
+  const evidence = await Promise.allSettled([
+    handoverEmailsAllowReply(ticketId, inboundAt, signal),
+    handoverConversationsAllowReply(ticketId, inboundAt, false, signal),
+    handoverConversationsAllowReply(ticketId, inboundAt, true, signal),
+  ]);
+  return evidence.every(result => result.status === "fulfilled" && result.value);
 }
 
 export function summarizeHubspotError(status: number, payload: unknown) {
@@ -1353,6 +1468,9 @@ async function processHubspotReceiptGroup(receiptIds: string[]) {
   if (!claimed.length) return [] as string[];
   try {
     const events = claimed.map(receipt => hubspotEventSchema.parse(receipt.payload));
+    if (savV2OwnerHandoverEnabled()) {
+      await (await import("./cases/owner-handover-markers")).observeSavOwnerHandoverEvents(events);
+    }
     const event = events.sort((a, b) => (b.occurredAt ?? 0) - (a.occurredAt ?? 0))[0];
     // Every raw receipt remains durable; one fresh snapshot covers this bounded
     // group for the same object. Mark each claimed event only after it succeeds.

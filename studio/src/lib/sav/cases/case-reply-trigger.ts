@@ -25,13 +25,15 @@ const CLASSES = {
 const no = (code: CaseReplyTriggerRefusal, detail: string): CaseReplyTriggerResolution => ({ ok: false, code, detail });
 
 export async function resolveCaseReplyTrigger(tx: ExecutionTx, proposal: Pick<CaseReplyProposal, "caseId" | "triggerEventId" | "inboundMessageId">): Promise<CaseReplyTriggerResolution> {
+  if (!proposal.inboundMessageId) return no("trigger_invalid", "message");
+  const messageId = proposal.inboundMessageId;
   const raw = proposal.triggerEventId;
   if (typeof raw !== "string") return no("trigger_invalid", "type");
   const events = savCaseEvents;
   // A customer mail: whichever name it came under, it must be an `inbound_confirmed` event of THIS case, and the stored message the reply answers must be that mail.
   const customerMail = async (dedupeKey: string) => {
     const gmailMessageId = dedupeKey.slice("inbound:".length);
-    const [message] = await tx.select({ gmail: savMessages.gmailMessageId }).from(savMessages).where(eq(savMessages.id, proposal.inboundMessageId));
+    const [message] = await tx.select({ gmail: savMessages.gmailMessageId }).from(savMessages).where(eq(savMessages.id, messageId));
     if (!message) return no("trigger_unknown", "message");
     if (message.gmail !== gmailMessageId) return no("trigger_inconsistent", "message");
     return { ok: true, triggerEventId: dedupeKey } as const;

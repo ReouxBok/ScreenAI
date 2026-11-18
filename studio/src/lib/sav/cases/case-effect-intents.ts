@@ -47,6 +47,7 @@ export type CaseReplySendIntent = Readonly<{
  * AI mention of its approval (a person's validation: "prepared with AI and validated by our team"), exactly once, in the shared outbound format.
  */
 export function buildReplySendIntent(proposal: CaseReplyProposal, approval: CaseReplyApproval, context: CaseReplyContext): CaseReplySendIntent {
+  if (proposal.ticketSource || proposal.inboundMessageId === null) throw Error("SAV_CASE_EFFECT_INBOUND_REQUIRED");
   const checked = checkCaseReplyApproval(proposal, approval);
   if (checked !== "ok") fault(checked.toUpperCase());
   const recipient = proposal.recipient.trim().toLowerCase();

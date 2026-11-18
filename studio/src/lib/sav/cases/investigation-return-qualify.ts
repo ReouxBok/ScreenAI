@@ -1,18 +1,20 @@
 import "server-only";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savMessages } from "@/db/schema";
+import { savIntakeEffects, savMessages } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { splitSavMessageText } from "../message-context";
 import { savOutsidePersonalAccessScope, savPersonalAccessIntent } from "../request-retrieval";
 import { admissionPolicyPort, type AdmissionPolicyRecord } from "./admission-runtime";
-import { SAV_CASE_SENSITIVE_FAMILIES, type CaseAdmissionQualification, type CaseRequestFamily } from "./case-types";
+import { readCaseThreadlessSource } from "./case-store";
+import { SAV_CASE_SENSITIVE_FAMILIES, type CaseAdmissionQualification, type CaseEvent, type CaseRequestFamily, type CaseSnapshot } from "./case-types";
 import { relayQualification } from "./intake-boundary";
 import { SAV_CASE_LOGIN_INFINITIVE, SAV_CASE_SENSITIVE_WORDS } from "./sensitive-words";
 import { loginCustomerStatement, reportsOngoingLoginFailure, reportsRestoredAccess } from "./restored-access";
 import { caseLatestCustomerMail } from "./investigation-runner";
 import type { CaseInvestigationStoreDeps } from "./investigation-store-ports";
 import { CaseQualificationUnavailableError, type CaseQualificationCauseCode } from "./qualification-diagnostic";
+import { threadlessReplySubject } from "./threadless-config";
 
 /*
  * V2 customer return (contract A-B, 4/11), LOCAL and OFF: a mail V2 consumed on an open case BEFORE V1 has, by construction, no V1 decision.
@@ -37,6 +39,31 @@ export type CaseReturnQualifyDeps = Readonly<{
 const sensitive = (family: string) => (SAV_CASE_SENSITIVE_FAMILIES as readonly string[]).includes(family);
 const lower = (value: string | null | undefined) => (value ?? "").trim().toLowerCase();
 
+/** Existing threadless cases keep the provenance of their real send across a flag change. */
+async function readThreadlessReturnOrigin(snapshot: CaseSnapshot, events: readonly CaseEvent[], mail: Pick<typeof savMessages.$inferSelect, "threadId" | "mailboxId" | "receivedAt">) {
+  const input = events.find(event => event.kind === "crm_observed" && (event.detail?.source as { kind?: unknown } | undefined)?.kind === "hubspot_ticket");
+  if (!input) return null;
+  const [sent, duplicate] = events.filter(event => event.kind === "outbound_observed" && event.direction === "agent_outbound"
+    && event.sourceRef.type === "email" && event.detail?.triggerEventId === `ticket:${input.id}`);
+  const effectId = sent?.detail?.effectId;
+  if (!sent || duplicate || typeof effectId !== "string") return null;
+  const db = requireDb();
+  const origin = await readCaseThreadlessSource(db, snapshot.caseId, input.id);
+  if (!origin?.source.contact || origin.source.ticketId !== snapshot.ticketId) return null;
+  const contact = origin.source.contact;
+  const previousProof = snapshot.admission?.qualification.identity.source;
+  if (previousProof?.type !== "hubspot_object" || previousProof.id !== origin.source.ticketId || previousProof.revision !== origin.source.version) return null;
+  const [effect] = await db.select({ id: savIntakeEffects.id }).from(savIntakeEffects)
+    .where(and(eq(savIntakeEffects.id, effectId), eq(savIntakeEffects.kind, "new_thread_send"), eq(savIntakeEffects.state, "confirmed")));
+  if (!effect) return null;
+  const [message] = await db.select({ from: savMessages.fromEmail, recipients: savMessages.toEmails, subject: savMessages.subject, at: savMessages.receivedAt })
+    .from(savMessages).where(and(eq(savMessages.direction, "outbound"), eq(savMessages.gmailMessageId, sent.sourceRef.id),
+      eq(savMessages.threadId, mail.threadId), eq(savMessages.mailboxId, mail.mailboxId)));
+  if (!message || message.from !== "contact@limova.ai" || message.subject !== threadlessReplySubject(snapshot.ticketId)
+      || message.recipients.length !== 1 || message.recipients[0] !== contact.email || message.at > mail.receivedAt) return null;
+  return { fromEmail: contact.email, subject: message.subject };
+}
+
 /**
  * B's `qualify` with the dedicated return path: a customer return is qualified here, anything else goes to `v1Qualify` (A's canonical V1 path)
  * unchanged. Refusals are A6's typed ones (technical: retried later, nothing written; contract: never retried as is).
@@ -53,22 +80,27 @@ export function caseInvestigationReturnAwareQualify(v1Qualify: CaseInvestigation
     const messageId = event.detail?.messageId, relay = event.detail?.relay as { messageId?: unknown } | undefined;
     if (event.kind !== "inbound_confirmed" || event.caseVersion !== inputVersion || typeof messageId !== "string" || relay?.messageId !== messageId) throw refuse("relay_proof_invalid");
     const db = requireDb();
-    let text: string, sender: string, subject: string;
+    let text: string, sender: string, subject: string, storedMail: typeof savMessages.$inferSelect;
     try {
       const [mail] = await db.select().from(savMessages).where(eq(savMessages.id, messageId));
       if (!mail || mail.direction !== "inbound" || mail.gmailMessageId !== latest.gmail || !snapshot.threadIds.includes(mail.threadId)) throw refuse("relay_proof_invalid");
       const body = decryptSavPayload<{ text?: unknown }>(mail.bodyCiphertext);
       if (typeof body.text !== "string" || !body.text.trim()) throw refuse("rule_unavailable");
-      text = body.text; sender = lower(mail.fromEmail); subject = mail.subject;
+      text = body.text; sender = lower(mail.fromEmail); subject = mail.subject; storedMail = mail;
     } catch (error) {
       if (error instanceof CaseQualificationUnavailableError) throw error;
       throw refuse("rule_unavailable");
     }
-    // Identity and CRM context are carried from the case's own admission only for the same stored sender as the mail V1 relayed; anyone else is unknown.
+    // Identity and CRM context belong to the sender V1 relayed or the verified recipient of the first send on a HubSpot ticket.
     const prior = snapshot.admission?.qualification;
     const relayed = [...events].reverse().find(row => row.direction === "customer_inbound" && (row.detail?.relay as { kind?: unknown } | undefined)?.kind === "intake_effects_confirmed");
     const relayedId = relayed?.detail?.messageId;
-    const [origin] = typeof relayedId === "string" ? await db.select({ fromEmail: savMessages.fromEmail, subject: savMessages.subject }).from(savMessages).where(eq(savMessages.id, relayedId)) : [];
+    let origin: { fromEmail: string; subject: string } | null | undefined;
+    if (typeof relayedId === "string") {
+      [origin] = await db.select({ fromEmail: savMessages.fromEmail, subject: savMessages.subject }).from(savMessages).where(eq(savMessages.id, relayedId));
+    } else {
+      try { origin = await readThreadlessReturnOrigin(snapshot, events, storedMail); } catch { throw refuse("rule_unavailable"); }
+    }
     const sameSender = Boolean(origin && sender && lower(origin.fromEmail) === sender);
     const identity: CaseAdmissionQualification["identity"] = sameSender && prior?.identity.status === "confirmed" ? prior.identity : { status: "unknown" };
     const crmContext: CaseAdmissionQualification["crmContext"] = sameSender && prior ? prior.crmContext : "unknown";
@@ -80,8 +112,7 @@ export function caseInvestigationReturnAwareQualify(v1Qualify: CaseInvestigation
     let qualification = hints;
     if (deps.returnRules) {
       let ruled: CaseAdmissionQualification["requests"];
-      // A reply prefix alone does not establish that the subject is old: compare it to the
-      // subject on the original stored mail. A new subject may veto a continuation.
+      // A reply prefix alone does not establish that the subject is old. A new subject may veto a continuation.
       const topic = (raw: string) => lower(raw).replace(/^(?:(?:re|rép|aw|sv)\s*:\s*)+/u, "").replace(/\s+/gu, " ").trim();
       const changedSubject = origin && topic(subject) === topic(origin.subject) ? undefined : subject;
       try { ruled = await deps.returnRules({ caseId: snapshot.caseId, messageId, text, changedSubject, requests: open }); } catch { throw refuse("rule_unavailable"); }

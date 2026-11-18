@@ -10,6 +10,8 @@ import {
 } from "./decision-contract";
 import { caseAccessSourceProblem } from "./investigation-access-scope";
 import { caseAskBeforeHandoffEnabled, caseReaskBeforeHandoff } from "./ask-before-handoff";
+import { accessSkillKernelHits } from "./access-skill/access-skill-kernel";
+import { readAccessSkillMode } from "./access-skill/access-skill-mode";
 
 /*
  * Pure and deterministic: no model, network, database, clock or effect. `now` is an argument.
@@ -863,6 +865,11 @@ Il vous suffira ensuite de saisir ce code sur la page pour accéder à votre esp
     });
     if (reply.accountAdvice === "new_subscription" || reply.accountAdvice === "new_account") reject("account_advice_forbidden", "reply.accountAdvice", reply.accountAdvice);
     if (requestsCredential(reply.text)) reject("credential_request_pattern", "reply.text");
+    // SAV-97 (`SAV_V2_ACCESS_SKILL=on` only): the exclude-only kernel on OUR outgoing text; a hit is refused, so the case goes to the team, never to the customer.
+    if ((action.kind === "answer" || action.kind === "ask") && readAccessSkillMode(process.env) === "on") {
+      const kernel = accessSkillKernelHits(reply.text);
+      if (kernel.length) reject("reply_sensitive_wording", "reply.text", kernel.join(","));
+    }
     // Pilot: an instruction the case already gave, or a step the customer states they did, is not given again. Our own composition reads the same ledgers and is not re-read.
     if (pilot && !composed && (action.kind === "ask" || action.kind === "answer")) for (const card of context.knowledge) {
       // Only the proven unused step is exempt from the sent-procedure check, never the whole card.

@@ -18,6 +18,7 @@ import { latestInvestigationInput } from "./investigation-runner";
 import { parseIncidentContext, revalidateIncidentContext } from "./investigation-incidents";
 import type { IncidentReader } from "./investigation-incidents-contract";
 import { unprovenFixClaim } from "@/lib/knowledge/temporary-incident-schema";
+import { readThreadlessReplyProvenance } from "./threadless-provenance";
 import { CASE_REPLY_STUDIO_CORRECTION_BASIS } from "./case-reply-validation";
 
 export const SAV_PILOT_PROVENANCE_REVISION = "sav-pilot-provenance-2026-11-04.v1";
@@ -48,8 +49,9 @@ const unproven = (...reasons: PilotProvenanceReason[]): PilotProvenance => ({ st
 /** The text the decision wrote, final: both languages are tried because a proposal does not name its own, and only an exact match counts. */
 /** Only a full ISO date with its time zone is a date here: `Date.parse` alone would read "2010", or a local date, as one. */
 const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+// SAV-94: a proposal prepared before the layout pass (stored, not yet sent) is still the decided text, so both preparations are tried; nothing else is widened.
 // The substance is what is compared: the decided text under either mention. WHICH mention may be sent is the persisted authorization basis' business (`case-reply-mode.ts`).
-const sameFinalText = (decided: string, proposed: string, purpose: CaseReplyProposal["purpose"]) => (["fr", "en"] as const).some(language => (["manual_reviewed", "automated"] as const).some(mode => prepareCaseReplyText(decided, language, mode, purpose) === proposed));
+const sameFinalText = (decided: string, proposed: string, purpose: CaseReplyProposal["purpose"]) => (["fr", "en"] as const).some(language => (["manual_reviewed", "automated"] as const).some(mode => [true, false].some(layout => prepareCaseReplyText(decided, language, mode, purpose, { layout }) === proposed)));
 
 export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal, "caseId" | "triggerEventId" | "purpose" | "text">, deps: PilotProvenanceDeps,
   /** SAV-92: a text an administrator corrected in the Studio (persisted correction basis only). It skips the text comparison, nothing else: the latest decision,
@@ -124,7 +126,9 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
 export function pilotProvenanceGate(deps: PilotProvenanceDeps) {
   return async (proposal: CaseReplyProposal, context?: Readonly<{ basis?: string | null }>): Promise<string | null> => {
     try {
-      const read = await readPilotReplyProvenance(proposal, deps, { humanCorrection: context?.basis === CASE_REPLY_STUDIO_CORRECTION_BASIS });
+      const humanCorrection = context?.basis === CASE_REPLY_STUDIO_CORRECTION_BASIS;
+      if (proposal.ticketSource) return await readThreadlessReplyProvenance(proposal, deps.env?.() ?? process.env, humanCorrection);
+      const read = await readPilotReplyProvenance(proposal, deps, { humanCorrection });
       return read.status === "proven" ? null : [...read.reasons].sort().join(",");
     } catch { return "decision_unreadable"; }
   };
