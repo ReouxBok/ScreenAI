@@ -42,7 +42,7 @@ export type CaseBoundaryDeps = {
    * `write: false` checks V1's proofs and the exact scope without writing anything (before any owner read); `write: true` binds atomically, asked only
    * after the fresh reading of the V2 owner. False refuses: the mail is recorded, never attributed. Not injected: no other way to bind than at creation. */
   bindQualificationThread?: (input: { messageId: string; ticketId: string; executionId: string; runId: string | null; runVersion: number; write: boolean }) => Promise<boolean>;
-  ownerHandover?: { ticketId: string; teamLast: boolean; assertFresh: (tx: CaseTx) => Promise<void> };
+  ownerHandover?: { ticketId: string; awaitCustomer: boolean; assertFresh: (tx: CaseTx) => Promise<void> };
 };
 export type CaseRelayRequest = { requestId: string; kind: string };
 /** What the relay is about to record, from its own V1 proof: a qualification port compares its
@@ -434,7 +434,7 @@ async function relayToCase(input: {
     gmailMessageId: input.gmailMessageId, requestIds: input.decision.requests.filter(request => request.kind !== "acknowledgement").map(request => request.id) }) : new Map<string, CaseRequestSubject>();
   const result = await openCaseEvent({
     ticketId: input.ticketId, threadId: input.threadId, admissionMode: "exclusions_only", attribution, admission,
-    ...(handover?.teamLast ? { attributionPhase: "awaiting_customer" } : {}),
+    ...(handover?.awaitCustomer ? { attributionPhase: "awaiting_customer" } : {}),
     opens: requests.map(request => ({ id: request.requestId, summary: openedSummary(request, input.gmailMessageId),
       // The `message` stand-in of a mail whose analysis listed no request has no V1 summary of its own.
       subject: subjects.get(request.requestId) ?? { status: "absent" as const, reason: "not_in_summary" as const } })),

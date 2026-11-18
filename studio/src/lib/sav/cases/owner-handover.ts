@@ -4,7 +4,7 @@ import { z } from "zod";
 import { requireDb } from "@/db";
 import { savIntakeExecutions, savMailboxes, savMessages, savThreads } from "@/db/schema";
 import { requestSavGmail } from "../gmail";
-import { readSavOwnerHandoverTicket } from "../hubspot";
+import { crmAllowsLinkedOwnerHandoverReply, readSavOwnerHandoverTicket } from "../hubspot";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "../intake/execution-policy";
 import { normalizeEmailAddress } from "../policy";
@@ -45,7 +45,7 @@ async function readThreadEnd(threadId: string) {
   }).sort((left, right) => right.at - left.at);
   const last = messages[0], inbound = messages.filter(message => !message.team);
   if (!last || messages[1]?.at === last.at || !inbound[0] || inbound[0].at === inbound[1]?.at) return null;
-  return { lastInboundId: inbound[0].id, teamLast: last.team };
+  return { lastInboundId: inbound[0].id, lastInboundAt: inbound[0].at, teamLast: last.team };
 }
 
 async function linkedThreads(ticketId: string, current: CaseSnapshot | null, db: Pick<CaseTx, "select" | "selectDistinct">) {
@@ -74,7 +74,7 @@ async function openHandoverTicket(input: OwnerHandoverTransition, ownerId: strin
 > {
   const ticket = await readSavOwnerHandoverTicket(input.ticketId);
   if (ticket.archived) return { skipped: "ticket_closed" } as const;
-  const { hubspot_owner_id, hs_pipeline, hs_pipeline_stage } = ticket.properties;
+  const { hubspot_owner_id, hs_pipeline, hs_pipeline_stage, hs_ticket_category } = ticket.properties;
   if (hubspot_owner_id !== ownerId) return { skipped: "owner_changed" } as const;
   const config = readCaseTicketStageConfig(env), stages = SAV_HUBSPOT_SUPPORT.stages;
   if (hs_pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId) return { skipped: "outside_support" } as const;
@@ -82,6 +82,7 @@ async function openHandoverTicket(input: OwnerHandoverTransition, ownerId: strin
   const openStages: string[] = [stages.new, stages.awaitingContact, stages.awaitingTeam];
   if (config.mode === "on") openStages.push(config.waitingCustomer);
   if (!openStages.includes(hs_pipeline_stage)) return { skipped: "stage_unverified" } as const;
+  if (hs_ticket_category !== SAV_HUBSPOT_SUPPORT.categories.access) return { skipped: "outside_access" } as const;
 
   // A later change away and back may already exist in HubSpot while its webhook is still in flight.
   // The history must confirm the same transition, not just the same current value.
@@ -111,7 +112,6 @@ async function processOwnerHandover(input: OwnerHandoverTransition, claim: Claim
   if (!linked || linked.length > 1) return "thread_unresolved";
   if (!linked.length) {
     if (scope.mode === "qualification") return "outside_scope";
-    if (live.ticket.properties.hs_ticket_category !== SAV_HUBSPOT_SUPPORT.categories.access) return "outside_access";
     if (!await ownerHandoverClaimIsCurrent(claim) || await relayPaused(db)) return "superseded_or_paused";
     return (await startV2FromThreadlessTicket(input)).status;
   }
@@ -124,6 +124,7 @@ async function processOwnerHandover(input: OwnerHandoverTransition, claim: Claim
   const gmail = await readThreadEnd(thread.gmailThreadId);
   if (!source || !gmail) return "thread_unresolved";
   if (source.gmailId !== gmail.lastInboundId) throw Error("SAV_OWNER_HANDOVER_INBOUND_NOT_SYNCED");
+  const awaitCustomer = gmail.teamLast || !await crmAllowsLinkedOwnerHandoverReply(input.ticketId, gmail.lastInboundAt);
   const relay = await recordCaseAfterConfirmedIntake(source.id, {
     ...v2EntryRelayDeps(env),
     readCreatedTicketOwner: async ticketId => {
@@ -132,7 +133,7 @@ async function processOwnerHandover(input: OwnerHandoverTransition, claim: Claim
       return "ticket" in fresh ? ownerId : null;
     },
     ownerHandover: {
-      ticketId: input.ticketId, teamLast: gmail.teamLast,
+      ticketId: input.ticketId, awaitCustomer,
       async assertFresh(tx) {
         const latest = await readCaseByTicket(input.ticketId, tx);
         const threads = await linkedThreads(input.ticketId, latest, tx);
@@ -147,7 +148,7 @@ async function processOwnerHandover(input: OwnerHandoverTransition, claim: Claim
     return relay.skipped;
   }
   if (relay.owner !== "agent") return "case_preserved";
-  if (gmail.teamLast) return "awaiting_customer";
+  if (awaitCustomer) return "awaiting_customer";
   if (await ownerHandoverClaimIsCurrent(claim) && !await relayPaused(db)) {
     // The reconcile pass has a shared budget. Let its ordinary case sweep continue the queued case.
     if (!options.catchUp) await continueCaseAfterCommit(relay.caseId, "relay", { env, immediateDeadlineMs: options.deadlineMs });

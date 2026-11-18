@@ -44,12 +44,13 @@ vi.mock("./v2-entry", async original => ({
   ...await original<typeof import("./v2-entry")>(), v2EntryRelayDeps: () => fixture.relayDeps, continueCaseAfterCommit: fixture.continueCase,
 }));
 vi.mock("./threadless-entry", async original => {
-  const module = await original<typeof import("./threadless-entry")>();
-  return { startV2FromThreadlessTicket: fixture.threadless.mockImplementation(module.startV2FromThreadlessTicket) };
+  const { startV2FromThreadlessTicket } = await original<typeof import("./threadless-entry")>();
+  return { startV2FromThreadlessTicket: fixture.threadless.mockImplementation(startV2FromThreadlessTicket) };
 });
 
 const MAILBOX = "contact@limova.ai", CLIENT = "client@example.invalid";
 const SETTLED_EVENT_AT = Date.now() - OWNER_HANDOVER_DELAY_MS - 1_000;
+const INBOUND_AT = SETTLED_EVENT_AT - 3_600_000;
 const DUE = SETTLED_EVENT_AT + OWNER_HANDOVER_DELAY_MS;
 const OWNER = "7001", HUMAN = "7002";
 const CODE_REVISION = "a".repeat(40), SECRET = "synthetic-webhook-secret";
@@ -71,20 +72,59 @@ function ownerEvent(ticketId: string, options: { at?: number; owner?: string; so
   };
 }
 
-function liveTicket(ticketId: string, options: { at?: number; owner?: string; stage?: string; category?: string; source?: string } = {}) {
+function liveTicket(ticketId: string, options: {
+  at?: number; owner?: string; stage?: string; category?: string; categoryOnRecheck?: string; source?: string;
+  emailBatch?: { id: string; properties: { hs_timestamp: string | null; hs_email_direction: string } }[];
+  paginateEmails?: boolean;
+  conversations?: { active?: unknown[]; archived?: unknown[] };
+  crmDenied?: boolean;
+} = {}) {
   const owner = options.owner ?? OWNER, at = options.at ?? SETTLED_EVENT_AT;
+  let ticketReads = 0;
   const read = vi.fn(async (url: string, init?: RequestInit) => {
     const request = new globalThis.URL(url);
+    if (request.pathname === `/crm/v4/objects/tickets/${ticketId}/associations/emails`) {
+      expect(init?.method ?? "GET").toBe("GET");
+      if (options.crmDenied) return Response.json({}, { status: 403 });
+      const results = options.emailBatch?.map(email => ({ toObjectId: Number(email.id) })) ?? [];
+      if (options.paginateEmails) {
+        if (!request.searchParams.has("after")) return Response.json({ results: results.slice(0, 1), paging: { next: { after: "next" } } });
+        expect(request.searchParams.get("after")).toBe("next");
+        return Response.json({ results: results.slice(1) });
+      }
+      return Response.json({ results });
+    }
+    if (request.pathname === "/crm/v3/objects/emails/batch/read") {
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        inputs: options.emailBatch?.map(({ id }) => ({ id })),
+        properties: ["hs_timestamp", "hs_email_direction"],
+      });
+      return Response.json({ status: "COMPLETE", results: options.emailBatch });
+    }
+    if (request.pathname === "/conversations/v3/conversations/threads") {
+      expect(init?.method ?? "GET").toBe("GET");
+      expect(request.searchParams.get("associatedTicketId")).toBe(ticketId);
+      expect(request.searchParams.get("association")).toBe("TICKET");
+      const threads = request.searchParams.get("archived") === "true" ? options.conversations?.archived : options.conversations?.active;
+      return Response.json({ results: threads ?? [] });
+    }
     expect(request.pathname).toBe(`/crm/v3/objects/tickets/${ticketId}`);
     expect(request.searchParams.get("propertiesWithHistory")).toBe("hubspot_owner_id");
+    expect(request.searchParams.get("properties")?.split(",")).toContain("hs_ticket_category");
     expect(init?.method ?? "GET").toBe("GET");
+    const category = ++ticketReads > 1 ? options.categoryOnRecheck ?? options.category : options.category;
     return Response.json({
-      id: ticketId, archived: false, properties: { hubspot_owner_id: owner, hs_pipeline: "0", hs_pipeline_stage: options.stage ?? "1", hs_ticket_category: options.category ?? ACCESS },
+      id: ticketId, archived: false, properties: { hubspot_owner_id: owner, hs_pipeline: "0", hs_pipeline_stage: options.stage ?? "1", hs_ticket_category: category ?? ACCESS },
       propertiesWithHistory: { hubspot_owner_id: [{ timestamp: new Date(at).toISOString(), sourceType: options.source ?? "CRM_UI", value: owner }] },
     });
   });
   vi.stubGlobal("fetch", read);
   return read;
+}
+
+function crmEmail(id: string, timestamp: string | null, direction = "EMAIL") {
+  return { id, properties: { hs_timestamp: timestamp, hs_email_direction: direction } };
 }
 
 function signedRequest(events: unknown[], signatureValid = true) {
@@ -106,7 +146,7 @@ function wake(input: OwnerHandoverTransition, at = DUE) {
 
 async function storedMail(ticketId: string, teamLast = false) {
   const threadId = randomUUID(), messageId = randomUUID(), gmailThreadId = `thread-${threadId}`, gmailId = `message-${messageId}`;
-  const receivedAt = new Date(SETTLED_EVENT_AT - 3600_000);
+  const receivedAt = new Date(INBOUND_AT);
   await database.db.insert(savThreads).values({ id: threadId, mailboxId, gmailThreadId, customerEmail: CLIENT, hubspotTicketId: ticketId });
   await database.db.insert(savMessages).values({
     id: messageId, threadId, mailboxId, gmailMessageId: gmailId, direction: "inbound", fromEmail: CLIENT, toEmails: [MAILBOX],
@@ -324,6 +364,80 @@ describe("owner handover from HubSpot's existing webhook", () => {
     expect(current).toMatchObject({ owner: "agent", phase: "awaiting_customer" });
     expect((await listCaseEvents(current.caseId)).at(-1)).toMatchObject({ kind: "owner_changed", detail: { toPhase: "awaiting_customer" } });
     expect(fixture.continueCase).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    SAV_HUBSPOT_SUPPORT.categories.billing,
+    SAV_HUBSPOT_SUPPORT.categories.cancellation,
+    `${ACCESS};${SAV_HUBSPOT_SUPPORT.categories.billing}`,
+  ])("blocks a Gmail-linked Access request reclassified in HubSpot as %s", async category => {
+    const input = await scheduled();
+    await storedMail(input.ticketId);
+    liveTicket(input.ticketId, { category });
+    await expect(wake(input)).resolves.toEqual({ status: "outside_access" });
+    expect(await readCaseByTicket(input.ticketId)).toBeNull();
+    expect(fixture.continueCase).not.toHaveBeenCalled();
+    expect(fixture.threadless).not.toHaveBeenCalled();
+    expect(fixture.gmail).not.toHaveBeenCalled();
+  });
+
+  it("blocks a linked ticket reclassified during the wake, before attribution", async () => {
+    const input = await scheduled();
+    await storedMail(input.ticketId);
+    liveTicket(input.ticketId, { categoryOnRecheck: SAV_HUBSPOT_SUPPORT.categories.cancellation });
+    await expect(wake(input)).resolves.toEqual({ status: "owner_handover_not_attributed" });
+    expect(await readCaseByTicket(input.ticketId)).toBeNull();
+    expect(fixture.continueCase).not.toHaveBeenCalled();
+  });
+
+  const recentCrmAt = new Date(INBOUND_AT + 1_000).toISOString();
+  const priorCrmEmail = crmEmail("320", String(INBOUND_AT - 1_000));
+  it.each([
+    { reason: "newer CRM email on the second association page", emailBatch: [priorCrmEmail, crmEmail("321", recentCrmAt)], paginateEmails: true },
+    { reason: "simultaneous CRM email", emailBatch: [crmEmail("321", String(INBOUND_AT))] },
+    { reason: "newer CRM-only inbound email", emailBatch: [crmEmail("321", recentCrmAt, "INCOMING_EMAIL")] },
+    { reason: "unreadable CRM timestamp", emailBatch: [crmEmail("321", null)] },
+    { reason: "denied CRM read", crmDenied: true },
+  ])(
+    "awaits the customer without continuing for a $reason",
+    async options => {
+      const input = await scheduled();
+      const mail = await storedMail(input.ticketId);
+      liveTicket(input.ticketId, options);
+      await expect(wake(input)).resolves.toEqual({ status: "awaiting_customer" });
+      expect(await readCaseByTicket(input.ticketId)).toMatchObject({ owner: "agent", phase: "awaiting_customer" });
+      expect(fixture.gmail).toHaveBeenCalledExactlyOnceWith(MAILBOX, `threads/${mail.gmailThreadId}?format=metadata&metadataHeaders=From`);
+      expect(fixture.continueCase).not.toHaveBeenCalled();
+      expect(fixture.threadless).not.toHaveBeenCalled();
+    },
+  );
+
+  it("awaits the customer for a reply only in an archived HubSpot conversation", async () => {
+    const input = await scheduled();
+    const mail = await storedMail(input.ticketId);
+    liveTicket(input.ticketId, { conversations: { archived: [{
+      id: "500", archived: true, threadAssociations: { associatedTicketId: input.ticketId },
+      latestMessageTimestamp: recentCrmAt, latestMessageSentTimestamp: recentCrmAt,
+    }] } });
+    await expect(wake(input)).resolves.toEqual({ status: "awaiting_customer" });
+    expect(await readCaseByTicket(input.ticketId)).toMatchObject({ owner: "agent", phase: "awaiting_customer" });
+    expect(fixture.gmail).toHaveBeenCalledExactlyOnceWith(MAILBOX, `threads/${mail.gmailThreadId}?format=metadata&metadataHeaders=From`);
+    expect(fixture.continueCase).not.toHaveBeenCalled();
+  });
+
+  it("relays the Gmail inbound when the CRM outbound is older", async () => {
+    const input = await scheduled();
+    await storedMail(input.ticketId);
+    liveTicket(input.ticketId, {
+      emailBatch: [priorCrmEmail],
+      conversations: { active: [{
+        id: "501", archived: false, threadAssociations: { associatedTicketId: input.ticketId },
+        latestMessageTimestamp: new Date(INBOUND_AT).toISOString(), latestMessageReceivedTimestamp: new Date(INBOUND_AT).toISOString(),
+        latestMessageSentTimestamp: new Date(INBOUND_AT - 1_000).toISOString(),
+      }] },
+    });
+    await expect(wake(input)).resolves.toEqual({ status: "relayed" });
+    expect(fixture.continueCase).toHaveBeenCalledTimes(1);
   });
 
   it("refuses a linked mail whose existing admission proves a family other than Access", async () => {
