@@ -85,6 +85,9 @@ export const savIntakeMutationSchema = z.enum([
   "set_case_ticket_stage",
   // SAV-96: start V2 from a confirmed manual HubSpot owner transition.
   "start_case_owner_handover",
+  // SAV-95 (behind `SAV_ACK_CLOSE=on`): V1 moves the thread's Support ticket to « Fermé » with one note after a customer's acknowledgement the model judged
+  // a confident close (`ack-closure.ts`); granted by no existing policy, so a renewal must add it explicitly.
+  "close_acknowledged_ticket",
 ]);
 export type SavIntakeMutation = z.infer<typeof savIntakeMutationSchema>;
 
