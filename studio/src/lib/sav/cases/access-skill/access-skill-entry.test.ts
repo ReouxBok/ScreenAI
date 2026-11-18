@@ -130,7 +130,7 @@ describe("shadow : calculé, stocké, comparé dans les journaux, jamais décisi
     const plain = await mail(PLAIN), capcar = await mail(CAPCAR);
     expect(admittedBy(await evidence(env("shadow"), plain, model.network))).toEqual(["rule-access@r1"]);
     expect(await evidence(env("shadow"), capcar, model.network)).toEqual([]);
-    expect(model.calls.map(call => call.kind)).toEqual(["judge", "judge", "counter"]);
+    expect(model.calls.map(call => call.kind)).toEqual(["judge", "counter", "judge", "counter"]);
     expect((await stored(capcar.messageId))?.status).toBe("done");
     const shadow = infos.mock.calls.filter((call: unknown[]) => call[0] === "sav_v2_access_skill_shadow").map((call: unknown[]) => call[1]);
     expect(shadow).toEqual([expect.objectContaining({ detectors: "admit", skill: "admit", disagree: false }), expect.objectContaining({ detectors: "team", skill: "admit", disagree: true, counterRead: "no" })]);

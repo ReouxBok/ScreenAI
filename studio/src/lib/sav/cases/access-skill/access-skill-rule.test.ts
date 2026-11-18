@@ -19,8 +19,9 @@ const decide = (judge: AccessSkillCall | null, extra: { texts?: AccessSkillTexts
 const reasons = (verdict: ReturnType<typeof decide>) => verdict.outcome === "team" ? verdict.reasons : [];
 
 describe("règle pure : table de vérité", () => {
-  it("connexion simple, lecture complète et sûre, citation exacte : admis sans contre-lecture", () => {
-    expect(decide(ok(judgment()))).toEqual({ outcome: "admit", requests: { r1: "access" }, counterRead: "not_required" });
+  it("connexion simple, lecture complète et sûre, citation exacte : admis seulement après une contre-lecture « non »", () => {
+    expect(decide(ok(judgment()), { counter: counter("no") })).toEqual({ outcome: "admit", requests: { r1: "access" }, counterRead: "no" });
+    expect(decide(ok(judgment()))).toMatchObject({ outcome: "team", reasons: ["counter_unavailable"] });
   });
   it.each<[string, AccessSkillCall | null, string]>([
     ["aucune lecture", null, "judgment_unavailable"],
@@ -79,8 +80,8 @@ describe("contre-lecture : exigée par les mots de contexte, plusieurs demandes 
     expect(decide(capcar, { texts: CAPCAR, counter: { status: "failed", problem: "http_500", uncertain: true } })).toMatchObject({ outcome: "team", reasons: ["counter_unavailable"] });
     expect(decide(capcar, { texts: CAPCAR, counter: ok({ asksOrContestsSensitive: "no" }) })).toMatchObject({ outcome: "team", reasons: ["counter_invalid"] });
   });
-  it("une connexion simple sans mot de contexte n'en a pas besoin ; deux demandes, si", () => {
-    expect(accessSkillCounterReadRequired(PLAIN, ["r1"], judgment())).toBe(false);
+  it("toujours requise, même pour une connexion simple sans mot de contexte (harnais : un juge qui ment n'est plus rattrapé par une liste de mots)", () => {
+    expect(accessSkillCounterReadRequired(PLAIN, ["r1"], judgment())).toBe(true);
     expect(accessSkillCounterReadRequired(PLAIN, ["r1", "r2"], judgment())).toBe(true);
     expect(accessSkillCounterReadRequired(PLAIN, ["r1"], judgment({ requests: [{ verdict: "other" }] }))).toBe(true);
     expect(accessSkillCounterReadRequired(PLAIN, ["r1"], "malformed")).toBe(true);

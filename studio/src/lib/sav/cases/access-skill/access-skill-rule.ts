@@ -1,6 +1,6 @@
 import { savEvidenceContains } from "../../evidence-text";
 import { containsPromptInjection } from "../../policy";
-import { accessSkillContextHits, accessSkillKernelHits } from "./access-skill-kernel";
+import { accessSkillKernelHits } from "./access-skill-kernel";
 import { accessSkillCounterReadSchema, accessSkillJudgmentSchema, accessSkillPromptPinned } from "./access-skill-guidelines";
 
 /*
@@ -26,7 +26,7 @@ export type AccessSkillTeamReason = typeof SAV_ACCESS_SKILL_TEAM_REASONS[number]
 
 export type AccessSkillVerdict =
   /** The mail may be V2's: `access` requests are admitted, `other` ones are the team's part (never sensitive, never unsure). */
-  | Readonly<{ outcome: "admit"; requests: Readonly<Record<string, "access" | "other">>; counterRead: "not_required" | "no" }>
+  | Readonly<{ outcome: "admit"; requests: Readonly<Record<string, "access" | "other">>; counterRead: "no" }>
   /** The WHOLE mail stays with the team. `family`: a sensitive family when one was named (kernel or model), for the return path. */
   | Readonly<{ outcome: "team"; reasons: readonly AccessSkillTeamReason[]; family: "cancellation" | "subscription" | "finance" | "rights" | "identity" | null; kernel: readonly string[] }>;
 
@@ -47,11 +47,14 @@ export function accessSkillKernelVerdict(texts: AccessSkillTexts): AccessSkillVe
   return kernel.length ? team(["kernel_phrase"], KERNEL_FAMILY[kernel[0]!] ?? null, kernel) : null;
 }
 
-/** Whether the counter-read must answer « no » before an admission: context words anywhere, several requests, or a request the judge called `other`. */
-export function accessSkillCounterReadRequired(texts: AccessSkillTexts, requestIds: readonly string[], judgment: unknown): boolean {
-  if (accessSkillContextHits(...allTexts(texts)).length || requestIds.length > 1) return true;
-  const parsed = accessSkillJudgmentSchema.safeParse(judgment);
-  return !parsed.success || parsed.data.requests.some(row => row.verdict !== "access");
+/**
+ * Whether the counter-read must answer « no » before an admission: ALWAYS. The model-double harness showed why (`access-skill-corpus.test.ts`): a judge
+ * that wrongly calls a sensitive mail Access with no context word in it (« passer à la version Pro », « transférer le compte à mon associé ») was admitted
+ * when the counter-read depended on a word list. One more call per admissible mail buys an independent second reading of every admission.
+ * The context words stay in the logs (`accessSkillContextHits`), never as a decider.
+ */
+export function accessSkillCounterReadRequired(_texts: AccessSkillTexts, _requestIds: readonly string[], _judgment: unknown): boolean {
+  return true;
 }
 
 /**
@@ -88,7 +91,6 @@ export function decideAccessSkill(input: Readonly<{ texts: AccessSkillTexts; req
   }
   if (!Object.values(requests).includes("access")) reasons.push("no_access_request");
   if (reasons.length) return team(reasons, family);
-  if (!accessSkillCounterReadRequired(input.texts, input.requestIds, judgment)) return { outcome: "admit", requests, counterRead: "not_required" };
   if (!input.counter || input.counter.status !== "ok") return team(["counter_unavailable"]);
   const counter = accessSkillCounterReadSchema.safeParse(input.counter.output);
   if (!counter.success) return team(["counter_invalid"]);
