@@ -26,8 +26,22 @@ export function boundAccessSkillInput(input: AccessSkillInput): AccessSkillInput
     requests: input.requests.slice(0, 8).map(row => ({ requestId: row.requestId, kind: row.kind, words: row.words === null ? null : row.words.slice(0, WORDS_MAX) })),
   };
 }
-/** The hash a stored reading is bound to: the same bounded input read again must give the same hash, or the reading is not this mail's. */
-export const accessSkillInputHash = (input: AccessSkillInput) => createHash("sha256").update(JSON.stringify(boundAccessSkillInput(input))).digest("hex");
+/**
+ * What bounding would hide from the model (Astra 6.2, 18/11): any part cut away could change the verdict (a sensitive PS after the limit), so a
+ * non-empty answer sends the WHOLE mail to the team before any call (`input_truncated` in the rule). Never admitted on a partial reading.
+ */
+export function accessSkillInputTruncations(input: AccessSkillInput): Array<"subject" | "text" | "original_subject" | "original_text" | "request_count" | "request_words"> {
+  const cut: ReturnType<typeof accessSkillInputTruncations> = [];
+  if (input.subject.length > SUBJECT_MAX) cut.push("subject");
+  if (input.text.length > TEXT_MAX) cut.push("text");
+  if (input.originalRequest && input.originalRequest.subject.length > SUBJECT_MAX) cut.push("original_subject");
+  if (input.originalRequest && input.originalRequest.text.length > TEXT_MAX) cut.push("original_text");
+  if (input.requests.length > 8) cut.push("request_count");
+  if (input.requests.some(row => row.words !== null && row.words.length > WORDS_MAX)) cut.push("request_words");
+  return cut;
+}
+/** The hash a stored reading is bound to, over the FULL input (never the bounded one): a mail that differs only beyond the limits is another mail. */
+export const accessSkillInputHash = (input: AccessSkillInput) => createHash("sha256").update(JSON.stringify(input)).digest("hex");
 
 /** The exact body sent for one call. The counter-read sees the same mail but not the judge's answer (independent reading). */
 export function accessSkillWireBody(kind: AccessSkillCallKind, input: AccessSkillInput, maxOutputTokens: number): string {

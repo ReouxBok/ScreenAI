@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { accessSkillAdmissibleBeforeCounter, decideAccessSkill, readAccessSkillMode, type AccessSkillCall, type AccessSkillTexts } from "./access-skill-rule";
+import { accessSkillAdmissibleBeforeCounter, accessSkillTextsOf, decideAccessSkill, readAccessSkillMode, runAccessSkillReadings, type AccessSkillCall, type AccessSkillTexts } from "./access-skill-rule";
+import { accessSkillInputHash, accessSkillInputTruncations, type AccessSkillInput } from "./access-skill-wire";
+import { accessSkillKernelHits } from "./access-skill-kernel";
 import { accessSkillSendProblem } from "./access-skill-send-fence";
 import { SAV_ACCESS_SKILL_REVISION } from "./access-skill-guidelines";
 
@@ -116,5 +118,42 @@ describe("dernier contrôle avant envoi", () => {
     expect(accessSkillSendProblem({ env, admission: skillAdmission(), text: "Pour résilier votre abonnement, cliquez...", purpose: "answer" })).toBe("CANCELLED_REPLY_SENSITIVE_WORDING");
     expect(accessSkillSendProblem({ env, admission: legacy, text: "Nous allons vous rembourser.", purpose: "question" })).toBe("CANCELLED_REPLY_SENSITIVE_WORDING");
     expect(accessSkillSendProblem({ env, admission: skillAdmission(), text: "Votre demande de remboursement est transmise à l'équipe.", purpose: "handoff" })).toBeNull();
+  });
+});
+
+/*
+ * Astra 6.2 blocker 1 (18/11): what the model is not shown cannot be judged. A fictional login mail, then after character 12 000 a PS asking to
+ * transfer the account to a partner (a wording the kernel does not hold): the bounded bodies were identical to the mail without the PS.
+ */
+describe("texte coupé avant le modèle : tout le mail à l'équipe, sans appel", () => {
+  const LOGIN = "Bonjour, je ne reçois pas le code de connexion depuis ce matin.";
+  const PAD = `\n${"Détail du contexte de notre équipe et de nos usages quotidiens. ".repeat(200)}`.slice(0, 12_000 - LOGIN.length);
+  const PS = "\n\nPS : merci de transférer la propriété du compte à mon associé.";
+  const input = (text: string, extra: Partial<AccessSkillInput> = {}): AccessSkillInput =>
+    ({ purpose: "first_mail", subject: "Connexion", text, originalRequest: null, requests: [{ requestId: "r1", kind: "support", words: null }], ...extra });
+  it("le PS au-delà de la limite change l'empreinte et rend le mail incomplet ; le noyau ne le voit pas", () => {
+    expect((LOGIN + PAD).length).toBe(12_000);
+    expect(accessSkillKernelHits(LOGIN + PAD + PS)).toEqual([]);
+    expect(accessSkillInputHash(input(LOGIN + PAD + PS))).not.toBe(accessSkillInputHash(input(LOGIN + PAD)));
+    expect(accessSkillInputTruncations(input(LOGIN + PAD))).toEqual([]);
+    expect(accessSkillInputTruncations(input(LOGIN + PAD + PS))).toEqual(["text"]);
+    expect(accessSkillInputTruncations(input("x", { subject: "s".repeat(501) }))).toEqual(["subject"]);
+    expect(accessSkillInputTruncations(input("x", { originalRequest: { subject: "o", text: "t".repeat(12_001) } }))).toEqual(["original_text"]);
+    expect(accessSkillInputTruncations(input("x", { requests: Array.from({ length: 9 }, (_, i) => ({ requestId: `r${i}`, kind: "support", words: null })) }))).toEqual(["request_count"]);
+    expect(accessSkillInputTruncations(input("x", { requests: [{ requestId: "r1", kind: "support", words: "w".repeat(1_001) }] }))).toEqual(["request_words"]);
+  });
+  it("un juge (même menteur) n'est jamais appelé et le verdict est l'équipe (input_truncated) ; un mail long mais complet reste lisible", async () => {
+    const calls: string[] = [];
+    const call = async (kind: "judge" | "counter"): Promise<AccessSkillCall> => { calls.push(kind); return kind === "judge" ? ok(judgment()) : counter("no"); };
+    const cut = accessSkillTextsOf(input(LOGIN + PAD + PS));
+    const readings = await runAccessSkillReadings({ texts: cut, requestIds: ["r1"] }, call);
+    expect(calls).toEqual([]);
+    expect(decideAccessSkill({ texts: cut, requestIds: ["r1"], ...readings })).toEqual({ outcome: "team", reasons: ["input_truncated"], family: null, kernel: [] });
+    // Even with readings stored before the rule existed, a cut input is never admitted.
+    expect(decideAccessSkill({ texts: cut, requestIds: ["r1"], judge: ok(judgment()), counter: counter("no") }).outcome).toBe("team");
+    const whole = accessSkillTextsOf(input(LOGIN + PAD));
+    const complete = await runAccessSkillReadings({ texts: whole, requestIds: ["r1"] }, call);
+    expect(calls).toEqual(["judge", "counter"]);
+    expect(decideAccessSkill({ texts: whole, requestIds: ["r1"], ...complete })).toMatchObject({ outcome: "admit" });
   });
 });

@@ -6,7 +6,7 @@ import { decryptSavPayload, encryptSavPayload } from "../../crypto";
 import { resolveCaseV2GeminiKey, SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
 import { assertCaseV2ReservedPolicy, readCaseV2TransportPolicy, releaseCaseV2Spend, reserveCaseV2Spend, settleCaseV2Spend } from "../investigation-v2-spend";
 import { SAV_ACCESS_SKILL_REVISION, accessSkillPromptSha256 } from "./access-skill-guidelines";
-import { decideAccessSkill, runAccessSkillReadings, type AccessSkillCall, type AccessSkillTexts, type AccessSkillVerdict } from "./access-skill-rule";
+import { accessSkillTextsOf, decideAccessSkill, runAccessSkillReadings, type AccessSkillCall, type AccessSkillVerdict } from "./access-skill-rule";
 import { accessSkillInputHash, accessSkillWireBody, readAccessSkillWireResponse, SAV_ACCESS_SKILL_GEMINI_URL, type AccessSkillCallKind, type AccessSkillInput, type AccessSkillWireResult } from "./access-skill-wire";
 
 /*
@@ -81,7 +81,7 @@ async function callModel(deps: AccessSkillDeps, kind: AccessSkillCallKind, callK
   return accessSkillCallOf(result);
 }
 
-const textsOf = (input: AccessSkillInput): AccessSkillTexts => ({ subject: input.subject, text: input.text, original: input.originalRequest });
+const textsOf = accessSkillTextsOf;
 const verdictOf = (stored: AccessSkillStored, input: AccessSkillInput) =>
   decideAccessSkill({ texts: textsOf(input), requestIds: input.requests.map(row => row.requestId), judge: stored.judge, counter: stored.counter });
 

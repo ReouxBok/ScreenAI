@@ -1,4 +1,4 @@
-import { decideAccessSkill, runAccessSkillReadings, type AccessSkillCall, type AccessSkillTeamReason, type AccessSkillTexts } from "./access-skill-rule";
+import { accessSkillTextsOf, decideAccessSkill, runAccessSkillReadings, type AccessSkillCall, type AccessSkillTeamReason, type AccessSkillTexts } from "./access-skill-rule";
 import type { AccessSkillCallKind, AccessSkillInput } from "./access-skill-wire";
 
 /*
@@ -32,7 +32,7 @@ export class AccessSkillEvalStop extends Error { constructor(readonly detail: st
 /** One corpus mail as the entry builds it: one request decided by the skill, no original request. */
 export function accessSkillEvalInput(row: AccessSkillEvalCase): { input: AccessSkillInput; texts: AccessSkillTexts; requestIds: string[] } {
   const input: AccessSkillInput = { purpose: row.purpose, subject: row.subject, text: row.text, originalRequest: null, requests: [{ requestId: "r1", kind: "support", words: null }] };
-  return { input, texts: { subject: row.subject, text: row.text, original: null }, requestIds: ["r1"] };
+  return { input, texts: accessSkillTextsOf(input), requestIds: input.requests.map(request => request.requestId) };
 }
 
 const JUDGE: ReadonlySet<AccessSkillTeamReason> = new Set(["mail_sensitive", "mail_unsure", "mention_request", "request_sensitive", "request_unsure", "no_access_request", "third_party", "instruction_like"]);

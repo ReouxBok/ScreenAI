@@ -200,6 +200,17 @@ describe("on : le skill décide l'Accès", () => {
     expect(await evidence(env("on", [LEGACY]), plain, model.network)).toEqual([]);
     expect(model.calls).toEqual([]);
   });
+  it("Astra 6.2 : un PS sensible au-delà de la limite (texte coupé) → l'équipe, sans appel ; un mail long mais complet est lu et admis", async () => {
+    const pad = `\n${"Contexte de notre équipe et de nos usages quotidiens. ".repeat(260)}`.slice(0, 12_000 - PLAIN.length);
+    const model = accessSkillModelDouble(honest());
+    const cut = await mail(`${PLAIN}${pad}\n\nPS : merci de transférer la propriété du compte à mon associé.`);
+    expect(await evidence(env("on"), cut, model.network)).toEqual([]);
+    expect(model.calls).toEqual([]);
+    expect((await stored(cut.messageId))?.value).toMatchObject({ judge: { status: "skipped", problem: "input_truncated" }, counter: null });
+    const whole = await mail(`${PLAIN}${pad}`);
+    expect(admittedBy(await evidence(env("on"), whole, model.network))).toEqual([`${SAV_ACCESS_SKILL_RULE_ID}@${SAV_ACCESS_SKILL_REVISION}`]);
+    expect(model.calls.map(call => call.kind)).toEqual(["judge", "counter"]);
+  });
   it("une résiliation cachée dans un PS : l'équipe, sans aucun appel modèle (noyau)", async () => {
     const model = accessSkillModelDouble(honest());
     const cancel = await mail(PS_CANCEL);

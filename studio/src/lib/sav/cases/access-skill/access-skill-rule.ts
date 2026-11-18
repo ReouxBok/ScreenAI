@@ -2,6 +2,7 @@ import { savEvidenceContains } from "../../evidence-text";
 import { containsPromptInjection } from "../../policy";
 import { accessSkillKernelHits } from "./access-skill-kernel";
 import { accessSkillCounterReadSchema, accessSkillJudgmentSchema, accessSkillPromptPinned } from "./access-skill-guidelines";
+import { accessSkillInputTruncations, type AccessSkillInput } from "./access-skill-wire";
 
 /*
  * SAV-97: the PURE rule that turns the model's stored readings into an admission verdict. No model, network, database or clock.
@@ -13,12 +14,17 @@ import { accessSkillCounterReadSchema, accessSkillJudgmentSchema, accessSkillPro
 export { readAccessSkillMode, SAV_V2_ACCESS_SKILL_ENV, type AccessSkillMode } from "./access-skill-mode";
 
 /** The texts the readings are checked against: the stored mail, and the original request mail when the stored one answers an identification. */
-export type AccessSkillTexts = Readonly<{ subject: string; text: string; original?: Readonly<{ subject: string; text: string }> | null }>;
+export type AccessSkillTexts = Readonly<{ subject: string; text: string; original?: Readonly<{ subject: string; text: string }> | null;
+  /** What bounding hid from the model (`accessSkillInputTruncations`): non-empty, the whole mail goes to the team, unread. */
+  truncated?: readonly string[] }>;
+/** The texts of a model input, with what bounding would hide from the model. */
+export const accessSkillTextsOf = (input: AccessSkillInput): AccessSkillTexts =>
+  ({ subject: input.subject, text: input.text, original: input.originalRequest, truncated: accessSkillInputTruncations(input) });
 /** One stored model call: its output (to be validated here, never trusted) or why it gave none. */
 export type AccessSkillCall = Readonly<{ status: "ok"; output: unknown }> | Readonly<{ status: "failed"; problem: string; uncertain: boolean }> | Readonly<{ status: "skipped"; problem: string }>;
 
 export const SAV_ACCESS_SKILL_TEAM_REASONS = [
-  "skill_unpinned", "kernel_phrase", "judgment_unavailable", "judgment_invalid", "request_set_mismatch", "prompt_injection", "instruction_like", "third_party",
+  "skill_unpinned", "kernel_phrase", "input_truncated", "judgment_unavailable", "judgment_invalid", "request_set_mismatch", "prompt_injection", "instruction_like", "third_party",
   "mail_sensitive", "mail_unsure", "mention_request", "mention_unverified", "request_sensitive", "request_unsure", "request_not_high", "quote_unverified",
   "no_access_request", "counter_unavailable", "counter_invalid", "counter_yes", "counter_unsure",
 ] as const;
@@ -62,6 +68,7 @@ export function decideAccessSkill(input: Readonly<{ texts: AccessSkillTexts; req
   if (!accessSkillPromptPinned()) return team(["skill_unpinned"]);
   const kernel = accessSkillKernelVerdict(input.texts);
   if (kernel) return kernel;
+  if (input.texts.truncated?.length) return team(["input_truncated"]);
   if (!input.judge || input.judge.status !== "ok") return team(["judgment_unavailable"]);
   const parsed = accessSkillJudgmentSchema.safeParse(input.judge.output);
   if (!parsed.success) return team(["judgment_invalid"]);
@@ -109,6 +116,7 @@ export function accessSkillAdmissibleBeforeCounter(input: Readonly<{ texts: Acce
 export async function runAccessSkillReadings(input: Readonly<{ texts: AccessSkillTexts; requestIds: readonly string[] }>, call: (kind: "judge" | "counter") => Promise<AccessSkillCall>):
   Promise<{ judge: AccessSkillCall; counter: AccessSkillCall | null }> {
   if (accessSkillKernelVerdict(input.texts)) return { judge: { status: "skipped", problem: "kernel_phrase" }, counter: null };
+  if (input.texts.truncated?.length) return { judge: { status: "skipped", problem: "input_truncated" }, counter: null };
   const judge = await call("judge");
   const counter = judge.status === "ok" && accessSkillAdmissibleBeforeCounter({ ...input, judge })
     ? await call("counter") : null;
