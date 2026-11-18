@@ -48,7 +48,21 @@ export const ackClosureAuditStore: AckClosureStore = {
     if (rows[0]?.cursor !== token) return null;
     return async () => { await requireDb().update(savSyncState).set({ status: "idle", updatedAt: new Date() }).where(and(eq(savSyncState.key, key), eq(savSyncState.cursor, token))); };
   },
+  async receipt(messageId, step) {
+    const [row] = await requireDb().select({ metadata: auditLogs.technicalMetadata }).from(auditLogs).where(and(eq(auditLogs.entityType, ENTITY),
+      eq(auditLogs.entityId, messageId), eq(auditLogs.actorEmail, ACTOR), eq(auditLogs.action, actionOf(step)))).orderBy(asc(auditLogs.createdAt)).limit(1);
+    return row?.metadata ?? null;
+  },
+  // One row per failed attempt (the pass holds the lease, so the count is its own); the sweep orders by the latest one.
+  async attempt(messageId, metadata) {
+    const db = requireDb();
+    await db.insert(auditLogs).values({ actorEmail: ACTOR, action: ATTEMPT, entityType: ENTITY, entityId: messageId, technicalMetadata: metadata });
+    const [row] = await db.select({ count: sql<number>`count(*)::int` }).from(auditLogs).where(and(eq(auditLogs.entityType, ENTITY),
+      eq(auditLogs.entityId, messageId), eq(auditLogs.actorEmail, ACTOR), eq(auditLogs.action, ATTEMPT)));
+    return Number(row?.count ?? 0);
+  },
 };
+const ATTEMPT = "sav_ack_close_attempt";
 const LEASE_SECONDS = 120;
 
 /** V1's execution authority, with the closure right, and the agent not paused. */
@@ -136,15 +150,18 @@ export async function reconcileAckClosures(limit = 3, deadlineMs = Date.now() + 
   const db = requireDb(), bound = Math.max(1, Math.min(10, limit));
   const finals = sql.join(ACK_CLOSURE_FINAL_STEPS.map(step => sql`${actionOf(step)}`), sql`, `);
   const noFinal = sql`not exists(select 1 from public.audit_logs a where a.entity_type=${ENTITY} and a.entity_id=${savMessages.id}::text and a.actor_email=${ACTOR} and a.action in (${finals}))`;
+  // Fair order (review Astra, 0ac3311, finding 2): the message whose last failed attempt is the oldest goes first, never attempted before all, so a
+  // ticket that keeps failing yields its slot to the others until its bounded attempts end it.
+  const lastAttempt = sql`coalesce((select max(a.created_at) from public.audit_logs a where a.entity_type=${ENTITY} and a.entity_id=${savMessages.id}::text and a.actor_email=${ACTOR} and a.action=${ATTEMPT}), '-infinity'::timestamptz)`;
   const resumes = await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.direction, "inbound"),
     sql`exists(select 1 from public.audit_logs a where a.entity_type=${ENTITY} and a.entity_id=${savMessages.id}::text and a.actor_email=${ACTOR} and a.action=${actionOf("stage_dispatched")})`,
-    noFinal)).orderBy(asc(savEffectiveReceivedAt), asc(savMessages.id)).limit(bound);
+    noFinal)).orderBy(asc(lastAttempt), asc(savEffectiveReceivedAt), asc(savMessages.id)).limit(bound);
   const fresh = resumes.length >= bound ? [] : await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.direction, "inbound"),
     gt(savMessages.receivedAt, new Date(Date.now() - 72 * 3_600_000)),
     sql`exists(select 1 from sav.threads t where t.id=${savMessages.threadId} and t.hubspot_ticket_id is not null)`,
     sql`exists(select 1 from sav.intake_console c where c.message_id=${savMessages.id} and c.epoch=c.projected_epoch and c.status='acknowledgement_only' and c.view='completed')`,
     sql`not exists(select 1 from sav.messages m where m.thread_id=${savMessages.threadId} and m.id<>${savMessages.id} and least(m.received_at,m.created_at)>=least(${savMessages.receivedAt},${savMessages.createdAt}))`,
-    noFinal)).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.id)).limit(bound - resumes.length);
+    noFinal)).orderBy(asc(lastAttempt), desc(savEffectiveReceivedAt), desc(savMessages.id)).limit(bound - resumes.length);
   const rows = [...resumes, ...fresh.filter(row => !resumes.some(r => r.id === row.id))];
   const results: Array<{ messageId: string; result: unknown }> = [];
   for (const row of rows) {

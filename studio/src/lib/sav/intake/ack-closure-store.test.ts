@@ -9,7 +9,7 @@ vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATAB
 import { encryptSavPayload } from "../crypto";
 import { ackClosureAuditStore, readAckClosureFacts, reconcileAckClosures } from "./ack-closure-store";
 import { closeAcknowledgedTicket, type AckClosureDeps } from "./ack-closure";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string;
 beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 60_000);
@@ -200,5 +200,95 @@ describe("review Astra (c4316e8): resume through the sweep", () => {
     await release!();
     const again = await ackClosureAuditStore.lease(id);
     expect(again).not.toBeNull(); await again!();
+  });
+});
+
+// Review Astra (0ac3311): the resume acts on the dispatched ticket only, and a ticket that is gone or keeps failing cannot hold the sweep. Through the
+// sweep, real receipts, attempts and lease; HubSpot faked behind the port, per ticket.
+describe("review Astra (0ac3311): resume through the sweep", () => {
+  type Ticket = { stage: string; mode: "ok" | "gone" | "fail"; failAfterPatch: number; reads: number; patches: number; notes: number };
+  function hubspot() {
+    const tickets = new Map<string, Ticket>(), notes = new Map<string, string>();
+    const of = (id: string) => { const row = tickets.get(id) ?? { stage: "2", mode: "ok", failAfterPatch: 1, reads: 0, patches: 0, notes: 0 }; tickets.set(id, row); return row; };
+    const port: AckClosureDeps["hubspot"] = {
+      readTicket: async id => {
+        const row = of(id); row.reads++;
+        if (row.mode === "gone") return "gone";
+        if (row.mode === "fail" || row.patches > 0 && row.failAfterPatch-- > 0) throw Error("SAV_SYNTHETIC_READ_FAILED");
+        return { pipeline: "0", stage: row.stage };
+      },
+      setClosed: async id => { const row = of(id); row.patches++; row.stage = "4"; return "applied"; },
+      createNote: async id => { of(id).notes++; const noteId = String(700 + notes.size); notes.set(noteId, id); return noteId; },
+      readNote: async noteId => ({ body: "<p>Fermé : le client a confirmé la résolution (accusé)</p>", ticketIds: [notes.get(noteId)!] }),
+    };
+    return { tickets, of, port };
+  }
+  async function scene(ticket: string, minutesAgo: number) {
+    const th = await thread(ticket);
+    await message(th.id, "outbound", "C'est corrigé.", t(minutesAgo + 30));
+    const mail = await message(th.id, "inbound", "Ok merci", t(minutesAgo));
+    await f.db.insert(savIntakeConsole).values({ threadId: th.id, messageId: mail.id, mailboxId, view: "completed", status: "acknowledgement_only", epoch: 1, projectedEpoch: 1 });
+    return { th, mail };
+  }
+  const sweepDeps = (hub: AckClosureDeps["hubspot"]): AckClosureDeps => ({ env: () => ({ SAV_ACK_CLOSE: "on" }), authority: async () => {}, store: ackClosureAuditStore, hubspot: hub,
+    // V1's acknowledgement and the model's close are stubbed; every thread and ticket fact is the stored one.
+    readFacts: async id => { const real = await readAckClosureFacts(id); return real && { ...real, v1Acknowledgement: true, model: { decision: "close", confidence: "high",
+      lastOutboundMessageId: real.previous!.messageId, lastOutboundState: "conclusive", customerMessage: "pure_ack", justification: "Réponse conclusive.", evidenceQuote: "C'est corrigé." } }; } });
+  const final = async (id: string) => (await f.db.select().from(auditLogs).where(and(eq(auditLogs.entityId, id),
+    sql`${auditLogs.action} in ('sav_ack_close_confirmed','sav_ack_close_uncertain','sav_ack_close_not_applied','sav_ack_close_already_closed')`)));
+  const sweep = (deps: AckClosureDeps, limit = 3) => reconcileAckClosures(limit, Date.now() + 60_000, deps) as Promise<{ candidates: number; resumes: number; results: Array<{ messageId: string; result: unknown }> }>;
+
+  it("finding 1: thread relinked from A to B after our dispatch: only A is finished, B gets no read, no PATCH, no note", async () => {
+    const { th, mail } = await scene("8401", 30);
+    const hub = hubspot(), deps = sweepDeps(hub.port);
+    expect(await sweep(deps)).toMatchObject({ results: [{ messageId: mail.id, result: { retry: "stage_unconfirmed" } }] });
+    await f.db.update(savThreads).set({ hubspotTicketId: "8402" }).where(eq(savThreads.id, th.id));
+    expect(await sweep(deps)).toMatchObject({ resumes: 1, results: [{ messageId: mail.id, result: { final: "confirmed" } }] });
+    expect(hub.of("8401")).toMatchObject({ stage: "4", patches: 1, notes: 1 });
+    expect(hub.tickets.has("8402")).toBe(false);
+    const [row] = await final(mail.id);
+    expect(row!.technicalMetadata).toMatchObject({ ticketId: "8401" });
+    expect(await sweep(deps)).toMatchObject({ candidates: 0 });
+  });
+  it("finding 1: relinked, then a newer mail: the uncertainty names A and reads only A", async () => {
+    const { th, mail } = await scene("8411", 30);
+    const hub = hubspot(), deps = sweepDeps(hub.port);
+    await sweep(deps);
+    await f.db.update(savThreads).set({ hubspotTicketId: "8412" }).where(eq(savThreads.id, th.id));
+    await message(th.id, "inbound", "Encore une chose", t(5));
+    expect(await sweep(deps)).toMatchObject({ resumes: 1, results: [{ result: { final: "uncertain", reason: "newer_message" } }] });
+    expect((await final(mail.id))[0]!.technicalMetadata).toMatchObject({ ticketId: "8411", currentTicketId: "8412", stageMayBeClosed: true, stageObserved: "4" });
+    expect(hub.tickets.has("8412")).toBe(false);
+  });
+  it("finding 2: three dispatched tickets now 404 and a fourth healthy one: the 404s end uncertain (ticket_gone), the fourth is closed by the next sweep", async () => {
+    const gone = [await scene("8501", 40), await scene("8502", 39), await scene("8503", 38)], healthy = await scene("8504", 10);
+    const hub = hubspot(), deps = sweepDeps(hub.port);
+    // All four dispatched, none read back (a crash right after each PATCH).
+    expect((await sweep(deps, 4)).results.map(r => r.result)).toEqual(Array(4).fill({ retry: "stage_unconfirmed" }));
+    for (const id of ["8501", "8502", "8503"]) hub.of(id).mode = "gone";
+    const first = await sweep(deps);
+    expect(first.results).toEqual(gone.map(g => ({ messageId: g.mail.id, result: { final: "uncertain", reason: "ticket_gone" } })));
+    const second = await sweep(deps);
+    expect(second.results).toMatchObject([{ messageId: healthy.mail.id, result: { final: "confirmed" } }]);
+    for (const g of gone) expect((await final(g.mail.id))[0]!.technicalMetadata).toMatchObject({ reason: "ticket_gone", stageMayBeClosed: true });
+    expect(["8501", "8502", "8503"].map(id => hub.of(id).notes)).toEqual([0, 0, 0]);
+    expect(hub.of("8504")).toMatchObject({ patches: 1, notes: 1 });
+    expect(await sweep(deps)).toMatchObject({ candidates: 0 });
+  });
+  it("finding 2: three dispatched tickets failing (5xx) and a fourth healthy one: fair order closes the fourth on the next sweep, the failing ones end uncertain after 5 attempts", async () => {
+    const failing = [await scene("8601", 40), await scene("8602", 39), await scene("8603", 38)], healthy = await scene("8604", 10);
+    const hub = hubspot(), deps = sweepDeps(hub.port);
+    await sweep(deps, 4);
+    for (const id of ["8601", "8602", "8603"]) hub.of(id).mode = "fail";
+    expect((await sweep(deps)).results.map(r => r.result)).toEqual(Array(3).fill({ retry: "ticket_unreadable" }));
+    // Never attempted, the healthy one goes first now.
+    expect((await sweep(deps)).results[0]).toMatchObject({ messageId: healthy.mail.id, result: { final: "confirmed" } });
+    let sweeps = 0;
+    while ((await sweep(deps)).candidates > 0 && sweeps < 10) sweeps++;
+    expect(sweeps).toBeLessThan(10);
+    for (const x of failing) expect((await final(x.mail.id))[0]!.technicalMetadata).toMatchObject({ reason: "ticket_unreadable_attempts", attempts: 5, stageMayBeClosed: true });
+    const attempts = await f.db.select().from(auditLogs).where(eq(auditLogs.action, "sav_ack_close_attempt"));
+    expect(attempts).toHaveLength(15);
+    expect(["8601", "8602", "8603"].map(id => [hub.of(id).patches, hub.of(id).notes])).toEqual([[1, 0], [1, 0], [1, 0]]);
   });
 });
