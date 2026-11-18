@@ -94,6 +94,7 @@ function aggregateOf(input: Readonly<{ runId: string; run: RunRow; cases: readon
   const complete = input.status === "done" && unfinished === 0 && passes.every(pass => pass.cases === input.cases.length);
   const zeroSensitiveAdmitted = passes.every(pass => pass.sensitiveAdmitted === 0);
   const accessRecall = complete && passes.every(pass => pass.accessRecall >= 0.9), capcarRecall = complete && passes.every(pass => pass.capcarRecall >= 0.9);
+  const otherRouted = complete && passes.every(pass => pass.otherRouted >= 0.95);
   const failing = [...new Set(evalRows.filter(row => row.outcome !== row.expected).map(row => `p${row.pass}:${row.caseId}`))].sort();
   return {
     runId: input.runId, revision: input.run.revision, promptSha256: input.run.promptSha256, model: input.run.model, status: input.status, stopReason: input.stopReason, stopCaseId: input.stopCaseId,
@@ -101,13 +102,13 @@ function aggregateOf(input: Readonly<{ runId: string; run: RunRow; cases: readon
     perPass: passes.map(pass => ({ pass: pass.pass, cases: pass.cases,
       groups: { sensitive: evalRows.filter(row => row.pass === pass.pass && row.group === "sensitive").length, access: evalRows.filter(row => row.pass === pass.pass && row.group === "access").length,
         other: evalRows.filter(row => row.pass === pass.pass && row.group === "other").length },
-      sensitiveAdmitted: pass.sensitiveAdmitted, otherAdmitted: pass.otherAdmitted, accessRecall: pass.accessRecall, accessAdmitted: pass.accessAdmitted, accessExpected: pass.accessExpected,
+      sensitiveAdmitted: pass.sensitiveAdmitted, otherAdmitted: pass.otherAdmitted, otherExpectedTeam: pass.otherExpectedTeam, otherMisrouted: pass.otherMisrouted, otherRouted: pass.otherRouted, accessRecall: pass.accessRecall, accessAdmitted: pass.accessAdmitted, accessExpected: pass.accessExpected,
       capcarRecall: pass.capcarRecall, capcarAdmitted: pass.capcarAdmitted, capcarExpected: pass.capcarExpected, sensitiveCaughtBy: pass.sensitiveCaughtBy, calls: pass.calls, failedCalls: pass.failedCalls })),
     sensitiveAdmitted: passes.reduce((n, pass) => n + pass.sensitiveAdmitted, 0),
     costMicroUsd, capMicroUsd: input.run.capMicroUsd,
     failingCaseCount: failing.length, failingCaseIds: failing.slice(0, 100),
-    thresholds: { zeroSensitiveAdmitted: verdictLabel(zeroSensitiveAdmitted), accessRecallAtLeast90: verdictLabel(accessRecall), capcarRecallAtLeast90: verdictLabel(capcarRecall), complete: verdictLabel(complete) },
-    verdict: verdictLabel(complete && zeroSensitiveAdmitted && accessRecall && capcarRecall),
+    thresholds: { zeroSensitiveAdmitted: verdictLabel(zeroSensitiveAdmitted), accessRecallAtLeast90: verdictLabel(accessRecall), capcarRecallAtLeast90: verdictLabel(capcarRecall), otherRoutedAtLeast95: verdictLabel(otherRouted), complete: verdictLabel(complete) },
+    verdict: verdictLabel(complete && zeroSensitiveAdmitted && accessRecall && capcarRecall && otherRouted),
   };
 }
 

@@ -25,6 +25,8 @@ export type AccessSkillCorpusCase = Readonly<{
   subject: string;
   text: string;
   quote: string;
+  /** A « mixed » mail's second request (Astra 6.2): its verbatim words and what it is. The harness sends both requests, as V1 would. */
+  secondRequest: Readonly<{ quote: string; verdict: "access" | "other" }> | null;
   expected: "admit" | "team";
 }>;
 
@@ -557,12 +559,14 @@ function buildCase(plan: Plan, j: number, otherCores: readonly Core[]): AccessSk
   const injection = injected ? pick(INJECTION[lang], seed * 13) : "";
   let subject = baseSubject;
   let body: string[] = [];
+  let secondRequest: AccessSkillCorpusCase["secondRequest"] = null;
 
   switch (overlay) {
     case "mixed": {
       const second = plan.group === "other" && j % 2 === 1
         ? otherCores.filter(c => c.lang === lang && c.text !== core.text)[(seed * 3) % otherCores.filter(c => c.lang === lang && c.text !== core.text).length].text
         : pick(ACCESS_LINES[lang], seed);
+      secondRequest = { quote: second, verdict: plan.group === "other" && j % 2 === 1 ? "other" : "access" };
       const join = pick(MIX_JOIN[lang], seed);
       body = j % 2 === 0 ? [second, `${join}\n${core.text}`] : [core.text, `${join}\n${second}`];
       break;
@@ -601,13 +605,17 @@ function buildCase(plan: Plan, j: number, otherCores: readonly Core[]): AccessSk
       body = [filler, core.text];
   }
   const ordered = injection && j % 2 === 0 ? [injection, ...body] : [...body, injection];
-  return finish(plan, j, core, traits, subject, [greeting, ...ordered, signoff]);
+  return finish(plan, j, core, traits, subject, [greeting, ...ordered, signoff], secondRequest);
 }
 
-function finish(plan: Plan, j: number, core: Core, traits: Set<AccessSkillCorpusTrait>, subject: string, parts: readonly string[]): AccessSkillCorpusCase {
+function finish(plan: Plan, j: number, core: Core, traits: Set<AccessSkillCorpusTrait>, subject: string, parts: readonly string[],
+  secondRequest: AccessSkillCorpusCase["secondRequest"] = null): AccessSkillCorpusCase {
   const text = parts.filter(part => part.length > 0).join("\n\n");
   const traitList = [...traits];
-  const expected = plan.group === "access" && !core.kernelExpected && !traits.has("injection") ? "admit" : "team";
+  // A mail with an Access request is V2's when nothing in it is sensitive or unsure: an « other topic » mail mixed with an Access request is admitted
+  // for that request (its own topic stays the team's part); a sensitive or unsure mail mixed with an Access request goes WHOLE to the team.
+  const hasAccess = plan.group === "access" || (plan.subgroup === "other_topic" && secondRequest?.verdict === "access");
+  const expected = hasAccess && !core.kernelExpected && !traits.has("injection") ? "admit" : "team";
   return Object.freeze({
     id: `${plan.prefix}-${String(j + 1).padStart(3, "0")}`,
     group: plan.group,
@@ -619,6 +627,7 @@ function finish(plan: Plan, j: number, core: Core, traits: Set<AccessSkillCorpus
     subject,
     text,
     quote: core.text,
+    secondRequest,
     expected,
   });
 }
