@@ -113,8 +113,15 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     const { reconcileCaseJ2 } = await import("@/lib/sav/cases/v2-j2-binding");
     return reconcileCaseJ2({ env: process.env, deadlineMs: derivedDeadline });
   });
+  // SAV-97 production self-test of the Access skill on the FICTIONAL corpus (Ugo 18/11): only when SAV_V2_ACCESS_SKILL_SELFTEST=run, independent of the
+  // skill's own switch; a small batch per pass, its own capped ledger, no case, ticket, mail, HubSpot or Gmail. Off: absent from the payload, nothing loaded.
+  const accessSkillSelfTest = process.env.SAV_V2_ACCESS_SKILL_SELFTEST === "run" ? await runStep("v2_access_skill_selftest", async () => {
+    if (Date.now() + 90_000 > derivedDeadline) return { skipped: "deadline" };
+    const { runAccessSkillSelfTestPass } = await import("@/lib/sav/cases/access-skill/access-skill-selftest");
+    return runAccessSkillSelfTestPass({ env: () => process.env, now: () => new Date(), deadlineMs: derivedDeadline });
+  }) : undefined;
   // V2 effects (replies, handoff notices, ticket stages, closures) have their own worker: /api/cron/sav-v2-effects (11/11).
-  const payload = { ...(ownerHandovers ? { ownerHandovers } : {}), caseReminders, ticketSafetyNet, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { ...(ownerHandovers ? { ownerHandovers } : {}), ...(accessSkillSelfTest ? { accessSkillSelfTest } : {}), caseReminders, ticketSafetyNet, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return { payload, hasStepFailure, pulseId };

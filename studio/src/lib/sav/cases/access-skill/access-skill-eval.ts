@@ -46,7 +46,7 @@ export function accessSkillBarrierOf(reasons: readonly AccessSkillTeamReason[]):
 }
 
 const ratio = (part: number, whole: number) => whole ? Math.round((part / whole) * 10_000) / 10_000 : 1;
-function metricsOf(pass: number, rows: readonly AccessSkillEvalRow[]): AccessSkillEvalPassMetrics {
+export function accessSkillEvalMetrics(pass: number, rows: readonly AccessSkillEvalRow[]): AccessSkillEvalPassMetrics {
   const caught: Record<AccessSkillBarrier, number> = { kernel: 0, injection_guard: 0, judge: 0, rule_checks: 0, counter: 0 };
   for (const row of rows) if (row.group === "sensitive" && row.barrier) caught[row.barrier] += 1;
   const access = rows.filter(row => row.group === "access" && row.expected === "admit"), capcar = access.filter(row => row.capcarTwin);
@@ -83,7 +83,7 @@ export async function runAccessSkillEvaluation(options: Readonly<{
       } catch (error) {
         if (!(error instanceof AccessSkillEvalStop)) throw error;
         stopped = { reason: "stop_requested", pass, caseId: row.id, detail: error.detail };
-        passes.push(metricsOf(pass, passRows));
+        passes.push(accessSkillEvalMetrics(pass, passRows));
         break outer;
       }
       const verdict = decideAccessSkill({ texts, requestIds, judge: readings.judge, counter: readings.counter });
@@ -93,11 +93,11 @@ export async function runAccessSkillEvaluation(options: Readonly<{
       passRows.push(result); rows.push(result);
       if (options.stopOnSensitiveAdmitted && row.group === "sensitive" && verdict.outcome === "admit") {
         stopped = { reason: "sensitive_admitted", pass, caseId: row.id };
-        passes.push(metricsOf(pass, passRows));
+        passes.push(accessSkillEvalMetrics(pass, passRows));
         break outer;
       }
     }
-    passes.push(metricsOf(pass, passRows));
+    passes.push(accessSkillEvalMetrics(pass, passRows));
   }
   const complete = !stopped && passes.length === options.passes && passes.every(pass => pass.cases === options.cases.length);
   const zeroSensitiveAdmitted = passes.every(pass => pass.sensitiveAdmitted === 0);

@@ -34,33 +34,51 @@ export type AccessSkillReading =
 export const accessSkillStoreKey = (purpose: AccessSkillPurpose, messageId: string, revision = SAV_ACCESS_SKILL_REVISION) => `${SAV_ACCESS_SKILL_STORE_PREFIX}:${purpose}:${messageId}:${revision}`;
 const MODEL_ID = /^[a-z0-9][a-z0-9.-]{0,99}$/;
 
-/** One call on V2's Gemini transport behind V2's `model` budget: reserved before, settled after; released only when nothing was sent. */
-async function callModel(deps: AccessSkillDeps, kind: AccessSkillCallKind, callKey: string, input: AccessSkillInput): Promise<AccessSkillCall> {
+/**
+ * One call on V2's Gemini transport, WITHOUT any budget: V2's key resolution, model, transport bounds and wire. `send` is reached only after every check
+ * passed; the caller reserves its budget in between (`prepared.send`), so nothing is sent unpaid. Shared by the production judge (V2's `model` budget)
+ * and the production self-test (its own capped ledger, `access-skill-selftest.ts`).
+ */
+export function prepareAccessSkillCall(deps: AccessSkillDeps, kind: AccessSkillCallKind, input: AccessSkillInput):
+  | Readonly<{ ok: true; send: () => Promise<AccessSkillWireResult> }> | Readonly<{ ok: false; call: AccessSkillCall }> {
   const env = deps.env(), key = resolveCaseV2GeminiKey(env), model = env[SAV_V2_MODEL_ENV] ?? "";
-  if (!key.ok) return { status: "failed", problem: "key_unavailable", uncertain: false };
-  if (!MODEL_ID.test(model)) return { status: "failed", problem: "model_invalid", uncertain: false };
+  const failed = (problem: string) => ({ ok: false as const, call: { status: "failed" as const, problem, uncertain: false } });
+  if (!key.ok) return failed("key_unavailable");
+  if (!MODEL_ID.test(model)) return failed("model_invalid");
   let bounds: ReturnType<typeof readCaseV2TransportPolicy>;
-  try { bounds = readCaseV2TransportPolicy(env, deps.now()); } catch { return { status: "failed", problem: "policy_invalid", uncertain: false }; }
+  try { bounds = readCaseV2TransportPolicy(env, deps.now()); } catch { return failed("policy_invalid"); }
   const body = accessSkillWireBody(kind, input, bounds.maxOutputTokens);
-  if (Buffer.byteLength(body, "utf8") > bounds.maxInputBytes) return { status: "failed", problem: "input_too_large", uncertain: false };
+  if (Buffer.byteLength(body, "utf8") > bounds.maxInputBytes) return failed("input_too_large");
+  const network = deps.network ?? ((url, init) => fetch(url, init));
+  return { ok: true, send: async () => {
+    try {
+      const response = await network(`${SAV_ACCESS_SKILL_GEMINI_URL}/${encodeURIComponent(model)}:generateContent`, {
+        method: "POST", signal: AbortSignal.timeout(deps.timeoutMs ?? 25_000), headers: { "content-type": "application/json", "x-goog-api-key": key.key }, body,
+      });
+      if (!response.ok) {
+        await response.body?.cancel();
+        const unprocessed = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429;
+        return { status: "failed", problem: `http_${response.status}`, uncertain: !unprocessed, usage: unprocessed ? { inputTokens: 0, outputTokens: 0 } : null };
+      }
+      return readAccessSkillWireResponse(await response.json());
+    } catch { return { status: "failed", problem: "network_failed", uncertain: true, usage: null }; }
+  } };
+}
+export const accessSkillCallOf = (result: AccessSkillWireResult): AccessSkillCall =>
+  result.status === "ok" ? { status: "ok", output: result.output } : { status: "failed", problem: result.problem, uncertain: result.uncertain };
+
+/** One call behind V2's `model` budget: reserved before, settled after; released only when nothing was sent. */
+async function callModel(deps: AccessSkillDeps, kind: AccessSkillCallKind, callKey: string, input: AccessSkillInput): Promise<AccessSkillCall> {
+  const prepared = prepareAccessSkillCall(deps, kind, input);
+  if (!prepared.ok) return prepared.call;
+  const env = deps.env();
   const reserved = await reserveCaseV2Spend({ env: deps.env, now: deps.now }, "model", callKey);
   if (reserved.status !== "allowed") return { status: "failed", problem: "spend_refused", uncertain: false };
   try { await assertCaseV2ReservedPolicy(reserved.reservationId, env); } catch { await releaseCaseV2Spend({ reservationId: reserved.reservationId }); return { status: "failed", problem: "spend_policy_changed", uncertain: false }; }
-  const network = deps.network ?? ((url, init) => fetch(url, init));
-  let result: AccessSkillWireResult;
-  try {
-    const response = await network(`${SAV_ACCESS_SKILL_GEMINI_URL}/${encodeURIComponent(model)}:generateContent`, {
-      method: "POST", signal: AbortSignal.timeout(deps.timeoutMs ?? 25_000), headers: { "content-type": "application/json", "x-goog-api-key": key.key }, body,
-    });
-    if (!response.ok) {
-      await response.body?.cancel();
-      const unprocessed = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429;
-      result = { status: "failed", problem: `http_${response.status}`, uncertain: !unprocessed, usage: unprocessed ? { inputTokens: 0, outputTokens: 0 } : null };
-    } else result = readAccessSkillWireResponse(await response.json());
-  } catch { result = { status: "failed", problem: "network_failed", uncertain: true, usage: null }; }
+  const result = await prepared.send();
   const uncertain = result.status === "failed" && result.uncertain;
   await settleCaseV2Spend({ env: deps.env, now: deps.now }, { reservationId: reserved.reservationId, usage: result.usage ?? "unknown", uncertain }).catch(() => undefined);
-  return result.status === "ok" ? { status: "ok", output: result.output } : { status: "failed", problem: result.problem, uncertain: result.uncertain };
+  return accessSkillCallOf(result);
 }
 
 const textsOf = (input: AccessSkillInput): AccessSkillTexts => ({ subject: input.subject, text: input.text, original: input.originalRequest });
