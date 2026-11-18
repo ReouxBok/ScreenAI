@@ -291,4 +291,19 @@ describe("review Astra (0ac3311): resume through the sweep", () => {
     expect(attempts).toHaveLength(15);
     expect(["8601", "8602", "8603"].map(id => [hub.of(id).patches, hub.of(id).notes])).toEqual([[1, 0], [1, 0], [1, 0]]);
   });
+  it("review 23f8c4e: A reopened, a new mail on a sibling thread of A, the thread now on B: no second PATCH, no note, uncertain on A", async () => {
+    const { th, mail } = await scene("8701", 30);
+    const hub = hubspot(), deps = sweepDeps(hub.port);
+    expect(await sweep(deps)).toMatchObject({ results: [{ messageId: mail.id, result: { retry: "stage_unconfirmed" } }] });
+    hub.of("8701").stage = "1";
+    const sibling = await thread("8701");
+    await message(sibling.id, "inbound", "Le problème est revenu", t(5));
+    await f.db.update(savThreads).set({ hubspotTicketId: "8702" }).where(eq(savThreads.id, th.id));
+    expect(await sweep(deps)).toMatchObject({ resumes: 1, results: [{ messageId: mail.id, result: { final: "uncertain", reason: "dispatched_stage_not_observed" } }] });
+    expect(hub.of("8701")).toMatchObject({ stage: "1", patches: 1, notes: 0 });
+    expect(hub.tickets.has("8702")).toBe(false);
+    expect((await final(mail.id))[0]!.technicalMetadata).toMatchObject({ ticketId: "8701", currentTicketId: "8702", stageMayBeClosed: false, stageObserved: "1" });
+    expect(await sweep(deps)).toMatchObject({ candidates: 0 });
+  });
 });
+

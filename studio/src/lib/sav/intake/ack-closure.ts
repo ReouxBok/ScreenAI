@@ -84,10 +84,10 @@ async function closeOwned(messageId: string, deps: AckClosureDeps, signal: Abort
   const touched = steps.includes("stage_confirmed") || steps.includes("stage_dispatched");
   const read = async (id: string) => { try { return await deps.hubspot.readTicket(id, signal); } catch { return null; } };
   /** An unreadable ticket: one more attempt, bounded; the last one ends the message for a person (after a dispatch) or for good (before). */
-  const unreadable = async (ticketId: string, basis: string | null, stage: "ticket_unreadable" | "stage_unconfirmed"): Promise<AckClosureResult> => {
+  const unreadable = async (ticketId: string, basis: string | null, stage: "ticket_unreadable"): Promise<AckClosureResult> => {
     const count = await deps.store.attempt(messageId, { ticketId, reason: stage });
     if (count < ACK_CLOSURE_MAX_ATTEMPTS) return { retry: stage };
-    return touched || stage === "stage_unconfirmed"
+    return touched
       ? final("uncertain", { reason: `${stage}_attempts`, attempts: count, stageMayBeClosed: true, ticketId, basis })
       : final("not_applied", { reason: `${stage}_attempts`, attempts: count, ticketId, basis });
   };
@@ -113,18 +113,10 @@ async function closeOwned(messageId: string, deps: AckClosureDeps, signal: Abort
       // A deleted or archived ticket ends the resume for a person (review Astra, 0ac3311, finding 2); any other failure is retried, bounded.
       if (ticket === "gone") return final("uncertain", { reason: "ticket_gone", stageMayBeClosed: true, ticketId, ...relinked });
       if (!ticket) return unreadable(ticketId, basis, "ticket_unreadable");
-      if (ticket.pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId) return final("uncertain", { reason: "pipeline_not_support", stageMayBeClosed: true, ticketId, ...relinked });
-      if (ticket.stage !== SAV_HUBSPOT_SUPPORT.stages.closed) {
-        // Our earlier PATCH did not apply: written again (idempotent by value) on the recorded ticket only, after the same last checks.
-        if (!ticket.stage || !OPEN_STAGES.has(ticket.stage)) return final("uncertain", { reason: "stage_unexpected", stageMayBeClosed: true, ticketId, ...relinked });
-        if (!savAckClosureEnabled(deps.env())) return { skipped: "off" };
-        try { await deps.authority(); } catch { return { retry: "authority_changed" }; }
-        const written = await deps.hubspot.setClosed(ticketId, signal).catch(() => "unknown" as const);
-        if (written === "rejected") return final("uncertain", { reason: "stage_rejected", stageMayBeClosed: true, ticketId, ...relinked });
-        const back = await read(ticketId);
-        if (back === "gone") return final("uncertain", { reason: "ticket_gone", stageMayBeClosed: true, ticketId, ...relinked });
-        if (back?.pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId || back.stage !== SAV_HUBSPOT_SUPPORT.stages.closed) return unreadable(ticketId, basis, "stage_unconfirmed");
-      }
+      // A resume NEVER writes the stage again (review Astra, 23f8c4e): it only finishes a closure it can see. Not « Fermé » in Support (reopened by
+      // someone, or our PATCH never landed): a person decides, no PATCH, no note.
+      if (ticket.pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId || ticket.stage !== SAV_HUBSPOT_SUPPORT.stages.closed)
+        return final("uncertain", { reason: "dispatched_stage_not_observed", stageMayBeClosed: false, stageObserved: ticket.stage, pipelineObserved: ticket.pipeline, ticketId, ...relinked });
       await deps.store.record(messageId, "stage_confirmed", { revision: SAV_ACK_CLOSURE_REVISION, ticketId, basis, stage: SAV_HUBSPOT_SUPPORT.stages.closed, resumed: true, ...relinked });
     }
     return postNote(messageId, deps, signal, now, final, ticketId, basis);

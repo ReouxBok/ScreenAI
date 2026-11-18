@@ -328,4 +328,17 @@ describe("review Astra (0ac3311)", () => {
     expect(await closeAcknowledgedTicket(MID, value)).toMatchObject({ final: "not_applied", reason: "ticket_gone" });
     expect(mem.rows.map(r => r.step)).toEqual(["claimed", "not_applied"]);
   });
+  it("review 23f8c4e: a resume finding the dispatched ticket open never PATCHes again: uncertain for a person, no note", async () => {
+    const mem = await dispatched();
+    const { value, hub } = deps({ mem, hub: fakeHubspot({ stage: "2" }) });
+    expect(await closeAcknowledgedTicket(MID, value)).toMatchObject({ final: "uncertain", reason: "dispatched_stage_not_observed" });
+    expect(hub.writes()).toEqual([]);
+    expect(mem.rows.at(-1)!.metadata).toMatchObject({ stageMayBeClosed: false, stageObserved: "2", ticketId: TICKET });
+  });
+  it("review 23f8c4e: a resume finding the ticket in another pipeline: same, no write", async () => {
+    const mem = await dispatched();
+    const { value, hub } = deps({ mem, hub: fakeHubspot({ stage: "4", pipeline: "77" }) });
+    expect(await closeAcknowledgedTicket(MID, value)).toMatchObject({ final: "uncertain", reason: "dispatched_stage_not_observed" });
+    expect(hub.writes()).toEqual([]);
+  });
 });
