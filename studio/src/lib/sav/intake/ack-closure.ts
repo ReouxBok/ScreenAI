@@ -39,7 +39,7 @@ export type AckClosureDeps = Readonly<{
   signal?: AbortSignal;
 }>;
 export type AckClosureResult =
-  | Readonly<{ skipped: "off" | "authority" | "already_done" | "facts_missing" | "note_in_progress"; detail?: string }>
+  | Readonly<{ skipped: "off" | "authority" | "already_done" | "facts_missing" | "note_in_progress" | "not_acknowledgement"; detail?: string }>
   | Readonly<{ retry: "ticket_unreadable" | "stage_unconfirmed" | "authority_changed" }>
   | Readonly<{ final: Exclude<AckClosureStep, "claimed" | "stage_confirmed" | "note_dispatched">; reason?: string; basis?: AckClosureBasis; noteId?: string }>;
 
@@ -65,6 +65,8 @@ export async function closeAcknowledgedTicket(messageId: string, deps: AckClosur
   const facts = await deps.readFacts(messageId);
   if (!facts) return { skipped: "facts_missing" };
   const decision = decideAckClosure(facts);
+  // The wake runs after every V1 mail: a mail V1 did not classify as an acknowledgement leaves no row at all.
+  if (!decision.close && decision.reason === "v1_not_acknowledgement" && !steps.length) return { skipped: "not_acknowledgement" };
   // A refusal is final for this mail only when nothing was written yet; after a claim the stage may already be « Fermé » and stays for a person to see.
   if (!decision.close) return final(steps.includes("stage_confirmed") ? "uncertain" : "not_applied", { reason: decision.reason, ...(steps.includes("stage_confirmed") ? { stageClosed: true } : {}) });
   const { ticketId, basis } = decision;

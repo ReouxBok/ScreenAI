@@ -135,6 +135,11 @@ describe("no close", () => {
     expect(await closeAcknowledgedTicket(MID, value)).toMatchObject({ final: "not_applied" });
     expect(hub.calls).toEqual([]);
   });
+  it("a mail V1 did not classify as an acknowledgement: no call, no row", async () => {
+    const { value, hub, mem } = deps({ facts: facts({ v1Acknowledgement: false }) });
+    expect(await closeAcknowledgedTicket(MID, value)).toEqual({ skipped: "not_acknowledgement" });
+    expect(hub.calls).toEqual([]); expect(mem.rows).toEqual([]);
+  });
   it("a ticket already closed by someone: no write, no note", async () => {
     const { value, hub } = deps({ hub: fakeHubspot({ stage: "4" }) });
     expect(await closeAcknowledgedTicket(MID, value)).toEqual({ final: "already_closed", basis: "conclusive_reply_acknowledged" });
