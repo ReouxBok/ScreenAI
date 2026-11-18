@@ -41,7 +41,8 @@ describe("SAV-92 compact prompt (offline, synthetic, attachments off)", () => {
       expect(prepared).toMatchObject({ ok: true });
       if (!prepared.ok) throw Error("prepare");
       expect(hash(prepared.body)).toBe(hash(legacy));
-      expect(hash(prepared.body)).toBe(purpose === "decision" ? "daf597e6e0b707f80852c50bd655bac9f13163dbe738797dc8f5bedb79b99929" : "e90239c01d21d104b7768057048191e5a585d69a9653a19fdfae5bd7611c0de8");
+      // SAV-94: the decision hash moved once, with the reply layout instruction (prompt revision v4 -> v6, v5 -> v7); resolution_check is unchanged.
+      expect(hash(prepared.body)).toBe(purpose === "decision" ? "adc3939f0dbb961f7af2d2038e95ff8532b176d9d117e7bfc0e2c0ea5b9ebc15" : "e90239c01d21d104b7768057048191e5a585d69a9653a19fdfae5bd7611c0de8");
     }
     for (const compact of [false, true]) for (const structuredOutput of [false, true]) {
       const prepared = prepareCaseGeminiDecisionRequest(req, { ...env, SAV_V2_PROMPT_COMPACT: compact ? "on" : "off", SAV_V2_STRUCTURED_OUTPUT: structuredOutput ? "on" : "off" });

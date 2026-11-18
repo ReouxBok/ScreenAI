@@ -31,7 +31,8 @@ export function j2ReminderText(origin: J2Origin, env: Record<string, string | un
   if (!context || !Number.isFinite(Date.parse(context.receivedAt)) || !context.subject.trim() || context.subject.length > 600 || /[\r\n]/.test(context.subject)) return J2_REMINDER_TEXT;
   if (caseReplyTextSafetyProblems(`${origin.text}\n${context.subject}`, { accessOpen: true, answersOrAsks: true })
     .some(problem => problem.code !== "access_link_missing")) return J2_REMINDER_TEXT;
-  const body = caseReplyEditableBody(origin.text);
+  // SAV-94: the body as it was sent (no new layout), so a reminder prepared before the layout pass is computed again byte for byte.
+  const body = caseReplyEditableBody(origin.text, { layout: false });
   let recall: string | null = null;
   const tracked = caseReplyQuestions(origin);
   const open = new Set(origin.j2OpenQuestionIds ?? []);
@@ -61,7 +62,8 @@ export function j2ReminderText(origin: J2Origin, env: Record<string, string | un
       const block = numbered.join("\n");
       const paragraphs = body.split("\n\n");
       const instructions = body.replace(/^Bonjour(?:,)?\n\n/, "");
-      if (paragraphs.includes(block) && instructions === block) {
+      // SAV-94: steps laid out one per paragraph (a blank line between them) are the same list; the recall quotes them as before, one per line.
+      if ((paragraphs.includes(block) && instructions === block) || (numbered.length > 1 && instructions === numbered.join("\n\n"))) {
         recall = `en vous proposant la marche à suivre suivante :\n${block}`;
       }
     } else if (!origin.procedures?.length && !/^(?:[-•] |\d+[.)] )/m.test(body)) {

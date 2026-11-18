@@ -12,6 +12,7 @@
 import { cleanSavModelDraft, renderSavOutboundReply, savReplyFooter, type SavReplySendMode } from "../reply-format";
 import { layoutCaseReplyBody } from "./case-reply-layout";
 import type { CaseReplyApproval, CaseReplyProposal, CaseReplyPurpose } from "./case-effects";
+import { layoutCaseReplyBody } from "./case-reply-layout";
 
 export const CASE_REPLY_OUTBOUND_CONTRACT = "sav-v2-reply-outbound.v1";
 
@@ -36,27 +37,34 @@ const HELP_LINES: Readonly<Record<CaseReplyLanguage, string>> = {
 };
 export const caseReplyHelpLine = (language: CaseReplyLanguage | "unknown") => HELP_LINES[language === "en" ? "en" : "fr"];
 const BARE_SIGNATURES = ["L’équipe Limova", "The Limova team"];
-/** The draft's own content: without the help line in either language or a trailing bare signature, so preparing again (or in the other language) never stacks. */
-function caseReplyBody(draft: string): string {
+/**
+ * The draft's own content: without the help line in either language or a trailing bare signature, so preparing again (or in the other language) never stacks.
+ * SAV-94: laid out as plain text (`case-reply-layout.ts`: blank lines, numbered steps, no Markdown markers), so the stored, hashed, approved and sent text is the
+ * laid-out one. `layout: false` is only the pre-SAV-94 preparation, kept to recognise a proposal stored before it (provenance), never to produce a new one.
+ */
+function caseReplyBody(draft: string, layout = true): string {
   let text = cleanSavModelDraft(draft);
   for (let previous = ""; previous !== text;) {
     previous = text;
+    if (layout) text = layoutCaseReplyBody(text);
     for (const line of LANGUAGES.map(language => HELP_LINES[language])) text = text.split(line).join("").trim();
     for (const signature of BARE_SIGNATURES) if (text.endsWith(signature)) text = text.slice(0, -signature.length).trim();
   }
   return text;
 }
 
-/** SAV-92: what a person edits in the Studio, the stored text without the help line, the signature and the mention (they are added again, once, by the preparation). */
-export const caseReplyEditableBody = (text: string) => caseReplyBody(text);
+/** SAV-92: what a person edits in the Studio, the stored text without the help line, the signature and the mention (they are added again, once, by the preparation).
+ * SAV-94: laid out like a new preparation; `layout: false` reads a sent text exactly as it was stored (J2 recalls), never to prepare one. */
+export const caseReplyEditableBody = (text: string, options: Readonly<{ layout?: boolean }> = {}) => caseReplyBody(text, options.layout !== false);
 
 /**
  * The final text of a reply, help line and mention included. Idempotent: a text that already carries a known footer (any language or mode, current or historical)
  * is re-rendered with exactly one, so preparing twice, or again in the other language, never stacks. `unknown` reads as French, like the shared format.
  * `automated` keeps the shared "sent automatically by an AI, may contain errors, reply to continue" notice; the human-validation path never uses it (see `finalize…`).
  */
-export function prepareCaseReplyText(draft: string, language: CaseReplyLanguage | "unknown", mode: CaseReplyAiMode, purpose?: CaseReplyPurpose): string {
-  const body = caseReplyBody(draft);
+export function prepareCaseReplyText(draft: string, language: CaseReplyLanguage | "unknown", mode: CaseReplyAiMode, purpose?: CaseReplyPurpose,
+  options: Readonly<{ layout?: boolean }> = {}): string {
+  const body = caseReplyBody(draft, options.layout !== false);
   if (!body) throw new Error("SAV_REPLY_EMPTY");
   // ONE follow-up per reply (Ugo 11/11): a `question` reply IS its follow-up (the tracked question, which J2 follows), so the standard line is not stacked after it.
   // Closing/handoff acknowledgements need no new diagnostic question. Answers and reminders keep the standard line once.

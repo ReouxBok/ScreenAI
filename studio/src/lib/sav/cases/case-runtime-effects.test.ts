@@ -26,9 +26,9 @@ import { listV2Cases, v2InventoryInput } from "./v2-inventory";
 import { pendingCaseEffectRecoveries } from "./case-effect-recovery";
 import { recordConfirmedCaseReply } from "./case-effect-outcomes";
 import { caseReplyPayloadHash, type CaseReplyProposal } from "./case-effects";
-import { caseReplyFinalTextProblem, readCaseReplyDisclosure } from "./case-reply-outbound";
+import { caseReplyFinalTextProblem, prepareCaseReplyText, readCaseReplyDisclosure } from "./case-reply-outbound";
 import type { CaseDecisionDraft } from "./investigation-intent";
-import { decideCaseReply, type CaseEffectNote } from "./case-reply-store";
+import { decideCaseReply, submitCaseReplyProposal, type CaseEffectNote } from "./case-reply-store";
 import type { CaseReplyAuthorizer } from "./case-reply-validation";
 import {
   describeCaseReplyForReview, listCaseEffectsNeedingPerson, proposeCaseReplyFromDraft, queueValidatedCaseReply, resolveCaseReplyLanguage, runCaseEffectsPass,
@@ -245,6 +245,59 @@ describe("draft -> final text -> durable validation -> one executor -> confirmat
     expect(result.supervised).toEqual([{ executionId: id, state: "refused", reason: "SAV_CASE_EFFECT_CANCELLED_AI_NOTICE" }]);
     expect(sends).toBe(0);
     expect(await effectsOf(id)).toMatchObject([{ state: "planned", dispatchedAt: null }]);
+  });
+});
+
+describe("SAV-94: a reply stored before the layout pass is never re-formatted", () => {
+  const COMPACT = "Bonjour,\n\nVoici les étapes à suivre :\n1) Ouvrez la page de connexion.\n2) Cliquez sur **Mot de passe oublié**.";
+  const sentBodies = () => Object.values(p.sent).map(message => Buffer.from((message as { payload: { body: { data: string } } }).payload.body.data, "base64url").toString("utf8").replace(/\r\n/g, "\n"));
+  /** What the code before SAV-94 stored: the same draft, prepared without the layout, through the real store. */
+  async function storedBeforeLayout(s: Scenario) {
+    const draft = { ...s.draft, reply: { purpose: "answer" as const, text: COMPACT } };
+    const old: CaseReplyProposal = { caseId: s.caseId, caseVersion: s.version, triggerEventId: draft.triggerEventId!, inboundMessageId: s.message.id, purpose: "answer",
+      recipient: "customer@example.invalid", subject: "Synthetic connection failure", text: prepareCaseReplyText(COMPACT, "en", "manual_reviewed", "answer", { layout: false }) };
+    const submitted = await submitCaseReplyProposal(old, storeDeps());
+    if (!submitted.ok) throw Error(`OLD_SUBMIT_REFUSED:${submitted.code}`);
+    expect(old.text).toContain("1) Ouvrez la page de connexion.\n2) Cliquez sur **Mot de passe oublié**.");
+    expect(prepareCaseReplyText(COMPACT, "en", "manual_reviewed", "answer")).not.toBe(old.text);
+    return { draft, old, validationId: submitted.id };
+  }
+
+  it("approved, not yet queued: the resumed decision finds the approval and queues it; the mail sent is the approved text, byte for byte, under its hash", async () => {
+    const s = await scenario("answer");
+    const { draft, old, validationId } = await storedBeforeLayout(s);
+    await approve(validationId);
+    // The resume, with the layout in the code: same decision, same draft.
+    const resumed = await proposeCaseReplyFromDraft(draft, storeDeps());
+    expect(resumed).toMatchObject({ ok: true, validationId, created: false, state: "approved", payloadHash: caseReplyPayloadHash(old) });
+    const queued = await queueValidatedCaseReply({ validationId, policy: policyArg(), deps: storeDeps() });
+    expect(queued).toMatchObject({ ok: true, created: true });
+    expect(await storedProposal(validationId)).toEqual(old);
+    expect((await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, validationId)))[0]!.payloadHash).toBe(caseReplyPayloadHash(old));
+    expect(await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, s.caseId))).toHaveLength(1);
+    expect((await pass()).supervised).toEqual([{ executionId: (queued as { executionId: string }).executionId, state: "confirmed", reason: null }]);
+    expect(sends).toBe(1);
+    expect(sentBodies()).toHaveLength(1);
+    expect(sentBodies()[0]).toContain(old.text);
+  });
+
+  it("proposed, not yet decided: the resumed decision returns the stored row and its hash, so the person (or the rule) approves the text it shows", async () => {
+    const s = await scenario("answer");
+    const { draft, old, validationId } = await storedBeforeLayout(s);
+    const resumed = await proposeCaseReplyFromDraft(draft, storeDeps());
+    expect(resumed).toMatchObject({ ok: true, validationId, created: false, state: "proposed", payloadHash: caseReplyPayloadHash(old) });
+    expect(await storedProposal(validationId)).toEqual(old);
+    const decided = await decideCaseReply({ action: "approve", validationId, approverId: APPROVER, authorizer: allow, deps: storeDeps(),
+      seen: { payloadHash: (resumed as { payloadHash: string }).payloadHash, caseVersion: old.caseVersion, recipient: old.recipient } });
+    expect(decided).toMatchObject({ ok: true, state: "approved" });
+  });
+
+  it("a NEW decision is laid out; a different text for an approved trigger is still refused", async () => {
+    const s = await scenario("answer");
+    const fresh = await propose(s, { reply: { purpose: "answer", text: COMPACT } });
+    expect((await storedProposal(fresh.validationId)).text).toContain("Voici les étapes à suivre :\n\n1. Ouvrez la page de connexion.\n\n2. Cliquez sur Mot de passe oublié.");
+    await approve(fresh.validationId);
+    expect(await proposeCaseReplyFromDraft({ ...s.draft, reply: { purpose: "answer", text: `${COMPACT}\n3) Autre étape.` } }, storeDeps())).toMatchObject({ ok: false, code: "trigger_already_approved" });
   });
 });
 
