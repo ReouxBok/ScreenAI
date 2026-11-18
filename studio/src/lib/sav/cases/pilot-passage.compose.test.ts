@@ -713,7 +713,8 @@ it.each([[false, false], [true, false], [false, true], [true, true]])("J2 follow
     let id = "";
     expect(await enqueueApprovedJ2(timer!, snapshot.version, { id: grant.id, hash: grant.policyHash }, deps, value => { id = value; })).toBe("queued");
     expect((await readCase(mail.caseId))!.phase).toBe("awaiting_customer");
-    expect(await executeIntakePass(id, options, {}, createCaseEffectDriver({ ...deps }))).toMatchObject({ state: contextual ? "waiting" : "confirmed" });
+    // 18/11 (SAV-93): the note no longer waits for the « closed » stage; both are written independently, the note without a status it cannot prove yet.
+    expect(await executeIntakePass(id, options, {}, createCaseEffectDriver({ ...deps }))).toMatchObject({ state: "confirmed" });
     if (contextual) {
       const rows = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, mail.caseId));
       const stage = rows.find(row => row.replyKey.startsWith(`case-stage:${mail.caseId}:closed:`));
@@ -729,11 +730,12 @@ it.each([[false, false], [true, false], [false, true], [true, true]])("J2 follow
         createTicketStageDriver({ env: () => environment, readTicketOwner: async () => "v2" }));
       expect(stageResult).toEqual({ state: "confirmed", executionId: stage!.id });
       expect(stageId).toBe("4"); expect(patches).toBe(1);
-      expect(await executeIntakePass(id, options, {}, createCaseEffectDriver({ ...deps }))).toMatchObject({ state: "confirmed" });
+      // Already confirmed with its note: a later pass has nothing to take.
+      expect(await executeIntakePass(id, options, {}, createCaseEffectDriver({ ...deps }))).toMatchObject({ skipped: "occupied" });
       const effects = await f.db.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, id));
       const notes = effects.filter(effect => effect.kind === "note_create");
       expect(notes).toHaveLength(1);
-      expect(decryptSavPayload<{ text: string }>(notes[0]!.intentCiphertext).text).toContain("J'ai relancé le client. Ticket fermé.");
+      expect(decryptSavPayload<{ text: string }>(notes[0]!.intentCiphertext).text).toMatch(/J'ai relancé le client\.$/);
     }
     await executeIntakePass(id, options, {}, createCaseEffectDriver({ ...deps }));
     expect((await readCase(mail.caseId))!.phase).toBe(contextual ? "closed_no_reply" : "awaiting_customer");

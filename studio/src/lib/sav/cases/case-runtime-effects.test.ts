@@ -957,13 +957,15 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     expect(sends).toBe(1);
   });
 
-  it.each([false, true])("confirmed stage stays visible when resuming the pending note (stages disabled: %s), without duplicate sends", async disableStages => {
+  // 18/11 (SAV-93, decision of Ugo): the note and the ticket status are independent. The note no longer waits a pass for the stage: it is written in the
+  // same pass as the reply, with the status sentence only when the stage is ALREADY confirmed (a recovered reply, below), never claimed otherwise.
+  it.each([false, true])("a stage confirmed BEFORE the note is named in it (stages disabled after: %s); one note, one send, one stage", async disableStages => {
     const inventoryFrom = new Date().toISOString();
     noteOn(); stagesOn();
-    const s = await scenario("answer"), { id } = await admit(s);
-    expect((await pass()).supervised).toEqual([{ executionId: id, state: "waiting", reason: "SAV_CASE_EFFECT_RECOVERY_NOTE_PENDING" }]);
-    expect(sends).toBe(1);
-    expect(await outbound(s.caseId)).toHaveLength(1);
+    const s = await scenario("answer"), id = await lostAck(s);
+    // The recovery confirms the reply and queues the stage; the note waits for a supervised pass (a write), not for the stage.
+    await letReconcile();
+    expect((await pass({ readTicketOwner: undefined as never })).recovery).toMatchObject([{ executionId: id, state: "waiting", reason: "SAV_CASE_EFFECT_RECOVERY_NOTE_PENDING" }]);
     expect(await notesOf(id)).toEqual([]);
     const [stage] = await stageRows(s.caseId);
     const { createTicketStageDriver } = await import("./case-ticket-stage-store");
@@ -989,22 +991,22 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     const inventory = await listV2Cases(v2InventoryInput.parse({ limit: 100, from: inventoryFrom }));
     const row = inventory.rows.find(row => row.caseId === s.caseId)!;
     expect(row.outcomes.find(outcome => outcome.executionId === id)?.status).toEqual({ state: "confirmed", reason: null, message: null });
+    expect(row.outcomes.find(outcome => outcome.executionId === id)?.note).toEqual({ state: "confirmed", reason: null, message: null });
     expect(row.hubspot.status).toBe("confirmed");
   });
 
-  it.each(["refused", "uncertain", "pending", "waiting"] as const)("stage %s after one catch-up: one note without status, no resend", async state => {
+  it.each(["refused", "uncertain", "pending", "waiting"] as const)("SAV-93: the note never waits for the stage (stage then %s): ONE note on the ticket in the reply's pass, without status, no resend", async state => {
     noteOn(); stagesOn();
     const s = await scenario("answer"), { id } = await admit(s);
-    await pass();
-    expect(await notesOf(id)).toEqual([]);
-    const [stage] = await stageRows(s.caseId);
-    await f.db.update(savCaseEffectExecutions).set({ state }).where(eq(savCaseEffectExecutions.id, stage!.id));
-    // An intervening hold / driver restart must not reset the persisted bound.
-    await setPause("v2", "fully_paused"); await pass(); await setPause("v2", null);
     expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
-    await pass();
     expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: ACCESS_ANSWER }]);
+    const [stage] = await stageRows(s.caseId);
+    expect(stage).toMatchObject({ state: "pending" });
+    await f.db.update(savCaseEffectExecutions).set({ state }).where(eq(savCaseEffectExecutions.id, stage!.id));
+    await pass(); await pass();
     expect(await notesOf(id)).toHaveLength(1);
+    expect(hubspotNotes()).toHaveLength(1);
+    expect(p.links.get(`notes:${hubspotNotes()[0]!.id}:tickets`)).toEqual([s.ticketId]);
     expect(sends).toBe(1);
   });
 
@@ -1074,18 +1076,18 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     expect(await stageRows(s.caseId)).toEqual([]);
   });
 
-  it("[P1] a customer mail while the stage waits: the cancelled stage adds no status to the note", async () => {
+  it("[P1] a customer mail after the reply: the note (already written, no status) stays ONE, the stage is cancelled on its own", async () => {
     noteOn(); stagesOn();
     const s = await scenario("answer"), { id } = await admit(s);
-    await pass();
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
     await customerMailAfterReply(s);
     const [stage] = await stageRows(s.caseId);
     const { createTicketStageDriver } = await import("./case-ticket-stage-store");
     environment.SAV_V2_HUBSPOT_OWNER_ID = "2002";
     await executeIntakePass(stage!.id, options, {}, createTicketStageDriver({ env: () => environment, readTicketOwner: async () => "v2" }));
     expect((await stageRows(s.caseId))[0]).toMatchObject({ state: "refused", reason: "SAV_TICKET_STAGE_CANCELLED_NEW_INPUT" });
-    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
-    expect((await notesOf(id))[0]!.text).toBe(ACCESS_ANSWER);
+    await pass();
+    expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: ACCESS_ANSWER }]);
     expect(await execution(id)).toMatchObject({ state: "confirmed" });
     expect(sends).toBe(1);
   });
@@ -1198,6 +1200,116 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
     expect((await effectsOf(id)).filter(effect => effect.kind === "note_associate")).toEqual([]);
     expect(p.links.get("notes:777001:tickets") ?? []).toEqual([]);
     expect(noteCreates()).toHaveLength(0);
+  });
+
+  // 18/11 (SAV-93, decision of Ugo) ----------------------------------------------------------------------------------------------------
+  const notePuts = () => p.calls.filter(call => call.method === "PUT" && /^\/crm\/v4\/objects\/notes\/\d+\/associations\//.test(call.path));
+  const runStage = async (s: Scenario, network: typeof fetch) => {
+    const [stage] = await stageRows(s.caseId);
+    const { createTicketStageDriver } = await import("./case-ticket-stage-store");
+    const { createCaseTicketStageAdapters } = await import("./case-ticket-stage-hubspot");
+    environment.SAV_V2_HUBSPOT_OWNER_ID = "2002";
+    await executeIntakePass(stage!.id, { ...options, adapters: { ...options.adapters, ...createCaseTicketStageAdapters({ env: () => environment, network }) } }, {},
+      createTicketStageDriver({ env: () => environment, readTicketOwner: async () => "v2" }));
+    return (await stageRows(s.caseId))[0]!;
+  };
+
+  it("SAV-93: the note is created ON the ticket in ONE HubSpot call (no separate PUT); replays add no second note", async () => {
+    noteOn();
+    const s = await scenario("answer"), { id, validationId } = await admit(s);
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
+    expect(noteCreates()).toHaveLength(1);
+    expect((noteCreates()[0]!.body as { associations: unknown }).associations)
+      .toEqual([{ to: { id: s.ticketId }, types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 228 }] }]);
+    expect(notePuts()).toEqual([]);
+    expect(p.links.get(`notes:${hubspotNotes()[0]!.id}:tickets`)).toEqual([s.ticketId]);
+    expect((await effectsOf(id)).filter(effect => effect.kind.startsWith("note_"))).toMatchObject([{ state: "confirmed" }, { state: "confirmed" }]);
+    expect(await queueValidatedCaseReply({ validationId, policy: policyArg(), deps: storeDeps() })).toEqual({ ok: true, executionId: id, created: false });
+    for (let n = 0; n < 2; n++) { await letReconcile(); await pass(); }
+    expect(noteCreates()).toHaveLength(1);
+    expect(hubspotNotes()).toHaveLength(1);
+    expect(sends).toBe(1);
+  });
+
+  it("SAV-93: HubSpot rewriting the body (entities, apostrophes, <br/>, wrapper, comment removed, LF) is still proven by the creation ACK and the ticket association", async () => {
+    noteOn();
+    const s = await scenario("answer"), { id } = await admit(s);
+    aroundDispatch("note_create", { after: async () => {
+      for (const note of hubspotNotes()) note.properties.hs_note_body = `<div>${note.properties.hs_note_body!.replace(/<!--[\s\S]*?-->/, "")
+        .replaceAll("&#39;", "’").replace("accès", "acc&egrave;s").replace(". J", ".&nbsp;J").replace("<p>", "<p dir=\"auto\">")}</div>\n`;
+    } });
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
+    expect(hubspotNotes()[0]!.properties.hs_note_body).toContain("acc&egrave;s");
+    expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: ACCESS_ANSWER }]);
+    expect(noteCreates()).toHaveLength(1);
+    expect(notePuts()).toEqual([]);
+  });
+
+  it("SAV-93: a body changed beyond formatting (another text) is NOT proven, even with the ACK; never created twice", async () => {
+    noteOn();
+    const s = await scenario("answer"), { id } = await admit(s);
+    aroundDispatch("note_create", { after: async () => {
+      for (const note of hubspotNotes()) note.properties.hs_note_body = note.properties.hs_note_body!.replace("connexion", "facturation");
+    } });
+    await pass();
+    for (let n = 0; n < 3; n++) { await letReconcile(); await expireHeldLease(id); await pass(); }
+    expect((await notesOf(id))[0]!.state).not.toBe("confirmed");
+    expect(noteCreates()).toHaveLength(1);
+    expect(sends).toBe(1);
+  });
+
+  it("SAV-93: the ticket status fails, the note is still on the ticket", async () => {
+    noteOn(); stagesOn();
+    const s = await scenario("answer"), { id } = await admit(s);
+    expect((await pass()).supervised).toEqual([{ executionId: id, state: "confirmed", reason: null }]);
+    const stage = await runStage(s, (async () => { throw Error("SAV_TEST_HUBSPOT_STAGE_DOWN"); }) as typeof fetch);
+    expect(stage.state).not.toBe("confirmed");
+    expect(await notesOf(id)).toMatchObject([{ state: "confirmed", text: ACCESS_ANSWER }]);
+    expect(p.links.get(`notes:${hubspotNotes()[0]!.id}:tickets`)).toEqual([s.ticketId]);
+    expect(await execution(id)).toMatchObject({ state: "confirmed" });
+  });
+
+  it("SAV-93: the note fails, the ticket status is still applied", async () => {
+    noteOn(); stagesOn();
+    const s = await scenario("answer"), { id } = await admit(s);
+    aroundDispatch("note_create", { before: async () => { throw Error("SAV_TEST_NOTE_CREATE_DOWN"); } });
+    await pass();
+    expect(hubspotNotes()).toEqual([]);
+    expect(await execution(id)).not.toMatchObject({ state: "confirmed" });
+    let stageId = "1", patches = 0;
+    const stage = await runStage(s, (async (_url, init) => {
+      if (init?.method === "PATCH") { stageId = JSON.parse(String(init.body)).properties.hs_pipeline_stage; patches++; }
+      return Response.json({ id: s.ticketId, properties: { hs_pipeline: "0", hs_pipeline_stage: stageId, hubspot_owner_id: "2002" } });
+    }) as typeof fetch);
+    expect(stage.state).toBe("confirmed");
+    expect(patches).toBe(1);
+    expect(sends).toBe(1);
+  });
+
+  it("SAV-93: an execution engaged in the OLD two-step form (create without association, proof failed on a rewritten body) still completes: verified, then associated by the historical PUT, one note", async () => {
+    noteOn();
+    const s = await scenario("answer"), { id } = await admit(s);
+    const { intakeRuntimeHash } = await import("../intake/runtime-contract");
+    const real = options.adapters.dispatch;
+    // The row as an older release stored it: no `ticketAssociation`, the note created alone; HubSpot then rewrites its body.
+    options = { ...options, adapters: { ...options.adapters, dispatch: (async (intent: { kind: string; key: string; ticketAssociation?: string }, ...rest: unknown[]) => {
+      if (intent.kind !== "note_create") return (real as (...a: unknown[]) => Promise<unknown>)(intent, ...rest);
+      const { ticketAssociation: _dropped, ...old } = intent;
+      await f.db.update(savIntakeEffects).set({ intentCiphertext: encryptSavPayload(old), intentHash: intakeRuntimeHash(old) }).where(eq(savIntakeEffects.businessKey, intent.key));
+      const ack = await (real as (...a: unknown[]) => Promise<unknown>)(old, ...rest);
+      for (const note of hubspotNotes()) note.properties.hs_note_body = note.properties.hs_note_body!.replaceAll("&#39;", "&#x27;").replace(/<!--[\s\S]*?-->/, "");
+      return ack;
+    }) as unknown as ExecutorAdapters["dispatch"] } };
+    await pass();
+    for (let n = 0; n < 4 && (await execution(id)).state !== "confirmed"; n++) { await letReconcile(); await expireHeldLease(id); await pass(); }
+    expect(await execution(id)).toMatchObject({ state: "confirmed" });
+    expect((noteCreates()[0]!.body as { associations?: unknown }).associations).toBeUndefined();
+    expect(notePuts()).toHaveLength(1);
+    expect(p.links.get(`notes:${hubspotNotes()[0]!.id}:tickets`)).toEqual([s.ticketId]);
+    expect(noteCreates()).toHaveLength(1);
+    expect(hubspotNotes()).toHaveLength(1);
+    expect((await effectsOf(id)).filter(effect => effect.kind.startsWith("note_"))).toMatchObject([{ state: "confirmed" }, { state: "confirmed" }]);
+    expect(sends).toBe(1);
   });
 
   it("[P2] a replay under `off` of an execution sealed with its note `on` returns the existing execution", async () => {

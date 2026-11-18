@@ -52,6 +52,9 @@ export type EffectIntent = {
     properties?: Record<string, string>;
     expectedProperties?: Record<string, string>;
     reuseExistingAssociation?: boolean;
+    /** 18/11 (SAV-93): a V2 case note created ALREADY associated to `ticketId` (one HubSpot call), so an unattached note cannot exist. Absent on older rows,
+     * which keep the historical two-step form (create, then a separate PUT). Carried to the association step, which then only re-reads it. */
+    ticketAssociation?: "at_create";
     confirmedNoteCreate?: { effectId: string; objectId: string };
     text?: string;
     marker?: string;

@@ -112,6 +112,15 @@ export function executionProvider(sender = "customer@example.invalid") {
                         links.set(key, [...new Set([...(links.get(key) ?? []), String(assoc.to.id)])]);
                     }
                 }
+                // 18/11 (SAV-93): a note created ON its ticket (HubSpot v3 `associations`, note → ticket HUBSPOT_DEFINED 228), linked both ways like a PUT.
+                if (type === "notes" && body.associations) {
+                    for (const assoc of body.associations) {
+                        if (assoc.types?.[0]?.associationCategory !== "HUBSPOT_DEFINED" || assoc.types[0].associationTypeId !== 228) throw Error("FAKE_NOTE_ASSOCIATION_INVALID");
+                        const target = String(assoc.to.id);
+                        links.set(`notes:${id}:tickets`, [...new Set([...(links.get(`notes:${id}:tickets`) ?? []), target])]);
+                        links.set(`tickets:${target}:notes`, [...new Set([...(links.get(`tickets:${target}:notes`) ?? []), id])]);
+                    }
+                }
                 if (type === "emails") {
                     const headers = JSON.parse(properties.hs_email_headers);
                     properties.hs_email_from_email = headers.from.email;

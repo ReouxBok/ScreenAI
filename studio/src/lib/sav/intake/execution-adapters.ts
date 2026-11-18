@@ -21,14 +21,43 @@ export const renderIntakeNoteHidden = (text: string, marker: string) => `<p>${pl
 /** Only the V2 reply's summary note (`note:<case>:reply-summary.<trigger>`) and the V2 closure note (`note:<case>:closed-summary.cycle-<n>`, SAV-92 16/11) are
  * rendered without a visible marker; every other note keeps the visible one. */
 export const hiddenMarkerNoteKey = (key: string | undefined) => typeof key === "string" && /^note:[^:]+:(?:reply|closed)-summary\./.test(key);
+/** 18/11 (SAV-93): HubSpot's default note → ticket association type (HUBSPOT_DEFINED 228), sent with the note's creation so it is born on the ticket. */
+export const HUBSPOT_NOTE_TO_TICKET = 228;
+const ENTITIES: Readonly<Record<string, string>> = {
+    amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'", nbsp: " ", rsquo: "'", lsquo: "'", ldquo: "\"", rdquo: "\"", laquo: "«", raquo: "»", hellip: "…", ndash: "–", mdash: "—", euro: "€",
+    eacute: "é", egrave: "è", ecirc: "ê", euml: "ë", agrave: "à", acirc: "â", ccedil: "ç", icirc: "î", iuml: "ï", ocirc: "ô", ugrave: "ù", ucirc: "û", uuml: "ü",
+    Eacute: "É", Egrave: "È", Ecirc: "Ê", Agrave: "À", Acirc: "Â", Ccedil: "Ç", Ocirc: "Ô", Ucirc: "Û",
+};
+/**
+ * 18/11 (SAV-93): the TEXT a person reads in a note body, whatever HTML HubSpot stores it as: comments removed (the hidden marker), line breaks and paragraphs
+ * as spaces, other tags dropped, entities decoded (named, decimal, hex), typographic quotes and non-breaking spaces folded, whitespace collapsed. HubSpot may
+ * rewrite the HTML it was sent (an apostrophe as `&#x27;` or `’`, `<br>` as `<br/>`, a wrapper, a removed comment): the first V2 note stayed unproven on byte
+ * equality. Used ONLY where the note's identity is already anchored by its creation ACK (and, for a V2 case note, by its ticket association).
+ */
+export function noteBodyText(html: string) {
+    const decoded = html.replace(/<!--[\s\S]*?-->/g, "").replace(/<br\s*\/?>|<\/(?:p|div|li)>/gi, " ").replace(/<[^>]*>/g, "")
+        .replace(/&(#\d{1,7}|#x[0-9a-f]{1,6}|[a-z]+);/gi, (all, name: string) => {
+            if (name[0] !== "#") return Object.hasOwn(ENTITIES, name) ? ENTITIES[name]! : Object.hasOwn(ENTITIES, name.toLowerCase()) ? ENTITIES[name.toLowerCase()]! : all;
+            const code = name[1] === "x" || name[1] === "X" ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
+            return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : all;
+        });
+    return decoded.normalize("NFC").replace(/[\u2018\u2019\u02bc]/g, "'").replace(/[\u201c\u201d]/g, "\"").replace(/[\s\u00a0\u202f]+/g, " ").trim();
+}
+/** 18/11 (SAV-93): a V2 case note whose proof may compare the normalized text (new rows carry `ticketAssociation`; older V2 summary rows are recognized by key). */
+const normalizedCaseNote = (intent: EffectIntent) => intent.ticketAssociation === "at_create"
+    || hiddenMarkerNoteKey(intent.key) || /^note-association:[^:]+:(?:reply|closed)-summary\./.test(intent.key);
 const ownerHistorySchema = z.object({ propertiesWithHistory: z.object({ hubspot_owner_id: z.array(z.object({ value: z.string().nullable().optional(), timestamp: z.string() }).passthrough()).min(1) }).passthrough() }).passthrough();
 const sameProperties = (actual: Record<string, string | null>, expected: Record<string, string>) => Object.entries(expected).every(([k, v]) => k === "hs_timestamp" ? Date.parse(actual[k] ?? "") === Date.parse(v) : actual[k] === v);
 // HubSpot removes this exact historical comment and may append one LF. Do
 // not strip arbitrary HTML or infer ownership from matching business text.
-function sameNoteProperties(actual: Record<string, string | null>, expected: Record<string, string>, allowRemovedMarker: boolean) {
+// 18/11 (SAV-93): `normalized` (a V2 case note anchored by its creation ACK) compares the text a person reads, not the bytes HubSpot stored.
+function sameNoteProperties(actual: Record<string, string | null>, expected: Record<string, string>, allowRemovedMarker: boolean, normalized = false) {
     const body = expected.hs_note_body, timestamp = expected.hs_timestamp;
     if (!body || !timestamp || !Number.isFinite(Date.parse(timestamp)) || !Number.isFinite(Date.parse(actual.hs_timestamp ?? "")))
         return false;
+    if (normalized && allowRemovedMarker)
+        return typeof actual.hs_note_body === "string" && Boolean(noteBodyText(body)) && noteBodyText(actual.hs_note_body) === noteBodyText(body)
+            && sameProperties({ ...actual, hs_note_body: body }, expected);
     const legacy = body.match(/^<p>(?:[^<>&"']|&(?:amp|lt|gt|quot|#39);|<br>)*<\/p>(<!-- sav-intake:[a-f0-9]{64} -->)$/);
     const stripped = allowRemovedMarker && legacy ? body.slice(0, -legacy[1].length) : null;
     const observed = actual.hs_note_body;
@@ -239,8 +268,11 @@ export function createIntakeExecutorAdapters(options: {
                 });
             }
             else if (intent.kind === "note_create")
+                // 18/11 (SAV-93): a V2 case note is created ON its ticket, in this one call; an older row (no flag) keeps the separate association step.
                 result = await hub("/crm/v3/objects/notes", "POST", signal, {
-                    properties: intent.properties
+                    properties: intent.properties, ...(intent.ticketAssociation === "at_create" ? {
+                        associations: [{ to: { id: id(intent.ticketId) }, types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: HUBSPOT_NOTE_TO_TICKET }] }]
+                    } : {})
                 });
             else if (intent.kind === "email_create" && intent.objectId)
                 return {
@@ -263,6 +295,9 @@ export function createIntakeExecutorAdapters(options: {
                 throw Error("SAV_INTAKE_EXECUTION_OWNER_UNGUARDED");
             else if (intent.kind === "note_associate" || intent.kind === "email_associate") {
                 if (intent.kind === "email_associate" && intent.reuseExistingAssociation && await association("emails", id(intent.objectId), "tickets", id(intent.ticketId), signal))
+                    return { id: intent.objectId };
+                // 18/11 (SAV-93): a note created on its ticket needs no second write: the association is only re-read (a PUT only repairs one found missing).
+                if (intent.kind === "note_associate" && intent.ticketAssociation === "at_create" && await association("notes", id(intent.objectId), "tickets", id(intent.ticketId), signal))
                     return { id: intent.objectId };
                 await hub(`/crm/v4/objects/${intent.kind === "note_associate" ? "notes" : "emails"}/${id(intent.objectId)}/associations/default/tickets/${id(intent.ticketId)}`, "PUT", signal);
                 return {
@@ -292,7 +327,7 @@ export function createIntakeExecutorAdapters(options: {
                 // create effect, never to arbitrary association properties.
                 const confirmedCreate = Boolean(intent.confirmedNoteCreate?.effectId && intent.confirmedNoteCreate.objectId === intent.objectId);
                 const ok = row.id === intent.objectId && (type !== "notes" || !ack?.id || ack.id === intent.objectId) && (type === "notes"
-                    ? sameNoteProperties(row.properties, intent.expectedProperties ?? {}, confirmedCreate)
+                    ? sameNoteProperties(row.properties, intent.expectedProperties ?? {}, confirmedCreate, normalizedCaseNote(intent))
                     : sameProperties(row.properties, intent.expectedProperties ?? {})) && await association(type, id(intent.objectId), "tickets", id(intent.ticketId), signal);
                 const p = row.properties, text = type === "notes" ? p.hs_note_body : JSON.stringify({
                     from: p.hs_email_from_email, to: p.hs_email_to_email, direction: p.hs_email_direction, subject: p.hs_email_subject, body: p.hs_email_text
@@ -357,10 +392,13 @@ export function createIntakeExecutorAdapters(options: {
             const createdOwner = type === "tickets" ? intent.properties?.hubspot_owner_id ?? null : null;
             const expected = createdOwner ? Object.fromEntries(Object.entries(intent.properties ?? {}).filter(([key]) => key !== "hubspot_owner_id")) : intent.properties ?? {};
             let ok = row.id === candidate && validNoteIntent && (type === "notes"
-                ? sameNoteProperties(row.properties, intent.properties ?? {}, Boolean(ack?.id === candidate && ack.operatorCandidate !== true))
+                ? sameNoteProperties(row.properties, intent.properties ?? {}, Boolean(ack?.id === candidate && ack.operatorCandidate !== true), normalizedCaseNote(intent))
                 : sameProperties(row.properties, expected));
             if (!ack && !intent.objectId && (!intent.marker || !Object.values(row.properties).some(v => v?.includes(intent.marker!))))
                 ok = false;
+            // 18/11 (SAV-93): a note created on its ticket is proven WITH that association (read back), never as a note alone.
+            if (type === "notes" && ok && intent.ticketAssociation === "at_create")
+                ok = await association("notes", id(candidate), "tickets", id(intent.ticketId), signal);
             // Without a created owner: empty, as before. With one: the creation is proven by today's owner being it, or else by
             // HubSpot's history showing it was the ticket's FIRST owner, set at its creation (review F3). A person who took the
             // ticket since keeps it (nothing is written) and the relay then reads « a person »; an insufficient history stays uncertain.
