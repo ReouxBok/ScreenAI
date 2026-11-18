@@ -102,7 +102,8 @@ describe("lots, reprise, arrêts et journal agrégé", () => {
     expect(event).toBe("sav_access_skill_selftest");
     expect(aggregate).toMatchObject({ runId: e.SAV_V2_ACCESS_SKILL_SELFTEST_ID, status: "done", stopReason: null, passesPlanned: 3, casesPerPass: 600, casesDone: 1800, unfinished: 0,
       sensitiveAdmitted: 0, failingCaseCount: 0, failingCaseIds: [], capMicroUsd: 10_000_000, verdict: "PASS",
-      thresholds: { zeroSensitiveAdmitted: "PASS", accessRecallAtLeast90: "PASS", capcarRecallAtLeast90: "PASS", otherRoutedAtLeast95: "PASS", complete: "PASS" } });
+      request_attribution_errors: 0,
+      thresholds: { zeroSensitiveAdmitted: "PASS", accessRecallAtLeast90: "PASS", capcarRecallAtLeast90: "PASS", otherRoutedAtLeast95: "PASS", requestAttributionErrorsZero: "PASS", complete: "PASS" } });
     for (const row of aggregate.perPass) expect(row).toMatchObject({ groups: { sensitive: 300, access: 200, other: 100 }, sensitiveAdmitted: 0, accessRecall: 1, capcarRecall: 1, otherMisrouted: 0, otherRouted: 1, calls: { judge: 485, counter: 198 } });
     // 110 kernel mails never reach the model; the counter-read is paid only for the 198 admissible mails. At the test prices: 1 µUSD per call.
     expect(aggregate.costMicroUsd).toBe(3 * 683);
@@ -125,6 +126,14 @@ describe("lots, reprise, arrêts et journal agrégé", () => {
     expect(await pass(e, m, { cases, log: (event, fields) => logs.push([event, fields as AccessSkillSelfTestAggregate]) })).toMatchObject({ status: "done" });
     expect(logs[0]![1]).toMatchObject({ sensitiveAdmitted: 0, verdict: "FAIL", failingCaseIds: ["p1:oth-001", "p1:oth-002", "p1:uns-001"],
       perPass: [expect.objectContaining({ otherExpectedTeam: 3, otherMisrouted: 3, otherRouted: 0 })], thresholds: { zeroSensitiveAdmitted: "PASS", otherRoutedAtLeast95: "FAIL" } });
+  });
+  it("Astra 6.2 : un modèle qui échange les ids des demandes d'un mail mixte fait échouer l'auto-test (request_attribution_errors > 0)", async () => {
+    const mixed = SAV_ACCESS_SKILL_CORPUS.filter(row => row.secondRequest && row.subgroup === "other_topic" && row.expected === "admit").slice(0, 2);
+    const cases = [...mixed, ...pick("acc-001")], m = model("swapped_ids"), logs: Array<[string, AccessSkillSelfTestAggregate]> = [];
+    const e = env({ SAV_V2_ACCESS_SKILL_SELFTEST_BATCH: "10", SAV_V2_ACCESS_SKILL_SELFTEST_PASSES: "1" });
+    expect(await pass(e, m, { cases, log: (event, fields) => logs.push([event, fields as AccessSkillSelfTestAggregate]) })).toMatchObject({ status: "done" });
+    expect(logs[0]![1]).toMatchObject({ sensitiveAdmitted: 0, request_attribution_errors: 4, verdict: "FAIL", failingCaseIds: mixed.map(row => `p1:${row.id}`).sort(),
+      perPass: [expect.objectContaining({ requestAttributionErrors: 4 })], thresholds: { requestAttributionErrorsZero: "FAIL" } });
   });
   it("plafond atteint : le mail qui le dépasserait n'est pas commencé, FAIL (incomplet)", async () => {
     // Worst case reserved per mail: 2 calls × 1 µUSD. A cap of 5 allows two mails (2 + 2), not a third (6 > 5).

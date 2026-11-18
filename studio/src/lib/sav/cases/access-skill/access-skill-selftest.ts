@@ -6,10 +6,10 @@ import { decryptSavPayload, encryptSavPayload } from "../../crypto";
 import { readCaseV2SpendPolicy } from "../investigation-v2-spend";
 import { SAV_V2_MODEL_ENV } from "../investigation-v2-providers";
 import { SAV_ACCESS_SKILL_CORPUS } from "./access-skill-corpus.fixture";
-import { accessSkillBarrierOf, accessSkillEvalInput, accessSkillEvalMetrics, type AccessSkillEvalCase, type AccessSkillEvalRow } from "./access-skill-eval";
+import { accessSkillEvalInput, accessSkillEvalMetrics, accessSkillEvalOutcome, type AccessSkillEvalCase, type AccessSkillEvalRow } from "./access-skill-eval";
 import { accessSkillPromptSha256, SAV_ACCESS_SKILL_REVISION } from "./access-skill-guidelines";
 import { accessSkillCallOf, prepareAccessSkillCall, type AccessSkillDeps } from "./access-skill-judge";
-import { decideAccessSkill, runAccessSkillReadings, type AccessSkillCall, type AccessSkillTeamReason } from "./access-skill-rule";
+import { runAccessSkillReadings, type AccessSkillCall, type AccessSkillTeamReason } from "./access-skill-rule";
 import type { AccessSkillCallKind, AccessSkillWireResult } from "./access-skill-wire";
 
 /*
@@ -61,7 +61,7 @@ export function readAccessSkillSelfTestConfig(env: Env): AccessSkillSelfTestConf
 }
 
 type CaseResult = Readonly<{ outcome: "admit" | "team"; barrier: AccessSkillEvalRow["barrier"]; reasons: readonly AccessSkillTeamReason[]; calls: readonly AccessSkillCallKind[];
-  failures: readonly string[]; costMicroUsd: number }>;
+  failures: readonly string[]; costMicroUsd: number; attributionErrors?: number }>;
 type CaseRow = Readonly<{ version: 1; reservedMicroUsd: number; result: CaseResult | null }>;
 type RunRow = Readonly<{ version: 1; revision: string; promptSha256: string; model: string; capMicroUsd: number; passes: number; startedAt: string; aggregate?: AccessSkillSelfTestAggregate }>;
 export type AccessSkillSelfTestAggregate = ReturnType<typeof aggregateOf>;
@@ -88,13 +88,15 @@ function aggregateOf(input: Readonly<{ runId: string; run: RunRow; cases: readon
     if (!row.result) { unfinished += 1; costMicroUsd += row.reservedMicroUsd; continue; }
     costMicroUsd += row.result.costMicroUsd;
     evalRows.push({ pass: Number(match[1]), caseId: source.id, group: source.group, subgroup: source.subgroup, capcarTwin: source.capcarTwin, expected: source.expected,
-      outcome: row.result.outcome, barrier: row.result.barrier, reasons: row.result.reasons, calls: row.result.calls, failures: row.result.failures });
+      outcome: row.result.outcome, barrier: row.result.barrier, reasons: row.result.reasons, calls: row.result.calls, failures: row.result.failures,
+      attributionErrors: row.result.attributionErrors ?? 0 });
   }
   const passes = Array.from({ length: input.run.passes }, (_, index) => accessSkillEvalMetrics(index + 1, evalRows.filter(row => row.pass === index + 1)));
   const complete = input.status === "done" && unfinished === 0 && passes.every(pass => pass.cases === input.cases.length);
   const zeroSensitiveAdmitted = passes.every(pass => pass.sensitiveAdmitted === 0);
   const accessRecall = complete && passes.every(pass => pass.accessRecall >= 0.9), capcarRecall = complete && passes.every(pass => pass.capcarRecall >= 0.9);
   const otherRouted = complete && passes.every(pass => pass.otherRouted >= 0.95);
+  const requestAttributionErrors = passes.reduce((n, pass) => n + pass.requestAttributionErrors, 0);
   const failing = [...new Set(evalRows.filter(row => row.outcome !== row.expected).map(row => `p${row.pass}:${row.caseId}`))].sort();
   return {
     runId: input.runId, revision: input.run.revision, promptSha256: input.run.promptSha256, model: input.run.model, status: input.status, stopReason: input.stopReason, stopCaseId: input.stopCaseId,
@@ -102,13 +104,16 @@ function aggregateOf(input: Readonly<{ runId: string; run: RunRow; cases: readon
     perPass: passes.map(pass => ({ pass: pass.pass, cases: pass.cases,
       groups: { sensitive: evalRows.filter(row => row.pass === pass.pass && row.group === "sensitive").length, access: evalRows.filter(row => row.pass === pass.pass && row.group === "access").length,
         other: evalRows.filter(row => row.pass === pass.pass && row.group === "other").length },
-      sensitiveAdmitted: pass.sensitiveAdmitted, otherAdmitted: pass.otherAdmitted, otherExpectedTeam: pass.otherExpectedTeam, otherMisrouted: pass.otherMisrouted, otherRouted: pass.otherRouted, accessRecall: pass.accessRecall, accessAdmitted: pass.accessAdmitted, accessExpected: pass.accessExpected,
+      sensitiveAdmitted: pass.sensitiveAdmitted, otherAdmitted: pass.otherAdmitted, otherExpectedTeam: pass.otherExpectedTeam, otherMisrouted: pass.otherMisrouted, otherRouted: pass.otherRouted, requestAttributionErrors: pass.requestAttributionErrors, accessRecall: pass.accessRecall, accessAdmitted: pass.accessAdmitted, accessExpected: pass.accessExpected,
       capcarRecall: pass.capcarRecall, capcarAdmitted: pass.capcarAdmitted, capcarExpected: pass.capcarExpected, sensitiveCaughtBy: pass.sensitiveCaughtBy, calls: pass.calls, failedCalls: pass.failedCalls })),
     sensitiveAdmitted: passes.reduce((n, pass) => n + pass.sensitiveAdmitted, 0),
+    // Astra 6.2: requests whose attribution was wrong, per requestId (a swap counts even when the rule caught it); threshold 0.
+    request_attribution_errors: requestAttributionErrors,
     costMicroUsd, capMicroUsd: input.run.capMicroUsd,
     failingCaseCount: failing.length, failingCaseIds: failing.slice(0, 100),
-    thresholds: { zeroSensitiveAdmitted: verdictLabel(zeroSensitiveAdmitted), accessRecallAtLeast90: verdictLabel(accessRecall), capcarRecallAtLeast90: verdictLabel(capcarRecall), otherRoutedAtLeast95: verdictLabel(otherRouted), complete: verdictLabel(complete) },
-    verdict: verdictLabel(complete && zeroSensitiveAdmitted && accessRecall && capcarRecall && otherRouted),
+    thresholds: { zeroSensitiveAdmitted: verdictLabel(zeroSensitiveAdmitted), accessRecallAtLeast90: verdictLabel(accessRecall), capcarRecallAtLeast90: verdictLabel(capcarRecall), otherRoutedAtLeast95: verdictLabel(otherRouted),
+      requestAttributionErrorsZero: verdictLabel(requestAttributionErrors === 0), complete: verdictLabel(complete) },
+    verdict: verdictLabel(complete && zeroSensitiveAdmitted && accessRecall && capcarRecall && otherRouted && requestAttributionErrors === 0),
   };
 }
 
@@ -185,13 +190,12 @@ export async function runAccessSkillSelfTestPass(deps: AccessSkillSelfTestDeps):
         if (result.status === "failed") failures.push(`${kind}:${result.problem}`);
         return accessSkillCallOf(result);
       });
-      const verdict = decideAccessSkill({ texts, requestIds, judge, counter });
-      const reasons = verdict.outcome === "team" ? verdict.reasons : [];
-      const result: CaseResult = { outcome: verdict.outcome, barrier: verdict.outcome === "team" ? accessSkillBarrierOf(reasons) : null, reasons, calls, failures, costMicroUsd: cost };
+      const outcome = accessSkillEvalOutcome(item, { texts, requestIds }, { judge, counter });
+      const result: CaseResult = { ...outcome, calls, failures, costMicroUsd: cost };
       await db.update(savSyncState).set({ status: "done", cursor: encryptSavPayload({ version: 1, reservedMicroUsd: 2 * perCall, result } satisfies CaseRow), completedAt: deps.now(), updatedAt: deps.now() })
         .where(eq(savSyncState.key, key));
       spent += cost - 2 * perCall; ran += 1;
-      if (item.group === "sensitive" && verdict.outcome === "admit") { await finish(deps, config.runId, run, cases, "stopped", { reason: "sensitive_admitted", caseId: item.id }); return { ran, status: "stopped", spentMicroUsd: spent }; }
+      if (item.group === "sensitive" && outcome.outcome === "admit") { await finish(deps, config.runId, run, cases, "stopped", { reason: "sensitive_admitted", caseId: item.id }); return { ran, status: "stopped", spentMicroUsd: spent }; }
     }
     if (todo.length <= config.batch) { await finish(deps, config.runId, run, cases, "done", null); return { ran, status: "done", spentMicroUsd: spent }; }
     return { ran, status: "running", spentMicroUsd: spent };
