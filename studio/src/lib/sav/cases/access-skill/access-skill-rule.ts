@@ -16,15 +16,41 @@ export { readAccessSkillMode, SAV_V2_ACCESS_SKILL_ENV, type AccessSkillMode } fr
 /** The texts the readings are checked against: the stored mail, and the original request mail when the stored one answers an identification. */
 export type AccessSkillTexts = Readonly<{ subject: string; text: string; original?: Readonly<{ subject: string; text: string }> | null;
   /** What bounding hid from the model (`accessSkillInputTruncations`): non-empty, the whole mail goes to the team, unread. */
-  truncated?: readonly string[] }>;
-/** The texts of a model input, with what bounding would hide from the model. */
+  truncated?: readonly string[];
+  /** Several requests: each request's OWN words (V1's verified per-request quote), by request id; null when it has none. Absent for a single request
+   * (its words are the whole mail). Astra 6.2: a request's quote is checked against its own words, never the whole mail. */
+  spans?: Readonly<Record<string, string | null>> }>;
+/** The texts of a model input, with what bounding would hide from the model and, for several requests, each request's own words. */
 export const accessSkillTextsOf = (input: AccessSkillInput): AccessSkillTexts =>
-  ({ subject: input.subject, text: input.text, original: input.originalRequest, truncated: accessSkillInputTruncations(input) });
+  ({ subject: input.subject, text: input.text, original: input.originalRequest, truncated: accessSkillInputTruncations(input),
+    ...(input.requests.length > 1 ? { spans: Object.fromEntries(input.requests.map(row => [row.requestId, row.words])) } : {}) });
+
+/**
+ * Which requests' attribution cannot be proven (several requests only): `missing` has no words of its own; `ambiguous` has words that contain, or are
+ * contained in, another request's words, or a quote that also lies in another request's words; `mismatched` has a quote outside its own words (a swapped
+ * attribution). Any of them sends the WHOLE mail to the team.
+ */
+export function accessSkillAttributionProblems(texts: AccessSkillTexts, requestIds: readonly string[], judgment: unknown): { mismatched: string[]; missing: string[]; ambiguous: string[] } {
+  const problems = { mismatched: [] as string[], missing: [] as string[], ambiguous: [] as string[] };
+  if (requestIds.length < 2) return problems;
+  const spans = texts.spans ?? {}, span = (id: string) => { const value = spans[id]; return typeof value === "string" && value.trim() ? value : null; };
+  const parsed = accessSkillJudgmentSchema.safeParse(judgment), quotes = new Map(parsed.success ? parsed.data.requests.map(row => [row.requestId, row.quote]) : []);
+  for (const id of requestIds) {
+    const own = span(id);
+    if (!own) { problems.missing.push(id); continue; }
+    const others = requestIds.filter(other => other !== id).map(span).filter((value): value is string => value !== null);
+    const quote = quotes.get(id);
+    if (others.some(other => savEvidenceContains(own, other) || savEvidenceContains(other, own))) problems.ambiguous.push(id);
+    else if (quote !== undefined && !savEvidenceContains(own, quote)) problems.mismatched.push(id);
+    else if (quote !== undefined && others.some(other => savEvidenceContains(other, quote))) problems.ambiguous.push(id);
+  }
+  return problems;
+}
 /** One stored model call: its output (to be validated here, never trusted) or why it gave none. */
 export type AccessSkillCall = Readonly<{ status: "ok"; output: unknown }> | Readonly<{ status: "failed"; problem: string; uncertain: boolean }> | Readonly<{ status: "skipped"; problem: string }>;
 
 export const SAV_ACCESS_SKILL_TEAM_REASONS = [
-  "skill_unpinned", "kernel_phrase", "input_truncated", "judgment_unavailable", "judgment_invalid", "request_set_mismatch", "prompt_injection", "instruction_like", "third_party",
+  "skill_unpinned", "kernel_phrase", "input_truncated", "attribution_missing", "attribution_ambiguous", "attribution_mismatch", "judgment_unavailable", "judgment_invalid", "request_set_mismatch", "prompt_injection", "instruction_like", "third_party",
   "mail_sensitive", "mail_unsure", "mention_request", "mention_unverified", "request_sensitive", "request_unsure", "request_not_high", "quote_unverified",
   "no_access_request", "counter_unavailable", "counter_invalid", "counter_yes", "counter_unsure",
 ] as const;
@@ -76,6 +102,10 @@ export function decideAccessSkill(input: Readonly<{ texts: AccessSkillTexts; req
   let family: Extract<AccessSkillVerdict, { outcome: "team" }>["family"] = null;
   const ids = judgment.requests.map(row => row.requestId), expected = new Set(input.requestIds);
   if (!input.requestIds.length || ids.length !== expected.size || new Set(ids).size !== ids.length || ids.some(id => !expected.has(id))) reasons.push("request_set_mismatch");
+  const attribution = accessSkillAttributionProblems(input.texts, input.requestIds, judgment);
+  if (attribution.missing.length) reasons.push("attribution_missing");
+  if (attribution.ambiguous.length) reasons.push("attribution_ambiguous");
+  if (attribution.mismatched.length) reasons.push("attribution_mismatch");
   if (allTexts(input.texts).some(value => typeof value === "string" && containsPromptInjection(value))) reasons.push("prompt_injection");
   if (judgment.mail.instructionLike) reasons.push("instruction_like");
   if (judgment.mail.thirdParty) reasons.push("third_party");

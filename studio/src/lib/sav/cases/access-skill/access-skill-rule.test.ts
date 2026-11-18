@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accessSkillAdmissibleBeforeCounter, accessSkillTextsOf, decideAccessSkill, readAccessSkillMode, runAccessSkillReadings, type AccessSkillCall, type AccessSkillTexts } from "./access-skill-rule";
+import { accessSkillAdmissibleBeforeCounter, accessSkillAttributionProblems, accessSkillTextsOf, decideAccessSkill, readAccessSkillMode, runAccessSkillReadings, type AccessSkillCall, type AccessSkillTexts } from "./access-skill-rule";
 import { accessSkillInputHash, accessSkillInputTruncations, type AccessSkillInput } from "./access-skill-wire";
 import { accessSkillKernelHits } from "./access-skill-kernel";
 import { accessSkillSendProblem } from "./access-skill-send-fence";
@@ -86,7 +86,8 @@ describe("contre-lecture : exigée par les mots de contexte, plusieurs demandes 
     expect(decide(ok(judgment()), { texts: PLAIN, counter: counter("no") })).toMatchObject({ outcome: "admit", counterRead: "no" });
   });
   it("deux demandes accès + autre : l'autre est la part de l'équipe, après une contre-lecture « non »", () => {
-    const texts: AccessSkillTexts = { subject: "Questions", text: "je ne reçois pas le code de connexion. Et comment configurer un agent ?" };
+    const texts: AccessSkillTexts = { subject: "Questions", text: "je ne reçois pas le code de connexion. Et comment configurer un agent ?",
+      spans: { r1: "je ne reçois pas le code de connexion", r2: "comment configurer un agent" } };
     const judge = ok(judgment({ requests: [{}, { requestId: "r2", verdict: "other", quote: "comment configurer un agent" }] }));
     expect(decide(judge, { texts, requestIds: ["r1", "r2"], counter: counter("no") })).toEqual({ outcome: "admit", requests: { r1: "access", r2: "other" }, counterRead: "no" });
     expect(decide(judge, { texts, requestIds: ["r1", "r2"] }).outcome).toBe("team");
@@ -155,5 +156,36 @@ describe("texte coupé avant le modèle : tout le mail à l'équipe, sans appel"
     const complete = await runAccessSkillReadings({ texts: whole, requestIds: ["r1"] }, call);
     expect(calls).toEqual(["judge", "counter"]);
     expect(decideAccessSkill({ texts: whole, requestIds: ["r1"], ...complete })).toMatchObject({ outcome: "admit" });
+  });
+});
+
+/*
+ * Astra 6.2 counter-review (18/11): with the two request ids swapped, the wrong request was admitted as Access, because each quote was checked against the
+ * WHOLE mail. Each request's quote must lie in THAT request's own words (V1's per-request quote); a request without its own words, or words that do not tell
+ * the requests apart, sends the whole mail to the team.
+ */
+describe("attribution par demande : la citation d'une demande est dans SES mots", () => {
+  const TEXT = "Bonjour, comment configurer un agent pour mon accueil ? Et aussi je ne reçois pas le code de connexion. Merci";
+  const OTHER = "comment configurer un agent pour mon accueil", ACCESS = "je ne reçois pas le code de connexion";
+  const texts = (r1: string | null, r2: string | null) => accessSkillTextsOf({ purpose: "first_mail", subject: "Deux questions", text: TEXT, originalRequest: null,
+    requests: [{ requestId: "r1", kind: "support", words: r1 }, { requestId: "r2", kind: "support", words: r2 }] });
+  const two = (first: Row, second: Row) => ok(judgment({ requests: [first, { requestId: "r2", ...second }] }));
+  const honest = two({ verdict: "other", quote: "comment configurer un agent" }, { verdict: "access", quote: ACCESS });
+  const swapped = two({ verdict: "access", quote: ACCESS }, { verdict: "other", quote: "comment configurer un agent" });
+  const run = (judge: AccessSkillCall, t: AccessSkillTexts) => decideAccessSkill({ texts: t, requestIds: ["r1", "r2"], judge, counter: counter("no") });
+  it("bonne attribution : r2 accès, r1 part de l'équipe", () => {
+    expect(run(honest, texts(OTHER, ACCESS))).toEqual({ outcome: "admit", requests: { r1: "other", r2: "access" }, counterRead: "no" });
+  });
+  it("ids échangés : la citation de « r1 accès » n'est pas dans les mots de r1 → tout le mail à l'équipe", () => {
+    expect(run(swapped, texts(OTHER, ACCESS))).toMatchObject({ outcome: "team", reasons: ["attribution_mismatch"] });
+    expect(accessSkillAttributionProblems(texts(OTHER, ACCESS), ["r1", "r2"], swapped.status === "ok" ? swapped.output : null)).toEqual({ mismatched: ["r1", "r2"], missing: [], ambiguous: [] });
+  });
+  it("une demande sans mots à elle, ou des mots qui ne distinguent pas les demandes → équipe", () => {
+    expect(run(honest, texts(OTHER, null))).toMatchObject({ outcome: "team", reasons: ["attribution_missing"] });
+    expect(run(honest, texts(TEXT, ACCESS))).toMatchObject({ outcome: "team", reasons: ["attribution_ambiguous"] });
+    expect(run(honest, texts(ACCESS, ACCESS))).toMatchObject({ outcome: "team" });
+  });
+  it("une demande unique n'a d'autres mots que le mail entier : inchangé", () => {
+    expect(decide(ok(judgment()), { counter: counter("no") })).toMatchObject({ outcome: "admit" });
   });
 });
