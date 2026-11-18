@@ -101,7 +101,7 @@ export function studioMcpWrite<T extends z.ZodRawShape>(name: string, title: str
   options: { idempotent?: boolean; authorize?: () => Promise<unknown> } = {}): StudioMcpTool {
   const input = z.object(shape).strict();
   return { name, title, description, write: true, input, async run(context: StudioMcpContext, raw: never) {
-    const values = raw as z.infer<z.ZodObject<T>> & { idempotencyKey?: string; threadId?: string };
+    const values = raw as z.infer<z.ZodObject<T>> & { idempotencyKey?: string; threadId?: string; handling?: { kind: string; ticketId?: string } };
     // The tool's own authority comes first: no replay, precondition or no-op answer without it.
     if (options.authorize) await options.authorize();
     const key = options.idempotent === false ? null : values.idempotencyKey ?? null, hash = payloadHash(name, values);
@@ -120,7 +120,9 @@ export function studioMcpWrite<T extends z.ZodRawShape>(name: string, title: str
     // the caller gets the real result, and a retry with this key answers uncertain.
     try {
       await requireDb().insert(auditLogs).values({ actorEmail: context.staff.email, ...WRITE_AUDIT, entityId: key ?? randomUUID(),
-        technicalMetadata: { channel: "mcp", tool: name, staffId: context.staff.id, payloadHash: hash, outcome: result.outcome, code: result.code, threadId: values.threadId ?? null } });
+        technicalMetadata: { channel: "mcp", tool: name, staffId: context.staff.id, payloadHash: hash, outcome: result.outcome, code: result.code, threadId: values.threadId ?? null,
+          // Orientation (17/11): the attested follow-up kind (and ticket), never the operator's free text.
+          ...(values.handling ? { handlingKind: values.handling.kind, handlingTicketId: values.handling.ticketId ?? null } : {}) } });
     } catch { console.error("studio_mcp_write_receipt_failed", { tool: name, outcome: result.outcome }); }
     // Cache refresh only: once the action is settled it can never turn the result into a failure.
     if (result.outcome !== "refused" && values.threadId) {
@@ -140,10 +142,28 @@ const completion = (result: { marked: number; alreadyCompleted: number; skipped:
           : refused("SAV_MCP_DOSSIER_CHANGED", "Le dossier a changé ou ne peut pas être traité ainsi : relire avant de réessayer.");
 const serverPrecheck = (skipped: Record<string, number>) => (Object.keys(savCompletionPrecheckLabels) as SavCompletionPrecheck[]).find(reason => skipped[reason]);
 const unavailable = (what: string) => refused("SAV_MCP_ACTION_UNAVAILABLE", `${what} n’est pas proposé sur ce dossier pour vous, comme dans la console.`);
+/** The dossier still waits for the team: a question, missing context or a supervised hand-off not yet taken. */
+export function intakeAwaitsTeamFollowUp(view: Pick<ReturnType<typeof intakeDossierView>, "question" | "disposition">) {
+  return Boolean(view.question) || view.disposition?.kind === "collect_context"
+    || view.disposition?.kind === "no_ticket" && view.disposition.nextAction !== "none";
+}
 
+/** Orientation (17/11): the proof the operator attests before « Terminés ». A transfer (forward, SENT copy, Slack
+ * message) proves a transmission, not that anyone took the follow-up; an email attached to an old closed or
+ * unrelated ticket proves nothing about the current request. Neither is an accepted kind. */
+export const closeHandlingSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("open_ticket"), ticketId: z.string().regex(/^\d{1,30}$/), evidence: reason }).strict(),
+  z.object({ kind: z.literal("human_takeover"), evidence: reason }).strict(),
+  z.object({ kind: z.literal("customer_answered"), evidence: reason }).strict(),
+  z.object({ kind: z.literal("nothing_to_follow"), evidence: reason }).strict(),
+]);
 const closeHandledOutside = studioMcpWrite("close_handled_outside", "Passer en Terminés (déjà traité)",
-  "Passe le dernier message en Terminés comme traité hors Studio. Aucun mail envoyé, aucun ticket HubSpot fermé. Réservé à l’opérateur autorisé, comme dans la console. Exige attestHandled: true.",
-  { ...dossierInput, attestHandled: z.literal(true) }, async (context, input, claim) => {
+  "Passe le dernier message en Terminés comme traité hors Studio. Aucun mail envoyé, aucun ticket HubSpot fermé. Réservé à l’opérateur autorisé, comme dans la console. Exige attestHandled: true et handling, la preuve du suivi réel : "
+  + "open_ticket (ticketId d’un ticket pertinent OUVERT, associé au contact et à cet email, qui porte ce suivi), human_takeover (reprise explicitement confirmée par le collègue qui suit le dossier), "
+  + "customer_answered (réponse envoyée au client dans ce fil, aucune demande restante) ou nothing_to_follow (rien à suivre ; refusé tant que le dossier attend une qualification, un contexte ou une prise en charge de l’équipe). "
+  + "Un transfert (forward, copie SENT, message Slack) prouve la transmission, pas la prise en charge. Un email rattaché à un ancien ticket fermé ou sans rapport ne prouve pas le suivi de cette demande. "
+  + "Une classification inconnue ou un contexte manquant n’est jamais une demande commerciale : ne pas transférer comme nouveau lead pour vider la file.",
+  { ...dossierInput, attestHandled: z.literal(true), handling: closeHandlingSchema }, async (context, input, claim) => {
     const found = await currentDossier(input); if (!found.ok) return found.result;
     const view = intakeDossierView(found.data), actions = intakeDossierActions(found.data, view, context.staff);
     // Night V1 (A + cycle 1): refused for a named server reason keeps that reason's explicit code, before any claim
@@ -156,6 +176,10 @@ const closeHandledOutside = studioMcpWrite("close_handled_outside", "Passer en T
       return refused(actions.completionBlockers.every(blocker => blocker === "active_worker") ? "SAV_MCP_ACTIVE_WORKER" : "SAV_MCP_UNSETTLED_ACTION", labels);
     }
     if (!actions.closeHandledOutside || !found.version.messageId) return unavailable("Le passage en Terminés");
+    // Orientation (17/11): a dossier still awaiting the team (question, missing context, supervised hand-off) is never
+    // closed as « nothing to follow »; only a real follow-up (open ticket, confirmed takeover, answer) is attested.
+    if (input.handling.kind === "nothing_to_follow" && intakeAwaitsTeamFollowUp(view))
+      return refused("SAV_MCP_HANDLING_NOT_PROVEN", "Ce dossier attend une qualification, un contexte ou une prise en charge : indiquer le ticket ouvert, la reprise confirmée ou la réponse au client. Un transfert seul ne suffit pas.");
     const lost = await claim(); if (lost) return lost;
     return completion(await completeSavDossierManually({ requestKey: input.idempotencyKey, threadId: input.threadId, messageId: found.version.messageId, confirmed: true }, versionGuard(found.version)),
       "Dossier passé en Terminés : déjà traité. Aucun mail envoyé ni ticket HubSpot fermé.");

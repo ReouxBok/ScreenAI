@@ -78,7 +78,7 @@ export async function intakeAvailableActions(data: IntakeConsoleDetail, staff: S
   const panel = actions.administrator && actions.operatorBinding ? await readOperatorPanel(actions.operatorBinding).catch(() => null) : null;
   const manualOther = await readIntakeManualOther(data, actions.manualOther).catch(() => null);
   return [
-    { tool: "close_handled_outside", available: actions.closeHandledOutside, requires: "attestHandled: true",
+    { tool: "close_handled_outside", available: actions.closeHandledOutside, requires: "attestHandled: true, handling {kind: open_ticket (ticketId) | human_takeover | customer_answered | nothing_to_follow, evidence} ; un transfert seul ne prouve pas la prise en charge",
       unavailableReason: actions.completionPrecheck || actions.completionBlockers.length ? [...(actions.completionPrecheck ? [savCompletionPrecheckLabels[actions.completionPrecheck]] : []), ...actions.completionBlockers.map(blocker => savCompletionBlockerLabels[blocker])].join(" ") : null },
     { tool: "classify_invalid_source_other", available: actions.classifyInvalidSource, requires: "attest: true" },
     { tool: "classify_other", available: Boolean(manualOther?.binding), requires: "attest: true, reason",

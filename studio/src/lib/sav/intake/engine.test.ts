@@ -859,10 +859,92 @@ describe("SAV-90 Other without catalogue and real requests", () => {
     const t = fixture(["other"]); delete t.policy.qualifiedOther;
     reason(await t.run(), "private_resource_unavailable");
   });
-  it("does not touch acknowledgement, commercial or support classifications", async () => {
+  it("does not touch acknowledgement or support classifications (commercial: see Orientation 17/11 below)", async () => {
     const a = fixture(["acknowledgement"]); a.input.message.currentText = "Merci."; a.analysis.nature = "information"; a.policy.quotedMailboxReply = true;
     expect((await a.run()).decision.disposition).toMatchObject({ kind: "no_ticket", reason: "acknowledgement_only" });
+    // Orientation (17/11): a « commercial » reply quoting the support mailbox now goes to the team's choice (was supervised_commercial).
     const c = fixture(["commercial"]); c.analysis.nature = "request"; c.policy.quotedMailboxReply = true;
-    expect((await c.run()).progress).toMatchObject({ kind: "supervised_action", classification: "commercial" });
+    humanChoice(await c.run(), "classification_incomplete");
+  });
+});
+
+// Orientation (17/11): request nature, relationship, follow-up owner and destination are separate. A « commercial »
+// label inside an existing exchange (support thread, colleague's offer) is never an automatic new-lead hand-off;
+// unknown never falls back to commercial; true prospects and explicit partnerships keep their path. Synthetic data only.
+describe("Orientation commercial vs customer follow-up", () => {
+  const followUp = (plan: IntakePlan, requestCount: number) => {
+    reason(plan, "classification_incomplete");
+    expect(plan.progress).toMatchObject({ kind: "human_choice", questionCode: "request_scope_uncertain", view: "to_validate" });
+    expect(plan.decision.classification).toBe("unknown");
+    // Every request is kept for the team (none dropped), none is a supervised commercial hand-off.
+    expect(plan.decision.requests).toHaveLength(requestCount);
+    expect(plan.decision.disposition).not.toMatchObject({ nextAction: "supervised_commercial" });
+    expect(plan.supervisedResource).toBeUndefined();
+    expect(plan.steps).toEqual([]);
+  };
+  const outbound = (f: ReturnType<typeof fixture>) => { f.input.conversation = read([{ ...f.input.message, id: otherMid, direction: "outbound", fromEmail: "support@example.test",
+    toEmails: ["sender@example.test"], currentText: "Synthetic support answer about an option", receivedAt: "2026-10-19T10:00:00.000Z" }, f.input.message]); };
+  it("scenario 1: an existing customer's API question with a price keeps both requests in one support follow-up, not a lead", async () => {
+    const f = fixture(["support", "commercial"]);
+    f.input.message.currentText = "Nous avons un abonnement annuel. Peut-on appeler notre agent par API, et à quel coût ?";
+    const plan = await f.run();
+    expect(plan.decision.classification).toBe("support");
+    expect(target(plan).requestIds).toEqual(["r0", "r1"]);
+    expect(plan.decision.disposition).not.toMatchObject({ nextAction: "supervised_commercial" });
+    // Same in a support thread: still one ticket carrying both requests.
+    const t = fixture(["support", "commercial"]); t.policy.quotedMailboxReply = true;
+    expect(target(await t.run()).requestIds).toEqual(["r0", "r1"]);
+  });
+  it("scenario 2: the same API question without a price is support", async () => {
+    const f = fixture(["support"]); f.input.message.currentText = "Peut-on appeler notre agent par API depuis notre outil interne ?";
+    const plan = await f.run();
+    expect(plan.decision.classification).toBe("support"); expect(target(plan).target.operation).toBe("create");
+  });
+  it("scenario 3: a reply to a colleague's offer (quote header of the team domain) is continuity, never a new lead", async () => {
+    const f = fixture(["commercial"]); f.analysis.nature = "request"; f.policy.quotedTeamReply = true;
+    f.input.message.currentText = "D'accord pour un rappel lundi au sujet de votre proposition.";
+    followUp(await f.run(), 1);
+    expect(f.calls).toEqual(["analyse"]);
+  });
+  it("scenario 5: an option price question in a support thread (stored outbound or quoted mailbox) goes to the team's choice, not no_ticket commercial", async () => {
+    const quoted = fixture(["commercial"]); quoted.policy.quotedMailboxReply = true; quoted.input.message.currentText = "Merci. Quel est le coût en plus pour une option ?";
+    followUp(await quoted.run(), 1);
+    const stored = fixture(["commercial", "commercial"]); outbound(stored);
+    followUp(await stored.run(), 2);
+  });
+  it("a person's explicit commercial choice in a thread is respected, not asked again", async () => {
+    const f = fixture(["commercial"]); f.policy.quotedMailboxReply = true; f.policy.quotedTeamReply = true;
+    f.input.humanResolution = { choiceId: "synthetic-choice", at, classification: "commercial" };
+    expect((await f.run()).decision.disposition).toMatchObject({ kind: "no_ticket", nextAction: "supervised_commercial" });
+  });
+  it("scenario 6: a prospect without any exchange asking for a demo or a quote keeps the supervised commercial path", async () => {
+    const f = fixture(["commercial"]); f.input.message.currentText = "Bonjour, pouvez-vous me proposer une démonstration et un devis ?";
+    const plan = await f.run();
+    expect(plan.decision.disposition).toMatchObject({ kind: "no_ticket", nextAction: "supervised_commercial" });
+    expect(plan.progress).toMatchObject({ kind: "supervised_action", classification: "commercial", approval: "human_confirmation_required" });
+  });
+  it("scenario 7: an explicit partnership keeps its supervised path, even in a thread", async () => {
+    for (const thread of [false, true]) {
+      const f = fixture(["partnership"]); if (thread) { f.policy.quotedMailboxReply = true; f.policy.quotedTeamReply = true; }
+      expect((await f.run()).decision.disposition).toMatchObject({ kind: "no_ticket", nextAction: "supervised_partnership" });
+    }
+  });
+  it("scenario 8: unknown or an unreadable history never becomes commercial", async () => {
+    const u = fixture(["unknown"]); followUp(await u.run(), 1);
+    const mixed = fixture(["commercial", "unknown"]); followUp(await mixed.run(), 2);
+    const h = fixture(["commercial"]); h.input.conversation = { status: "failed", observedAt: at } as never;
+    const plan = await h.run();
+    reason(plan, "history_incomplete");
+    expect(plan.decision.disposition).not.toMatchObject({ nextAction: "supervised_commercial" });
+  });
+  it("scenario 4: an old closed ticket on another subject is never the relevant dossier; an old closed same one is only a predecessor", async () => {
+    const closedOld = { stage: "closed" as const, createdAt: "2026-06-01T00:00:00.000Z", closedAt: "2026-07-01T00:00:00.000Z", ownerId: "9" };
+    const different = fixture(); different.tickets.push(ticket("205", closedOld)); different.matches["205"] = "different";
+    const d = target(await different.run());
+    expect(d.target).toMatchObject({ operation: "create", predecessor: null });
+    const old = fixture(); old.tickets.push(ticket("206", closedOld)); old.matches["206"] = "same";
+    const o = target(await old.run());
+    expect(o.target).toMatchObject({ operation: "create", predecessor: { ticketId: "206" } });
+    expect(o.target.operation).not.toBe("reopen");
   });
 });

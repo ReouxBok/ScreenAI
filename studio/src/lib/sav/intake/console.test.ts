@@ -2064,7 +2064,7 @@ it("REVIEW776 close_handled_outside rejects a version changed after its MCP read
   });
   const response = await handleStudioMcpRequest(new Request("https://studio.example.invalid/api/mcp", { method: "POST",
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "close_handled_outside", arguments: {
-      threadId, versionToken, idempotencyKey: randomUUID(), attestHandled: true } } }),
+      threadId, versionToken, idempotencyKey: randomUUID(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } } } }),
     headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer synthetic" } }),
     { env: { STUDIO_MCP_ENABLED: "true", STUDIO_MCP_WRITES_ENABLED: "true" }, resolveUser: async () => state.user as never });
   const body = await response.json();
@@ -2080,7 +2080,7 @@ it("REVIEW776 witness: the same MCP close on an unchanged version passes the und
   const versionToken = intakeVersionToken((await readIntakeConsoleDetail(threadId))!);
   const response = await handleStudioMcpRequest(new Request("https://studio.example.invalid/api/mcp", { method: "POST",
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "close_handled_outside", arguments: {
-      threadId, versionToken, idempotencyKey: randomUUID(), attestHandled: true } } }),
+      threadId, versionToken, idempotencyKey: randomUUID(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } } } }),
     headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer synthetic" } }),
     { env: { STUDIO_MCP_ENABLED: "true", STUDIO_MCP_WRITES_ENABLED: "true" }, resolveUser: async () => state.user as never });
   const body = await response.json();
@@ -2179,7 +2179,7 @@ it.each(["worker","uncertain_effect"])("REVIEW-AE real close refuses a protected
     await db.db.update(savIntakeEffects).set({state:"uncertain"}).where(eq(savIntakeEffects.id,effect.id));
   }
   const {intakeVersionToken}=await import("@/lib/mcp/tools"),before=(await readIntakeConsoleDetail(threadId))!;
-  const result=await reviewAeMcpCall("close_handled_outside",intakeVersionToken(before),{attestHandled:true});
+  const result=await reviewAeMcpCall("close_handled_outside",intakeVersionToken(before),{attestHandled:true,handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." }});
   expect(result).toMatchObject({outcome:"refused",code:blocked==="worker"?"SAV_MCP_ACTIVE_WORKER":"SAV_MCP_UNSETTLED_ACTION"});
   expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_EXTERNAL_COMPLETION))).toHaveLength(0);
   expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();

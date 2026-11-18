@@ -3,7 +3,7 @@ import { intakeForwardNeedsOriginal } from "./message";
 import { decryptSavPayload } from "../crypto";
 import { releaseLegacyAiPauses } from "./legacy-pause";
 import { intakeOtherQualificationFresh } from "./other-routing";
-import { intakeQuotedMailboxReply, qualifyRuntimeOther } from "./other-routing-runtime";
+import { intakeQuotedReplyEvidence, qualifyRuntimeOther } from "./other-routing-runtime";
 import { assertSavIntakeCallPlan } from "./runtime-store";
 import { createIntakeModelDispatcher } from "./model-dispatch";
 import { prepareIntakeAttachments, intakeInputWithAttachments, finishIntakeAttachmentRead } from "./attachments";
@@ -150,8 +150,11 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     if(qualifiedOther) payload.other=qualifiedOther;
     traces.push({otherQualification:otherEvaluation.state, qualified:Boolean(qualifiedOther)});
     // SAV-90: a reply quoting a mail of the mailbox is never accepted as Other (engine rule); no evidence when unreadable.
-    const quotedMailboxReply = await intakeQuotedMailboxReply(lease, config.mailboxId).catch(() => false);
+    // Orientation (17/11): a reply quoting the mailbox or a colleague is never handed off automatically as a new commercial lead.
+    const quoted = await intakeQuotedReplyEvidence(lease, config.mailboxId).catch(() => ({ mailbox: false, team: false }));
+    const quotedMailboxReply = quoted.mailbox, quotedTeamReply = quoted.team;
     if (quotedMailboxReply) traces.push({ phase: "support_thread_reply", quotedMailbox: true });
+    if (quotedTeamReply) traces.push({ phase: "team_thread_reply", quotedTeam: true });
     await writeCheckpoint();
     const retryOrdinal = await intakeTransientRetries(lease.run.messageId);
     // SAV-92: the single-call reader (simple pipeline, never at_receipt) runs exactly as the comparison's simple side.
@@ -211,7 +214,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     });
     const otherPolicy = qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule" as const}} : { ...config.policy,
       otherRuleStatus: otherEvaluation.state === "qualified" ? undefined : otherEvaluation.state };
-    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, quotedMailboxReply ? { ...otherPolicy, quotedMailboxReply: true as const } : otherPolicy,
+    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, { ...otherPolicy, ...(quotedMailboxReply ? { quotedMailboxReply: true as const } : {}), ...(quotedTeamReply ? { quotedTeamReply: true as const } : {}) },
       // SAV-92: CRM reads keep 10 s each; the model gets the whole shared AI allowance, exactly like the comparison campaign.
       { timeoutMs: 10_000, modelTimeoutMs: SAV_INTAKE_ANALYSIS_TIMING.modelMs }, () => new Date()));
     assertSavIntakeObservation(payload.plan);

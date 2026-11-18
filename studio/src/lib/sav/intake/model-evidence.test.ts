@@ -280,6 +280,10 @@ describe("commercial/support prompt contract and inert routing with a synthetic 
     expect(instruction).toContain("a contact record alone does not prove active usage");
     expect(instruction).toContain("Neither the word compatible nor a CRM status alone determines");
     expect(instruction).toContain("language of the current authored message");
+    // Orientation (17/11): prompt contract only; the model's behaviour on these words is NOT runtime-verified here.
+    for (const text of ["Nature, relationship and follow-up are separate", "commercial is only a new pre-sale inquiry with no existing exchange",
+      "a reply to an offer or call a team member already sent", "keep a price question as its own request", "never commercial to fill a gap", "Never invent a capability, endpoint or price"])
+      expect(instruction).toContain(text);
   });
 });
 it("reports a known rejected field without retaining its private value", async () => {

@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { auditLogs, staffUsers } from "@/db/schema";
@@ -87,25 +87,25 @@ it("SAV-24 write tools are absent while STUDIO_MCP_WRITES_ENABLED is off, and re
   { env: { STUDIO_MCP_ENABLED: "true" }, resolveUser: async () => current as never })).json() as { result: { tools: { name: string }[] } };
   expect(list.result.tools.map(t => t.name)).toEqual(expect.arrayContaining(["get_agent_pause", "get_dossier"]));
   expect(list.result.tools.map(t => t.name)).not.toContain("close_handled_outside");
-  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true }, { STUDIO_MCP_ENABLED: "true" })).toMatchObject({ outcome: "error" });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } }, { STUDIO_MCP_ENABLED: "true" })).toMatchObject({ outcome: "error" });
   expect(state.complete).not.toHaveBeenCalled();
 });
 it("SAV-28 close_handled_outside runs the console function as the key's staff member, on the version read", async () => {
   const idem = key();
-  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: idem, attestHandled: true })).toMatchObject({ outcome: "done" });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: idem, attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ outcome: "done" });
   expect(state.complete).toHaveBeenCalledExactlyOnceWith({ requestKey: idem, threadId, messageId, confirmed: true }, expect.any(Function));
   expect(state.seen).toEqual(["user_ugo"]);
   expect(await writes()).toMatchObject([{ actorEmail: "ugo@limova.ai", entityId: idem, technicalMetadata: { channel: "mcp", tool: "close_handled_outside", outcome: "done", threadId } }]);
 });
 it("SAV-27 a changed dossier, a token of another dossier or garbage are refused before any console function", async () => {
   const stale = token(); detail.projection.epoch = 5;
-  expect(await call("close_handled_outside", { threadId, versionToken: stale, idempotencyKey: key(), attestHandled: true })).toMatchObject({ outcome: "refused", code: "SAV_MCP_DOSSIER_CHANGED" });
+  expect(await call("close_handled_outside", { threadId, versionToken: stale, idempotencyKey: key(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ outcome: "refused", code: "SAV_MCP_DOSSIER_CHANGED" });
   const other = Buffer.from(JSON.stringify({ v: 1, threadId: "10000000-0000-4000-8000-000000000099" })).toString("base64url");
   for (const versionToken of [other, "not-a-token"]) expect(await call("release_hold", { threadId, versionToken, idempotencyKey: key(), reason: "Reprise synthétique demandée." })).toMatchObject({ code: "SAV_MCP_VERSION_TOKEN_INVALID" });
   expect(state.complete).not.toHaveBeenCalled(); expect(state.release).not.toHaveBeenCalled();
 });
 it("SAV-27 same key and request returns the first outcome without running twice; same key, other request is refused", async () => {
-  const idem = key(), args = { threadId, versionToken: token(), idempotencyKey: idem, attestHandled: true };
+  const idem = key(), args = { threadId, versionToken: token(), idempotencyKey: idem, attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } };
   await call("close_handled_outside", args);
   expect(await call("close_handled_outside", args)).toMatchObject({ outcome: "already_done" });
   expect(state.complete).toHaveBeenCalledTimes(1);
@@ -116,17 +116,17 @@ it("SAV-27 same key and request returns the first outcome without running twice;
   expect(state.release).not.toHaveBeenCalled();
 });
 it("SAV-28 the console's restrictions hold: owner operator only, explicit attestation, real outcomes", async () => {
-  for (const who of [reouven, contact]) { current = who; expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true })).toMatchObject({ code: "SAV_MCP_ACTION_UNAVAILABLE" }); }
+  for (const who of [reouven, contact]) { current = who; expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ code: "SAV_MCP_ACTION_UNAVAILABLE" }); }
   current = ugo;
-  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: false })).toMatchObject({ outcome: "error" });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: false, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ outcome: "error" });
   state.complete.mockResolvedValueOnce({ batchId: "b", requested: 1, marked: 0, alreadyCompleted: 0, skipped: { active_worker: 1 } });
-  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true })).toMatchObject({ code: "SAV_MCP_ACTIVE_WORKER" });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ code: "SAV_MCP_ACTIVE_WORKER" });
   state.complete.mockResolvedValueOnce({ batchId: "b", requested: 1, marked: 0, alreadyCompleted: 0, skipped: { unsettled_action: 1 } });
-  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true })).toMatchObject({ code: "SAV_MCP_UNSETTLED_ACTION" });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ code: "SAV_MCP_UNSETTLED_ACTION" });
   state.complete.mockResolvedValueOnce({ batchId: "b", requested: 1, marked: 0, alreadyCompleted: 1, skipped: {} });
-  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true })).toMatchObject({ outcome: "already_done" });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ outcome: "already_done" });
   state.complete.mockRejectedValueOnce(Error("SAV_EXTERNAL_COMPLETION_V0_ONLY"));
-  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true })).toMatchObject({ outcome: "refused", code: "SAV_EXTERNAL_COMPLETION_V0_ONLY" });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ outcome: "refused", code: "SAV_EXTERNAL_COMPLETION_V0_ONLY" });
 });
 it("SAV-30 release_hold passes the epoch read and the reason, administrators only, replay is already_done", async () => {
   detail.humanHeld = true; detail.projection.status = "human_hold";
@@ -374,7 +374,7 @@ it("REVIEW776 witness: after a lost receipt the same key answers uncertain and n
   vi.mocked(Date.now).mockRestore();
   expect((await f.db.select().from(auditLogs)).filter(a => a.action === "sav_agent_pause_set")).toHaveLength(1);
   state.complete.mockRejectedValueOnce(Error("synthetic network failure after commit"));
-  const idem = key(), close = { threadId, versionToken: token(), idempotencyKey: idem, attestHandled: true };
+  const idem = key(), close = { threadId, versionToken: token(), idempotencyKey: idem, attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } };
   expect(await call("close_handled_outside", close)).toMatchObject({ outcome: "uncertain", code: "SAV_MCP_RESULT_UNCERTAIN" });
   expect(await call("close_handled_outside", close)).toMatchObject({ outcome: "uncertain" });
   expect(state.complete).toHaveBeenCalledTimes(1);
@@ -383,13 +383,13 @@ it("REVIEW776 witness: after a lost receipt the same key answers uncertain and n
 it("REVIEW776 witness: refusals before any action claim nothing, and classify_other refuses a binding of another version", async () => {
   const stale = token(); detail.projection.epoch = 5;
   const idem = key();
-  expect(await call("close_handled_outside", { threadId, versionToken: stale, idempotencyKey: idem, attestHandled: true })).toMatchObject({ code: "SAV_MCP_DOSSIER_CHANGED" });
-  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: idem, attestHandled: true })).toMatchObject({ outcome: "done" });
+  expect(await call("close_handled_outside", { threadId, versionToken: stale, idempotencyKey: idem, attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ code: "SAV_MCP_DOSSIER_CHANGED" });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: idem, attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ outcome: "done" });
   state.manualBinding.mockResolvedValue({ revision: "r", threadId, messageId, runId, version: 8, runSourceHash: sourceHash, sourceHash, expectedEpoch: 5 });
   expect(await call("classify_other", { threadId, versionToken: token(), idempotencyKey: key(), reason: "Notification automatique synthétique.", attest: true })).toMatchObject({ code: "SAV_MCP_DOSSIER_CHANGED" });
   expect(state.manual).not.toHaveBeenCalled();
   state.detail.mockRejectedValueOnce(Error("synthetic read failure"));
-  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true })).toMatchObject({ outcome: "refused", code: "MCP_INTERNAL_ERROR" });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ outcome: "refused", code: "MCP_INTERNAL_ERROR" });
 });
 it("SAV-71 composition: get_dossier and classify_other give the page's manual-Other eligibility and its bounded reason", async () => {
   state.manualBinding.mockResolvedValue(null); state.panel.mockResolvedValue({ allowResume: false, allowReanalysis: false, allowInformation: false, unavailableReason: "x", information: null });
@@ -420,16 +420,16 @@ it("night V1 A: verified effects are not called « to verify », and Terminés i
   expect(listed.classify_other).toMatchObject({ available: false, unavailableReason: "Une action engagée ou son résultat reste à vérifier." });
   const dossier = (await call("get_dossier", { threadId }) as { data: { locks: { completionBlockers: string[]; unsettledEffects: number } } }).data;
   expect(dossier.locks).toMatchObject({ completionBlockers: ["human_action"], unsettledEffects: 0 });
-  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true })).toMatchObject({ outcome: "refused", code: "SAV_MCP_UNSETTLED_ACTION" });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ outcome: "refused", code: "SAV_MCP_UNSETTLED_ACTION" });
   current = contact; // not the owner operator: still the generic unavailability, no blocker detail
-  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true })).toMatchObject({ outcome: "refused", code: "SAV_MCP_ACTION_UNAVAILABLE" });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } })).toMatchObject({ outcome: "refused", code: "SAV_MCP_ACTION_UNAVAILABLE" });
   expect(state.complete).not.toHaveBeenCalled(); expect(await writes()).toHaveLength(0);
 });
 
 // Night V1 cycle 1 (I-1 review): the server's pre-check refusals are part of the offer and get explicit codes.
 it("night V1 cycle 1: server pre-check refusals are not offered, refused before any claim with an explicit code, and mapped after the server", async () => {
   state.manualBinding.mockResolvedValue(null);
-  const close = () => call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true });
+  const close = () => call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true, handling: { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." } });
   const listed = async () => Object.fromEntries((await call("get_dossier", { threadId }) as { data: { availableActions: { tool: string; available: boolean; unavailableReason?: string | null }[] } }).data.availableActions.map(a => [a.tool, a]));
   Object.assign(detail, { completionBlockers: [], completionPrecheck: "technical_exclusion" });
   expect((await listed()).close_handled_outside).toMatchObject({ available: false, unavailableReason: expect.stringContaining("classé technique") });
@@ -471,7 +471,7 @@ it.each(["close_handled_outside", "classify_invalid_source_other", "classify_oth
   current = contact; detail.humanHeld = name === "release_hold";
   state.panel.mockResolvedValue({ allowResume: true, allowReanalysis: true, allowInformation: true, information: null });
   const args: Record<string, unknown> = { threadId, versionToken: token(), idempotencyKey: key(), reason: "Synthetic explicit reviewer reason" };
-  if (name === "close_handled_outside") { args.attestHandled = true; delete args.reason; }
+  if (name === "close_handled_outside") { args.attestHandled = true; args.handling = { kind: "customer_answered", evidence: "Réponse synthétique envoyée au client dans ce fil." }; delete args.reason; }
   if (name === "classify_invalid_source_other") { args.attest = true; delete args.reason; }
   if (name === "classify_other") args.attest = true;
   if (name === "continue_dossier") args.kind = "resume";
@@ -500,4 +500,55 @@ it("SAV-34 witness: running is not offered by the MCP schema; pausing and readin
   expect(await call("set_agent_pause", { level: "actions_paused", expectedLevel: "running", reason: "Pause synthétique", idempotencyKey: key() })).toMatchObject({ outcome: "done" });
   expect(await call("get_agent_pause", {})).toMatchObject({ data: { state: { level: "actions_paused" } } });
   expect((await f.db.select().from(auditLogs)).filter(a => a.action === "sav_agent_pause_set")).toHaveLength(1);
+});
+
+// Orientation (17/11): « Terminés » needs the attested proof of a real follow-up. A transfer (forward, SENT copy) or an
+// email attached to an old closed, unrelated ticket is not an accepted proof; a dossier still awaiting the team
+// (question, missing context, supervised commercial hand-off) is never closed as « nothing to follow ». Synthetic data.
+describe("Orientation close_handled_outside requires a real follow-up proof", () => {
+  const close = (handling: unknown) => call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true, ...(handling === undefined ? {} : { handling }) });
+  const evidence = "Preuve synthétique relue par l’opérateur.";
+  const plan = (disposition: unknown) => { (detail.current.payload.plan.decision as { disposition: unknown }).disposition = disposition; };
+  const settled = () => { detail.projection = { ...detail.projection, view: "in_progress", status: "processing" }; };
+  it("scenario 9: a forward/SENT or an email association to a closed ticket is not an accepted kind; a proof is required", async () => {
+    for (const handling of [undefined, { kind: "forwarded", evidence }, { kind: "sent_copy", evidence }, { kind: "email_associated_closed_ticket", ticketId: "201", evidence },
+      { kind: "open_ticket", evidence }, { kind: "human_takeover" }, { kind: "human_takeover", evidence: "court" }])
+      expect(await close(handling)).toMatchObject({ outcome: "error" });
+    expect(state.complete).not.toHaveBeenCalled();
+    expect(await writes()).toEqual([]);
+  });
+  it("scenario 8: missing context or an unknown classification is never closed as nothing to follow", async () => {
+    plan({ kind: "collect_context", reasons: ["history_incomplete"] }); settled();
+    expect(await close({ kind: "nothing_to_follow", evidence })).toMatchObject({ outcome: "refused", code: "SAV_MCP_HANDLING_NOT_PROVEN" });
+    detail = base();
+    expect(await close({ kind: "nothing_to_follow", evidence })).toMatchObject({ outcome: "refused", code: "SAV_MCP_HANDLING_NOT_PROVEN" });
+    expect(state.complete).not.toHaveBeenCalled();
+    expect((await f.db.select().from(auditLogs)).filter(a => a.action === "studio_mcp_write_claim")).toEqual([]);
+  });
+  it("a supervised commercial hand-off not yet taken is never closed as nothing to follow; a confirmed takeover can be attested", async () => {
+    plan({ kind: "no_ticket", reason: "outside_support", nextAction: "supervised_commercial", learning: "excluded", evidenceIds: ["current"] }); settled();
+    expect(await close({ kind: "nothing_to_follow", evidence })).toMatchObject({ code: "SAV_MCP_HANDLING_NOT_PROVEN" });
+    expect(await close({ kind: "human_takeover", evidence })).toMatchObject({ outcome: "done" });
+    expect(state.complete).toHaveBeenCalledTimes(1);
+  });
+  it("an open relevant ticket is recorded by kind and ticket, never with the operator's free text", async () => {
+    expect(await close({ kind: "open_ticket", ticketId: "201", evidence })).toMatchObject({ outcome: "done" });
+    const [row] = await writes();
+    expect(row.technicalMetadata).toMatchObject({ tool: "close_handled_outside", handlingKind: "open_ticket", handlingTicketId: "201" });
+    expect(JSON.stringify(row.technicalMetadata)).not.toContain(evidence);
+  });
+  it("nothing to follow stays possible when the dossier no longer awaits the team", async () => {
+    settled();
+    expect(await close({ kind: "nothing_to_follow", evidence })).toMatchObject({ outcome: "done" });
+  });
+  it("the tool contract states that a transfer proves a transmission, not a takeover", async () => {
+    const response = await handleStudioMcpRequest(new Request("https://studio.example.invalid/api/mcp", { method: "POST",
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer synthetic-token-0123456789" } }),
+    { env, resolveUser: async () => current as never });
+    const tools = (await response.json() as { result: { tools: { name: string; description: string }[] } }).result.tools;
+    const description = tools.find(t => t.name === "close_handled_outside")!.description;
+    for (const text of ["prouve la transmission, pas la prise en charge", "ancien ticket fermé ou sans rapport", "jamais une demande commerciale", "OUVERT"])
+      expect(description).toContain(text);
+  });
 });

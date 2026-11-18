@@ -46,11 +46,27 @@ export function intakeForwardNeedsOriginal(message: IntakeMessage) {
 export function intakeQuotesMailbox(provenance: { currentText: string; quotedText: string }, mailboxEmail: string) {
   const address = mailboxEmail.trim().toLowerCase();
   if (!/^[^\s@<>]+@[^\s@<>]+$/.test(address)) return false;
-  const named = new RegExp(`(?<![\\w.+@-])${address.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w.@-])`, "i");
+  const named = new RegExp(`(?<![\\w.+@-])${escapeRegExp(address)}(?![\\w.@-])`, "i");
+  return quoteHeaders(provenance).some(header => named.test(header));
+}
+/** Quote header lines (Gmail/Apple « Le … a écrit : » / « On … wrote: », possibly wrapped, or « De : » / « From: »). */
+function quoteHeaders(provenance: { currentText: string; quotedText: string }) {
   const lines = `${provenance.currentText}\n${provenance.quotedText}`.split("\n").map(line => line.replace(/^[\s>]+/, "").trim());
-  return lines.some((line, index) => {
+  return lines.map((line, index) => {
     const next = lines[index + 1] ?? "";
-    const header = /^(?:a\s+)?(?:écrit|wrote)\s*:$/i.test(next) ? `${line} ${next}` : line;
-    return named.test(header) && (/(?:\bwrote|a\s+écrit|écrit)\s*:$/i.test(header) || /^(?:from|de)\s*:/i.test(header));
-  });
+    return /^(?:a\s+)?(?:écrit|wrote)\s*:$/i.test(next) ? `${line} ${next}` : line;
+  }).filter(header => /(?:\bwrote|a\s+écrit|écrit)\s*:$/i.test(header) || /^(?:from|de)\s*:/i.test(header));
+}
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** Shared public mail providers: an address there is never a team member's. */
+const PUBLIC_MAIL_DOMAINS = /^(?:gmail\.com|googlemail\.com|outlook\.[a-z.]+|hotmail\.[a-z.]+|live\.[a-z.]+|msn\.com|yahoo\.[a-z.]+|ymail\.com|icloud\.com|me\.com|mac\.com|aol\.com|gmx\.[a-z.]+|proton(?:mail)?\.[a-z.]+|orange\.fr|wanadoo\.fr|free\.fr|sfr\.fr|laposte\.net|bbox\.fr|neuf\.fr)$/i;
+/** Orientation (17/11): the current mail answers a mail of the team: a quote header names an address of the
+ * support mailbox's own (non-public) domain, e.g. a colleague's offer or follow-up. Like intakeQuotesMailbox it
+ * only keeps a mail out of an automatic « commercial » hand-off and in the team's choice; it never creates a
+ * ticket, chooses a classification, names an owner, or proves that anyone took the follow-up. */
+export function intakeQuotesTeamAddress(provenance: { currentText: string; quotedText: string }, mailboxEmail: string) {
+  const domain = /^[^\s@<>]+@([a-z0-9-]+(?:\.[a-z0-9-]+)+)$/i.exec(mailboxEmail.trim())?.[1]?.toLowerCase();
+  if (!domain || PUBLIC_MAIL_DOMAINS.test(domain)) return false;
+  const named = new RegExp(`(?<![\\w.+@-])[a-z0-9._%+-]+@${escapeRegExp(domain)}(?![\\w.@-])`, "i");
+  return quoteHeaders(provenance).some(header => named.test(header));
 }

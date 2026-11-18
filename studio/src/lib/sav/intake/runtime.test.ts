@@ -1350,6 +1350,37 @@ it.each([
   expect(await f.db.select().from(savIntakeEffects)).toHaveLength(0);
 });
 
+// Orientation (17/11): the runtime reads the stored quote header. A « commercial » reply quoting the support mailbox
+// or a colleague of the team domain reaches the team's choice; without any quote the existing commercial path is
+// unchanged (here: no commercial resource configured in this fixture). Synthetic data; the model is scripted.
+it.each([
+  ["option price in a support thread", "Merci. Quel est le coût en plus pour cette option ?\n\nLe lun. 10 nov. 2026 à 10:00, Support <support@example.invalid> a écrit :\n> Bonjour, cette option est individuelle.", true],
+  ["reply to a colleague's offer", "D'accord pour un rappel lundi.\n\nLe mer. 1 oct. 2026 à 10:00, Conseiller <conseiller@example.invalid> a écrit :\n> Voici notre proposition.", true],
+  ["prospect without any exchange", "Bonjour, pouvez-vous me proposer une démonstration et un devis ?", false],
+] as const)("Orientation routes a « commercial » reply in an existing exchange to the team's choice (%s)", async (_case, body, followUp) => {
+  await f.db.delete(savMessages).where(eq(savMessages.id, messageId));
+  messageId = (await message({ body })).id;
+  const id = (await enqueueSavIntakeMessage(messageId, config))!;
+  const network = vi.fn<typeof fetch>(async (_url, init) => {
+    const data = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+    return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify({ messageId, nature: "request",
+      requests: [{ id: "r1", kind: "commercial", currentMessageId: messageId, quoteId: data.citationCatalogue[0].id }] }) }] } }],
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10, thoughtsTokenCount: 0, totalTokenCount: 20 } });
+  });
+  // Without a configured commercial resource the existing path waits on that marker (unchanged behaviour).
+  expect(await analyseSavIntakeRuntime(id, config, { env: () => environment, network })).toMatchObject({ state: followUp ? "observed" : "waiting" });
+  const current = await readSavIntakeCurrent(threadId, config), plan = current?.payload.plan;
+  expect(plan?.decision.disposition).not.toMatchObject({ kind: "no_ticket" });
+  if (followUp) {
+    expect(plan?.decision.classification).toBe("unknown");
+    expect(plan?.decision.requests.map(r => r.id)).toEqual(["r1"]);
+    expect(plan?.progress).toMatchObject({ kind: "human_choice", questionCode: "request_scope_uncertain", view: "to_validate" });
+  } else expect(plan?.decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining(["private_resource_unavailable"]) });
+  expect(network).toHaveBeenCalledTimes(1);
+  expect(await f.db.select().from(savActions)).toHaveLength(0);
+  expect(await f.db.select().from(savIntakeEffects)).toHaveLength(0);
+});
+
 // SAV-92 fix 2: an uncertain cost stays counted but no longer blocks the mail forever.
 it("SAV-92 a timed-out call stays in the ledger at its reserved price; the mail returns to normal scheduling under the attempt limits", async () => {
   operational(); const l = await lease(), r = await reserveSavIntakeCall(l, config, "a".repeat(64));

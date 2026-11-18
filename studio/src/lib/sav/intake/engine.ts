@@ -369,6 +369,17 @@ export async function planSavIntake(
         const resource = savIntakePrivateResourceSchema.parse(policy.qualifiedOther.resource);
         ruleId = addEvidence("classification-rule", policy.qualifiedOther.evidenceSource, resource.resourceId, resource);
       }
+      // Orientation (17/11): the nature of a request (a price, an option, an API) is not the relationship. A
+      // « commercial » request that answers the support mailbox (stored outbound mail or quote header) or a
+      // colleague of the team (quote header of the team domain) continues an existing exchange: it is never
+      // handed off automatically as a new lead and goes to the team's classification choice, its requests
+      // kept. Nothing is forced to support; a person who already chose the classification is not asked again.
+      // Partnership and investor, and a commercial mail outside any such thread (a prospect), are unchanged.
+      if (outside === "commercial" && !input.humanResolution?.classification && (policy.quotedMailboxReply === true || policy.quotedTeamReply === true
+        || conversation.some(row => row.direction === "outbound" && row.id !== message.id))) {
+        classification = "unknown"; requests = requests.map(r => ({ ...r, kind: "unknown" as const }));
+        return context("classification_incomplete", "request_scope_uncertain");
+      }
       const resource = outside === "other" || outside === "acknowledgement" ? undefined : policy.resources[outside];
       if (!["other", "acknowledgement"].includes(outside) && !resource) return context("private_resource_unavailable");
       if (resource) savIntakePrivateResourceSchema.parse(resource);
