@@ -12,7 +12,6 @@
 import { cleanSavModelDraft, renderSavOutboundReply, savReplyFooter, type SavReplySendMode } from "../reply-format";
 import { layoutCaseReplyBody } from "./case-reply-layout";
 import type { CaseReplyApproval, CaseReplyProposal, CaseReplyPurpose } from "./case-effects";
-import { layoutCaseReplyBody } from "./case-reply-layout";
 
 export const CASE_REPLY_OUTBOUND_CONTRACT = "sav-v2-reply-outbound.v1";
 
