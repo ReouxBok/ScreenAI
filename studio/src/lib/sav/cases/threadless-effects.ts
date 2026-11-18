@@ -22,6 +22,7 @@ const parents = savCaseEffectExecutions;
 const ledger = savIntakeEffects;
 const CRM_KIND = "new_thread_crm_email";
 const SEND_KIND = "new_thread_send";
+const CRM_PENDING = "new_thread_crm_pending";
 const MAX_READS = 5;
 const RECOVERY_DELAY_MS = 60_000;
 
@@ -107,7 +108,7 @@ async function verifyAndPersist(parent: Parent, effect: Effect, deps: PassDeps, 
     if (intent.kind === SEND_KIND && proof.kind === SEND_KIND) {
       await persistVerifiedThread(tx, payload.proposal, intent, proof.receipt, current.id);
       await confirmExecutionEffect(current, proof.receipt, proof.receipt, tx);
-      await updateParent(tx, parent.id, "waiting", "new_thread_crm_pending");
+      await updateParent(tx, parent.id, "waiting", CRM_PENDING);
     } else if (intent.kind === CRM_KIND && proof.kind === CRM_KIND) {
       const [message] = await tx.update(savMessages).set({ hubspotEmailId: proof.receipt.id }).where(and(
         eq(savMessages.mailboxId, intent.sent.mailboxId), eq(savMessages.gmailMessageId, intent.receipt.id), eq(savMessages.direction, "outbound"),
@@ -188,6 +189,13 @@ async function passOne(parent: Parent, deps: PassDeps) {
   }
   if (!gmail) await deps.gmailPermissions(THREADLESS_MAILBOX, signal);
   const read = await (deps.readTicket ?? readThreadlessTicket)(input.source.ticketId, env);
+  if (gmail && read.status === "closed") {
+    // A concurrent CRM dispatch moves the parent out of this state under its lock.
+    // In that case keep the marker eligible for verification.
+    await db.update(parents).set({ state: "refused", reason: "crm_skipped_ticket_closed", updatedAt: new Date() })
+      .where(and(eq(parents.id, parent.id), eq(parents.state, "waiting"), eq(parents.reason, CRM_PENDING)));
+    return;
+  }
   if (read.status === "unavailable") return;
   if (read.status !== "ready" || read.source.contact?.id !== input.source.contact.id || read.source.contact.email !== input.source.contact.email
       || !gmail && caseEffectHash(read.source) !== proposal.ticketSource.version) {
@@ -265,12 +273,14 @@ export async function runThreadlessEffectsPass(deps: PassDeps) {
       await passOne(row, deps);
       const [next] = await db.select({ reason: parents.reason }).from(parents).where(eq(parents.id, row.id));
       // Only a just-confirmed send can immediately journal CRM.
-      if (row.reason !== "new_thread_crm_pending" && next?.reason === "new_thread_crm_pending" && Date.now() < deps.deadlineMs)
+      if (row.reason !== CRM_PENDING && next?.reason === CRM_PENDING && Date.now() < deps.deadlineMs)
         await passOne(row, deps);
     } catch {
-      await db.update(parents).set({ updatedAt: new Date() }).where(eq(parents.id, row.id));
+      // The parent and any committed markers remain eligible for their normal recovery.
     }
-    const [state] = await db.select({ state: parents.state, reason: parents.reason }).from(parents).where(eq(parents.id, row.id));
+    // Rotate every attempted row out of the oldest slots, including waits that wrote no effect.
+    const [state] = await db.update(parents).set({ updatedAt: sql`clock_timestamp()` }).where(eq(parents.id, row.id))
+      .returning({ state: parents.state, reason: parents.reason });
     if (state) handled.push({ executionId: row.id, ...state });
   }
   return handled;

@@ -6,8 +6,9 @@ const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }))
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }));
 
-import { savCases, savCaseReplyValidations, savIntakeEffects, savIntakeExecutions, savMailboxes, savMessages, savThreads, staffUsers } from "@/db/schema";
+import { savCases, savCaseEffectExecutions, savCaseReplyValidations, savIntakeEffects, savIntakeExecutions, savMailboxes, savMessages, savThreads, staffUsers } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
+import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 import { createIntakeExecutorAdapters, type GmailRequest } from "../intake/execution-adapters";
 import { approveIntakeExecutionPolicy, type ExecutionPolicy } from "../intake/execution-policy";
 import { savIntakeSourceSnapshot } from "../intake/runtime-store";
@@ -90,14 +91,22 @@ function fixture() {
   const ticket = { id: ticketId, updatedAt: observedAt,
     properties: { subject: "Impossible de me connecter", content: "Je n’arrive pas à me connecter à mon compte.",
       hubspot_owner_id: OWNER, hs_pipeline: "0", hs_pipeline_stage: "1" } };
-  const controls = { contacts: [CONTACT], existingCrmEmail: false, loseGmailAck: false, crmUnavailable: false };
+  const controls = {
+    contacts: [CONTACT], existingCrmEmail: false, loseGmailAck: false, crmUnavailable: false,
+    ticketAfterSend: null as "closed" | "unavailable" | null,
+  };
   const counts = { crmReads: 0, crmPosts: 0, gmailPosts: 0, gmailSearches: 0, gmailPermissions: 0 };
   let storedCrmProperties: unknown, sentMail: { subject: string; rfcId: string; body: string; at: string } | undefined;
   const network: typeof fetch = async (url, init) => {
     const path = new URL(String(url)).pathname;
     if (init?.method === "GET") counts.crmReads++;
     const ticketPath = `/crm/v4/objects/tickets/${ticketId}/associations`;
-    if (path === `/crm/v3/objects/tickets/${ticketId}`) return Response.json(ticket);
+    if (path === `/crm/v3/objects/tickets/${ticketId}`) {
+      if (sentMail && controls.ticketAfterSend === "unavailable") return Response.json({}, { status: 503 });
+      if (sentMail && controls.ticketAfterSend === "closed")
+        return Response.json({ ...ticket, properties: { ...ticket.properties, hs_pipeline_stage: SAV_HUBSPOT_SUPPORT.stages.closed } });
+      return Response.json(ticket);
+    }
     if (path === `${ticketPath}/emails`) return Response.json({ results: controls.existingCrmEmail ? [{ toObjectId: "740001" }] : [] });
     if (path === `${ticketPath}/contacts`) return Response.json({ results: controls.contacts.map(toObjectId => ({ toObjectId })) });
     if (path === `${ticketPath}/notes`) return Response.json({ results: [{ toObjectId: "123" }] });
@@ -164,7 +173,7 @@ function fixture() {
     adapters: createIntakeExecutorAdapters({ env, gmailRequest, network, gmailPermissions }),
     threadless: { transport, gmailPermissions },
   });
-  return { input, ack, crmId, controls, counts, run, sentMail: () => sentMail };
+  return { input, ack, crmId, controls, counts, run, network, sentMail: () => sentMail };
 }
 
 async function approveAndQueue(scenario: ReturnType<typeof fixture>) {
@@ -191,6 +200,53 @@ const makeReadsDue = (id: string) => f.db.update(savIntakeEffects).set({ nextRec
   .where(eq(savIntakeEffects.executionId, id));
 
 describe("SAV-96 new Gmail thread through entry, approval, effect and inbound return", () => {
+  it.each(["closed", "unavailable"] as const)("lets the fourth CRM log progress behind three %s tickets", async status => {
+    const oldest = Date.now() - (status === "closed" ? 60_000 : 120_000);
+    const createPendingLog = async (position: number) => {
+      const scenario = fixture(), start = await approveAndQueue(scenario);
+      scenario.controls.ticketAfterSend = "unavailable";
+      expect((await scenario.run(start.executionId)).supervised).toMatchObject([{ state: "waiting", reason: "new_thread_crm_pending" }]);
+      const updatedAt = new Date(oldest + position * 1_000);
+      await f.db.update(savCaseEffectExecutions).set({ updatedAt }).where(eq(savCaseEffectExecutions.id, start.executionId));
+      return { scenario, start, updatedAt };
+    };
+    const first = await createPendingLog(0);
+    const second = await createPendingLog(1);
+    const third = await createPendingLog(2);
+    const { scenario: healthy, start: healthyStart } = await createPendingLog(3);
+    const blocked = [first, second, third];
+    for (const { scenario } of blocked) scenario.controls.ticketAfterSend = status;
+    healthy.controls.ticketAfterSend = null;
+    const network: typeof fetch = (url, init) => {
+      const ticketId = new URL(String(url)).pathname.match(/\/tickets\/(\d+)(?:\/|$)/)?.[1];
+      const stalled = blocked.find(({ scenario }) => scenario.input.ticketId === ticketId);
+      return (stalled?.scenario.network ?? healthy.network)(url, init);
+    };
+    vi.stubGlobal("fetch", network);
+
+    const firstPass = (await healthy.run()).supervised;
+    expect(firstPass.map(row => row.executionId)).toEqual(blocked.map(({ start }) => start.executionId));
+    expect(healthy.counts.crmPosts).toBe(0);
+    const secondPass = (await healthy.run()).supervised;
+    expect(secondPass[0]).toEqual({ executionId: healthyStart.executionId, state: "confirmed", reason: null });
+    expect(healthy.counts).toMatchObject({ gmailPosts: 1, crmPosts: 1 });
+    if (status === "closed") {
+      const selectedIds = secondPass.map(row => row.executionId);
+      for (const { start } of blocked) expect(selectedIds).not.toContain(start.executionId);
+    }
+
+    for (const { scenario, start, updatedAt } of blocked) {
+      expect(firstPass.find(row => row.executionId === start.executionId)).toMatchObject(status === "closed"
+        ? { state: "refused", reason: "crm_skipped_ticket_closed" }
+        : { state: "waiting", reason: "new_thread_crm_pending" });
+      const [execution] = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.id, start.executionId));
+      expect(execution!.updatedAt.getTime()).toBeGreaterThan(updatedAt.getTime());
+      expect(await effects(start.executionId)).toMatchObject([{ kind: "new_thread_send", state: "confirmed" }]);
+      expect(await threadFor(scenario)).toMatchObject({ hubspotTicketId: scenario.input.ticketId });
+      expect(scenario.counts).toMatchObject({ gmailPosts: 1, crmPosts: 0 });
+    }
+  });
+
   it("confirms only the approved mail, links it to the CRM ticket and lets V1 and V2 recognise the actual customer reply", async () => {
     const s = fixture(), start = await approveAndQueue(s);
     const before = await readCase(start.caseId);
