@@ -158,6 +158,8 @@ export async function finishSavIntakeWake(runId: string) {
   await (await import("./gmail-read")).syncHandledIntakeGmailRead(run.messageId).catch(() => {
     console.error("sav_intake_gmail_read", { runId, errorCode: "SAV_INTAKE_GMAIL_READ_RETRY_REQUIRED" });
   });
+  // SAV-95: an acknowledgement the model judged a confident close moves its ticket to « Fermé ». Nothing unless SAV_ACK_CLOSE=on; never throws.
+  if (process.env.SAV_ACK_CLOSE === "on") await (await import("./ack-closure-store")).syncAckClosure(run.messageId).catch(() => undefined);
   const [message] = await requireDb().select({ receivedAt: savMessages.receivedAt, createdAt: savMessages.createdAt }).from(savMessages).where(eq(savMessages.id, run.messageId));
   const progress = await readIntakeExecutionProgress(run.messageId);
   const confirmedAt = progress?.confirmed ? Math.max(...(await getExecutionEffects(progress.executionId)).map(e => e.confirmedAt?.getTime() ?? 0)) : null;

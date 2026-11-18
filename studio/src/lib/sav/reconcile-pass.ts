@@ -85,6 +85,12 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
   const caseRelays = await runStep<Awaited<ReturnType<typeof sweepMissedCaseRelays>> | { skipped: string }>("case_relays", () => Date.now()+20_000>derivedDeadline ? Promise.resolve({skipped:"deadline"}) : sweepMissedCaseRelays());
   const intakeTracking = await runStep("intake_tracking", () => ensureIntakeObservations({ deadlineMs: derivedDeadline }));
   const intakeConsole = await runStep("intake_console", () => refreshIntakeConsole(20));
+  // SAV-95: recovery of acknowledgement closures (off unless SAV_ACK_CLOSE=on; the wake after the projection is the fast path).
+  const ackClosures = await runStep<Awaited<ReturnType<typeof import("@/lib/sav/intake/ack-closure-store").reconcileAckClosures>> | { skipped: string }>("intake_ack_closure", async () => {
+    if (process.env.SAV_ACK_CLOSE !== "on") return { skipped: "off" };
+    if (Date.now() + 20_000 > derivedDeadline) return { skipped: "deadline" };
+    return (await import("@/lib/sav/intake/ack-closure-store")).reconcileAckClosures(3, Math.min(derivedDeadline, Date.now() + 20_000));
+  });
   const intakeRead = await runStep<Awaited<ReturnType<typeof reconcileHandledIntakeGmailRead>> | { skipped: string }>("intake_gmail_read", () => Date.now()+1000>=derivedDeadline ? Promise.resolve({skipped:"deadline"}) : reconcileHandledIntakeGmailRead(3,Math.min(derivedDeadline,Date.now()+30000)));
   // Four model runs leave enough headroom for the 45 s grounded-agent budget,
   // a guarded legacy fallback and the remaining integrations inside the 300 s
@@ -111,7 +117,7 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     return reconcileCaseJ2({ env: process.env, deadlineMs: derivedDeadline });
   });
   // V2 effects (replies, handoff notices, ticket stages, closures) have their own worker: /api/cron/sav-v2-effects (11/11).
-  const payload = { caseReminders, ticketSafetyNet, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { caseReminders, ticketSafetyNet, ackClosures, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return { payload, hasStepFailure, pulseId };

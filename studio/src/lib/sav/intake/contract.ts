@@ -82,6 +82,9 @@ export const savIntakeMutationSchema = z.enum([
   // V2 (ticket states): the ticket's pipeline stage only (waiting for the customer after a confirmed reply, closed after a proven resolution); granted by no existing policy.
   // SAV-92 (Ugo 17/11, behind `SAV_V2_HANDOFF_STAGE=on`): on a V2 hand-over, the same right moves the ticket to « Nouveau » and clears its owner (and nothing else).
   "set_case_ticket_stage",
+  // SAV-95 (behind `SAV_ACK_CLOSE=on`): V1 moves the thread's Support ticket to « Fermé » with one note after a customer's acknowledgement the model judged
+  // a confident close (`ack-closure.ts`); granted by no existing policy, so a renewal must add it explicitly.
+  "close_acknowledged_ticket",
 ]);
 export type SavIntakeMutation = z.infer<typeof savIntakeMutationSchema>;
 
