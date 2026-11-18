@@ -14,11 +14,11 @@ export async function loadThreadlessFirstMailDeps(env: Env): Promise<ThreadlessF
     const { createCaseTicketOwnerPort } = await import("../case-v2-wake-ports");
     const { v2EntryPolicySources } = await import("../v2-entry");
     const { intakeExecutionConfig, readIntakeExecutionAuthority } = await import("../../intake/execution-policy");
-    const { readOrComputeAccessSkill } = await import("../access-skill/access-skill-judge");
+    const { readThreadlessAccessSkill } = await import("../threadless-source");
     const config = intakeExecutionConfig(env);
     if (!config) return null;
     await readIntakeExecutionAuthority(config);
-    const source = () => env, now = () => new Date();
+    const source = () => env;
     const readTicketOwner = createCaseTicketOwnerPort({ env: source });
     // A ticket case is only opened under an open qualification scope; a scope closed since is a full pause of the factory (`casePauseState`).
     const built = createCaseInvestigationV2Deps({ ...v2EntryPolicySources(env, { accessSkillCompute: "never" }), env: source, readTicketOwner });
@@ -29,7 +29,8 @@ export async function loadThreadlessFirstMailDeps(env: Env): Promise<ThreadlessF
     return {
       env: source, investigation: built.deps, provenance: built.provenance, readTicketOwner,
       executionPolicy: { id: config.policyId, hash: config.policyHash },
-      accessSkill: request => readOrComputeAccessSkill({ env: source, now }, { purpose: "first_mail", messageId: request.messageId, input: request.input, compute: true }),
+      // The reading the entry stored when it admitted the ticket (computed here only if it is missing: once, under V2's model budget).
+      accessSkill: ticket => readThreadlessAccessSkill(ticket, env, true),
     };
   } catch {
     return null;

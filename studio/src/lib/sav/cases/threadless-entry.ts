@@ -48,7 +48,8 @@ async function start(input: Input, env: NodeJS.ProcessEnv, options: EntryOptions
   if (!authority) return { status: "unavailable" };
   const read = await readThreadlessTicket(input.ticketId, env);
   if (read.status !== "ready" && read.status !== "human_wait") return { status: read.status };
-  const qualification = await qualifyThreadlessTicket(read.source, env);
+  // SAV-96 B: under SAV-97 `on`, the entry is the one place that may pay for the skill's reading of the ticket; every later check reads it.
+  const qualification = await qualifyThreadlessTicket(read.source, env, new Date(), { accessSkillCompute: true });
   if (qualification.status === "out_of_scope") return { status: "out_of_scope" };
   const revision = qualification.status === "admitted" ? await threadlessAccessRevision(env, db) : null;
   if (qualification.status === "admitted" && !revision) return { status: "out_of_scope" };

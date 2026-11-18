@@ -21,7 +21,7 @@ export const HANDOFF_NOTICE_TITLE = "Nouveau ticket à transmettre à l'équipe"
 export const HANDOFF_NOTICE_KEY_PREFIX = "handoff-notice:";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const INPUT_KEY = /^(in|back):[A-Za-z0-9._@<>=+-]{1,200}$/;
+const INPUT_KEY = /^(in|back|ticket):[A-Za-z0-9._@<>=+-]{1,200}$/;
 /** One notice per final handoff decision: the case and the input the decision answers. A new customer mail is a new input, hence a new decision and a new key. */
 export function handoffNoticeKey(caseId: string, inputKey: string): string {
   if (!UUID.test(caseId) || !INPUT_KEY.test(inputKey)) throw new Error("SAV_HANDOFF_NOTICE_KEY_INVALID");

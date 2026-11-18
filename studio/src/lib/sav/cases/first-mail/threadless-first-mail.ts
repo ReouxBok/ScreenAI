@@ -3,7 +3,6 @@ import { requireDb } from "@/db";
 import { containsPromptInjection } from "../../policy";
 import { accessSkillKernelHits } from "../access-skill/access-skill-kernel";
 import type { AccessSkillReading } from "../access-skill/access-skill-judge";
-import type { AccessSkillInput } from "../access-skill/access-skill-wire";
 import { caseAdmissionStatus } from "../admission-policy";
 import { caseEffectHash, caseReplyPayloadHash, type CaseReplyProposal } from "../case-effects";
 import { caseReplyEditableBody, finalizeCaseReplyProposal } from "../case-reply-outbound";
@@ -22,7 +21,7 @@ import { runCaseInvestigationRuntime, type CaseInvestigationRuntimeDeps } from "
 import { pilotProvenanceGate, readPilotReplyProvenance, type PilotProvenanceDeps } from "../pilot-passage-provenance";
 import { savV2NewThreadAutoEnabled, threadlessReplySubject } from "../threadless-config";
 import { threadlessInputKey } from "../threadless-provenance";
-import { threadlessTicketPlainDescription, threadlessTicketSourceRef, type ThreadlessTicketSource } from "../threadless-source";
+import { threadlessRequestId, threadlessTicketPlainDescription, threadlessTicketSourceRef, type ThreadlessTicketSource } from "../threadless-source";
 import { threadlessAutoSendProblem } from "./first-mail-authority";
 import { firstMailSkillPinned, SAV_FIRST_MAIL_PROMPT_SUFFIX } from "./first-mail-skill";
 
@@ -52,7 +51,7 @@ export type ThreadlessFirstMailDeps = Readonly<{
   /** The approved execution policy an automated first mail is queued under; null: a person validates it. */
   executionPolicy: Readonly<{ id: string; hash: string }> | null;
   /** SAV-97's reading of the ticket (`readOrComputeAccessSkill`, purpose `first_mail`): the stored one, or computed once. */
-  accessSkill: (request: Readonly<{ messageId: string; input: AccessSkillInput }>) => Promise<AccessSkillReading>;
+  accessSkill: (source: ThreadlessTicketSource) => Promise<AccessSkillReading>;
 }>;
 
 export type ThreadlessFirstMailResult =
@@ -72,10 +71,6 @@ export function threadlessFirstMailContext(source: ThreadlessTicketSource, obser
     thread: [], threadOmitted: 0, crm: null, missing: [],
   };
 }
-
-/** SAV-97's input for the ticket: one Access request, the ticket's whole subject and description (never a note). */
-export const threadlessAccessSkillInput = (source: ThreadlessTicketSource, requestId: string): AccessSkillInput =>
-  ({ purpose: "first_mail", subject: source.subject, text: threadlessTicketPlainDescription(source), originalRequest: null, requests: [{ requestId, kind: "support", words: null }] });
 
 /** Hands the whole ticket to the team (same transition as the B entry's wait), nothing for the customer. Idempotent on the command key. */
 async function handToTeam(caseId: string, reason: string) {
@@ -102,7 +97,8 @@ export async function composeThreadlessFirstMail(caseId: string, deps: Threadles
     await handToTeam(caseId, "sensitive_request");
     return { status: "team", reason: "kernel_phrase" };
   }
-  const reading = await deps.accessSkill({ messageId: `hubspot-ticket-${source.ticketId}`, input: threadlessAccessSkillInput(source, request.id) })
+  if (request.id !== threadlessRequestId(source)) return { status: "fallback", reason: "request_unproven" };
+  const reading = await deps.accessSkill(source)
     .catch((): AccessSkillReading => ({ status: "unavailable", reason: "store_failed" }));
   if (reading.status !== "ready" || reading.verdict.outcome !== "admit" || reading.verdict.requests[request.id] !== "access") {
     const reason = reading.status !== "ready" ? `access_skill_${reading.reason}` : reading.verdict.outcome === "team" ? `access_skill_${reading.verdict.reasons[0]}` : "access_skill_not_access";

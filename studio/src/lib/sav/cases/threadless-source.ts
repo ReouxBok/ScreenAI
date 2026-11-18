@@ -14,6 +14,10 @@ import { savCaseSensitiveWording } from "./investigation-return-qualify";
 import { readSavV2QualificationScope } from "./qualification-scope";
 import { caseSensitiveFamiliesInText } from "./sensitive-words";
 import { savV2NewThreadEnabled } from "./threadless-config";
+import { readOrComputeAccessSkill, type AccessSkillDeps, type AccessSkillReading } from "./access-skill/access-skill-judge";
+import { SAV_ACCESS_SKILL_REVISION, SAV_ACCESS_SKILL_RULE_ID } from "./access-skill/access-skill-guidelines";
+import { readAccessSkillMode } from "./access-skill/access-skill-rule";
+import type { AccessSkillInput } from "./access-skill/access-skill-wire";
 
 type Env = Readonly<Record<string, string | undefined>>;
 export const SAV_THREADLESS_SOURCE_REVISION = "sav-hubspot-ticket-source.v1";
@@ -151,29 +155,63 @@ export type ThreadlessTicketQualification =
   | { status: "admitted"; admission: CaseAdmissionInput; request: CaseOpenedRequest }
   | { status: "out_of_scope" | "human_wait"; reason: string };
 
-/** A subject or contact alone never admits a case. Only the whole CRM description can match the approved Access rule. */
-export async function qualifyThreadlessTicket(source: ThreadlessTicketSource, env: Env, now = new Date()): Promise<ThreadlessTicketQualification> {
+/** SAV-96 B: the one request of a ticket case (`openCaseFromHubspotTicket`), and SAV-97's input for it: subject and whole description, never a note. */
+export const threadlessRequestId = (source: Pick<ThreadlessTicketSource, "ticketId">) => `hubspot-ticket:${source.ticketId}/access`;
+export const threadlessAccessSkillMessageId = (source: Pick<ThreadlessTicketSource, "ticketId">) => `hubspot-ticket-${source.ticketId}`;
+export const threadlessAccessSkillInput = (source: ThreadlessTicketSource): AccessSkillInput =>
+  ({ purpose: "first_mail", subject: source.subject, text: threadlessTicketPlainDescription(source), originalRequest: null, requests: [{ requestId: threadlessRequestId(source), kind: "support", words: null }] });
+
+/** SAV-97's reading of a ticket: the stored one, or computed once when `compute` (the entry only; every later check reads what was stored). */
+export function readThreadlessAccessSkill(source: ThreadlessTicketSource, env: Env, compute: boolean, deps: Partial<AccessSkillDeps> = {}): Promise<AccessSkillReading> {
+  return readOrComputeAccessSkill({ env: () => env, now: () => new Date(), ...deps },
+    { purpose: "first_mail", messageId: threadlessAccessSkillMessageId(source), input: threadlessAccessSkillInput(source), compute });
+}
+
+export type ThreadlessQualifyOptions = Readonly<{ accessSkillCompute?: boolean; accessSkillDeps?: Partial<AccessSkillDeps> }>;
+
+/**
+ * A subject or contact alone never admits a case. Only the whole CRM description can match the approved Access rule.
+ * SAV-96 B, `SAV_V2_ACCESS_SKILL=on`: like a mail (`v2-entry.ts` `accessSkillBlockEvidence`), the Access block is decided by SAV-97's skill on the ticket's
+ * subject and description (kernel, judge, counter-read), never by the detector's wording nor its lexical veto; only the skill's rule at THIS revision admits.
+ * Kept: the CRM billing and cancellation categories, the notes' alerts, the prompt-injection check, the identified contact and the approved policy.
+ */
+export async function qualifyThreadlessTicket(source: ThreadlessTicketSource, env: Env, now = new Date(), options: ThreadlessQualifyOptions = {}): Promise<ThreadlessTicketQualification> {
   if (readSavV2QualificationScope(env, now).mode !== "open") return { status: "out_of_scope", reason: "threadless_qualification_not_configured" };
   const description = threadlessTicketPlainDescription(source);
   const categories = source.categories.split(";").map(category => category.trim());
+  const skill = readAccessSkillMode(env) === "on";
   // Notes may alert the team about a sensitive case. Only the ticket's own description may admit it.
   if (categories.includes(SAV_HUBSPOT_SUPPORT.categories.billing) || categories.includes(SAV_HUBSPOT_SUPPORT.categories.cancellation)
-    || savCaseSensitiveWording(description, source.subject) || source.notes.some(note => caseSensitiveFamiliesInText(intakeHtmlToText(note.body)).length > 0))
+    || (!skill && savCaseSensitiveWording(description, source.subject)) || source.notes.some(note => caseSensitiveFamiliesInText(intakeHtmlToText(note.body)).length > 0))
     return { status: "human_wait", reason: "sensitive_request" };
   if (containsPromptInjection(`${source.subject}\n${description}`)) return { status: "human_wait", reason: "untrusted_source" };
   try {
     const rules = JSON.parse(env.SAV_V2_ADMISSION_RULES_JSON ?? "[]") as CaseEntryRule[];
-    const selected = selectCaseBlockRule(caseBlockCandidates(rules, SAV_CASE_BLOCK_REGISTRY), description, source.subject);
-    if (selected.reason !== "admitted") return { status: "out_of_scope", reason: selected.reason };
-    if (selected.block.blockId !== SAV_CASE_ACCESS_BLOCK_ID || selected.rule.family !== "access") return { status: "out_of_scope", reason: "not_access" };
-    if (!source.contact) return { status: "human_wait", reason: "identity_unconfirmed" };
+    let rule: CaseEntryRule;
+    if (skill) {
+      const own = rules.find(row => row?.ruleId === SAV_ACCESS_SKILL_RULE_ID && row.revision === SAV_ACCESS_SKILL_REVISION && row.family === "access" && row.v1Kind === "support"
+        && (row.blockId === undefined || row.blockId === SAV_CASE_ACCESS_BLOCK_ID));
+      if (!own) return { status: "out_of_scope", reason: "no_block_rule" };
+      if (!source.contact) return { status: "human_wait", reason: "identity_unconfirmed" };
+      const reading = await readThreadlessAccessSkill(source, env, options.accessSkillCompute === true, options.accessSkillDeps);
+      if (reading.status !== "ready") return { status: "human_wait", reason: `access_skill_${reading.reason}` };
+      if (reading.verdict.outcome !== "admit") return { status: "human_wait", reason: reading.verdict.reasons.includes("no_access_request") && reading.verdict.reasons.length === 1 ? "not_access" : "sensitive_request" };
+      if (reading.verdict.requests[threadlessRequestId(source)] !== "access") return { status: "out_of_scope", reason: "not_access" };
+      rule = own;
+    } else {
+      const selected = selectCaseBlockRule(caseBlockCandidates(rules.filter(row => row?.ruleId !== SAV_ACCESS_SKILL_RULE_ID), SAV_CASE_BLOCK_REGISTRY), description, source.subject);
+      if (selected.reason !== "admitted") return { status: "out_of_scope", reason: selected.reason };
+      if (selected.block.blockId !== SAV_CASE_ACCESS_BLOCK_ID || selected.rule.family !== "access") return { status: "out_of_scope", reason: "not_access" };
+      if (!source.contact) return { status: "human_wait", reason: "identity_unconfirmed" };
+      rule = selected.rule;
+    }
     const policy = await admissionPolicyPort({
       read: async () => JSON.parse(env.SAV_V2_ADMISSION_POLICY_JSON ?? "null") as AdmissionPolicyRecord | null,
       now: () => now,
     })();
-    const request = { id: `hubspot-ticket:${source.ticketId}/access`, summary: "Difficulté de connexion signalée dans HubSpot" };
+    const request = { id: threadlessRequestId(source), summary: "Difficulté de connexion signalée dans HubSpot" };
     const admission: CaseAdmissionInput = { policy, qualification: {
-      requests: [{ requestId: request.id, family: "access", provenance: caseBlockRuleProvenance(selected.rule) }],
+      requests: [{ requestId: request.id, family: "access", provenance: caseBlockRuleProvenance(rule) }],
       identity: { status: "confirmed", source: threadlessTicketSourceRef(source) }, crmContext: "complete", teamSignals: [],
     } };
     const decision = decideCaseAdmission({ ...admission, caseSensitivity: "none" });
