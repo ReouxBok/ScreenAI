@@ -8,8 +8,8 @@ import { bracesAdvisory, verifyBracesRemediation } from './verify-braces-remedia
 /**
  * Temporary, advisory-scoped exception: GHSA-fc5q-39xc-vjpf (picomatch ReDoS through
  * repeated extglobs in the PATTERN) has no patched release yet (<=4.0.7, updated 2026-11-17).
- * picomatch only reaches build, lint and test tooling here; no code path passes a customer- or
- * request-controlled glob pattern. Exact versions only, hard expiry, any other advisory still fails.
+ * picomatch is mostly reached through build, lint and test tooling (some copies sit under production
+ * dependencies); no repository code path passes a customer- or request-controlled glob pattern. Exact versions only, hard expiry, any other advisory still fails.
  */
 export const picomatchException = Object.freeze({
   url: 'https://github.com/advisories/GHSA-fc5q-39xc-vjpf',
