@@ -119,7 +119,8 @@ export async function proposeCaseReplyFromDraft(input: CaseReplyDraftInput, deps
   const proposal = input.validation === "automated" ? { ...draft, text: prepareCaseReplyText(draft.text, language.language, "automated", draft.purpose) } : finalizeCaseReplyProposal(draft, { language: language.language, validation: "human" });
   const submitted = await submitCaseReplyProposal(proposal, deps);
   if (!submitted.ok) return no(submitted.code, submitted.detail);
-  return { ok: true, validationId: submitted.id, created: submitted.created, state: submitted.state, payloadHash: caseReplyPayloadHash(proposal), caseVersion: proposal.caseVersion, recipient: proposal.recipient, language };
+  // SAV-94: a reply stored before the layout pass is the stored row as it is: its hash is returned, never the hash of a re-formatted text.
+  return { ok: true, validationId: submitted.id, created: submitted.created, state: submitted.state, payloadHash: submitted.storedPayloadHash ?? caseReplyPayloadHash(proposal), caseVersion: proposal.caseVersion, recipient: proposal.recipient, language };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------

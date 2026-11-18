@@ -1,4 +1,4 @@
-import { caseReplyEditableBody } from "./case-reply-outbound";
+import { caseReplyEditableBody, prepareCaseReplyText, readCaseReplyDisclosure } from "./case-reply-outbound";
 // SAV-10 (pole C): the DURABLE human validation of a prepared reply, and its idempotent hand-off to the executor's queue.
 //   submit  -> `proposed`   what the agent prepared, stored exactly as the person will read it (B produces the proposal, this stores it, it never sends it)
 //   decide  -> `approved` | `declined`   a person, authorized by an INJECTED port that refuses by default, for THIS payload, case version and recipient
@@ -101,7 +101,30 @@ function proposalProblem(proposal: CaseReplyProposal): string | null {
   } catch { return "invalid"; }
 }
 
-export type SubmitCaseReplyResult = Readonly<{ ok: true; id: string; created: boolean; state: CaseReplyValidationState }> | CaseReplyRefusal;
+export type SubmitCaseReplyResult = Readonly<{ ok: true; id: string; created: boolean; state: CaseReplyValidationState;
+  /** SAV-94: set only when the row found is one stored before the layout pass (its text kept as stored): the hash of THAT row, which the caller must use. */
+  storedPayloadHash?: string }> | CaseReplyRefusal;
+
+/**
+ * SAV-94: a proposal stored (and maybe approved, hashed, queued) BEFORE the layout pass, that the same decision prepared again now would only lay out
+ * (blank lines, "1)" -> "1.", Markdown markers). That row is the reply: its text is kept and sent exactly as stored, never re-formatted, so a resumed
+ * decision finds its approval instead of being refused as a second text (`trigger_already_approved`). Same trigger, same fields, same mention: only the
+ * layout of the stored text may differ. Approved rows first, like the exact lookup otherwise returns the one row with that hash.
+ */
+async function findCaseReplyStoredBeforeLayout(tx: Pick<ExecutionTx, "select">, replyKey: string, payloadHash: string) {
+  const t = savCaseReplyValidations;
+  const rows = await tx.select({ id: t.id, state: t.state, payloadHash: t.payloadHash, proposalCiphertext: t.proposalCiphertext }).from(t).where(eq(t.replyKey, replyKey));
+  for (const row of [...rows].sort((a, b) => Number(b.state === "approved") - Number(a.state === "approved"))) {
+    let stored: CaseReplyProposal;
+    try { stored = decryptSavPayload<CaseReplyProposal>(row.proposalCiphertext); } catch { continue; }
+    const disclosure = readCaseReplyDisclosure(stored.text);
+    if (!disclosure) continue;
+    let relaid: string;
+    try { relaid = prepareCaseReplyText(stored.text, disclosure.language, disclosure.mode, stored.purpose); } catch { continue; }
+    if (relaid !== stored.text && caseReplyPayloadHash({ ...stored, text: relaid }) === payloadHash) return row;
+  }
+  return null;
+}
 
 /**
  * Stores what the agent prepared. Idempotent on (trigger, payload): the same proposal is the same row. A new proposal for the case replaces the proposals
@@ -139,6 +162,9 @@ export async function submitCaseReplyProposal(requested: CaseReplyProposal, deps
     const replyKey = caseReplyKey(proposal.caseId, proposal.triggerEventId), payloadHash = caseReplyPayloadHash(proposal);
     const [existing] = await tx.select().from(savCaseReplyValidations).where(and(eq(savCaseReplyValidations.replyKey, replyKey), eq(savCaseReplyValidations.payloadHash, payloadHash)));
     if (existing) return { ok: true, id: existing.id, created: false, state: existing.state as CaseReplyValidationState };
+    // SAV-94: the same reply stored before the layout pass is found as it is (a Studio correction is a new text and keeps its own path).
+    const kept = options.supersedes ? null : await findCaseReplyStoredBeforeLayout(tx, replyKey, payloadHash);
+    if (kept) return { ok: true, id: kept.id, created: false, state: kept.state as CaseReplyValidationState, storedPayloadHash: kept.payloadHash };
     if (options.supersedes) {
       // Case first (above), validation second: the lock order of this file.
       const [prior] = await tx.select({ caseId: savCaseReplyValidations.caseId, replyKey: savCaseReplyValidations.replyKey, payloadHash: savCaseReplyValidations.payloadHash, state: savCaseReplyValidations.state })
