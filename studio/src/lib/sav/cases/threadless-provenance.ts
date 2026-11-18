@@ -3,17 +3,33 @@ import { requireDb } from "@/db";
 import { caseEffectHash, type CaseReplyProposal } from "./case-effects";
 import { finalizeCaseReplyProposal } from "./case-reply-outbound";
 import { readCaseThreadlessSource } from "./case-store";
-import { savV2NewThreadEnabled, THREADLESS_ACCESS_DRAFT, threadlessReplyShape, threadlessReplySubject } from "./threadless-config";
+import { readPilotReplyProvenance, type PilotProvenanceDeps } from "./pilot-passage-provenance";
+import { savV2NewThreadAutoEnabled, savV2NewThreadEnabled, THREADLESS_ACCESS_DRAFT, threadlessReplyShape, threadlessReplySubject } from "./threadless-config";
 import { threadlessAccessRevision } from "./threadless-guard";
 import { qualifyThreadlessTicket } from "./threadless-source";
 
-/** The fixed first-contact draft has no model, source quotation or diagnostic claim. Only Studio corrections may depart from its text. */
-export async function readThreadlessReplyProvenance(proposal: CaseReplyProposal, env: Record<string, string | undefined>, humanCorrection: boolean) {
+/** The input key of a first mail: the ticket's own stored event (`investigation-runner.ts` `threadlessInput`). */
+export const threadlessInputKey = (eventId: string) => `ticket:${eventId}`;
+
+/**
+ * The fixed first-contact draft has no model, source quotation or diagnostic claim. Only Studio corrections may depart from its text.
+ * SAV-96 B: with `SAV_V2_NEW_THREAD_AUTO=on`, a text the V2 decision model wrote is proven like any pilot reply (`readPilotReplyProvenance`): the
+ * decision recorded on the ticket's input, its text, the scope in force and every shown source active now. Returns null when proven.
+ */
+export async function readThreadlessReplyProvenance(proposal: CaseReplyProposal, env: Record<string, string | undefined>, humanCorrection: boolean,
+  deps?: PilotProvenanceDeps) {
   if (!savV2NewThreadEnabled(env) || !threadlessReplyShape(proposal)) return "threadless_off_or_invalid";
   const row = await readCaseThreadlessSource(requireDb(), proposal.caseId, proposal.triggerEventId);
   if (!row?.source.contact || row.source.contact.email !== proposal.recipient || proposal.subject !== threadlessReplySubject(row.source.ticketId)
       || caseEffectHash(row.source) !== proposal.ticketSource?.version) return "threadless_source_changed";
   if ((await qualifyThreadlessTicket(row.source, env)).status !== "admitted" || !await threadlessAccessRevision(env)) return "threadless_access_unproven";
   const template = finalizeCaseReplyProposal({ ...proposal, text: THREADLESS_ACCESS_DRAFT }, { language: "fr", validation: "human" });
-  return humanCorrection || template.text === proposal.text ? null : "threadless_draft_changed";
+  if (template.text === proposal.text) return null;
+  if (savV2NewThreadAutoEnabled(env) && deps) {
+    // `reminderInputKey` names the input whose recorded decision is read: here the ticket's event, never a customer mail.
+    const read = await readPilotReplyProvenance(proposal, deps, { humanCorrection, reminderInputKey: threadlessInputKey(row.eventId) });
+    if (read.status === "proven") return null;
+    return humanCorrection ? null : `threadless_reply_unproven:${[...read.reasons].sort().join(",")}`;
+  }
+  return humanCorrection ? null : "threadless_draft_changed";
 }

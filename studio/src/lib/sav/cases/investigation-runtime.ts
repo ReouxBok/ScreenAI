@@ -42,6 +42,8 @@ export type CaseInvestigationRuntimeDeps = {
   /** SAV-92: optional; absent, the model sees no customer context and the search uses V1's subjects only (as before). */
   customerContext?: CaseInvestigationPorts["customerContext"];
   revisions?: CaseInvestigationPorts["revisions"];
+  /** SAV-96 B: the ticket input of a case with no thread (first mail only); absent, the customer-mail input as before. */
+  threadlessInput?: CaseInvestigationPorts["threadlessInput"];
   ledger?: CaseCallLedgerPort;
   knowledge: { vectors?: CaseKnowledgeVectorSearch; embed?: CaseEmbeddingTransport; spend?: CaseEmbeddingSpendPort };
   model: { preflight?: CaseCallLedgerAdapterOptions["preflight"]; provider?: CaseCallLedgerAdapterOptions["provider"]; money?: CaseCallLedgerAdapterOptions["money"]; releaseMoney?: CaseCallLedgerAdapterOptions["releaseMoney"] };
@@ -78,6 +80,7 @@ export async function runCaseInvestigationRuntime(caseId: string, deps: CaseInve
   return runCaseInvestigation(caseId, "observe", { ...ports, accessScope: deps.accessScope ?? (async () => null),
     ...(deps.temporaryIncidents ? { temporaryIncidents: deps.temporaryIncidents } : {}),
     ...(deps.customerContext ? { customerContext: deps.customerContext } : {}),
+    ...(deps.threadlessInput ? { threadlessInput: deps.threadlessInput } : {}),
     // Scope-first knowledge (11/11): the exact-version read of the block's scope sources, and the transport's own preflight to fit the input.
     ...(readExact ? { readScopeCards: readExact } : {}), ...(deps.model.preflight ? { preflight: deps.model.preflight } : {}) });
 }

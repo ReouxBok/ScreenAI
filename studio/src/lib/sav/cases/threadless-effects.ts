@@ -15,6 +15,7 @@ import { savCaseReplyValidations } from "./case-reply-validation-table";
 import { savV2NewThreadEnabled, THREADLESS_ADMIT_PERMISSION, THREADLESS_CRM_PERMISSION, THREADLESS_SEND_PERMISSION } from "./threadless-config";
 import { readThreadlessAuthority, threadlessAccessRevision, threadlessActionAllowed, threadlessAuthorityStillGranted, threadlessSchemaInstalled } from "./threadless-guard";
 import { qualifyThreadlessTicket, readThreadlessTicket } from "./threadless-source";
+import { threadlessAutoSendProblem } from "./first-mail/first-mail-authority";
 import { buildNewThreadSendIntent, THREADLESS_MAILBOX, type createThreadlessTransport, type NewThreadAck, type NewThreadReceipt, type NewThreadSendIntent, type ThreadlessCrmAck } from "./threadless-transport";
 import type { CaseRuntimeDeps } from "./case-runtime-effects";
 
@@ -224,8 +225,11 @@ async function passOne(parent: Parent, deps: PassDeps) {
       const facts = await readCaseReplyFacts(tx, proposal, accessRevision, { lockCase: true });
       if (!facts.admission.admitted || facts.storedSender !== proposal.recipient || await hasLocalThreadForTicket(input.source.ticketId, tx)) return null;
       const [approval] = await tx.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, validationId)).for("share");
+      // SAV-96 B: an automated first mail is sent only while every right it was approved under still holds, read now under the same locks.
+      const automated = caseReplyModeForBasis(approval?.authorizationBasis) === "automated";
       if (approval?.state !== "approved" || approval.executionId !== parent.id || !approval.decidedAt || !approval.decidedBy
-          || caseReplyModeForBasis(approval.authorizationBasis) !== "manual_reviewed"
+          || (automated ? await threadlessAutoSendProblem(tx, deps.env(), { proposal, decidedBy: approval.decidedBy, admissionRecord: facts.admissionRecord }) !== null
+            : caseReplyModeForBasis(approval.authorizationBasis) !== "manual_reviewed")
           || caseReplyTextProblemForBasis(proposal.text, approval.authorizationBasis)
           || checkCaseReplyApproval(proposal, { payloadHash: approval.payloadHash, caseVersion: approval.caseVersion, recipient: approval.recipient,
             approvedBy: approval.decidedBy, approvedAt: approval.decidedAt.toISOString() }) !== "ok") return null;
