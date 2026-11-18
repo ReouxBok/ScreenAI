@@ -12,7 +12,9 @@ const facts = (over: Partial<AckClosureFacts> = {}): AckClosureFacts => ({ v1Ack
 
 function memoryStore() {
   const rows: Array<{ messageId: string; step: AckClosureStep; metadata: Record<string, unknown> }> = [];
+  const leased = new Set<string>();
   const store: AckClosureStore = {
+    lease: async id => { if (leased.has(id)) return null; leased.add(id); return async () => { leased.delete(id); }; },
     steps: async id => rows.filter(r => r.messageId === id).map(r => r.step),
     record: async (id, step, metadata) => { if (rows.some(r => r.messageId === id && r.step === step)) return false; rows.push({ messageId: id, step, metadata }); return true; },
   };
@@ -110,7 +112,7 @@ describe("a confident close", () => {
     const shared = deps();
     const [a, b] = await Promise.all([closeAcknowledgedTicket(MID, shared.value), closeAcknowledgedTicket(MID, shared.value)]);
     expect(shared.hub.calls.filter(c => c.method === "POST")).toHaveLength(1);
-    expect([a, b]).toContainEqual({ skipped: "note_in_progress" });
+    expect([a, b]).toContainEqual({ skipped: "busy" });
   });
   it("a crash after the stage resumes with the note only (no second stage write)", async () => {
     const mem = memoryStore();
@@ -176,7 +178,7 @@ describe("no close", () => {
     await mem.store.record(MID, "claimed", {}); await mem.store.record(MID, "stage_confirmed", {});
     const { value, hub } = deps({ mem, facts: facts({ newerMessage: true }) });
     expect(await closeAcknowledgedTicket(MID, value)).toEqual({ final: "uncertain", reason: "newer_message" });
-    expect(hub.calls).toEqual([]);
+    expect(hub.writes()).toEqual([]);
   });
 });
 
@@ -222,8 +224,8 @@ describe("review Astra (8c2891d)", () => {
     await mem.store.record(MID, "claimed", {}); await mem.store.record(MID, "stage_dispatched", {});
     const { value, hub } = deps({ mem, hub: fakeHubspot({ stage: "4" }), facts: facts({ newerMessage: true }) });
     expect(await closeAcknowledgedTicket(MID, value)).toEqual({ final: "uncertain", reason: "newer_message" });
-    expect(hub.calls).toEqual([]);
-    expect(mem.rows.at(-1)!.metadata).toMatchObject({ stageMayBeClosed: true });
+    expect(hub.writes()).toEqual([]);
+    expect(mem.rows.at(-1)!.metadata).toMatchObject({ stageMayBeClosed: true, stageObserved: "4", ticketId: TICKET });
   });
   it("finding 3: a ticket closed after our dispatched PATCH is ours, never « already closed »", async () => {
     const mem = memoryStore();
@@ -239,5 +241,34 @@ describe("review Astra (8c2891d)", () => {
     expect(await closeAcknowledgedTicket(MID, value)).toEqual({ retry: "ticket_unreadable" });
     expect(hub.writes()).toEqual([]);
     expect(mem.rows.map(r => r.step)).toEqual(["claimed", "stage_dispatched"]);
+  });
+});
+
+describe("review Astra (c4316e8)", () => {
+  it("a pass that cannot take the lease does nothing at all (no receipt read, no call)", async () => {
+    const mem = memoryStore();
+    const release = await mem.store.lease(MID);
+    const { value, hub } = deps({ mem });
+    expect(await closeAcknowledgedTicket(MID, value)).toEqual({ skipped: "busy" });
+    expect(hub.calls).toEqual([]); expect(mem.rows).toEqual([]);
+    await release!();
+    expect(await closeAcknowledgedTicket(MID, value)).toMatchObject({ final: "confirmed" });
+  });
+  it("a ticket found closed while another pass's dispatch is recorded is never « already closed »", async () => {
+    const mem = memoryStore();
+    const hub = fakeHubspot({ stage: "4" });
+    // Another pass (lease expired) records its dispatch between this pass's receipt read and its ticket read.
+    const store: AckClosureStore = { ...mem.store, steps: async id => { const seen = await mem.store.steps(id); await mem.store.record(id, "stage_dispatched", {}); return seen; } };
+    let first = true;
+    const { value } = deps({ mem, hub, store: { ...store, steps: async id => first ? (first = false, store.steps(id)) : mem.store.steps(id) } });
+    const result = await closeAcknowledgedTicket(MID, value);
+    expect(result).not.toMatchObject({ final: "already_closed" });
+    expect(mem.rows.map(r => r.step)).not.toContain("already_closed");
+  });
+  it("facts unreadable after our dispatch: explicit uncertainty, never a silent skip", async () => {
+    const mem = memoryStore();
+    await mem.store.record(MID, "claimed", {}); await mem.store.record(MID, "stage_dispatched", {});
+    const { value } = deps({ mem, facts: null });
+    expect(await closeAcknowledgedTicket(MID, value)).toEqual({ final: "uncertain", reason: "facts_missing" });
   });
 });

@@ -9,13 +9,14 @@ vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATAB
 import { encryptSavPayload } from "../crypto";
 import { ackClosureAuditStore, readAckClosureFacts, reconcileAckClosures } from "./ack-closure-store";
 import { closeAcknowledgedTicket, type AckClosureDeps } from "./ack-closure";
+import { and, eq } from "drizzle-orm";
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string;
 beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 60_000);
 afterAll(async () => { await f?.client.close(); });
 beforeEach(async () => {
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "synthetic-ack-closure-encryption-key-000");
-  await f.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.cases CASCADE; TRUNCATE public.audit_logs");
+  await f.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.cases CASCADE; TRUNCATE public.audit_logs; DELETE FROM sav.sync_state WHERE key LIKE 'sav-ack-close:%'");
   const [mailbox] = await f.db.insert(savMailboxes).values({ email: "support@example.invalid" }).returning(); mailboxId = mailbox.id;
 });
 afterEach(() => vi.unstubAllEnvs());
@@ -131,4 +132,73 @@ it("end to end on the real receipts: one close, then nothing on retry", async ()
   expect(await closeAcknowledgedTicket(mail.id, deps)).toEqual({ skipped: "already_done" });
   expect(writes).toEqual(["stage", "note"]);
   expect(await ackClosureAuditStore.steps(mail.id)).toEqual(["claimed", "stage_dispatched", "stage_confirmed", "note_dispatched", "confirmed"]);
+});
+
+// Review Astra (c4316e8): both resume scenarios THROUGH the recovery sweep, real receipts and lease, HubSpot faked behind the port.
+describe("review Astra (c4316e8): resume through the sweep", () => {
+  function hubspot(options: { failedReadsAfterPatch?: number } = {}) {
+    const state = { stage: "2", patches: 0, notes: 0, failing: 0 };
+    const port: AckClosureDeps["hubspot"] = {
+      readTicket: async () => { if (state.failing > 0) { state.failing--; throw Error("SAV_SYNTHETIC_READ_FAILED"); } return { pipeline: "0", stage: state.stage }; },
+      setClosed: async () => { state.patches++; state.stage = "4"; state.failing = options.failedReadsAfterPatch ?? 0; return "applied"; },
+      createNote: async () => { state.notes++; return String(500 + state.notes); },
+      readNote: async id => ({ body: "<p>Fermé : le client a confirmé la résolution (accusé)</p>", ticketIds: [id && "8101"] }),
+    };
+    return { state, port };
+  }
+  async function scene() {
+    const th = await thread("8101");
+    const ours = await message(th.id, "outbound", "C'est corrigé.", t(60));
+    const mail = await message(th.id, "inbound", "Ok merci", t(30));
+    await f.db.insert(savIntakeConsole).values({ threadId: th.id, messageId: mail.id, mailboxId, view: "completed", status: "acknowledgement_only", epoch: 1, projectedEpoch: 1 });
+    return { th, ours, mail };
+  }
+  const sweepDeps = (ours: { id: string }, hub: AckClosureDeps["hubspot"]): AckClosureDeps => ({ env: () => ({ SAV_ACK_CLOSE: "on" }), authority: async () => {}, store: ackClosureAuditStore, hubspot: hub,
+    // V1's acknowledgement and the model's close are stubbed (they need a full V1 run); every thread and ticket fact is the stored one.
+    readFacts: async id => { const real = await readAckClosureFacts(id); return real && { ...real, v1Acknowledgement: true, model: { decision: "close", confidence: "high",
+      lastOutboundMessageId: ours.id, lastOutboundState: "conclusive", customerMessage: "pure_ack", justification: "Réponse conclusive.", evidenceQuote: "C'est corrigé." } }; } });
+  const actions = async (id: string) => (await f.db.select({ action: auditLogs.action }).from(auditLogs).where(eq(auditLogs.entityId, id))).map(r => r.action).sort();
+
+  it("PATCH ok + read-back failed, then a new inbound on the thread: the sweep still resumes it to an explicit uncertainty (stage seen closed, no note)", async () => {
+    const { th, ours, mail } = await scene();
+    const hub = hubspot({ failedReadsAfterPatch: 1 }), deps = sweepDeps(ours, hub.port);
+    expect(await reconcileAckClosures(3, Date.now() + 60_000, deps)).toMatchObject({ candidates: 1, resumes: 0, results: [{ messageId: mail.id, result: { retry: "stage_unconfirmed" } }] });
+    await message(th.id, "inbound", "Encore une chose", t(5));
+    expect(await reconcileAckClosures(3, Date.now() + 60_000, deps)).toMatchObject({ candidates: 1, resumes: 1, results: [{ messageId: mail.id, result: { final: "uncertain", reason: "newer_message" } }] });
+    const [row] = await f.db.select().from(auditLogs).where(and(eq(auditLogs.entityId, mail.id), eq(auditLogs.action, "sav_ack_close_uncertain")));
+    expect(row!.technicalMetadata).toMatchObject({ stageMayBeClosed: true, stageObserved: "4", ticketId: "8101" });
+    expect(hub.state).toMatchObject({ stage: "4", patches: 1, notes: 0 });
+    expect(await reconcileAckClosures(3, Date.now() + 60_000, deps)).toMatchObject({ candidates: 0 });
+  });
+  it("PATCH ok + read-back failed, nothing new: the sweep resumes it and posts the note exactly once", async () => {
+    const { ours, mail } = await scene();
+    const hub = hubspot({ failedReadsAfterPatch: 1 }), deps = sweepDeps(ours, hub.port);
+    await reconcileAckClosures(3, Date.now() + 60_000, deps);
+    expect(await reconcileAckClosures(3, Date.now() + 60_000, deps)).toMatchObject({ resumes: 1, results: [{ result: { final: "confirmed" } }] });
+    expect(hub.state).toMatchObject({ stage: "4", patches: 1, notes: 1 });
+    expect(await actions(mail.id)).toEqual(["sav_ack_close_claimed", "sav_ack_close_confirmed", "sav_ack_close_note_dispatched", "sav_ack_close_stage_confirmed", "sav_ack_close_stage_dispatched"]);
+  });
+  it("two concurrent sweeps, the first fails before the note: no false « already closed », the resume posts the note once", async () => {
+    const { ours, mail } = await scene();
+    const hub = hubspot({ failedReadsAfterPatch: 1 }), deps = sweepDeps(ours, hub.port);
+    const passes = await Promise.all([reconcileAckClosures(3, Date.now() + 60_000, deps), reconcileAckClosures(3, Date.now() + 60_000, deps)]);
+    const results = passes.flatMap(p => (p as { results: Array<{ result: unknown }> }).results.map(r => r.result));
+    expect(results).toContainEqual({ retry: "stage_unconfirmed" });
+    // The race is real: both sweeps picked the same ack; the lease let only one of them act.
+    expect(results).toContainEqual({ skipped: "busy" });
+    expect(results.every(r => JSON.stringify(r) !== JSON.stringify({ final: "already_closed" }))).toBe(true);
+    expect(await actions(mail.id)).not.toContain("sav_ack_close_already_closed");
+    expect(await reconcileAckClosures(3, Date.now() + 60_000, deps)).toMatchObject({ resumes: 1, results: [{ result: { final: "confirmed" } }] });
+    expect(hub.state).toMatchObject({ stage: "4", patches: 1, notes: 1 });
+    expect(await reconcileAckClosures(3, Date.now() + 60_000, deps)).toMatchObject({ candidates: 0 });
+  });
+  it("the lease is exclusive and released", async () => {
+    const id = randomUUID();
+    const release = await ackClosureAuditStore.lease(id);
+    expect(release).not.toBeNull();
+    expect(await ackClosureAuditStore.lease(id)).toBeNull();
+    await release!();
+    const again = await ackClosureAuditStore.lease(id);
+    expect(again).not.toBeNull(); await again!();
+  });
 });

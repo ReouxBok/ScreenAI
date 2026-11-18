@@ -4,7 +4,8 @@
 import "server-only";
 import { and, asc, desc, eq, gt, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { auditLogs, savCases, savIntakeRuns, savMessages, savThreads } from "@/db/schema";
+import { randomUUID } from "node:crypto";
+import { auditLogs, savCases, savIntakeRuns, savMessages, savSyncState, savThreads } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { savEffectiveReceivedAt, savEffectiveReceivedAtOfRow } from "../message-order";
 import { closeAcknowledgedTicket, createAckClosureHubspot, ACK_CLOSURE_FINAL_STEPS, type AckClosureDeps, type AckClosureStep, type AckClosureStore } from "./ack-closure";
@@ -35,7 +36,20 @@ export const ackClosureAuditStore: AckClosureStore = {
       return true;
     });
   },
+  // A lease row in sav.sync_state (no migration): taken when free, released, or older than LEASE_SECONDS (a crashed pass). The longest pass is
+  // bounded by its HubSpot timeouts (six calls of at most 10 s), well inside the lease.
+  async lease(messageId) {
+    const key = `sav-ack-close:${messageId}`, token = randomUUID();
+    const taken = await requireDb().execute(sql`insert into sav.sync_state (key, cursor, status, started_at, updated_at) values (${key}, ${token}, 'leased', now(), now())
+      on conflict (key) do update set cursor = excluded.cursor, status = 'leased', started_at = now(), updated_at = now()
+      where sav.sync_state.status <> 'leased' or sav.sync_state.started_at < now() - make_interval(secs => ${LEASE_SECONDS})
+      returning cursor`);
+    const rows = (Array.isArray(taken) ? taken : (taken as { rows?: unknown[] }).rows ?? []) as Array<{ cursor?: unknown }>;
+    if (rows[0]?.cursor !== token) return null;
+    return async () => { await requireDb().update(savSyncState).set({ status: "idle", updatedAt: new Date() }).where(and(eq(savSyncState.key, key), eq(savSyncState.cursor, token))); };
+  },
 };
+const LEASE_SECONDS = 120;
 
 /** V1's execution authority, with the closure right, and the agent not paused. */
 export async function ackClosureAuthority(env: Record<string, string | undefined>) {
@@ -111,21 +125,31 @@ export async function syncAckClosure(messageId: string, deps?: AckClosureDeps) {
   }
 }
 
-/** Recovery: acknowledgements of the last 72 hours, newest first, still the latest message of their thread, with a ticket and no final receipt. Bounded. */
-export async function reconcileAckClosures(limit = 3, deadlineMs = Date.now() + 20_000) {
-  if (!savAckClosureEnabled(process.env)) return { skipped: "off" };
-  const finals = ACK_CLOSURE_FINAL_STEPS.map(step => actionOf(step));
-  const rows = await requireDb().select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.direction, "inbound"),
+/**
+ * Recovery, bounded. FIRST every message whose stage write was dispatched and that has no final receipt, whatever happened since (a newer mail, an
+ * older date, a changed projection): it is always resumed to a note posted once or an explicit `uncertain` (review Astra, c4316e8, finding 1). THEN
+ * new acknowledgements of the last 72 hours, still the latest message of their thread, with a ticket and no receipt that ends them; the « newer mail »
+ * exclusion applies only before a dispatch.
+ */
+export async function reconcileAckClosures(limit = 3, deadlineMs = Date.now() + 20_000, deps?: AckClosureDeps) {
+  if (!savAckClosureEnabled(deps?.env() ?? process.env)) return { skipped: "off" };
+  const db = requireDb(), bound = Math.max(1, Math.min(10, limit));
+  const finals = sql.join(ACK_CLOSURE_FINAL_STEPS.map(step => sql`${actionOf(step)}`), sql`, `);
+  const noFinal = sql`not exists(select 1 from public.audit_logs a where a.entity_type=${ENTITY} and a.entity_id=${savMessages.id}::text and a.actor_email=${ACTOR} and a.action in (${finals}))`;
+  const resumes = await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.direction, "inbound"),
+    sql`exists(select 1 from public.audit_logs a where a.entity_type=${ENTITY} and a.entity_id=${savMessages.id}::text and a.actor_email=${ACTOR} and a.action=${actionOf("stage_dispatched")})`,
+    noFinal)).orderBy(asc(savEffectiveReceivedAt), asc(savMessages.id)).limit(bound);
+  const fresh = resumes.length >= bound ? [] : await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.direction, "inbound"),
     gt(savMessages.receivedAt, new Date(Date.now() - 72 * 3_600_000)),
     sql`exists(select 1 from sav.threads t where t.id=${savMessages.threadId} and t.hubspot_ticket_id is not null)`,
     sql`exists(select 1 from sav.intake_console c where c.message_id=${savMessages.id} and c.epoch=c.projected_epoch and c.status='acknowledgement_only' and c.view='completed')`,
     sql`not exists(select 1 from sav.messages m where m.thread_id=${savMessages.threadId} and m.id<>${savMessages.id} and least(m.received_at,m.created_at)>=least(${savMessages.receivedAt},${savMessages.createdAt}))`,
-    sql`not exists(select 1 from public.audit_logs a where a.entity_type=${ENTITY} and a.entity_id=${savMessages.id}::text and a.actor_email=${ACTOR} and a.action in (${sql.join(finals.map(a => sql`${a}`), sql`, `)}))`,
-  )).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.id)).limit(Math.max(1, Math.min(10, limit)));
+    noFinal)).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.id)).limit(bound - resumes.length);
+  const rows = [...resumes, ...fresh.filter(row => !resumes.some(r => r.id === row.id))];
   const results: Array<{ messageId: string; result: unknown }> = [];
   for (const row of rows) {
     if (Date.now() + 2000 >= deadlineMs) break;
-    results.push({ messageId: row.id, result: await syncAckClosure(row.id) });
+    results.push({ messageId: row.id, result: await syncAckClosure(row.id, deps) });
   }
-  return { candidates: rows.length, results };
+  return { candidates: rows.length, resumes: resumes.length, results };
 }

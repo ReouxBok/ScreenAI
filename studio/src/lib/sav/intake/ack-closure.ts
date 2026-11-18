@@ -20,6 +20,9 @@ export type AckClosureStore = Readonly<{
   steps(messageId: string): Promise<AckClosureStep[]>;
   /** Records the step once: true when this call recorded it, false when it already existed (atomic per message and step). */
   record(messageId: string, step: AckClosureStep, metadata: AckClosureMetadata): Promise<boolean>;
+  /** Review Astra (c4316e8, finding 2): ONE pass owns a message from reading its receipts to its note. Null: another pass holds it. The returned
+   * function releases it. A lease outlives a crashed pass only for its bounded duration. */
+  lease(messageId: string): Promise<(() => Promise<void>) | null>;
 }>;
 export type AckClosureTicket = Readonly<{ pipeline: string | null; stage: string | null }>;
 export type AckClosureHubspot = Readonly<{
@@ -41,7 +44,7 @@ export type AckClosureDeps = Readonly<{
   signal?: AbortSignal;
 }>;
 export type AckClosureResult =
-  | Readonly<{ skipped: "off" | "authority" | "already_done" | "facts_missing" | "note_in_progress" | "not_acknowledgement"; detail?: string }>
+  | Readonly<{ skipped: "off" | "authority" | "already_done" | "facts_missing" | "note_in_progress" | "not_acknowledgement" | "busy"; detail?: string }>
   | Readonly<{ retry: "ticket_unreadable" | "stage_unconfirmed" | "authority_changed" }>
   | Readonly<{ final: Exclude<AckClosureStep, "claimed" | "stage_confirmed" | "note_dispatched">; reason?: string; basis?: AckClosureBasis; noteId?: string }>;
 
@@ -55,6 +58,13 @@ export async function closeAcknowledgedTicket(messageId: string, deps: AckClosur
   const signal = deps.signal ?? new AbortController().signal, now = deps.now ?? (() => new Date());
   if (!savAckClosureEnabled(deps.env())) return { skipped: "off" };
   try { await deps.authority(); } catch (error) { return { skipped: "authority", detail: codeOf(error) }; }
+  const release = await deps.store.lease(messageId);
+  if (!release) return { skipped: "busy" };
+  try { return await closeOwned(messageId, deps, signal, now); } finally { await release().catch(() => undefined); }
+}
+
+async function closeOwned(messageId: string, deps: AckClosureDeps, signal: AbortSignal, now: () => Date): Promise<AckClosureResult> {
+  // Read under the lease: no other pass can be between its receipts and its note.
   const steps = await deps.store.steps(messageId);
   if (steps.some(step => ACK_CLOSURE_FINAL_STEPS.includes(step))) return { skipped: "already_done" };
   const final = async (step: "confirmed" | "already_closed" | "not_applied" | "uncertain", metadata: AckClosureMetadata) => {
@@ -64,14 +74,20 @@ export async function closeAcknowledgedTicket(messageId: string, deps: AckClosur
   };
   // A note whose POST may have happened is never posted again: a person checks it.
   if (steps.includes("note_dispatched")) return final("uncertain", { reason: "note_outcome_unknown" });
+  const touched = steps.includes("stage_confirmed") || steps.includes("stage_dispatched");
   const facts = await deps.readFacts(messageId);
-  if (!facts) return { skipped: "facts_missing" };
+  // After our stage write was dispatched, nothing ends silently: a person sees the state (review Astra, c4316e8, finding 1).
+  if (!facts) return touched ? final("uncertain", { reason: "facts_missing", stageMayBeClosed: true }) : { skipped: "facts_missing" };
   const decision = decideAckClosure(facts);
   // The wake runs after every V1 mail: a mail V1 did not classify as an acknowledgement leaves no row at all.
   if (!decision.close && decision.reason === "v1_not_acknowledgement" && !steps.length) return { skipped: "not_acknowledgement" };
   // A refusal is final for this mail only when nothing was written yet; after a claim the stage may already be « Fermé » and stays for a person to see.
-  const touched = steps.includes("stage_confirmed") || steps.includes("stage_dispatched");
-  if (!decision.close) return final(touched ? "uncertain" : "not_applied", { reason: decision.reason, ...(touched ? { stageMayBeClosed: true } : {}) });
+  if (!decision.close) {
+    if (!touched) return final("not_applied", { reason: decision.reason });
+    // Resume after our dispatch refused (a newer mail, a V2 case...): the stage is read for the person who checks it; no note, no second write.
+    const seen = facts.ticketId ? await deps.hubspot.readTicket(facts.ticketId, signal).catch(() => null) : null;
+    return final("uncertain", { reason: decision.reason, stageMayBeClosed: true, stageObserved: seen?.stage ?? null, ...(facts.ticketId ? { ticketId: facts.ticketId } : {}) });
+  }
   const { ticketId, basis } = decision;
   await deps.store.record(messageId, "claimed", { revision: SAV_ACK_CLOSURE_REVISION, ticketId, basis });
 
@@ -84,7 +100,8 @@ export async function closeAcknowledgedTicket(messageId: string, deps: AckClosur
       return final(dispatchedBefore ? "uncertain" : "not_applied", { reason: "pipeline_not_support", ticketId, basis });
     if (ticket.stage === SAV_HUBSPOT_SUPPORT.stages.closed) {
       // Closed and we never wrote: closed by someone else, nothing to add. Closed after OUR dispatched PATCH: our close, the note follows.
-      if (!dispatchedBefore) return final("already_closed", { ticketId, basis });
+      // Receipts read again before concluding « someone else »: a dispatch recorded by another pass is ours (defence beside the lease).
+      if (!dispatchedBefore && !(await deps.store.steps(messageId)).includes("stage_dispatched")) return final("already_closed", { ticketId, basis });
       await deps.store.record(messageId, "stage_confirmed", { revision: SAV_ACK_CLOSURE_REVISION, ticketId, basis, stage: ticket.stage, resumed: true });
     } else {
       if (!ticket.stage || !OPEN_STAGES.has(ticket.stage)) return final(dispatchedBefore ? "uncertain" : "not_applied", { reason: "stage_unexpected", ticketId, basis });
