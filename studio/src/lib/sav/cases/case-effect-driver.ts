@@ -225,10 +225,9 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     // Under the same lock as the marker: the mention of the text must be the one the PERSISTED basis allows (a falsified or swapped basis, or a text under the wrong authority, never reaches a marker).
     if (phase === "reply" && check === "ok" && caseReplyTextProblemForBasis(proposal.text, approval?.basis)) return fault("CANCELLED_AI_NOTICE");
     // SAV-97: a case the Access skill admitted is answered only under the same switch, revision and pinned prompt; with the switch `on`, our own text never
-    // carries a kernel phrase. Read under the same case lock as the marker.
+    // carries a kernel phrase. On the admission the facts already read and decrypted under the same case lock (no extra read, in any mode).
     if (phase === "reply") {
-      const [row] = await tx.select({ admission: savCases.admissionCiphertext }).from(savCases).where(eq(savCases.id, proposal.caseId));
-      const skill = accessSkillSendProblem({ env: deps.env(), admission: row?.admission ? decryptSavPayload(row.admission) : null, text: proposal.text, purpose: proposal.purpose });
+      const skill = accessSkillSendProblem({ env: deps.env(), admission: facts.admissionRecord ?? null, text: proposal.text, purpose: proposal.purpose });
       if (skill) return fault(skill);
     }
     // A note describes an interaction that already happened: it is held by the mode, the pauses and the lease, not by what came after (but never by a LOCAL human).
