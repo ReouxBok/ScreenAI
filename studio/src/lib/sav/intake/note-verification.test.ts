@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
-import { createIntakeExecutorAdapters, renderIntakeNote } from "./execution-adapters";
+import { createIntakeExecutorAdapters, noteBodyText, renderIntakeNote, renderIntakeNoteHidden } from "./execution-adapters";
 import type { EffectAck, EffectIntent } from "./execution-types";
 
 const marker = "a".repeat(64), at = new Date("2026-01-01T12:00:00Z"), timestamp = at.toISOString();
@@ -109,4 +109,50 @@ it.each(["ticket", "id", "ack-id", "text", "timestamp", "missing-provenance", "w
     if (change === "missing-provenance") delete intent.confirmedNoteCreate;
     if (change === "wrong-create-id") intent.confirmedNoteCreate!.objectId = "902";
     expect(await f.adapter.verify(intent, { id: change === "ack-id" ? "902" : "901" }, at, signal())).toMatchObject(rejected);
+});
+
+// 18/11 (SAV-93): a V2 case note created ON its ticket; its proof is the creation ACK, the read-back ticket association and the normalized text.
+const caseText = "Le client signale un problème d'accès.\nJ'ai répondu.";
+function caseNote(): EffectIntent {
+    return { kind: "note_create", permission: "append_case_note" as EffectIntent["permission"], key: "note:case-1:reply-summary.inbound:gm-1", sourceMessageId: "synthetic-source", ticketId: "201",
+        text: caseText, marker, ticketAssociation: "at_create", properties: { hs_note_body: renderIntakeNoteHidden(caseText, marker), hs_timestamp: timestamp } };
+}
+it("SAV-93: noteBodyText reads the same text through HubSpot's rewritings, and not through a changed text", () => {
+    const sent = renderIntakeNoteHidden(caseText, marker);
+    for (const rewritten of [sent.replace(/<!--[\s\S]*?-->/, "") + "\n", sent.replaceAll("&#39;", "&#x27;"), sent.replaceAll("&#39;", "’"), sent.replace("<br>", "<br />"),
+        `<div>${sent.replace("è", "&egrave;").replace("<p>", "<p style=\"margin:0\">")}</div>`, sent.replace("<br>", "&nbsp;<br>\r\n")])
+        expect(noteBodyText(rewritten)).toBe(noteBodyText(sent));
+    expect(noteBodyText(sent)).toBe("Le client signale un problème d'accès. J'ai répondu.");
+    expect(noteBodyText(sent.replace("accès", "facturation"))).not.toBe(noteBodyText(sent));
+});
+it("SAV-93: dispatch creates the note with its ticket association in ONE call", async () => {
+    const intent = caseNote(), f = fixture(intent);
+    const ack = await f.adapter.dispatch(intent, signal());
+    expect(f.provider.calls.map(c => `${c.method} ${c.path}`)).toEqual(["POST /crm/v3/objects/notes"]);
+    expect(f.provider.calls[0]!.body).toMatchObject({ associations: [{ to: { id: "201" }, types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 228 }] }] });
+    expect(f.provider.links.get(`notes:${ack.id}:tickets`)).toEqual(["201"]);
+});
+it("SAV-93: a rewritten body with the creation ACK and the ticket association is proven; without the association, or without the ACK, it is not", async () => {
+    const intent = caseNote(), f = fixture(intent), row = f.provider.objects.notes["901"];
+    row.properties.hs_note_body = `<div>${intent.properties!.hs_note_body.replace(/<!--[\s\S]*?-->/, "").replaceAll("&#39;", "&#x27;")}</div>\n`;
+    expect(await f.adapter.verify(intent, { id: "901" }, at, signal())).toMatchObject(rejected);
+    f.provider.links.set("notes:901:tickets", ["202"]);
+    expect(await f.adapter.verify(intent, { id: "901" }, at, signal())).toMatchObject(rejected);
+    f.provider.links.set("notes:901:tickets", ["201"]);
+    expect(await f.adapter.verify(intent, { id: "901" }, at, signal())).toMatchObject({ confirmed: true, attributed: true, ack: { id: "901" } });
+    expect(await f.adapter.verify(intent, null, at, signal())).toMatchObject(rejected);
+    expect(await f.adapter.verify(intent, { id: "901", operatorCandidate: true }, at, signal())).toMatchObject(rejected);
+    row.properties.hs_timestamp = new Date(at.getTime() + 1).toISOString();
+    expect(await f.adapter.verify(intent, { id: "901" }, at, signal())).toMatchObject(rejected);
+});
+it("SAV-93: the association step of a note created on its ticket only re-reads it (no PUT); an older step without the flag keeps the PUT", async () => {
+    const created = caseNote(), f = fixture(created);
+    f.provider.links.set("notes:901:tickets", ["201"]);
+    const step: EffectIntent = { ...created, kind: "note_associate", key: "note-association:case-1:reply-summary.inbound:gm-1", objectId: "901",
+        expectedProperties: created.properties, confirmedNoteCreate: { effectId: "synthetic-confirmed-create", objectId: "901" } };
+    expect(await f.adapter.dispatch(step, signal())).toEqual({ id: "901" });
+    expect(f.provider.calls.filter(c => c.method !== "GET")).toEqual([]);
+    const { ticketAssociation: _old, ...older } = step;
+    await f.adapter.dispatch(older, signal());
+    expect(f.provider.calls.filter(c => c.method === "PUT")).toHaveLength(1);
 });

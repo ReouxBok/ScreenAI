@@ -347,10 +347,10 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     await localFenceAfterRead(lease);
   }
 
-  /** Only a confirmed stage execution proves the HubSpot move. Persist ONE wait in the journal:
-   * the next catch-up pass writes without a status if the stage is still undecided, even across
-   * process restarts or unrelated holds. The reply receipt is committed before this wait. */
-  async function durableReplyStage(lease: ExecutionLease, proposal: CaseEffectPayload["proposal"]): Promise<CaseReplySummaryStage> {
+  /** Only a confirmed stage execution proves the HubSpot move: its sentence is added when it is ALREADY confirmed, nothing otherwise.
+   * 18/11 (SAV-93, decision of Ugo): the note and the ticket status are independent, neither waits for the other. The note no longer waits a pass
+   * for the stage (the old `reply_note_stage_wait`): an undecided, failed or absent stage gives a note without a status sentence, written now. */
+  async function confirmedReplyStage(proposal: CaseEffectPayload["proposal"]): Promise<CaseReplySummaryStage> {
     let key: string;
     const replyKey = caseReplyKey(proposal.caseId, proposal.triggerEventId);
     let target: "closed" | "waiting_customer" = "waiting_customer";
@@ -360,22 +360,8 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
       if (closed) target = "closed";
     }
     try { key = caseTicketStageKey(proposal.caseId, target, replyKey); } catch { return null; }
-    const waiting = await requireDb().transaction(async tx => {
-      if (!await ownedExecution(tx, lease)) return fault("LEASE_LOST");
-      const [row] = await tx.select({ state: savCaseEffectExecutions.state }).from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.replyKey, key));
-      if (!row || row.state === "refused") return { stage: null };
-      if (row.state === "confirmed") return { stage: target };
-      const [waited] = await tx.select({ id: savIntakeEffectJournal.id }).from(savIntakeEffectJournal).where(and(
-        eq(savIntakeEffectJournal.executionId, lease.row.id), eq(savIntakeEffectJournal.kind, "reply_note_stage_wait"),
-      )).limit(1);
-      if (waited) return { stage: null };
-      await executionJournal(tx, lease.row.id, "reply_note_stage_wait", { stageKey: key });
-      return { wait: true };
-    });
-    // The receipt is already committed: reuse its pending-note reason so recovery does not
-    // consume the next pass merely recording that same receipt again.
-    if ("wait" in waiting) throw Error(CASE_RECOVERY_NOTE_PENDING);
-    return waiting.stage;
+    const [row] = await requireDb().select({ state: savCaseEffectExecutions.state }).from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.replyKey, key));
+    return row?.state === "confirmed" ? target : null;
   }
   async function skipNote(lease: ExecutionLease, reason: string) {
     await requireDb().transaction(async tx => {
@@ -449,7 +435,7 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
         }
         const [row] = await requireDb().select({ ticketId: savCases.ticketId }).from(savCases).where(eq(savCases.id, proposal.caseId));
         if (!row) return fault("CASE_MISSING");
-        const text = summary ? caseReplySummaryWithStage(note.text, await durableReplyStage(lease, proposal)) : note.text;
+        const text = summary ? caseReplySummaryWithStage(note.text, await confirmedReplyStage(proposal)) : note.text;
         return buildCaseNoteIntent({ caseId: proposal.caseId, interactionId: note.interactionId, ticketId: row.ticketId, sourceMessageId: proposal.inboundMessageId, text, at: note.at });
       }
       if (associated?.state === "confirmed") return null;
