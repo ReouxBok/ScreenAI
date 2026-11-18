@@ -101,3 +101,17 @@ export function decideAccessSkill(input: Readonly<{ texts: AccessSkillTexts; req
 export function accessSkillAdmissibleBeforeCounter(input: Readonly<{ texts: AccessSkillTexts; requestIds: readonly string[]; judge: AccessSkillCall | null }>): boolean {
   return decideAccessSkill({ ...input, counter: { status: "ok", output: { asksOrContestsSensitive: "no", families: [], quote: null, reason: "pre-check" } } }).outcome === "admit";
 }
+
+/**
+ * The readings of one mail, in the production order, with the calls injected (the V2 transport behind the spend gate in production; a scripted double in
+ * the evaluation harness): the kernel first (an excluded mail is never sent to a model, nothing is paid), then the judge, then the counter-read only when it
+ * can still change the verdict. The production judge (`access-skill-judge.ts`) and the evaluation run exactly this function.
+ */
+export async function runAccessSkillReadings(input: Readonly<{ texts: AccessSkillTexts; requestIds: readonly string[] }>, call: (kind: "judge" | "counter") => Promise<AccessSkillCall>):
+  Promise<{ judge: AccessSkillCall; counter: AccessSkillCall | null }> {
+  if (accessSkillKernelVerdict(input.texts)) return { judge: { status: "skipped", problem: "kernel_phrase" }, counter: null };
+  const judge = await call("judge");
+  const counter = judge.status === "ok" && accessSkillAdmissibleBeforeCounter({ ...input, judge }) && accessSkillCounterReadRequired(input.texts, input.requestIds, judge.output)
+    ? await call("counter") : null;
+  return { judge, counter };
+}

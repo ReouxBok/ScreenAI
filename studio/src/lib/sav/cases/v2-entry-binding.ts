@@ -48,7 +48,8 @@ export async function loadCaseContinuationPoint(options: CaseContinuationOptions
     const returnRule = configuredRule && typeof configuredRule.ruleId === "string" && typeof configuredRule.revision === "string"
       ? { ruleId: configuredRule.ruleId, revision: configuredRule.revision } : undefined;
     const binding = createCaseInvestigationToReplyPlan({
-      ...v2EntryPolicySources(env), env: source, readTicketOwner, store: { env: source, readTicketOwner },
+      // SAV-97: the re-evaluation reads the Access skill's stored reading of a relayed mail, it never pays for one (`never`).
+      ...v2EntryPolicySources(env, { accessSkillCompute: "never" }), env: source, readTicketOwner, store: { env: source, readTicketOwner },
       // SAV-80: the qualification scope read again before every new cost of this case (embedding, model call), not only at the entry.
       caseAllowed: async () => (await savV2QualificationCaseAllowed(env, caseId)).allowed,
       executionPolicy: { id: config.policyId, hash: config.policyHash }, ...(returnRule ? { returnRule } : {}),

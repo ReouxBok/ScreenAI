@@ -31,6 +31,7 @@ import {
   type CaseApprovalCheck, type CaseEffectLive, type CaseReplyApproval,
 } from "./case-effects";
 import { readCaseReplyFacts } from "./case-reply-facts";
+import { accessSkillSendProblem } from "./access-skill/access-skill-send-fence";
 import { caseReplyStoredTextProblem, caseReplyTextProblemForBasis } from "./case-reply-mode";
 import { judgeCurrentTicketOwner, readCaseTicketId, type CaseOwnerRefusal, type CaseTicketOwnerPort } from "./case-ticket-owner";
 import { findCaseReplySituationTakerForExecution } from "./case-reply-situation";
@@ -223,6 +224,13 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     const { check, approval } = await durableApproval(tx, lease, payload);
     // Under the same lock as the marker: the mention of the text must be the one the PERSISTED basis allows (a falsified or swapped basis, or a text under the wrong authority, never reaches a marker).
     if (phase === "reply" && check === "ok" && caseReplyTextProblemForBasis(proposal.text, approval?.basis)) return fault("CANCELLED_AI_NOTICE");
+    // SAV-97: a case the Access skill admitted is answered only under the same switch, revision and pinned prompt; with the switch `on`, our own text never
+    // carries a kernel phrase. Read under the same case lock as the marker.
+    if (phase === "reply") {
+      const [row] = await tx.select({ admission: savCases.admissionCiphertext }).from(savCases).where(eq(savCases.id, proposal.caseId));
+      const skill = accessSkillSendProblem({ env: deps.env(), admission: row?.admission ? decryptSavPayload(row.admission) : null, text: proposal.text, purpose: proposal.purpose });
+      if (skill) return fault(skill);
+    }
     // A note describes an interaction that already happened: it is held by the mode, the pauses and the lease, not by what came after (but never by a LOCAL human).
     const live: CaseEffectLive = {
       mode: readCaseEffectsMode(deps.env()).mode, pause: { intake: pauseLevel(pauses[0]), v2: pauseLevel(pauses[1]) }, leaseValid: true,
