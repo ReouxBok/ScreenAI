@@ -5,11 +5,28 @@ import { fileURLToPath } from 'node:url';
 
 import { bracesAdvisory, verifyBracesRemediation } from './verify-braces-remediation.mjs';
 
+/**
+ * Temporary, advisory-scoped exception: GHSA-fc5q-39xc-vjpf (picomatch ReDoS through
+ * repeated extglobs in the PATTERN) has no patched release yet (<=4.0.7, updated 2026-11-17).
+ * picomatch is mostly reached through build, lint and test tooling (some copies sit under production
+ * dependencies); no repository code path passes a customer- or request-controlled glob pattern. Exact versions only, hard expiry, any other advisory still fails.
+ */
+export const picomatchException = Object.freeze({
+  url: 'https://github.com/advisories/GHSA-fc5q-39xc-vjpf',
+  dependency: 'picomatch',
+  range: '<=4.0.7',
+  severity: 'high',
+  versions: Object.freeze(['2.3.2', '4.0.5', '4.0.7']),
+  reviewedAt: '2026-11-18T00:00:00Z',
+  expiresAt: '2026-12-01T00:00:00Z',
+  owner: 'Ugo Le Bras',
+});
+
 const severities = new Set(['info', 'low', 'moderate', 'high', 'critical']);
 const blocking = (severity) => severity === 'high' || severity === 'critical';
 
 /** Fail closed: a verified local remediation applies to an advisory, never an entire dependency tree. */
-export function evaluateAudit(report, lock, remediatedLocations = new Set()) {
+export function evaluateAudit(report, lock, remediatedLocations = new Set(), now = new Date()) {
   if (report?.error || report?.auditReportVersion !== 2 || !report.vulnerabilities
     || typeof report.vulnerabilities !== 'object' || Array.isArray(report.vulnerabilities)
     || !report.metadata?.vulnerabilities || !lock?.packages) {
@@ -37,6 +54,7 @@ export function evaluateAudit(report, lock, remediatedLocations = new Set()) {
   }
   const rejected = new Set();
   const remediated = new Set();
+  const excepted = new Set();
   const visit = (name, ancestry = new Set()) => {
     if (ancestry.has(name)) throw new Error(`Cyclic blocking audit chain: ${name}`);
     const node = nodes[name];
@@ -51,14 +69,21 @@ export function evaluateAudit(report, lock, remediatedLocations = new Set()) {
           && via.url === bracesAdvisory && via.severity === 'high'
           && node.severity === 'high' && via.range === '<=3.0.3'
           && node.nodes.every(location => lock.packages[location]?.version === '3.0.3' && remediatedLocations.has(location));
-        (corrected ? remediated : rejected).add(via.url);
+        const temporarilyExcepted = !corrected && name === picomatchException.dependency
+          && via.dependency === picomatchException.dependency && via.url === picomatchException.url
+          && via.severity === picomatchException.severity && node.severity === 'high'
+          && via.range === picomatchException.range
+          && node.nodes.every(location => picomatchException.versions.includes(lock.packages[location]?.version))
+          && Number.isFinite(now.getTime())
+          && now >= new Date(picomatchException.reviewedAt) && now < new Date(picomatchException.expiresAt);
+        (corrected ? remediated : temporarilyExcepted ? excepted : rejected).add(via.url);
       }
     }
     if (!found) throw new Error(`Blocking audit node has no blocking advisory: ${name}`);
     return found;
   };
   for (const [name, node] of Object.entries(nodes)) if (blocking(node.severity)) visit(name);
-  return { counts, remediated: [...remediated], rejected: [...rejected], ok: rejected.size === 0 };
+  return { counts, remediated: [...remediated], excepted: [...excepted], rejected: [...rejected], ok: rejected.size === 0 };
 }
 
 export function runAudit(prefix = '.') {
@@ -70,7 +95,7 @@ export function runAudit(prefix = '.') {
   const verified = verifyBracesRemediation(cwd, lock);
   const result = evaluateAudit(report, lock, verified);
   console.log(JSON.stringify({ scope: prefix, ...result }, null, 2));
-  console.log(JSON.stringify({ verifiedLocalBracesCopies: verified.size, temporaryExceptions: 0 }));
+  console.log(JSON.stringify({ verifiedLocalBracesCopies: verified.size, temporaryExceptions: result.excepted.length }));
   if (!result.ok) process.exitCode = 1;
   return result;
 }
