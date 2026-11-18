@@ -47,15 +47,12 @@ export function accessSkillKernelVerdict(texts: AccessSkillTexts): AccessSkillVe
   return kernel.length ? team(["kernel_phrase"], KERNEL_FAMILY[kernel[0]!] ?? null, kernel) : null;
 }
 
-/**
- * Whether the counter-read must answer « no » before an admission: ALWAYS. The model-double harness showed why (`access-skill-corpus.test.ts`): a judge
+/*
+ * The counter-read must answer « no » before ANY admission. The model-double harness showed why (`access-skill-corpus.test.ts`): a judge
  * that wrongly calls a sensitive mail Access with no context word in it (« passer à la version Pro », « transférer le compte à mon associé ») was admitted
  * when the counter-read depended on a word list. One more call per admissible mail buys an independent second reading of every admission.
- * The context words stay in the logs (`accessSkillContextHits`), never as a decider.
+ * The context words (`accessSkillContextHits`) decide nothing here any more.
  */
-export function accessSkillCounterReadRequired(_texts: AccessSkillTexts, _requestIds: readonly string[], _judgment: unknown): boolean {
-  return true;
-}
 
 /**
  * The verdict on the stored readings. `requestIds`: the requests the entry must decide (V1's requests, or a return's open requests), each exactly once.
@@ -113,7 +110,7 @@ export async function runAccessSkillReadings(input: Readonly<{ texts: AccessSkil
   Promise<{ judge: AccessSkillCall; counter: AccessSkillCall | null }> {
   if (accessSkillKernelVerdict(input.texts)) return { judge: { status: "skipped", problem: "kernel_phrase" }, counter: null };
   const judge = await call("judge");
-  const counter = judge.status === "ok" && accessSkillAdmissibleBeforeCounter({ ...input, judge }) && accessSkillCounterReadRequired(input.texts, input.requestIds, judge.output)
+  const counter = judge.status === "ok" && accessSkillAdmissibleBeforeCounter({ ...input, judge })
     ? await call("counter") : null;
   return { judge, counter };
 }

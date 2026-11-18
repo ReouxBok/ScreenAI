@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accessSkillAdmissibleBeforeCounter, accessSkillCounterReadRequired, decideAccessSkill, readAccessSkillMode, type AccessSkillCall, type AccessSkillTexts } from "./access-skill-rule";
+import { accessSkillAdmissibleBeforeCounter, decideAccessSkill, readAccessSkillMode, type AccessSkillCall, type AccessSkillTexts } from "./access-skill-rule";
 import { accessSkillSendProblem } from "./access-skill-send-fence";
 import { SAV_ACCESS_SKILL_REVISION } from "./access-skill-guidelines";
 
@@ -71,7 +71,6 @@ describe("contre-lecture : exigée par les mots de contexte, plusieurs demandes 
   const capcar = ok(judgment({ sensitive: "context_only", requests: [{ quote: "on me demande de choisir un abonnement" }],
     mentions: [{ quote: "mandat de prélèvement", family: "finance", role: "context" }] }));
   it("capcar : admis seulement si la contre-lecture répond non", () => {
-    expect(accessSkillCounterReadRequired(CAPCAR, ["r1"], capcar.status === "ok" ? capcar.output : null)).toBe(true);
     expect(accessSkillAdmissibleBeforeCounter({ texts: CAPCAR, requestIds: ["r1"], judge: capcar })).toBe(true);
     expect(decide(capcar, { texts: CAPCAR, counter: counter("no") })).toEqual({ outcome: "admit", requests: { r1: "access" }, counterRead: "no" });
     expect(decide(capcar, { texts: CAPCAR, counter: counter("yes") })).toMatchObject({ outcome: "team", reasons: ["counter_yes"] });
@@ -81,10 +80,8 @@ describe("contre-lecture : exigée par les mots de contexte, plusieurs demandes 
     expect(decide(capcar, { texts: CAPCAR, counter: ok({ asksOrContestsSensitive: "no" }) })).toMatchObject({ outcome: "team", reasons: ["counter_invalid"] });
   });
   it("toujours requise, même pour une connexion simple sans mot de contexte (harnais : un juge qui ment n'est plus rattrapé par une liste de mots)", () => {
-    expect(accessSkillCounterReadRequired(PLAIN, ["r1"], judgment())).toBe(true);
-    expect(accessSkillCounterReadRequired(PLAIN, ["r1", "r2"], judgment())).toBe(true);
-    expect(accessSkillCounterReadRequired(PLAIN, ["r1"], judgment({ requests: [{ verdict: "other" }] }))).toBe(true);
-    expect(accessSkillCounterReadRequired(PLAIN, ["r1"], "malformed")).toBe(true);
+    expect(decide(ok(judgment()), { texts: PLAIN })).toMatchObject({ outcome: "team", reasons: ["counter_unavailable"] });
+    expect(decide(ok(judgment()), { texts: PLAIN, counter: counter("no") })).toMatchObject({ outcome: "admit", counterRead: "no" });
   });
   it("deux demandes accès + autre : l'autre est la part de l'équipe, après une contre-lecture « non »", () => {
     const texts: AccessSkillTexts = { subject: "Questions", text: "je ne reçois pas le code de connexion. Et comment configurer un agent ?" };
