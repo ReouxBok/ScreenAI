@@ -278,7 +278,7 @@ describe("owner handover from HubSpot's existing webhook", () => {
     await expect(wake(input, DUE - 1)).resolves.toEqual({ status: "not_due_or_claimed" });
     expect(fixture.threadless).not.toHaveBeenCalled();
     const outcomes = await Promise.all([wake(input), wake(input)]);
-    expect(outcomes.map(result => result.status).sort()).toEqual(["not_due_or_claimed", "threadless_not_enabled"]);
+    expect(outcomes.map(result => result.status).sort()).toEqual(["not_due_or_claimed", "off"]);
     expect(fixture.threadless).toHaveBeenCalledExactlyOnceWith(input);
     expect(fixture.gmail).not.toHaveBeenCalled();
   });
@@ -288,7 +288,7 @@ describe("owner handover from HubSpot's existing webhook", () => {
     liveTicket(ticketId);
     fixture.start.mockRejectedValueOnce(Error("synthetic start failed"));
     await scheduled(ticketId);
-    await expect(sweepDueOwnerHandovers(Date.now() + 240_000)).resolves.toEqual({ threadless_not_enabled: 1 });
+    await expect(sweepDueOwnerHandovers(Date.now() + 240_000)).resolves.toEqual({ off: 1 });
     expect(fixture.start).toHaveBeenCalledTimes(1);
     expect(fixture.threadless).toHaveBeenCalledTimes(1);
   });
