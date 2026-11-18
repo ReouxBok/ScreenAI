@@ -743,7 +743,7 @@ export const savCaseEvents = sav.table("case_events", {
  * replaces the foreign keys of `execution_id` by triggers that accept either kind of execution, on the child and on the parent side. */
 export const savCaseEffectExecutions = sav.table("case_effect_executions", {
   id: uuid("id").defaultRandom().primaryKey(), caseId: uuid("case_id").notNull().references(() => savCases.id), replyKey: text("reply_key").notNull().unique(),
-  threadId: uuid("thread_id").notNull(), policyId: uuid("policy_id").notNull().references(() => savIntakeExecutionPolicies.id), policyHash: text("policy_hash").notNull(),
+  threadId: uuid("thread_id"), policyId: uuid("policy_id").notNull().references(() => savIntakeExecutionPolicies.id), policyHash: text("policy_hash").notNull(),
   state: text("state").notNull().default("pending"), reason: text("reason"), leaseToken: uuid("lease_token"), leaseUntil: timestamp("lease_until", { withTimezone: true }),
   payloadCiphertext: text("payload_ciphertext").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(), updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),

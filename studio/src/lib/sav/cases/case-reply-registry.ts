@@ -42,7 +42,7 @@ async function build(rows: readonly CaseReplyValidationRow[], deps: CaseReplyRea
   const db = requireDb(), mode = readCaseEffectsMode(deps.env()).mode;
   const executionIds = rows.flatMap(row => row.executionId ? [row.executionId] : []);
   const executions = executionIds.length ? await db.select().from(savCaseEffectExecutions).where(inArray(savCaseEffectExecutions.id, executionIds)) : [];
-  const ledger = await db.select().from(savIntakeEffects).where(and(inArray(savIntakeEffects.businessKey, rows.map(row => row.replyKey)), eq(savIntakeEffects.kind, "reply_send")));
+  const ledger = await db.select().from(savIntakeEffects).where(and(inArray(savIntakeEffects.businessKey, rows.map(row => row.replyKey)), inArray(savIntakeEffects.kind, ["reply_send", "new_thread_send"])));
   const timers = await db.select().from(savCaseTimers).where(inArray(savCaseTimers.caseId, [...new Set(rows.map(row => row.caseId))]));
   return rows.map(row => {
     const proposal = decryptSavPayload<CaseReplyProposal>(row.proposalCiphertext);

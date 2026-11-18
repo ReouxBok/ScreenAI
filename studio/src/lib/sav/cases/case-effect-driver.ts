@@ -99,6 +99,7 @@ async function commitReceipt(
       // Every wait is behind us: judge the clock, the receipt, the owner and the pauses ONCE MORE, against the database.
       if (owned.leaseUntil <= new Date()) return fault("LEASE_LOST");
       const ack = reply && ackOf(reply);
+      if (!owned.row.threadId) return fault("THREAD_REQUIRED");
       if (!reply || reply.businessKey !== key || reply.state !== "confirmed" || reply.ackCiphertext !== before.ackCiphertext || !reply.dispatchedAt || !ack?.id || !ack.threadId) return fault("RECEIPT_CHANGED");
       if (locked.owner !== "agent" && !(proposal.purpose === "handoff" && (await readCaseReplyFacts(tx, proposal, currentPolicyRevision, { lockCase: true })).owner === "agent")) throw new ReceiptOwnerChanged();
       if (projectionBlockedByPause(await readSavAgentPause(tx, "intake"), await readSavAgentPause(tx, "v2"))) return fault("RECEIPT_HELD_BY_PAUSE");
@@ -436,6 +437,7 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
         const [row] = await requireDb().select({ ticketId: savCases.ticketId }).from(savCases).where(eq(savCases.id, proposal.caseId));
         if (!row) return fault("CASE_MISSING");
         const text = summary ? caseReplySummaryWithStage(note.text, await confirmedReplyStage(proposal)) : note.text;
+        if (!proposal.inboundMessageId) return fault("INBOUND_REQUIRED");
         return buildCaseNoteIntent({ caseId: proposal.caseId, interactionId: note.interactionId, ticketId: row.ticketId, sourceMessageId: proposal.inboundMessageId, text, at: note.at });
       }
       if (associated?.state === "confirmed") return null;

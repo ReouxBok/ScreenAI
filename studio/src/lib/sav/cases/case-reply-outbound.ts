@@ -10,6 +10,7 @@
 // 3. `buildReplySendIntent` re-checks the approved text and refuses (never fixes) one that breaks the contract;
 // 4. any edit is a new text: it goes through 1 again and needs its own approval (the hash covers the text, mention included).
 import { cleanSavModelDraft, renderSavOutboundReply, savReplyFooter, type SavReplySendMode } from "../reply-format";
+import { layoutCaseReplyBody } from "./case-reply-layout";
 import type { CaseReplyApproval, CaseReplyProposal, CaseReplyPurpose } from "./case-effects";
 
 export const CASE_REPLY_OUTBOUND_CONTRACT = "sav-v2-reply-outbound.v1";
@@ -100,7 +101,8 @@ export function caseReplyFinalTextProblem(text: string, expectedMode: CaseReplyA
 export function finalizeCaseReplyProposal(draft: Omit<CaseReplyProposal, "text"> & Readonly<{ text: string }>,
   options: Readonly<{ language: CaseReplyLanguage | "unknown"; validation: "human" | "automated" }>): CaseReplyProposal {
   if (options.validation !== "human" && options.validation !== "automated") throw new Error("SAV_REPLY_VALIDATION_INVALID");
-  return { ...draft, text: prepareCaseReplyText(draft.text, options.language, options.validation === "automated" ? "automated" : CASE_REPLY_V2_MODE, draft.purpose) };
+  const text = draft.ticketSource ? layoutCaseReplyBody(draft.text) : draft.text;
+  return { ...draft, text: prepareCaseReplyText(text, options.language, options.validation === "automated" ? "automated" : CASE_REPLY_V2_MODE, draft.purpose) };
 }
 
 /**

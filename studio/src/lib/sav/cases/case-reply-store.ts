@@ -17,6 +17,8 @@ import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { executionJournal, type ExecutionTx } from "../intake/execution-store";
 import { assertSavOutboundRecipientAllowed } from "../policy";
 import type { CaseReplyContext } from "./case-effect-intents";
+import { caseReplyModeForBasis } from "./case-reply-mode";
+import { savV2NewThreadEnabled, threadlessReplyShape } from "./threadless-config";
 import { caseReplyKey, caseReplyPayloadHash, caseReplyQuestions, readCaseEffectsMode, type CaseReplyProposal } from "./case-effects";
 import { readCaseReplyFacts } from "./case-reply-facts";
 import { caseReplyStoredTextProblem, caseReplyTextProblemForBasis } from "./case-reply-mode";
@@ -89,7 +91,9 @@ function proposalProblem(proposal: CaseReplyProposal): string | null {
     if (isTerminalReply(proposal.purpose) && caseReplyEditableBody(proposal.text) !== (proposal.purpose === "closing" ? CLOSING_REPLY : HANDOFF_REPLY)) return "terminal_text";
     if (typeof proposal.subject !== "string" || !proposal.subject.trim() || /[\r\n]/.test(proposal.subject)) return "subject";
     if (typeof proposal.recipient !== "string" || !ADDRESS.test(proposal.recipient.trim())) return "recipient";
-    if (typeof proposal.inboundMessageId !== "string" || !proposal.inboundMessageId) return "inbound";
+    if (proposal.ticketSource || proposal.inboundMessageId === null) {
+      if (!threadlessReplyShape(proposal)) return "ticket_source";
+    } else if (typeof proposal.inboundMessageId !== "string" || !proposal.inboundMessageId) return "inbound";
     const questions = caseReplyQuestions(proposal);
     if (proposal.question && proposal.questions !== undefined) return "question";
     if (proposal.questions !== undefined && (!Array.isArray(proposal.questions) || proposal.questions.length < 2 || proposal.questions.length > 5)) return "question";
@@ -116,6 +120,7 @@ export async function submitCaseReplyProposal(requested: CaseReplyProposal, deps
 }> = {}): Promise<SubmitCaseReplyResult> {
   if (!isSupervised(deps)) return refuse("effects_off");
   if (isTerminalReply(requested.purpose) && !closingHandoffReplyEnabled(deps.env())) return refuse("effects_off");
+  if (requested.ticketSource && !savV2NewThreadEnabled(deps.env())) return refuse("effects_off");
   const problem = proposalProblem(requested);
   if (problem) return refuse("proposal_invalid", problem);
   // The CRM owner NOW, before anything is stored: asked outside the transaction, about the ticket of this very case (minimal read, nothing decrypted). The local facts are judged under the case lock afterwards.
@@ -128,14 +133,17 @@ export async function submitCaseReplyProposal(requested: CaseReplyProposal, deps
     const facts = await readCaseReplyFacts(tx, requested, revision, { lockCase: true });
     if (facts.caseVersion === null) return refuse("case_unknown");
     if (requested.caseVersion > facts.caseVersion) return refuse("version_unknown");
-    const [inbound] = await tx.select({ threadId: savMessages.threadId }).from(savMessages).where(eq(savMessages.id, requested.inboundMessageId));
-    if (!inbound) return refuse("inbound_unknown");
-    const [owner] = await tx.select({ threadIds: savCases.threadIds }).from(savCases).where(eq(savCases.id, requested.caseId));
-    if (!owner?.threadIds.includes(inbound.threadId)) return refuse("inbound_not_in_case");
-    // The trigger is the stored fact the reply answers, under ONE canonical name; the proposal is stored (and hashed, and approved) under that name.
-    const trigger = await resolveCaseReplyTrigger(tx, requested);
-    if (!trigger.ok) return refuse(trigger.code, trigger.detail);
-    const proposal: CaseReplyProposal = { ...requested, triggerEventId: trigger.triggerEventId };
+    let proposal = requested;
+    if (!requested.ticketSource) {
+      if (!requested.inboundMessageId) return refuse("inbound_unknown");
+      const [inbound] = await tx.select({ threadId: savMessages.threadId }).from(savMessages).where(eq(savMessages.id, requested.inboundMessageId));
+      if (!inbound) return refuse("inbound_unknown");
+      const [owner] = await tx.select({ threadIds: savCases.threadIds }).from(savCases).where(eq(savCases.id, requested.caseId));
+      if (!owner?.threadIds.includes(inbound.threadId)) return refuse("inbound_not_in_case");
+      const trigger = await resolveCaseReplyTrigger(tx, requested);
+      if (!trigger.ok) return refuse(trigger.code, trigger.detail);
+      proposal = { ...requested, triggerEventId: trigger.triggerEventId };
+    }
     const replyKey = caseReplyKey(proposal.caseId, proposal.triggerEventId), payloadHash = caseReplyPayloadHash(proposal);
     const [existing] = await tx.select().from(savCaseReplyValidations).where(and(eq(savCaseReplyValidations.replyKey, replyKey), eq(savCaseReplyValidations.payloadHash, payloadHash)));
     if (existing) return { ok: true, id: existing.id, created: false, state: existing.state as CaseReplyValidationState };
@@ -185,6 +193,7 @@ export async function decideCaseReply(input: Readonly<{
   const seenCheck = checkCaseReplySeen({ payloadHash: row.payloadHash, caseVersion: row.caseVersion, recipient: row.recipient }, seen);
   if (seenCheck !== "ok") return refuse(seenCheck);
   const proposal = proposalOf(row);
+  if (action === "approve" && proposal.ticketSource && !savV2NewThreadEnabled(deps.env())) return refuse("effects_off");
   if (action === "approve" && isTerminalReply(proposal.purpose) && !closingHandoffReplyEnabled(deps.env())) return refuse("effects_off");
   // A row stored before the contract can still be declined, never approved: nobody validates a text that cannot be sent as written.
   if (action === "approve") { const notFinal = caseReplyStoredTextProblem(proposal.text); if (notFinal) return refuse("proposal_invalid", notFinal); }
@@ -204,6 +213,7 @@ export async function decideCaseReply(input: Readonly<{
   }
   const authorization = early ?? await authorizeCaseReplyDecision(authorizer, request);
   if (!authorization.allowed) return refuse(authorization.code);
+  if (action === "approve" && proposal.ticketSource && caseReplyModeForBasis(authorization.basis) !== "manual_reviewed") return refuse("proposal_invalid", "ticket_review_required");
   // The mention the text carries must be the one THIS authority allows: the automated mention only under the automatic rule's basis, the reviewed one only under a human's.
   if (action === "approve") { const wrongMode = caseReplyTextProblemForBasis(proposal.text, authorization.basis); if (wrongMode) return refuse("proposal_invalid", wrongMode); }
   const revision = action === "approve" ? await deps.currentPolicyRevision() : null;
@@ -315,6 +325,20 @@ export async function enqueueApprovedCaseReply(input: Readonly<{
     // B-7: the last fence before an execution exists. A situation that another approved reply already queued (or sent) is never queued a second time, even if a database
     // written before the guard holds two approvals for it.
     if (await findCaseReplySituationTaker(tx, { caseId: row.caseId, replyKey: row.replyKey, triggerEventId: proposal.triggerEventId, scope: "queue" })) return refuse("situation_already_answered");
+    if (proposal.ticketSource) {
+      if (!savV2NewThreadEnabled(deps.env()) || note) return refuse("effects_off");
+      const facts = await readCaseReplyFacts(tx, proposal, await deps.currentPolicyRevision(), { lockCase: false });
+      if (!facts.admission.admitted || facts.storedSender !== row.recipient) return refuse("not_admitted");
+      const [created] = await tx.insert(savCaseEffectExecutions).values({
+        caseId: row.caseId, replyKey: row.replyKey, threadId: null, policyId: policy.id, policyHash: policy.hash,
+        payloadCiphertext: encryptSavPayload({ validationId, proposal }),
+      }).onConflictDoNothing().returning({ id: savCaseEffectExecutions.id });
+      if (!created) return refuse("trigger_already_planned");
+      await tx.update(savCaseReplyValidations).set({ executionId: created.id }).where(eq(savCaseReplyValidations.id, validationId));
+      await executionJournal(tx, created.id, "case_effect_admitted", { replyKey: row.replyKey, validationId, payloadHash: row.payloadHash, approvedBy: row.decidedBy, caseVersion: row.caseVersion });
+      return { ok: true, executionId: created.id, created: true };
+    }
+    if (!proposal.inboundMessageId) return refuse("inbound_unknown");
     const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, proposal.inboundMessageId));
     const [thread] = message ? await tx.select().from(savThreads).where(eq(savThreads.id, message.threadId)) : [undefined];
     const [mailbox] = thread ? await tx.select({ email: savMailboxes.email }).from(savMailboxes).where(eq(savMailboxes.id, thread.mailboxId)) : [undefined];

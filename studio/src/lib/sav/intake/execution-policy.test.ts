@@ -24,8 +24,8 @@ const legacyHashes = [
   "5391bdbaf31459d4d9cb509d5a09f7a385706167e8a836ae31a8314942fcc244",
 ];
 
-it("accepts all 12 execution rights without changing their order or granting additional rights", () => {
-  expect(savIntakeMutationSchema.options).toHaveLength(12);
+it("accepts all 15 execution rights without changing their order or granting additional rights", () => {
+  expect(savIntakeMutationSchema.options).toHaveLength(15);
   const policy = { ...legacyPolicy, mutations: [...savIntakeMutationSchema.options].reverse() };
   expect(executionPolicySchema.parse(policy)).toEqual(policy);
 });

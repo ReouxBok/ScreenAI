@@ -20,6 +20,7 @@ import { savIntakeRuntimeConfig } from "../intake/runtime-contract";
 import { HANDOFF_NOTICE_KEY_PREFIX } from "./case-handoff-notice";
 import { TICKET_STAGE_KEY_PREFIX } from "./case-ticket-stage";
 import { createCaseEffectDriver, ownerBeforeClaim, type CaseEffectDriverDeps } from "./case-effect-driver";
+import { runThreadlessEffectsPass, type ThreadlessEffectPorts } from "./threadless-effects";
 import { caseEffectSchemaInstalled, recoverCaseEffects, type CaseEffectRecoveryResult } from "./case-effect-recovery";
 import { caseReplyPayloadHash, readCaseEffectsMode, SAV_CASE_EFFECT_PERMISSIONS, type CaseReplyProposal } from "./case-effects";
 import { CASE_VERIFICATION_READ_LIMIT, classifyEffectVerification } from "./case-effect-verification";
@@ -144,7 +145,8 @@ export async function queueValidatedCaseReply(input: Readonly<{
   if (input.note) return enqueueApprovedCaseReply({ validationId: input.validationId, policy: input.policy, note: input.note, deps: input.deps });
   // SAV-92 (16/11): a queued reply carries its short summary note, written only after the reply is CONFIRMED (the driver plans it after the receipt),
   // and sealed only when `SAV_V2_REPLY_NOTE=on` AND the signed policy this execution is queued under grants `append_case_note`. Otherwise nothing changes.
-  const note = await summaryNoteGranted(input.policy, input.deps) ? await caseReplySummaryNote(row.caseId, decryptSavPayload<CaseReplyProposal>(row.proposal), row.decidedAt) : null;
+  const proposal = decryptSavPayload<CaseReplyProposal>(row.proposal);
+  const note = !proposal.ticketSource && await summaryNoteGranted(input.policy, input.deps) ? await caseReplySummaryNote(row.caseId, proposal, row.decidedAt) : null;
   // `derivedNote` on THIS path whatever the switch says now: a replay (e.g. under `off`, after a note was sealed `on`) returns the existing execution as it is.
   return enqueueApprovedCaseReply({ validationId: input.validationId, policy: input.policy, ...(note ? { note } : {}), derivedNote: true, deps: input.deps });
 }
@@ -182,6 +184,7 @@ async function caseReplySummaryNote(caseId: string, proposal: CaseReplyProposal,
 export type CaseRuntimeDeps = CaseEffectDriverDeps & Readonly<{
   /** The provider ports. REQUIRED: there is no default transport here, so nothing can reach a real provider by omission. Verification-only work receives `verify` alone. */
   adapters: ExecutorAdapters;
+  threadless?: ThreadlessEffectPorts;
   deadlineMs: number;
   /** Tests inject the runtime pins / policy the V1 environment would provide; by default they are read like the ledger's own recovery. */
   context?: Pick<ExecutionOptions, "runtime" | "policy">;
@@ -235,7 +238,7 @@ async function pendingSupervisedExecutions(limit: number, skipIds: ReadonlySet<s
   const db = requireDb(), e = savCaseEffectExecutions;
   const rows = await db.select({ id: e.id }).from(e).where(and(
     ...(only === undefined ? [] : [eq(e.id, only)]),
-    inArray(e.state, ["pending", "running", "waiting", "uncertain"]), or(isNull(e.leaseUntil), lte(e.leaseUntil, now)),
+    inArray(e.state, ["pending", "running", "waiting", "uncertain"]), isNotNull(e.threadId), or(isNull(e.leaseUntil), lte(e.leaseUntil, now)),
     notLike(e.replyKey, `${HANDOFF_NOTICE_KEY_PREFIX}%`), // a handoff notice has its own pass (`case-handoff-notice-store.ts`)
     notLike(e.replyKey, `${TICKET_STAGE_KEY_PREFIX}%`), // so has a ticket stage (`case-ticket-stage-store.ts`)
     notExists(db.select({ one: sql`1` }).from(savIntakeEffects).where(and(eq(savIntakeEffects.executionId, e.id), inArray(savIntakeEffects.state, [...ENGAGED])))),
@@ -284,7 +287,7 @@ export async function runCaseEffectsPass(deps: CaseRuntimeDeps): Promise<CaseRun
     touched.add(result.executionId);
   }
 
-  const supervised: { executionId: string; state: string; reason: string | null }[] = [];
+  const supervised: { executionId: string; state: string; reason: string | null }[] = deps.threadless ? await runThreadlessEffectsPass({ ...deps, ...deps.threadless }) : [];
   // NEW work needs the current CRM owner: without the port nothing new starts (the verification above does not need it and has already run).
   if (typeof deps.readTicketOwner !== "function") return { skipped: null, recovery, supervised, supervisedSkipped: "owner_port_absent", needsPerson: await listCaseEffectsNeedingPerson() };
   for (const executionId of await pendingSupervisedExecutions(limit, touched, new Date(), deps.executionId)) {

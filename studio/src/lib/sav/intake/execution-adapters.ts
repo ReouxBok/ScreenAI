@@ -66,14 +66,14 @@ function sameNoteProperties(actual: Record<string, string | null>, expected: Rec
 }
 // Gmail headers are strings, and inbound bodyText intentionally strips signatures.
 // Verify the single decoded MIME part byte-for-byte instead of that inbound view.
-function oneAddress(header: string) {
+export function oneAddress(header: string) {
     const parts = header.split(",");
     if (parts.length !== 1)
         return null;
     const value = parts[0].trim().match(/^(?:[^<>]*<([^<>]+)>|([^<>\s]+@[^<>\s]+))$/);
     return (value?.[1] ?? value?.[2] ?? "").trim().toLowerCase() || null;
 }
-function exactMimeText(payload: unknown): string | null {
+export function exactMimeText(payload: unknown): string | null {
     const p = z.object({
         mimeType: z.string(), filename: z.string().optional(), body: z.object({
             data: z.string().optional(), attachmentId: z.string().optional()

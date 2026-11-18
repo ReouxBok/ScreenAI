@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { and, asc, count, desc, eq, gt, gte, like, lte, max, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { savCaseEvents, savCaseReplyValidations, savCaseTimers, savCases, savIntakeEffects, savIntakeExecutions, savSyncState } from "@/db/schema";
+import { savCaseEvents, savCaseReplyValidations, savCaseTimers, savCases, savIntakeEffects, savIntakeExecutions, savSyncState, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { readCaseBlockHold } from "./case-block-hold";
@@ -22,6 +22,8 @@ import {
 } from "./case-types";
 import { trialsOnCustomerReturn } from "./case-trial-return";
 import { caseQualificationPrecheck } from "./qualification-diagnostic";
+import { savV2NewThreadEnabled } from "./threadless-config";
+import type { ThreadlessTicketEvent, ThreadlessTicketSource } from "./threadless-source";
 
 type Db = ReturnType<typeof requireDb>;
 export type CaseTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -40,8 +42,8 @@ export class CaseVersionStaleError extends Error {
 
 const CRM_ID = /^\d{1,30}$/, UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, CODE = /^[a-z0-9_.:-]{1,200}$/i;
 
-async function assertWritable(db: Db | CaseTx) {
-  if (!savCaseRecordingEnabled()) fault("RECORDING_OFF");
+async function assertWritable(db: Db | CaseTx, env: Env = process.env) {
+  if (!savCaseRecordingEnabled(env)) fault("RECORDING_OFF");
   const [row] = await db.select({ key: savSyncState.key }).from(savSyncState).where(eq(savSyncState.key, "sav-case-schema-v4"));
   if (!row) fault("SCHEMA_MISSING");
 }
@@ -360,6 +362,86 @@ export async function openCaseEvent(input: OpenCaseEventInput) {
     if (input.attribution && input.attribution !== "pending") row = await attributeLocked(tx, row, proof!, { ...input.admission, qualification }, event.sourceRef);
     return { case: toSnapshot(row), created, appended: appended.appended };
   });
+}
+
+/** A local association or an intake execution targeting the ticket is evidence of a mail path already in progress. */
+export async function hasLocalThreadForTicket(ticketId: string, db: Pick<CaseTx, "select"> = requireDb()): Promise<boolean> {
+  const [thread] = await db.select({ id: savThreads.id }).from(savThreads).where(eq(savThreads.hubspotTicketId, ticketId)).limit(1);
+  if (thread) return true;
+  const [execution] = await db.select({ id: savIntakeExecutions.id }).from(savIntakeExecutions).where(eq(savIntakeExecutions.ticketId, ticketId)).limit(1);
+  return Boolean(execution);
+}
+
+const THREADLESS_INPUT_VERSION = 2;
+type ThreadlessCaseStart = {
+  source: ThreadlessTicketSource; ownerTransitionKey: string; observedAt: string;
+  admission?: CaseAdmissionInput; request?: CaseOpenedRequest; waitReason?: string;
+  env?: Env; assertFresh?: (tx: CaseTx) => Promise<boolean>;
+};
+type ThreadlessCaseStartResult =
+  | { status: "created" | "existing_case"; case: CaseSnapshot }
+  | { status: "off" | "paused" | "existing_thread" | "out_of_scope" | "unavailable" };
+
+/** The encrypted CRM input, request and initial admission are committed under the ticket lock as one operation. */
+export async function openCaseFromHubspotTicket(input: ThreadlessCaseStart): Promise<ThreadlessCaseStartResult> {
+  const env = input.env ?? process.env;
+  if (!savV2NewThreadEnabled(env) || !savCaseRecordingEnabled(env)) return { status: "off" };
+  const { threadlessTicketEventSchema, threadlessTicketSourceRef } = await import("./threadless-source");
+  const detail = threadlessTicketEventSchema.parse({ source: input.source, ownerTransitionKey: input.ownerTransitionKey,
+    observedAt: input.observedAt, ...(input.waitReason ? { waitReason: input.waitReason } : {}) });
+  const { source } = detail, ticketId = source.ticketId;
+  const sourceRef = threadlessTicketSourceRef(source);
+  const admission = input.admission && { ...input.admission, qualification: parseQualification(input.admission.qualification) };
+  const approved = admission && decideCaseAdmission({ ...admission, caseSensitivity: "none" }).target === "agent";
+  if (!detail.waitReason && (!approved || !source.contact || !input.request)) return { status: "out_of_scope" };
+  const owner = detail.waitReason ? "human" : "agent";
+  const db = requireDb();
+  await assertWritable(db, env);
+  return db.transaction(async tx => {
+    await lockTicket(tx, ticketId);
+    const pauses = await Promise.all([readSavAgentPause(tx, "intake"), readSavAgentPause(tx, "v2")]);
+    if (pauses.some(pause => pause.invalid || pause.level !== "running")) return { status: "paused" };
+    const [existing] = await tx.select().from(savCases).where(eq(savCases.ticketId, ticketId)).for("update");
+    if (existing?.threadIds.length || await hasLocalThreadForTicket(ticketId, tx)) return { status: "existing_thread" };
+    if (existing) return { status: "existing_case", case: toSnapshot(existing) };
+    if (input.assertFresh && !await input.assertFresh(tx)) return { status: "unavailable" };
+    const body: CaseBody = { ...emptyCaseBody(), handoff: detail.waitReason ? { reason: detail.waitReason } : null,
+      waiting: detail.waitReason ? { kind: "team", reasonCode: detail.waitReason, since: detail.observedAt } : null };
+    const [row] = await tx.insert(savCases).values({
+      ticketId, threadIds: [], owner, phase: owner === "human" ? "handoff_pending" : "queued", version: THREADLESS_INPUT_VERSION - 1,
+      contractRevision: SAV_CASE_CONTRACT_REVISION, payloadCiphertext: encryptSavPayload(body),
+      ...(approved && owner === "agent" ? { admissionTarget: "agent" } : {}),
+    }).returning();
+    const event = validEvent({ kind: "crm_observed", sourceRef, occurredAt: input.observedAt,
+      // The ordinary owner reader uses this key's date to ignore older CRM events.
+      dedupeKey: caseDedupeKey.crm(ticketId, source.version), detail: {
+        source: { kind: source.kind, revision: source.revision }, sourceCiphertext: encryptSavPayload(detail), crmChange: "owner_changed",
+      } });
+    const { row: versioned } = await appendLocked(tx, row!, event);
+    if (owner === "human" || !admission || !input.request) return { status: "created", case: toSnapshot(versioned) };
+    const admitted = await applyAdmission(tx, versioned, admission, sourceRef);
+    const opened = await openRequestsLocked(tx, admitted, [input.request], admission, event);
+    return { status: "created", case: toSnapshot(opened) };
+  });
+}
+
+/** Read the case’s original ticket input. Other CRM observations and unrelated event ids never qualify as a source. */
+export async function readCaseThreadlessSource(db: Pick<CaseTx, "select">, caseId: string, triggerEventId?: string): Promise<
+  (ThreadlessTicketEvent & { eventId: string; eventVersion: number }) | null
+> {
+  const eventId = triggerEventId?.replace(/^ticket:/, "");
+  if (!UUID.test(caseId) || (eventId !== undefined && !UUID.test(eventId))) return null;
+  const [row, duplicate] = await db.select({ id: savCaseEvents.id, version: savCaseEvents.caseVersion, payload: savCaseEvents.payloadCiphertext })
+    .from(savCaseEvents).where(and(eq(savCaseEvents.caseId, caseId), eq(savCaseEvents.kind, "crm_observed"),
+      eq(savCaseEvents.caseVersion, THREADLESS_INPUT_VERSION))).limit(2);
+  if (!row || duplicate || (eventId !== undefined && row.id !== eventId)) return null;
+  const payload = decryptSavPayload<{ sourceRef?: SourceRef; detail?: { source?: { kind?: unknown }; sourceCiphertext?: unknown } }>(row.payload);
+  if (payload?.detail?.source?.kind !== "hubspot_ticket" || typeof payload.detail.sourceCiphertext !== "string") return null;
+  const { threadlessTicketEventSchema } = await import("./threadless-source");
+  const parsed = threadlessTicketEventSchema.safeParse(decryptSavPayload(payload.detail.sourceCiphertext));
+  if (!parsed.success || payload.sourceRef?.type !== "hubspot_object" || payload.sourceRef.id !== parsed.data.source.ticketId
+    || payload.sourceRef.revision !== parsed.data.source.version) return null;
+  return { ...parsed.data, eventId: row.id, eventVersion: row.version };
 }
 
 /** After a policy change or a non-inbound input (CRM, command, human reply): re-evaluate
