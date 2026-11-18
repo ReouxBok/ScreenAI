@@ -18,6 +18,7 @@ import { processPendingSavContextRefreshes, dispatchPendingSavEmailOpenings } fr
 import { refreshSavDashboardProjection, savSqlDashboardEnabled } from "@/lib/sav/dashboard-projection";
 import { randomUUID } from "node:crypto";
 import { recordSavWorkerPulse } from "@/lib/sav/monitor";
+import { savV2OwnerHandoverEnabled } from "@/lib/sav/cases/owner-handover-config";
 
 export type SavReconcileTrigger = "vercel_cron" | "gmail_webhook" | "heartbeat_workflow";
 export type SavReconcilePassOptions = { trigger: SavReconcileTrigger; pulseId?: string; budgetMs?: number };
@@ -66,6 +67,8 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     runStep("gmail_receipts", () => processPendingGmailReceipts(50)),
     runStep("hubspot_receipts", () => processPendingHubspotReceipts(50)),
   ]);
+  const ownerHandovers = savV2OwnerHandoverEnabled() ? await runStep("v2_owner_handovers", async () =>
+    (await import("@/lib/sav/cases/owner-handover")).sweepDueOwnerHandovers(derivedDeadline)) : undefined;
   const emailOpenings = await runStep("email_openings", () => dispatchPendingSavEmailOpenings(10));
   const contextRefreshes = await runStep("context_refreshes", () => processPendingSavContextRefreshes(5));
   const [trainings, evaluations] = await Promise.all([
@@ -111,7 +114,7 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     return reconcileCaseJ2({ env: process.env, deadlineMs: derivedDeadline });
   });
   // V2 effects (replies, handoff notices, ticket stages, closures) have their own worker: /api/cron/sav-v2-effects (11/11).
-  const payload = { caseReminders, ticketSafetyNet, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { ...(ownerHandovers ? { ownerHandovers } : {}), caseReminders, ticketSafetyNet, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return { payload, hasStepFailure, pulseId };

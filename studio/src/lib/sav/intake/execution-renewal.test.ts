@@ -61,8 +61,8 @@ it("launch preview preserves all 12 explicitly requested rights without installi
   expect(fetch).not.toHaveBeenCalled();
 });
 
-it.each(["legacy", "all 12 rights"])("renews the configured %s policy for the deployed revision only: every other field copied, source preserved, receipt and audit, no external effect", async kind => {
-  if (kind === "all 12 rights") await approveSource({ mutations: [...savIntakeMutationSchema.options] });
+it.each(["legacy", "all rights"])("renews the configured %s policy for the deployed revision only: every other field copied, source preserved, receipt and audit, no external effect", async kind => {
+  if (kind === "all rights") await approveSource({ mutations: [...savIntakeMutationSchema.options] });
   const rowCount = (await policyRows()).length;
   const before = await sourceRow(), budgetBefore = await db.db.select().from(savIntakeExecutionBudget);
   const deployed = env(NEW), commandId = randomUUID();

@@ -52,6 +52,7 @@ import { phoneMatchesHint, type SavIdentityCandidate, type SavIdentityHints } fr
 import { assertSavActor } from "./access";
 import { resolveSavCustomerIdentity, resolveSavCustomerMessage } from "./forwarded-identity";
 import { hasSavTicketObservation, refreshSavTicketObservations } from "./observations";
+import { savV2OwnerHandoverEnabled } from "./cases/owner-handover-config";
 
 const hubspotEventSchema = z.object({
   eventId: z.number().optional(),
@@ -175,6 +176,31 @@ async function hubspotFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return requestSavHubspot<T>(path, {
     ...init, headers: { Authorization: `Bearer ${requiredEnv("HUBSPOT_ACCESS_TOKEN")}`, "Content-Type": "application/json", Accept: "application/json", ...(init?.headers ?? {}) },
   }, summarizeHubspotError);
+}
+
+const ownerHandoverTicketSchema = z.object({
+  id: z.string(), archived: z.boolean(),
+  properties: z.object({
+    hubspot_owner_id: z.string().nullable(), hs_pipeline: z.string(), hs_pipeline_stage: z.string(),
+    hs_ticket_category: z.string().nullish(),
+  }),
+  propertiesWithHistory: z.object({ hubspot_owner_id: z.array(z.object({
+    value: z.string().nullish(), timestamp: z.iso.datetime({ offset: true }), sourceType: z.string(),
+  })) }).optional(),
+});
+
+/** Fresh owner, stage and the last change, with no ticket body or contact data. */
+export async function readSavOwnerHandoverTicket(ticketId: string) {
+  if (!/^\d{1,30}$/.test(ticketId)) throw Error("SAV_OWNER_HANDOVER_TICKET_INVALID");
+  const properties = "hubspot_owner_id,hs_pipeline,hs_pipeline_stage,hs_ticket_category";
+  const ticket = ownerHandoverTicketSchema.parse(await hubspotFetch<unknown>(
+    `/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}?properties=${properties}&propertiesWithHistory=hubspot_owner_id`,
+  ));
+  if (ticket.id !== ticketId) throw Error("SAV_OWNER_HANDOVER_TICKET_MISMATCH");
+  const history = ticket.propertiesWithHistory?.hubspot_owner_id ?? [];
+  const latestAt = Math.max(...history.map(row => Date.parse(row.timestamp)));
+  const latest = history.filter(row => Date.parse(row.timestamp) === latestAt);
+  return { ...ticket, latestOwner: latest.length === 1 ? latest[0] : null };
 }
 
 export function summarizeHubspotError(status: number, payload: unknown) {
@@ -1353,6 +1379,9 @@ async function processHubspotReceiptGroup(receiptIds: string[]) {
   if (!claimed.length) return [] as string[];
   try {
     const events = claimed.map(receipt => hubspotEventSchema.parse(receipt.payload));
+    if (savV2OwnerHandoverEnabled()) {
+      await (await import("./cases/owner-handover-markers")).observeSavOwnerHandoverEvents(events);
+    }
     const event = events.sort((a, b) => (b.occurredAt ?? 0) - (a.occurredAt ?? 0))[0];
     // Every raw receipt remains durable; one fresh snapshot covers this bounded
     // group for the same object. Mark each claimed event only after it succeeds.

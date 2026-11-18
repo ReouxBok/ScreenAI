@@ -284,7 +284,8 @@ async function attributionProven(tx: CaseTx, proof: CaseAttributionProof, ticket
 /** v9 `v2_attribution`, under the ticket lock: the case still waits, is not sensitive, has room,
  * and the admission decided again on this version targets the agent. Otherwise nothing is written
  * and the case stays with the team; never a fault, so the relayed mail is kept. */
-async function attributeLocked(tx: CaseTx, row: CaseRow, proof: CaseAttributionProof, admission: CaseAdmissionInput & { qualification: CaseAdmissionQualification }, sourceRef: SourceRef) {
+async function attributeLocked(tx: CaseTx, row: CaseRow, proof: CaseAttributionProof, admission: CaseAdmissionInput & { qualification: CaseAdmissionQualification }, sourceRef: SourceRef,
+  phase: "queued" | "awaiting_customer" = "queued") {
   const event = validEvent({ kind: "owner_changed", dedupeKey: caseDedupeKey.command(proof.kind === "hubspot_owner_read" ? `v2-attribution.owner-read.${proof.messageId}` : `v2-attribution.${proof.effectId}`), sourceRef });
   const [done] = await tx.select({ id: savCaseEvents.id }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, row.id), eq(savCaseEvents.dedupeKey, event.dedupeKey)));
   const current = toSnapshot(row);
@@ -292,10 +293,10 @@ async function attributeLocked(tx: CaseTx, row: CaseRow, proof: CaseAttributionP
   const decision = decideCaseAdmission({ policy: admission.policy, qualification: admission.qualification, caseSensitivity: current.sensitivity });
   if (decision.target !== "agent" || !await attributionProven(tx, proof, current.ticketId)) return row;
   const moved = await recordAdmission(tx, row, decision, admission.qualification, sourceRef, {
-    owner: "agent", phase: "queued", payloadCiphertext: encryptSavPayload(parseBody({ ...current.body, handoff: null })),
+    owner: "agent", phase, payloadCiphertext: encryptSavPayload(parseBody({ ...current.body, handoff: null })),
   });
   return (await appendLocked(tx, moved, { ...event, detail: {
-    transition: "v2_attribution", from: "human", to: "agent", fromPhase: current.phase, toPhase: "queued", actor: { type: "system" }, reason: proof.kind, proof,
+    transition: "v2_attribution", from: "human", to: "agent", fromPhase: current.phase, toPhase: phase, actor: { type: "system" }, reason: proof.kind, proof,
   } })).row;
 }
 
@@ -320,6 +321,8 @@ export type OpenCaseEventInput = EventInput & {
    * owner (`pending`), and goes to the agent only on V1's verified owner effect, re-checked here.
    * Absent: v8 creation (tests only; the relay is the one creator in production). */
   attribution?: "pending" | CaseAttributionProof;
+  /** An owner handover with a freshly observed team reply waits for the customer from the first commit. */
+  attributionPhase?: "awaiting_customer";
 };
 /** Get-or-create the ticket's case, append one event and re-evaluate the admission in the
  * same transaction. A new case belongs to the agent only when admitted; otherwise it waits
@@ -357,7 +360,7 @@ export async function openCaseEvent(input: OpenCaseEventInput) {
     }
     row = reevaluate ? await applyAdmission(tx, appended.row, { ...input.admission, qualification }, event.sourceRef) : appended.row;
     if (appended.appended && input.opens?.length) row = await openRequestsLocked(tx, row, input.opens, { ...input.admission, qualification }, event);
-    if (input.attribution && input.attribution !== "pending") row = await attributeLocked(tx, row, proof!, { ...input.admission, qualification }, event.sourceRef);
+    if (input.attribution && input.attribution !== "pending") row = await attributeLocked(tx, row, proof!, { ...input.admission, qualification }, event.sourceRef, input.attributionPhase);
     return { case: toSnapshot(row), created, appended: appended.appended };
   });
 }
@@ -754,9 +757,9 @@ export async function readCase(caseId: string, tx?: CaseTx) {
   const [row] = await (tx ?? requireDb()).select().from(savCases).where(eq(savCases.id, caseId));
   return row ? toSnapshot(row) : null;
 }
-export async function readCaseByTicket(ticketId: string) {
+export async function readCaseByTicket(ticketId: string, tx?: CaseTx) {
   if (!CRM_ID.test(ticketId)) return null;
-  const [row] = await requireDb().select().from(savCases).where(eq(savCases.ticketId, ticketId));
+  const [row] = await (tx ?? requireDb()).select().from(savCases).where(eq(savCases.ticketId, ticketId));
   return row ? toSnapshot(row) : null;
 }
 /** Without options the whole journal (short cases); a long case is read by pages of at most
