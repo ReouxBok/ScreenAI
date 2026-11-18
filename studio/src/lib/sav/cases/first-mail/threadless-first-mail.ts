@@ -22,7 +22,7 @@ import { pilotProvenanceGate, readPilotReplyProvenance, type PilotProvenanceDeps
 import { savV2NewThreadAutoEnabled, threadlessReplySubject } from "../threadless-config";
 import { threadlessInputKey } from "../threadless-provenance";
 import { threadlessRequestId, threadlessTicketPlainDescription, threadlessTicketSourceRef, type ThreadlessTicketSource } from "../threadless-source";
-import { threadlessAutoSendProblem } from "./first-mail-authority";
+import { threadlessAutoSendProblem } from "./first-mail-rights";
 import { firstMailSkillPinned, SAV_FIRST_MAIL_PROMPT_SUFFIX } from "./first-mail-skill";
 
 /*
@@ -34,7 +34,7 @@ import { firstMailSkillPinned, SAV_FIRST_MAIL_PROMPT_SUFFIX } from "./first-mail
  *   2. The normal V2 investigation (`runCaseInvestigationRuntime`): knowledge cards, decision validator, call ledger and V2 budget. The ticket's
  *      own stored event is the input; its subject and description are the only customer text, as untrusted data; the CRM notes are never shown.
  *   3. The recorded decision becomes ONE proposal (`caseDecisionDraft`, SAV-94 layout, `finalizeCaseReplyProposal`, help line, signature, mention).
- *   4. Automated only when every right holds (`first-mail-authority.ts` + A's Access rule on facts read now); otherwise a person validates it.
+ *   4. Automated only when every right holds (`first-mail-rights.ts` + A's Access rule on facts read now); otherwise a person validates it.
  *
  * Anything the model path cannot prove returns `fallback`: the caller keeps today's fixed draft for a person (never a silent drop, never a send).
  */
@@ -193,7 +193,7 @@ async function autoReasons(snapshot: CaseSnapshot, proposal: CaseReplyProposal, 
 }
 
 /**
- * The only authorizer that may approve a first mail without a person: the text-and-switch rights (`first-mail-authority.ts`), then A's Access rule
+ * The only authorizer that may approve a first mail without a person: the text-and-switch rights (`first-mail-rights.ts`), then A's Access rule
  * (`accessAutoReplyAuthorizer`, `auto_access.v1`) on facts read now: admitted agent case, access only, the recorded decision accepted on THIS ticket
  * input, every shown source proven, the CRM owner V2.
  */

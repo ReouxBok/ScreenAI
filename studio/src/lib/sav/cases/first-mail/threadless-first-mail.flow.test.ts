@@ -336,7 +336,7 @@ describe("SAV-96 B : le premier mail d'un ticket sans fil, écrit par le modèle
     const s = fixture(), model = decisionModel(() => "Bonjour,\n\nSuite à votre demande concernant la connexion : vous pouvez résilier votre abonnement depuis votre espace.");
     const started = await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps(model)) });
     expect(model.requests.length).toBeGreaterThan(0);
-    // The decision validator already refuses it (twice: the refusal hand-over); the kernel on OUR text is the next fence (`first-mail-authority.test.ts`).
+    // The decision validator already refuses it (twice: the refusal hand-over); the kernel on OUR text is the next fence (`first-mail-rights.test.ts`).
     expect(["existing_case", "human_wait"]).toContain(started.status);
     const opened = await caseOf(s.input.ticketId);
     expect(await readCase(opened!.id)).toMatchObject({ owner: "human" });

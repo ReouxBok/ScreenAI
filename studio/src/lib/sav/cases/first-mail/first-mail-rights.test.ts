@@ -5,7 +5,7 @@ import { finalizeCaseReplyProposal } from "../case-reply-outbound";
 import type { CaseInvestigationModelRequest } from "../investigation-runner";
 import { caseInvestigationPrompt } from "../investigation-v2-providers";
 import { SAV_THREADLESS_SOURCE_REVISION, type ThreadlessTicketSource } from "../threadless-source";
-import { threadlessAutoSendProblem, threadlessAutoTextProblem } from "./first-mail-authority";
+import { threadlessAutoSendProblem, threadlessAutoTextProblem } from "./first-mail-rights";
 import { firstMailSkillInstruction } from "./first-mail-skill";
 import { threadlessFirstMailContext } from "./threadless-first-mail";
 

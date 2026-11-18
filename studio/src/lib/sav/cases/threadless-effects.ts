@@ -15,7 +15,7 @@ import { savCaseReplyValidations } from "./case-reply-validation-table";
 import { savV2NewThreadEnabled, THREADLESS_ADMIT_PERMISSION, THREADLESS_CRM_PERMISSION, THREADLESS_SEND_PERMISSION } from "./threadless-config";
 import { readThreadlessAuthority, threadlessAccessRevision, threadlessActionAllowed, threadlessAuthorityStillGranted, threadlessSchemaInstalled } from "./threadless-guard";
 import { qualifyThreadlessTicket, readThreadlessTicket } from "./threadless-source";
-import { threadlessAutoSendProblem } from "./first-mail/first-mail-authority";
+import { threadlessAutoSendProblem } from "./first-mail/first-mail-rights";
 import { buildNewThreadSendIntent, THREADLESS_MAILBOX, type createThreadlessTransport, type NewThreadAck, type NewThreadReceipt, type NewThreadSendIntent, type ThreadlessCrmAck } from "./threadless-transport";
 import type { CaseRuntimeDeps } from "./case-runtime-effects";
 
