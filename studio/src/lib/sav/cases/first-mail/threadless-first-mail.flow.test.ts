@@ -16,7 +16,9 @@ import type { SavRetrievalCandidate } from "../../request-retrieval";
 import { SAV_ACCESS_SKILL_REVISION, SAV_ACCESS_SKILL_RULE_ID } from "../access-skill/access-skill-guidelines";
 import type { CaseReplyProposal } from "../case-effects";
 import { finalizeCaseReplyProposal, readCaseReplyDisclosure } from "../case-reply-outbound";
-import { runCaseEffectsPass } from "../case-runtime-effects";
+import { queueValidatedCaseReply, runCaseEffectsPass } from "../case-runtime-effects";
+import { decideCaseReply, submitCaseReplyProposal } from "../case-reply-store";
+import { CASE_REPLY_STUDIO_CORRECTION_BASIS } from "../case-reply-validation";
 import { listCaseEvents, readCase } from "../case-store";
 import type { KnowledgeRef } from "../case-types";
 import { SAV_CASE_ACCESS_SCOPE_REVISION } from "../investigation-access-scope";
@@ -60,6 +62,7 @@ const FIRST_MAIL = "Bonjour,\n\nSuite à votre demande concernant l’écran qui
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>;
 let mailboxId: string;
+let staffId: string;
 let grant: Awaited<ReturnType<typeof approveIntakeExecutionPolicy>>;
 let executionPolicy: ExecutionPolicy;
 let seq = 960_000;
@@ -68,6 +71,7 @@ beforeAll(async () => {
   f = await createSavTestDb();
   state.db = f.db;
   const [staff] = await f.db.insert(staffUsers).values({ clerkId: "first-mail-fixture", name: "Relecteur fictif", role: "admin", email: THREADLESS_MAILBOX, active: true }).returning();
+  staffId = staff!.id;
   state.user = { id: staff!.clerkId, primaryEmailAddress: { emailAddress: staff!.email, verification: { status: "verified" } } };
   const [mailbox] = await f.db.insert(savMailboxes).values({ email: THREADLESS_MAILBOX, active: true }).returning();
   mailboxId = mailbox!.id;
@@ -491,5 +495,39 @@ describe("SAV-96 B (revue Astra 6.2, bloquant 2) : la fiche citée est revérifi
     expect(s.counts).toMatchObject({ gmailPosts: 0, crmPosts: 0 });
     expect(await threadFor(s)).toBeUndefined();
     expect(await readCase(started.caseId)).toMatchObject({ owner: "human" });
+  });
+});
+
+describe("SAV-96 B (contre-revue Astra) : une correction humaine ne dispense jamais de revérifier la fiche citée", () => {
+  it.each(["active", "retired"] as const)("brouillon du modèle corrigé dans le Studio, fiche %s à l'envoi", async state => {
+    await configure({ autoReply: false });
+    const s = fixture();
+    const started = await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps()) });
+    if (started.status !== "started") throw Error(`NOT_STARTED_${started.status}`);
+    const [row] = await validations(started.caseId);
+    const original = textOf(row!);
+    // What the Studio correction stores (`case-reply-review.ts`): the corrected text supersedes the proposal, approved under the correction basis, queued.
+    const corrected = finalizeCaseReplyProposal({ ...original, text: "Bonjour,\n\nSuite à votre demande concernant l’écran d’abonnement à la connexion : connectez-vous depuis https://new.limova.ai, puis ouvrez votre espace." },
+      { language: readCaseReplyDisclosure(original.text)?.language ?? "unknown", validation: "human" });
+    const store = { env: () => process.env, currentPolicyRevision: async () => REVISION, readTicketOwner: async () => "v2" as const };
+    const submitted = await submitCaseReplyProposal(corrected, store, { supersedes: { validationId: row!.id, payloadHash: row!.payloadHash } });
+    if (!submitted.ok) throw Error(`SUBMIT_${submitted.code}`);
+    const [fresh] = (await validations(started.caseId)).filter(one => one.id === submitted.id);
+    expect(await decideCaseReply({ action: "approve", validationId: submitted.id, approverId: staffId, deps: store,
+      seen: { payloadHash: fresh!.payloadHash, caseVersion: fresh!.caseVersion, recipient: fresh!.recipient },
+      authorizer: () => ({ allowed: true, basis: CASE_REPLY_STUDIO_CORRECTION_BASIS }) })).toMatchObject({ ok: true, state: "approved" });
+    const queued = await queueValidatedCaseReply({ validationId: submitted.id, policy: { id: grant.id, hash: grant.policyHash }, deps: store });
+    if (!queued.ok) throw Error(`QUEUE_${queued.code}`);
+    knowledgeNow.card = state;
+    await s.run(queued.executionId);
+    await s.run(queued.executionId);
+    if (state === "active") {
+      expect(s.counts.gmailPosts).toBe(1);
+      expect(s.sentMail()!.body).toBe(corrected.text);
+    } else {
+      expect(s.counts).toMatchObject({ gmailPosts: 0, crmPosts: 0 });
+      expect(await threadFor(s)).toBeUndefined();
+      expect(await readCase(started.caseId)).toMatchObject({ owner: "human" });
+    }
   });
 });

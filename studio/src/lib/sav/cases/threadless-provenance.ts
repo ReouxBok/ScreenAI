@@ -27,9 +27,10 @@ export async function readThreadlessReplyProvenance(proposal: CaseReplyProposal,
   if (template.text === proposal.text) return null;
   if (savV2NewThreadAutoEnabled(env) && deps) {
     // `reminderInputKey` names the input whose recorded decision is read: here the ticket's event, never a customer mail.
+    // As a thread reply (`readPilotReplyProvenance`): a Studio correction skips the text comparison ONLY. The decision, its scope and every cited card
+    // are still proven now, so a card retired or changed after a correction keeps the mail from leaving.
     const read = await readPilotReplyProvenance(proposal, deps, { humanCorrection, reminderInputKey: threadlessInputKey(row.eventId) });
-    if (read.status === "proven") return null;
-    return humanCorrection ? null : `threadless_reply_unproven:${[...read.reasons].sort().join(",")}`;
+    return read.status === "proven" ? null : `threadless_reply_unproven:${[...read.reasons].sort().join(",")}`;
   }
   return humanCorrection ? null : "threadless_draft_changed";
 }
