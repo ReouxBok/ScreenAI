@@ -5,7 +5,9 @@ import { z } from "zod";
  * Pure: schemas and closed codes, no model, network, database or clock. Every other `smart/` file imports these types without changing them.
  *
  *   reading   what the « understand » call reads in the mail: the needs (PS included), what the customer already did, sensitive or doubt;
- *   decision  what the « decide » call chooses: reply, ask THE question, or hand over; the reply and the list of its facts, each with its source;
+ *   step      one pass of the bounded decide loop (v2): « thinking » first, then either read-only tool calls or the final decision;
+ *   decision  what the loop concludes: reply, ask THE question, or hand over; the reply and its facts, each with its source (a card, the customer,
+ *             or an Academy tool call); the structured team note; what this mail taught the case memory;
  *   verdict   what the independent counter-read says of a reply (closed codes, the sentence at fault);
  *   judge     the later comparison with what the team did (A/B, closed codes): an interface, not wired (lot 0).
  *
@@ -13,7 +15,7 @@ import { z } from "zod";
  * Parsing strips unknown keys (a model may add some) but never fills a missing required field: a missing field is an invalid output.
  */
 
-export const SAV_SMART_CONTRACT_REVISION = "sav-smart-contract-2026-11-20.v1";
+export const SAV_SMART_CONTRACT_REVISION = "sav-smart-contract-2026-11-20.v2";
 
 export const SAV_SMART_OUTCOMES = ["reply", "ask", "handoff"] as const;
 export type SmartOutcome = typeof SAV_SMART_OUTCOMES[number];
@@ -58,10 +60,12 @@ export const smartFactSchema = z.object({
   sentence: text(600).min(1),
   needId,
   type: z.enum(SAV_SMART_FACT_TYPES),
-  /** Where it comes from: a card (id + version), the customer's message, or nothing (advice only). */
-  sourceKind: z.enum(["fiche", "client", "aucune"]),
+  /** Where it comes from: a card (id + version), an Academy tool call (its call id), the customer's message, or nothing (advice only). */
+  sourceKind: z.enum(["fiche", "academy", "client", "aucune"]),
   cardId: text(120).nullable().default(null),
   version: text(120).nullable().default(null),
+  /** The id of the Academy tool call (`t1`...) whose result carries the fact. */
+  toolCallId: text(10).nullable().default(null),
   /** The passage of the source that carries the fact, copied word for word; null for advice. */
   excerpt: text(600).nullable().default(null),
 });
@@ -70,18 +74,76 @@ export type SmartFact = z.infer<typeof smartFactSchema>;
 export const smartCoverageSchema = z.object({ needId, status: z.enum(["answered", "asked", "handed"]) });
 
 export const SAV_SMART_HANDOFF_REASONS = ["no_source", "real_bug", "account_action", "wants_human", "upset", "sensitive", "unsure", "other"] as const;
+/** Reasons only the server writes on its fallback note: budget spent, a failure, no progress, the exchange cap. */
+export const SAV_SMART_FALLBACK_REASONS = ["budget_epuise", "panne", "pas_de_progres", "trop_d_echanges"] as const;
+
+/**
+ * The structured note for the team (HARNAIS 4): the need, what was understood, what was checked and its source, what was tried and its result,
+ * the hypotheses and their state, THE next check, what the customer was told. Even when the knowledge falls short, the agent starts the
+ * investigation and hands over something concrete. A plain string from the model is accepted as the need (lenient: never lose a note).
+ */
+const noteItems = <T extends z.ZodTypeAny>(item: T, max: number) => z.array(item).max(max).catch([] as z.infer<T>[]).default([]);
+export const smartTeamNoteSchema = z.preprocess(value => typeof value === "string" ? { besoin: value } : value, z.object({
+  raison: z.enum([...SAV_SMART_HANDOFF_REASONS, ...SAV_SMART_FALLBACK_REASONS]).catch("other").default("other"),
+  besoin: text(600).min(1),
+  compris: text(800).default(""),
+  verifie: noteItems(z.object({ fait: text(400).min(1), source: text(160).default("") }), 6),
+  essaye: noteItems(z.object({ quoi: text(300).min(1), resultat: text(160).default("") }), 6),
+  hypotheses: noteItems(z.object({ texte: text(300).min(1), statut: text(30).default("ouverte") }), 6),
+  prochaineVerification: text(400).default(""),
+  ditAuClient: text(400).nullable().default(null),
+}));
+export type SmartTeamNote = z.infer<typeof smartTeamNoteSchema>;
+
+/** What one mail taught the case memory, written by the model; the server merges and counts it (`smart-memory.ts`). */
+export const smartMemoryUpdateSchema = z.object({
+  newFacts: noteItems(z.object({ needId: needId.catch("n1"), text: text(300).min(1), excerpt: text(300).min(1) }), 6),
+  hypotheses: noteItems(z.object({ id: text(10).min(1), needId: needId.catch("n1"), text: text(300).min(1), status: z.enum(["open", "ruled_out", "confirmed"]), why: text(300).default("") }), 6),
+  trials: noteItems(z.object({ id: text(10).min(1), needId: needId.catch("n1"), what: text(300).min(1), cardId: text(120).nullable().default(null) }), 4),
+  trialResults: noteItems(z.object({ trialId: text(10).min(1), result: z.enum(["worked", "failed"]) }), 6),
+  question: text(400).nullable().default(null),
+}).default({ newFacts: [], hypotheses: [], trials: [], trialResults: [], question: null });
+export type SmartMemoryUpdate = z.infer<typeof smartMemoryUpdateSchema>;
 
 export const smartDecisionSchema = z.object({
   outcome: z.enum(SAV_SMART_OUTCOMES),
   /** The mail to the customer (plain text, no signature: the server adds it). Required to reply or ask; optional on a handoff. */
   reply: text(6_000).nullable().default(null),
-  /** For the team on a handoff: the need, the facts and their source, what was tried, the hypotheses, THE next check. */
-  teamNote: text(3_000).nullable().default(null),
+  /** For the team when a need is handed: the structured note (required then). */
+  teamNote: smartTeamNoteSchema.nullable().default(null),
   handoffReason: z.enum(SAV_SMART_HANDOFF_REASONS).nullable().default(null),
   coverage: z.array(smartCoverageSchema).max(4),
   facts: z.array(smartFactSchema).max(20).default([]),
+  memory: smartMemoryUpdateSchema,
 });
 export type SmartDecision = z.infer<typeof smartDecisionSchema>;
+
+/** The tools a decide pass may call (the registry, `smart-tools.ts`, says which are on). */
+export const SAV_SMART_TOOL_NAMES = ["chercher_fiches", "rechercher_integrations", "lister_actions_integration", "obtenir_guide_connexion"] as const;
+export type SmartToolName = typeof SAV_SMART_TOOL_NAMES[number];
+export const smartToolCallSchema = z.object({
+  id: z.string().regex(/^t[1-9]$/),
+  tool: text(60).min(1),
+  needId: needId.catch("n1"),
+  args: z.record(z.string(), z.unknown()).default({}),
+});
+export type SmartToolCall = z.infer<typeof smartToolCallSchema>;
+
+/**
+ * One pass of the decide loop: « thinking » comes first (the model reasons before committing; bounded, stored encrypted, never shown to the
+ * counter-read), then `action: "tools"` with 1 to 3 read-only calls, or `action: "final"` with the decision. A v1 bare decision is refused.
+ */
+export const smartStepSchema = z.object({
+  thinking: text(800).default(""),
+  action: z.enum(["tools", "final"]),
+  calls: z.array(smartToolCallSchema).max(3).default([]),
+  decision: smartDecisionSchema.nullable().default(null),
+}).superRefine((value, ctx) => {
+  if (value.action === "final" && !value.decision) ctx.addIssue({ code: "custom", message: "FINAL_WITHOUT_DECISION" });
+  if (value.action === "tools" && !value.calls.length) ctx.addIssue({ code: "custom", message: "TOOLS_WITHOUT_CALL" });
+  if (new Set(value.calls.map(call => call.id)).size !== value.calls.length) ctx.addIssue({ code: "custom", message: "CALL_IDS_DUPLICATED" });
+});
+export type SmartStep = z.infer<typeof smartStepSchema>;
 
 /** What the independent counter-read may report. One closed code per problem, with the sentence at fault. */
 export const SAV_SMART_VERIFY_CODES = [
@@ -101,6 +163,8 @@ export const SAV_SMART_CHECK_CODES = [
   "reply_missing", "coverage_invalid", "need_not_covered", "fact_sentence_missing", "excerpt_not_found", "card_not_retrieved_for_need", "fact_source_invalid",
   "third_party_fact_unsourced", "link_not_allowed", "other_platform_recommended", "third_party_named", "credential_request", "promise_unsourced",
   "account_action_claimed", "kernel_in_reply", "team_note_missing",
+  // v2, the progress rule (HARNAIS 2): the only two refusals it adds.
+  "question_repeated", "trial_repeated",
 ] as const;
 export type SmartCheckCode = typeof SAV_SMART_CHECK_CODES[number];
 
@@ -131,22 +195,3 @@ export function parseSmartOutput<T>(schema: z.ZodType<T>, output: unknown): { ok
   const parsed = schema.safeParse(output);
   return parsed.success ? { ok: true, value: parsed.data } : { ok: false, problem: "output_invalid" };
 }
-
-// ---------------------------------------------------------------------------------------------------------------------------------
-// Generic tool interface (20/11): the Academy and webinar tools are written elsewhere (`smart/tools/`, another branch) and plugged in later.
-// NOT WIRED in this scope (one turn, no tool loop). A tool is read-only: it never writes, never sees a secret, never acts on an account.
-// ---------------------------------------------------------------------------------------------------------------------------------
-export type SmartToolSource = Readonly<{ kind: "academy" | "webinar" | "page"; url: string; title: string | null; readAt: string }>;
-export type SmartToolResult<O> = Readonly<{ status: "ok"; output: O; sources: readonly SmartToolSource[] }> | Readonly<{ status: "failed"; problem: string }>;
-export type SmartTool<I = unknown, O = unknown> = Readonly<{
-  /** Stable id the model calls it by (`[a-z_]{2,40}`). */
-  name: string;
-  /** What it is for, shown to the model. */
-  description: string;
-  /** The input the model must give (validated before any execution). */
-  inputSchema: z.ZodType<I>;
-  /** Off unless its own switch says on (Academy: off until Ugo's signal). */
-  enabled: (env: Readonly<Record<string, string | undefined>>) => boolean;
-  /** Read only, bounded in time; every fact it returns carries its source (the server checks links against `sources`). */
-  execute: (input: I, context: Readonly<{ now: Date; signal: AbortSignal }>) => Promise<SmartToolResult<O>>;
-}>;
