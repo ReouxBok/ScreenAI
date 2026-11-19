@@ -32,7 +32,8 @@ export const SAV_CASE_BLOCK_SCOPE_REVISION = "sav-case-block-scope-2026-11-11.v1
 // Kept pure (zod only, as the purity test requires): the same values as `case-types.ts` (`SAV_CASE_ACCESS_BLOCK_ID`, `SAV_CASE_BLOCK_ID`, and the
 // admissible families other than `access`); `case-blocks.test.ts` proves they stay equal.
 const SAV_CASE_ACCESS_BLOCK_ID = "access";
-export const SAV_CASE_BLOCK_SCOPE_FAMILIES = ["usage"] as const;
+// 19/11: `integration` for the Integrations block; Collaborators and Charly Max are `usage` blocks.
+export const SAV_CASE_BLOCK_SCOPE_FAMILIES = ["usage", "integration"] as const;
 const caseBlockIdSchema = z.string().regex(/^[a-z][a-z0-9_-]{1,39}$/);
 /** At most this many block scopes in the list (Access excluded): a longer list voids every listed block, never Access. */
 export const SAV_CASE_BLOCK_SCOPES_MAX = 20;

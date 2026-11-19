@@ -7,7 +7,8 @@ import { closingHandoffReplyEnabled, isTerminalReply } from "./case-terminal-rep
 // Nothing here classifies a mail: the facts are the stored link, V1's own confirmed records and the owner read now. A mail that needs judging goes to B
 // (an open case, with its context) or to V1's normal intake (a closed case, a new subject), never to a keyword.
 import type { CaseEffectLedgerState } from "./case-effects";
-import type { CaseOwner, CasePhase, CaseSensitivity } from "./case-types";
+import { SAV_CASE_ACCESS_BLOCK_ID, type CaseOwner, type CasePhase, type CaseSensitivity } from "./case-types";
+import { autoBlockProblem, readAutoReplyConfig, type AutoReplyConfig, type SavAutoOpenBlock } from "./block-auto-reply";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 
 export const CUSTOMER_RETURN_REVISION = "sav-v2-customer-return.v1";
@@ -224,32 +225,48 @@ export function verifyCaseTicketStage(intent: CaseTicketStageIntent, observed: R
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-// Automatic reply approval for the access family (no systematic human validation inside the qualified scope)
+// Automatic reply approval (no systematic human validation inside the qualified scope): the allow-list of blocks (`block-auto-reply.ts`)
 // ---------------------------------------------------------------------------------------------------------------------------------
 
+/** The persisted basis of a rule approval. It names the RULE (an allow-listed automatic approval), never a block: the case says which block it was,
+ * and every reader of the basis (the AI mention, the Studio wording) keeps reading this one value, exactly as before. */
 export const ACCESS_AUTO_APPROVAL_BASIS = "auto_access.v1";
+export const SAV_AUTO_APPROVAL_BASIS = ACCESS_AUTO_APPROVAL_BASIS;
 export type AccessAutoApprovalConfig = Readonly<{ mode: "off"; why: "disabled" | "approver_invalid" }> | Readonly<{ mode: "on"; approverId: string }>;
-/** Only `SAV_V2_AUTO_REPLY=access` enables it, with a dedicated approver id (a UUID that stands for the rule, never a person's). */
+/**
+ * Access's own view of the allow-list, same shape as before: `on` only when `access` is listed (with the rule approver), so a list without Access
+ * never turns on an Access-only path (the threadless first mail). With `SAV_V2_AUTO_REPLY=access` it reads exactly as it always did.
+ */
 export function readAccessAutoApprovalConfig(env: Readonly<Record<string, string | undefined>>): AccessAutoApprovalConfig {
-  if (env.SAV_V2_AUTO_REPLY !== "access") return { mode: "off", why: "disabled" };
-  const approverId = env.SAV_V2_AUTO_APPROVER_ID ?? "";
-  return UUID.test(approverId) ? { mode: "on", approverId: approverId.toLowerCase() } : { mode: "off", why: "approver_invalid" };
+  const config = readAutoReplyConfig(env);
+  if (!config.blocks.has(SAV_CASE_ACCESS_BLOCK_ID)) return { mode: "off", why: "disabled" };
+  return config.mode === "on" ? { mode: "on", approverId: config.approverId } : { mode: "off", why: config.why };
 }
 
 export type AccessAutoApprovalFacts = Readonly<{
   case: Readonly<{ owner: CaseOwner; sensitivity: CaseSensitivity; admitted: boolean }>;
   /** Families of the case's OPEN requests. */
   openFamilies: readonly string[];
+  /** Each open request's family and block (`caseRequestBlockId`), same rows as `openFamilies`. Read only when the allow-list is more than `access`:
+   * absent there, the blocks are unknown and nothing is approved. */
+  openBlocks?: readonly SavAutoOpenBlock[];
   /** B's latest decision on the version the reply was proposed at: accepted, its access scope stamp current, every source shown to the customer verified. */
   decision: Readonly<{ accepted: boolean; scopeCurrent: boolean; shownSourcesVerified: boolean; nextAction: string }> | null;
   ownerNow: CustomerReturnOwnerNow;
 }>;
+export type AutoApprovalFacts = AccessAutoApprovalFacts;
 export type AccessAutoApprovalOutcome = Readonly<{ allowed: true; basis: typeof ACCESS_AUTO_APPROVAL_BASIS }> | Readonly<{ allowed: false; reason: string }>;
 
-/** The rule that stands in for a person's approval, and only for this: an access-only, admitted agent case whose reply rests on B's accepted, sourced decision.
- * Terminal acknowledgements also require their dedicated switch. Anything else (another family, a mixed case, an unverified source, an owner not V2) goes to a person, as today. It approves; it never revokes or declines. */
-export function decideAccessAutoApproval(input: Readonly<{ config: AccessAutoApprovalConfig; action: string; approverId: string; purpose: string; env?: Readonly<Record<string, string | undefined>>; facts: AccessAutoApprovalFacts | null }>): AccessAutoApprovalOutcome {
-  const { config, facts } = input;
+/** An Access-shaped config (`readAccessAutoApprovalConfig`) is the list `access` alone: the legacy reading, unchanged. */
+const asAutoReplyConfig = (config: AutoReplyConfig | AccessAutoApprovalConfig): AutoReplyConfig => "blocks" in config ? config
+  : config.mode === "on" ? { mode: "on", approverId: config.approverId, blocks: new Set([SAV_CASE_ACCESS_BLOCK_ID]), pairs: new Set(), ignored: [] }
+  : { mode: "off", why: config.why, blocks: new Set(config.why === "approver_invalid" ? [SAV_CASE_ACCESS_BLOCK_ID] : []), pairs: new Set(), ignored: [] };
+
+/** The rule that stands in for a person's approval, and only for this: an admitted agent case of ONE allow-listed block (or a qualified pair) whose reply rests
+ * on B's accepted, sourced decision. Terminal acknowledgements also require their dedicated switch. Anything else (a block not listed, a mixed case, an unverified
+ * source, an owner not V2) goes to a person, as today. It approves; it never revokes or declines. With the list `access` alone: exactly the former Access rule. */
+export function decideAutoApproval(input: Readonly<{ config: AutoReplyConfig | AccessAutoApprovalConfig; action: string; approverId: string; purpose: string; env?: Readonly<Record<string, string | undefined>>; facts: AccessAutoApprovalFacts | null }>): AccessAutoApprovalOutcome {
+  const config = asAutoReplyConfig(input.config), { facts } = input;
   if (config.mode !== "on") return { allowed: false, reason: `auto_${config.why}` };
   if (input.action !== "approve") return { allowed: false, reason: "action_not_auto" };
   if (input.approverId.toLowerCase() !== config.approverId) return { allowed: false, reason: "approver_not_rule" };
@@ -258,7 +275,8 @@ export function decideAccessAutoApproval(input: Readonly<{ config: AccessAutoApp
   if (!facts) return { allowed: false, reason: "facts_unread" };
   if (facts.case.owner !== "agent" || !facts.case.admitted) return { allowed: false, reason: "case_not_admitted" };
   if (facts.case.sensitivity !== "none") return { allowed: false, reason: "sensitive" };
-  if (!facts.openFamilies.length || facts.openFamilies.some(family => family !== "access")) return { allowed: false, reason: "not_access_only" };
+  const blocked = autoBlockProblem(facts, config);
+  if (blocked) return { allowed: false, reason: blocked };
   if (input.purpose !== "reminder") {
     if (!facts.decision?.accepted) return { allowed: false, reason: "decision_not_accepted" };
     const matches = terminal
@@ -271,3 +289,5 @@ export function decideAccessAutoApproval(input: Readonly<{ config: AccessAutoApp
   if (facts.ownerNow !== "v2") return { allowed: false, reason: facts.ownerNow === "unknown" ? "owner_unread" : "owner_not_v2" };
   return { allowed: true, basis: ACCESS_AUTO_APPROVAL_BASIS };
 }
+/** Former name, same function: callers written for Access keep compiling and deciding exactly as before. */
+export const decideAccessAutoApproval = decideAutoApproval;

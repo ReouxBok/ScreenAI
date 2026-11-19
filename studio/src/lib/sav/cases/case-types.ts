@@ -199,8 +199,9 @@ export function emptyCaseBody(): CaseBody {
 /** Admission (SAV-44): whether the agent may own the case. Exclusions first, then a
  * positive list. An intake category is a hint: it can exclude, never admit. */
 export const SAV_CASE_ADMISSION_REVISION = "sav-admission-2026-10-27.v1";
-/** The only families an admission policy may list. */
-export const SAV_CASE_ADMISSIBLE_FAMILIES = ["access", "usage"] as const;
+/** The only families an admission policy may list. 19/11: `integration` added for the Integrations block (Collaborators and Charly Max are `usage`).
+ * Widening only: every policy written before parses exactly as it did, and a family admits nobody until an approved policy lists it. */
+export const SAV_CASE_ADMISSIBLE_FAMILIES = ["access", "usage", "integration"] as const;
 export const SAV_CASE_ADMISSION_TARGETS = ["agent", "team", "qualification"] as const;
 export type CaseAdmissionTarget = typeof SAV_CASE_ADMISSION_TARGETS[number];
 /** In decision order; the first applicable reason sets the target. */
@@ -242,11 +243,36 @@ export const caseAdmissionPolicySchema = z.object({
   revision: ref, admittedFamilies: admissibleFamilies,
   // Treatment blocks (11/11): `blockId` binds an approved rule to its block. Absent (every policy written before blocks) or `access`: today's
   // exact semantics. Another block's rule never lists the family `access`, which is the Access block's alone.
-  qualifiedRules: z.array(z.object({ ruleId: ref, revision: ref, families: admissibleFamilies, blockId: caseBlockIdSchema.optional() }).strict()
-    .refine(rule => rule.blockId === undefined || rule.blockId === SAV_CASE_ACCESS_BLOCK_ID || !rule.families.includes("access"), "ACCESS_FAMILY_RESERVED")).max(20),
+  // Revision lifecycle (19/11, `caseAdmissionPolicyLifecycleProblem`): a rule may be listed at its revision N and at N-1, the latter marked `previous: true`, so a
+  // case admitted under N-1 ends under N-1 when N is approved. Absent: a current entry, as every policy written before. At most 20 entries (two per block: 10 blocks).
+  qualifiedRules: z.array(z.object({ ruleId: ref, revision: ref, families: admissibleFamilies, blockId: caseBlockIdSchema.optional(), previous: z.literal(true).optional() }).strict()
+    .refine(rule => rule.blockId === undefined || rule.blockId === SAV_CASE_ACCESS_BLOCK_ID || !rule.families.includes("access"), "ACCESS_FAMILY_RESERVED")).max(20)
+    .refine(rules => caseAdmissionRuleLifecycleProblem(rules) === null, "RULE_LIFECYCLE_INVALID"),
   approvedBy: staffId, approvedAt: at,
 }).strict();
 export type CaseAdmissionPolicy = z.infer<typeof caseAdmissionPolicySchema>;
+
+export const SAV_CASE_RULE_LIFECYCLE_PROBLEMS = ["rule_revision_duplicate", "rule_previous_without_current", "rule_two_current", "rule_too_many_revisions", "rule_block_changed"] as const;
+export type CaseRuleLifecycleProblem = typeof SAV_CASE_RULE_LIFECYCLE_PROBLEMS[number];
+/**
+ * Revision lifecycle (19/11, METHODE §3): a rule that marks an entry `previous` is listed exactly twice, its revision N (current) and N-1 (previous),
+ * both for the same block (no `blockId` is Access's). A rule without any `previous` entry is read exactly as before (no new constraint), so every
+ * policy written before this marker existed parses unchanged.
+ */
+export function caseAdmissionRuleLifecycleProblem(rules: ReadonlyArray<Readonly<{ ruleId: string; revision: string; blockId?: string; previous?: true }>>): CaseRuleLifecycleProblem | null {
+  const byRule = new Map<string, Array<(typeof rules)[number]>>();
+  for (const rule of rules) byRule.set(rule.ruleId, [...byRule.get(rule.ruleId) ?? [], rule]);
+  for (const entries of byRule.values()) {
+    if (!entries.some(entry => entry.previous)) continue;
+    if (new Set(entries.map(entry => entry.revision)).size !== entries.length) return "rule_revision_duplicate";
+    if (entries.length > 2) return "rule_too_many_revisions";
+    const current = entries.filter(entry => !entry.previous);
+    if (!current.length) return "rule_previous_without_current";
+    if (current.length > 1) return "rule_two_current";
+    if (new Set(entries.map(entry => entry.blockId ?? SAV_CASE_ACCESS_BLOCK_ID)).size !== 1) return "rule_block_changed";
+  }
+  return null;
+}
 
 /** SAV-92: why a request of a multi-request mail is left to the team while the agent handles the others. `no_block_match`: no active block's detector reads
  * the request's own words as its request; `ambiguous_block`: two blocks (or one configured twice) claim it; `block_scope_unavailable`: its block has no valid scope

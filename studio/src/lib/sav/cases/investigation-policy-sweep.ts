@@ -1,4 +1,4 @@
-import { caseAdmissionStatus } from "./admission-policy";
+import { caseAdmissionRuleStage, caseAdmissionStatus } from "./admission-policy";
 import { caseAdmissionPolicySchema, SAV_CASE_CONTRACT_REVISION, type CaseAdmissionPolicy, type CaseAdmissionReason, type CaseSnapshot } from "./case-types";
 
 /*
@@ -12,6 +12,19 @@ import { caseAdmissionPolicySchema, SAV_CASE_CONTRACT_REVISION, type CaseAdmissi
  * cursor never passes a case whose write lost a version race: the pass stops before it, so the next pass reads it
  * again (no retry inside a pass). A case the race made newer, or gave to a person, then no longer holds the others.
  * Off unless the caller enables it: nothing in production calls it.
+ *
+ * Revision lifecycle (19/11, METHODE §3): a rule's revision N and N-1 may both be listed (`previous: true` on N-1, `caseAdmissionRuleLifecycleProblem`).
+ * Because each case is decided again on the qualification it recorded, a case admitted under N-1 is KEPT while the new policy still lists N-1 (it ends
+ * under N-1, reported `stage: "previous"`), and goes to the team only when N-1 has left the policy (`detail: "revision_withdrawn"`). The report says, per kept
+ * case, under which entry it stands: N-1 may leave the policy once a full pass reports no `previous` case.
+ *
+ * How to wire it (NOT done: Ugo's go first). Wiring it while the policy lists only N would send every open N-1 case to the team.
+ *   - Trigger: the V2 reconcile tick, after an approved policy change only (a durable cursor `nextSweepPage({ name: "policy_sweep" })`), with its deadline.
+ *   - Ports: `enabled` = an explicit `SAV_V2_POLICY_SWEEP=on`; `pauseState` = `readSavAgentPause(db, "v2").level`; `admissionPolicyRevision` and
+ *     `approvedPolicy` = the provenance readers (`caseProvenanceReaders(...).currentPolicyRevision` and the parsed `SAV_V2_ADMISSION_POLICY_JSON` policy);
+ *     `listCases` = `listCaseIdsForPolicyRevalidation`; `readCase` = `readCase`; `revalidate` = `revalidateCaseAdmissionForPolicy({ caseId, expectedVersion:
+ *     snapshot.version, policy })` mapping `revalidated:false` to `refused` and `CaseVersionStaleError` to `version_moved`; `now` = the clock.
+ *   - Before turning it on: approve a policy that lists N AND N-1 (`previous: true`) for every block whose skill changed, then run one pass and read the report.
  */
 
 export const SAV_CASE_POLICY_SWEEP_MAX_PAGE = 200;
@@ -59,6 +72,9 @@ export type CaseAdmissionSweepOutcome =
   | "refused_by_store"
   | "missing";
 
+/** Per swept case: `stage: "previous"` for a case kept with the agent under N-1 (a case under a current entry reads exactly as before); `detail: "revision_withdrawn"` for a case sent to the team
+ * because the revision it was admitted under left the policy while its rule is still listed. */
+export type CaseAdmissionSweepCase = { caseId: string; outcome: CaseAdmissionSweepOutcome; reason?: CaseAdmissionReason; stage?: "previous"; detail?: "revision_withdrawn" };
 export type CaseAdmissionSweepReport =
   | { status: "disabled" | "paused" }
   | { status: "refused"; reason: "policy_missing" | "policy_invalid" | "policy_conflict" | "policy_unapproved" | "page_invalid" }
@@ -68,7 +84,7 @@ export type CaseAdmissionSweepReport =
     status: "done" | "partial" | "paused";
     policyRevision: string;
     next: string | null;
-    cases: Array<{ caseId: string; outcome: CaseAdmissionSweepOutcome; reason?: CaseAdmissionReason }>;
+    cases: CaseAdmissionSweepCase[];
   };
 
 export async function sweepCaseAdmissionsAfterPolicyChange(
@@ -101,7 +117,7 @@ export async function sweepCaseAdmissionsAfterPolicyChange(
   return { status: page.length === limit ? "partial" : "done", policyRevision: revision, next: page.length === limit ? page.at(-1)! : null, cases };
 }
 
-async function sweepOne(ports: CaseAdmissionSweepPorts, caseId: string, policy: CaseAdmissionPolicy, revision: string) {
+async function sweepOne(ports: CaseAdmissionSweepPorts, caseId: string, policy: CaseAdmissionPolicy, revision: string): Promise<Omit<CaseAdmissionSweepCase, "caseId">> {
   const snapshot = await ports.readCase(caseId);
   if (!snapshot) return { outcome: "missing" as const };
   if (snapshot.contractRevision !== SAV_CASE_CONTRACT_REVISION) return { outcome: "contract_conflict" as const };
@@ -116,6 +132,10 @@ async function sweepOne(ports: CaseAdmissionSweepPorts, caseId: string, policy: 
   if (result === "version_moved") return { outcome: "version_moved" as const };
   if (result === "refused") return { outcome: "refused_by_store" as const };
   const after = await ports.readCase(caseId);
-  if (after && caseAdmissionStatus(after, revision).admitted) return { outcome: "kept_agent" as const };
-  return { outcome: "to_team" as const, ...(after?.admission ? { reason: after.admission.reasons[0] } : {}) };
+  if (after && caseAdmissionStatus(after, revision).admitted) {
+    const stage = caseAdmissionRuleStage(after.admission?.qualification, policy);
+    return { outcome: "kept_agent" as const, ...(stage === "previous" ? { stage } : {}) };
+  }
+  const withdrawn = caseAdmissionRuleStage(snapshot.admission.qualification, policy) === "withdrawn";
+  return { outcome: "to_team" as const, ...(after?.admission ? { reason: after.admission.reasons[0] } : {}), ...(withdrawn ? { detail: "revision_withdrawn" as const } : {}) };
 }
