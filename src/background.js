@@ -184,6 +184,8 @@ let lastUserTurn = null;
 let userTurnSequence = 0;
 let voiceSessionActive = false;
 let voiceSessionGeneration = 0;
+let voiceTaskRevision = 0;
+let voiceTaskProgress = { phase: 'not_started', stepCount: 0 };
 const userPageInteractionSequences = new Map();
 let trainingState = { active: false, stopping: false, token: null, session: null };
 let evaluationState = { active: false, token: null, run: null, testCase: null, content: null };
@@ -528,6 +530,7 @@ function childTabOpenedSince(openerTabId, since) {
 function followedTabOpenedByClick(operation, since) {
   if (operation.generation !== sessionGeneration || operation.signal?.aborted) return null;
   if (operation.voiceGeneration !== undefined && operation.voiceGeneration !== voiceSessionGeneration) return null;
+  if (operation.taskRevision !== undefined && operation.taskRevision !== voiceTaskRevision) return null;
   const openedTabId = childTabOpenedSince(operation.tabId, since);
   return openedTabId && openedTabId === sessionState.lockedTabId ? openedTabId : null;
 }
@@ -801,9 +804,10 @@ function isTrustedMessageSource(request, sender) {
 
 async function handleMessage(request, sender) {
   await initializationPromise;
+  if (request.taskRevision !== undefined && request.taskRevision !== voiceTaskRevision) return cancelledOperation();
   if (trainingState.active && [
     'USER_MESSAGE', 'ANALYZE_PAGE', 'TAKE_SCREENSHOT', 'NEXT_STEP',
-    'VOICE_ACTION_REQUEST', 'VOICE_TEXT_INPUT_REQUEST', 'VOICE_SCROLL_REQUEST', 'VOICE_KB_SEARCH',
+    'VOICE_ACTION_REQUEST', 'VOICE_CONTROL_STATE_REQUEST', 'VOICE_SELECT_CONTROL_REQUEST', 'VOICE_TEXT_INPUT_REQUEST', 'VOICE_SCROLL_REQUEST', 'VOICE_KB_SEARCH',
     'CONFIRM_ACTION'
   ].includes(request.type)) {
     return { ok: false, trainingMode: true, error: 'Mode formateur actif : Charly observe sans agir.' };
@@ -965,7 +969,34 @@ async function handleMessage(request, sender) {
           ? request.toolName
           : 'inspect_current_page',
         '',
-        () => getFreshVoiceContext(null, { capture: request.capture === true, operation: captureVoiceOperation() })
+        () => request.toolName === 'verify_expected_result'
+          ? verifyVoiceResult(request.conditions, request.expectation)
+          : getFreshVoiceContext(null, { capture: request.capture === true, operation: captureVoiceOperation() })
+      );
+
+    case 'VOICE_TASK_BEGIN':
+    case 'VOICE_TASK_UPDATE':
+      if (request.type === 'VOICE_TASK_UPDATE' && (!Number.isSafeInteger(request.revision) || request.revision <= voiceTaskRevision)) return { ok: false };
+      voiceTaskRevision = request.type === 'VOICE_TASK_BEGIN' ? voiceTaskRevision + 1 : request.revision;
+      voiceTaskProgress = { phase: request.type === 'VOICE_TASK_BEGIN' ? 'not_started' : 'listening', stepCount: 0 };
+      for (const tabId of [...presenceTabs]) hideAgentPresence(tabId, { stop: true });
+      if (sessionState.lockedTabId) await chrome.tabs.sendMessage(sessionState.lockedTabId, { type: 'VOICE_TASK_REVISION', revision: voiceTaskRevision }).catch(() => {});
+      Logger.event('voice', 'VOICE_TASK_UPDATED', { revision: voiceTaskRevision });
+      return { ok: true, revision: voiceTaskRevision };
+
+    case 'VOICE_TASK_PROGRESS':
+      if (!['executing', 'continuing', 'verified', 'needs_attention', 'cancelled'].includes(request.phase)) return { ok: false };
+      voiceTaskProgress = { phase: request.phase, stepCount: Math.max(0, Math.min(100, Number(request.stepCount) || 0)) };
+      return { ok: true };
+
+    case 'VOICE_CONTROL_STATE_REQUEST':
+      return runEvaluatedVoiceTool('set_control_state', request.targetLabel, () =>
+        setVoiceControlState(request.elementId, request.checked, request.contextVersion, request.targetLabel)
+      );
+
+    case 'VOICE_SELECT_CONTROL_REQUEST':
+      return runEvaluatedVoiceTool('select_control', request.targetLabel, () =>
+        selectVoiceControl(request.targetLabel, request.checked)
       );
 
     case 'VOICE_TRANSCRIPT': {
@@ -1522,6 +1553,12 @@ async function runDiagnostics(client = {}) {
   }
 
   const operationalIssues = summarizeRecentOperationalIssues(Logger.getLogs());
+  if (voiceTaskProgress.phase !== 'not_started') {
+    addCheck('voiceTask', voiceTaskProgress.phase === 'verified' ? 'ok' : 'info',
+      voiceTaskProgress.phase === 'verified' ? 'Dernière condition demandée vérifiée ; objectif global à confirmer dans la conversation'
+        : `Résultat de la demande vocale non confirmé (${voiceTaskProgress.phase}, ${voiceTaskProgress.stepCount} étapes)`,
+      'DIAGNOSTIC_VOICE_TASK_STATE');
+  }
   addCheck(
     'pageActions',
     operationalIssues.blockedActionCount >= 2 ? 'error' : operationalIssues.blockedActionCount === 1 ? 'info' : 'ok',
@@ -2715,6 +2752,26 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           return true;
         }
 
+        // Styled native checkboxes can be transparent while their label or
+        // painted wrapper is the actual surface a person activates.
+        function selectionSurface(el) {
+          for (let parent = el; parent && parent !== document.body; parent = parent.parentElement) {
+            const style = getComputedStyle(parent);
+            if (parent.hidden || parent.hasAttribute('inert') || parent.getAttribute('aria-hidden') === 'true'
+              || style.display === 'none' || style.visibility === 'hidden' || (parent !== el && style.opacity === '0')) return null;
+          }
+          if (isVisible(el)) return el;
+          if (!(el instanceof HTMLInputElement) || !['checkbox', 'radio'].includes(el.type)
+            || getComputedStyle(el).opacity !== '0') return null;
+          const label = [...(el.labels || [])].find(candidate => isVisible(candidate));
+          if (label) return label;
+          const parent = el.parentElement;
+          const labelled = el.hasAttribute('aria-label') || el.hasAttribute('aria-labelledby');
+          const oneControl = parent?.querySelectorAll('input, [role="checkbox"], [role="radio"], [role="switch"]').length === 1;
+          const painted = [...(parent?.children || [])].some(child => child !== el && isVisible(child));
+          return labelled && oneControl && painted && isVisible(parent) ? parent : null;
+        }
+
         function isLayeredAbovePage(element) {
           for (let current = element; current && current !== document.body; current = current.parentElement) {
             const style = window.getComputedStyle(current);
@@ -3049,6 +3106,7 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
         );
         clickables.forEach(el => {
           if (!isVisible(el)) return;
+          if (el.matches('input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"]')) return;
           const nestedInteractive = el.querySelector('button, a[href], [role="button"], [role="link"], input[type="submit"], input[type="button"]');
           if (nestedInteractive && nestedInteractive !== el && isVisible(nestedInteractive)
             && !el.matches('button, a[href], [role="button"], [role="link"]')) return;
@@ -3140,9 +3198,10 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
         });
 
         // 3. Checkboxes & toggles & radios
-        const checks = contextRoot.querySelectorAll('input[type="checkbox"], input[type="radio"], [role="switch"]');
+        const checks = contextRoot.querySelectorAll('input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"]');
         checks.forEach(el => {
-          if (!isVisible(el)) return;
+          const surface = selectionSurface(el);
+          if (!surface || (activeModalSurface && !activeModalSurface.contains(surface))) return;
           let label = '';
           if (el.id) {
             const lbl = document.querySelector(`label[for="${el.id}"]`);
@@ -3152,17 +3211,20 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
             const parentLabel = el.closest('label');
             if (parentLabel) label = parentLabel.textContent.trim();
           }
-          if (!label) label = el.getAttribute('aria-label') || el.name || '';
+          if (!label) label = getExplicitLabel(el) || el.name || el.textContent || '';
           label = sanitizeVisibleText(label, 80);
           if (!label) return;
 
           const id = idCounter++;
           el.setAttribute('data-lid', id);
-          const isSwitch = el.getAttribute('role') === 'switch';
+          const role = el.getAttribute('role');
+          const state = el instanceof HTMLInputElement ? (el.indeterminate ? 'mixed' : el.checked) : el.getAttribute('aria-checked');
           elementMap.push({
-            id, type: isSwitch ? 'toggle' : el.type, text: label.substring(0, 80),
+            id, type: role === 'switch' ? 'toggle' : role || el.type, tag: el.tagName.toLowerCase(), text: label.substring(0, 80),
             zone: getZone(el), pos: getPosition(el),
-            checked: el.checked ?? el.getAttribute('aria-checked') === 'true'
+            inForm: Boolean(el.closest('form')), disabled: Boolean(isDisabled(el)),
+            section: getParentContext(el) || undefined,
+            checked: typeof state === 'boolean' ? state : state === 'true' ? true : state === 'false' ? false : 'mixed'
           });
         });
 
@@ -4226,13 +4288,15 @@ async function getPublishedOnboardingTemplate() {
 }
 
 function captureVoiceOperation() {
-  return { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration, tabId: sessionState.lockedTabId };
+  return { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration,
+    ...(voiceTaskRevision > 0 ? { taskRevision: voiceTaskRevision } : {}), tabId: sessionState.lockedTabId };
 }
 
 function isCurrentOperation(operation) {
   return operation.generation === sessionGeneration
     && !operation.signal?.aborted
     && (operation.voiceGeneration === undefined || operation.voiceGeneration === voiceSessionGeneration)
+    && (operation.taskRevision === undefined || operation.taskRevision === voiceTaskRevision)
     && (operation.tabId == null || operation.tabId === sessionState.lockedTabId);
 }
 
@@ -4265,9 +4329,93 @@ async function proposeVoiceAction(elementId, requestedContextVersion, toolIntent
   return proposeOrExecuteAction(elementId, voiceTurn.message, {
     toolExplicitRequest: toolIntent.explicitRequest === true,
     targetLabel: toolIntent.targetLabel,
+    desiredChecked: toolIntent.desiredChecked,
     requestedContextVersion,
     operation
   });
+}
+
+async function setVoiceControlState(elementId, checked, contextVersion, targetLabel) {
+  if (typeof checked !== 'boolean') return { ok: false, error: 'État coché requis.' };
+  const element = lastPageElements.get(elementId);
+  if (!element || !['checkbox', 'radio', 'toggle'].includes(element.type)) return { ok: false, error: 'La cible n’est pas un contrôle de sélection.' };
+  const label = normalizeActionLanguage(targetLabel);
+  const candidates = [...lastPageElements.values()].filter(candidate => ['checkbox', 'radio', 'toggle'].includes(candidate.type)
+    && label && semanticTargetLabels(candidate).includes(label));
+  if (candidates.length !== 1 || candidates[0].id !== elementId) return { ok: false, clarificationRequired: true,
+    error: 'Le contrôle demandé n’est pas identifié de façon unique. Précise son libellé ou son contexte.' };
+  return proposeVoiceAction(elementId, contextVersion, { explicitRequest: true, targetLabel, desiredChecked: checked });
+}
+
+async function selectVoiceControl(targetLabel, checked) {
+  const startedAt = Date.now();
+  const operation = { ...captureVoiceOperation(), tabId: null };
+  const query = normalizeActionLanguage(targetLabel);
+  if (query.length < 3 || typeof checked !== 'boolean') return { ok: false, clarificationRequired: true, error: 'Précise le nom du contrôle et son état souhaité.' };
+  const fresh = await getFreshVoiceContext(null, { operation });
+  if (!fresh.ok) return fresh;
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  const controls = [...lastPageElements.values()].filter(element => ['checkbox', 'radio', 'toggle'].includes(element.type));
+  const exact = controls.filter(element => semanticTargetLabels(element).includes(query));
+  const tokens = query.split(' ').filter(token => !['agenda', 'calendrier', 'case', 'cocher', 'interrupteur', 'de', 'du', 'd', 'l', 'le', 'la'].includes(token));
+  const matches = exact.length ? exact : controls.filter(element => semanticTargetLabels(element)
+    .some(label => tokens.length > 0 && tokens.every(token => label.split(' ').includes(token))));
+  if (matches.length !== 1) {
+    Logger.event('voice', 'VOICE_SELECTION_COMPLETED', { outcome: matches.length ? 'ambiguous' : 'not_found', matchCount: matches.length, durationMs: Date.now() - startedAt });
+    return { ok: false, status: matches.length ? 'ambiguous' : 'not_found', clarificationRequired: true,
+      matches: matches.map(element => ({ targetLabel: element.text, checked: element.checked })),
+      error: matches.length ? 'Plusieurs contrôles correspondent. Demande quel libellé exact choisir.' : 'Aucun contrôle de sélection correspondant n’est exposé sur cette page. Ne défile pas dans la grille sans savoir où chercher.' };
+  }
+  const target = matches[0];
+  const voiceTurn = lastUserTurn?.source === 'voice' && Date.now() - lastUserTurn.createdAt <= ACTION_INTENT_MAX_AGE_MS ? lastUserTurn : null;
+  const words = actionTargetTokens(voiceTurn?.message);
+  const targetWords = elementActionTokens(target).filter(word => !['agenda', 'calendrier', 'case'].includes(word));
+  const selectionIntent = /(?:^|\s)(?:affiche|afficher|montre|montrer|masque|masquer|coche|cocher|decoche|decocher|desactive|desactiver)(?:\s|$)/.test(normalizeActionLanguage(voiceTurn?.message))
+    && words.some(word => targetWords.some(targetWord => actionTokenMatches(word, targetWord)));
+  if (!voiceTurn || !(resolveActionIntent(voiceTurn.message, target).explicit || selectionIntent)) return { ok: false, clarificationRequired: true,
+    error: 'La dernière consigne ne demande pas explicitement cette sélection. Confirme le contrôle à activer ou à masquer.' };
+  const result = await setVoiceControlState(target.id, checked, fresh.contextVersion, target.text);
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  if (!result.ok) return result;
+  const proof = await verifyVoiceResult([{ kind: 'control_checked', targetLabel: target.text, checked }]);
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  const durationMs = Date.now() - startedAt;
+  Logger.event('voice', 'VOICE_SELECTION_COMPLETED', { outcome: proof.ok ? 'confirmed' : 'not_confirmed', matchCount: 1, unchanged: Boolean(result.unchanged), durationMs });
+  return { ...proof, targetLabel: target.text, checked, unchanged: Boolean(result.unchanged), durationMs,
+    verification: { ...proof.verification, scope: 'selection_state' },
+    // Keep the full map locally; the model needs only the selected control and
+    // its proof for this operation, rather than another copy of the whole page.
+    pageContext: `${String(proof.pageContext || '').split('\n').slice(0, 4).join('\n')}\n[contrôle vérifié]\n${target.text}: ${checked ? 'coché' : 'décoché'}.\nLa sélection est ${proof.ok ? 'confirmée' : 'non confirmée'} ; le contenu des rendez-vous n’a pas été vérifié par cette opération.` };
+}
+
+async function verifyVoiceResult(conditions) {
+  const operation = captureVoiceOperation();
+  const fresh = await getFreshVoiceContext(null, { operation });
+  if (!fresh.ok || !isCurrentOperation(operation)) return fresh;
+  const valid = Array.isArray(conditions) && conditions.length > 0 && conditions.length <= 10;
+  const tab = await chrome.tabs.get(sessionState.lockedTabId).catch(() => null);
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  const checks = valid ? conditions.map(condition => {
+    if (condition?.kind === 'text_present' && typeof condition.text === 'string' && condition.text.trim()) {
+      return { kind: condition.kind, matched: fresh.pageContext.toLocaleLowerCase().includes(condition.text.trim().toLocaleLowerCase()) };
+    }
+    if (condition?.kind === 'url_path' && typeof condition.path === 'string' && condition.path.startsWith('/')) {
+      let path; try { path = new URL(tab?.url).pathname; } catch (_) {}
+      return { kind: condition.kind, matched: path === condition.path };
+    }
+    if (condition?.kind === 'control_checked' && typeof condition.checked === 'boolean' && typeof condition.targetLabel === 'string') {
+      const label = normalizeActionLanguage(condition.targetLabel);
+      const candidates = [...lastPageElements.values()].filter(element => ['checkbox', 'radio', 'toggle'].includes(element.type)
+        && label && semanticTargetLabels(element).includes(label));
+      return { kind: condition.kind, matched: candidates.length === 1 && candidates[0].checked === condition.checked };
+    }
+    return { kind: 'invalid', matched: false };
+  }) : [];
+  const confirmed = valid && checks.every(check => check.matched);
+  const verification = { status: confirmed ? 'confirmed' : valid ? 'not_confirmed' : 'unverified', checks };
+  Logger.event('voice', 'VOICE_RESULT_VERIFIED', { status: verification.status, conditionCount: checks.length });
+  return { ...fresh, ok: confirmed, verification, verificationRequired: !confirmed,
+    ...(!confirmed ? { status: 'unexpected', error: valid ? 'Les conditions attendues ne sont pas toutes observées.' : 'La page a été relue ; fournissez des conditions observables pour confirmer le résultat.' } : {}) };
 }
 
 async function scrollVoicePage(rawDirection, rawAmount, rawElementId, requestedContextVersion, operation = captureVoiceOperation()) {
@@ -4945,6 +5093,13 @@ function classifyActionRisk(element, {
   const label = String(element?.text || 'cet élément');
   const consequential = element?.buttonType === 'submit'
     || /supprim|delete|remove|payer|payment|achat|buy|purchase|send|envoyer|publish|publier|autoriser|authorize|allow|grant|confirmer|confirm|valider|save|sauveg|enregistr|submit|invite|déconnect|disconnect|revoke|révoqu/i.test(label);
+  if (['checkbox', 'radio', 'toggle'].includes(element?.type)) {
+    const sensitiveSelection = element.inForm || element.disabled || consequential
+      || /consent|accept|terms|conditions|permission|autoris|partag|share|abonn|subscrib|factur|billing|paiement|payment|marketing/i.test(`${label} ${element.section || ''}`);
+    return explicitRequest && !sensitiveSelection
+      ? { level: 'low', label, reason: 'explicit_state_control' }
+      : { level: 'sensitive', label, reason: 'state_control_requires_confirmation' };
+  }
   const clickableControl = element?.type === 'clickable'
     && !element?.external
     && !element?.disabled;
@@ -5147,6 +5302,10 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
   }, operationId);
 
   if (risk.level === 'low') {
+    if (typeof options.desiredChecked === 'boolean' && element.checked === options.desiredChecked) {
+      return { ok: true, unchanged: true, pageContext: lastPageContext, contextVersion: pageContextVersion,
+        verification: { status: 'confirmed', checks: [{ kind: 'control_checked', matched: true }] } };
+    }
     return executeElementAction({
       elementId,
       contextVersion: pageContextVersion,
@@ -5155,6 +5314,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
       targetDescriptor: element,
       operationId,
       userTurnId: intent.turnId,
+      desiredChecked: options.desiredChecked,
       operation
     });
   }
@@ -5266,7 +5426,9 @@ async function executeElementAction(action) {
     result = await sendContentMessage(operation.tabId, {
       type: 'EXECUTE_ELEMENT_ACTION',
       id: activeAction.elementId,
-      contextVersion: activeAction.contextVersion
+      contextVersion: activeAction.contextVersion,
+      ...(operation.taskRevision === undefined ? {} : { taskRevision: operation.taskRevision }),
+      ...(typeof action.desiredChecked === 'boolean' ? { desiredChecked: action.desiredChecked } : {})
     }, true, operation);
   } catch (_) {
     result = { ok: false, error: 'La page Limova ne répond plus.' };
@@ -5278,7 +5440,8 @@ async function executeElementAction(action) {
       expectedContextVersion: activeAction.contextVersion,
       descriptor: activeAction.targetDescriptor,
       commandType: 'action',
-      message: { type: 'EXECUTE_ELEMENT_ACTION' },
+      message: { type: 'EXECUTE_ELEMENT_ACTION', ...(operation.taskRevision === undefined ? {} : { taskRevision: operation.taskRevision }),
+        ...(typeof action.desiredChecked === 'boolean' ? { desiredChecked: action.desiredChecked } : {}) },
       operationId: activeAction.operationId,
       operation
     }).catch(() => null);
@@ -5414,6 +5577,9 @@ async function enrichBlockedActionWithFreshContext(payload, operationId, reason,
 
 async function sendContentMessage(tabId, message, allowRepair = true, operation = { generation: sessionGeneration }) {
   if (!isCurrentOperation(operation)) return cancelledOperation();
+  if (operation.taskRevision !== undefined && ['EXECUTE_ELEMENT_ACTION', 'TYPE_ELEMENT_TEXT', 'EXECUTE_PAGE_SCROLL'].includes(message?.type)) {
+    message = { ...message, taskRevision: operation.taskRevision };
+  }
   try {
     return await chrome.tabs.sendMessage(tabId, message);
   } catch (error) {
@@ -5633,11 +5799,12 @@ function normalizeRequestedPageUrl(rawUrl) {
 }
 
 async function openPageForUser(rawUrl, { newTab = false } = {}) {
+  const operation = { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration, taskRevision: voiceTaskRevision };
   const url = normalizeRequestedPageUrl(rawUrl);
   if (!url) return { ok: false, error: 'Adresse web invalide. Donne une adresse comme lemonde.fr.' };
   if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
-  const operation = { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration };
   const [current] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   const keepCurrent = newTab || !current?.id || isLimovaUrl(current.url);
   let tab;
   tabOpeningsInProgress += 1;
@@ -5653,6 +5820,7 @@ async function openPageForUser(rawUrl, { newTab = false } = {}) {
       tab = await chrome.tabs.update(current.id, { url });
     }
     if (!tab?.id) return { ok: false, error: 'Impossible d’ouvrir cette page.' };
+    if (!isCurrentOperation(operation)) return cancelledOperation();
     moveAssistantToTab(tab.id, current?.id);
     Logger.event('navigation', 'PAGE_OPENED_FOR_USER', { origin: new URL(url).origin, newTab: keepCurrent });
     await waitForTabLoaded(tab.id, 12_000, { afterNavigation: !keepCurrent });

@@ -961,11 +961,20 @@ function openAiLiveTools(evaluationMode) {
   const contextVersion = { type: 'integer', description: 'Version exacte de la carte DOM courante.' };
   const targetLabel = { type: 'string', description: 'Libellé accessible exact de la cible.' };
   return [
+    tool('select_control', 'Cherche une case, un bouton radio ou un interrupteur par son nom, fixe son état et le vérifie dans une seule opération. Utilise directement pour « affiche/active/masque l’agenda de X », sans inspection, capture ou défilement préalable. Les noms ambigus ne sont jamais sélectionnés.', {
+      targetLabel, checked: { type: 'boolean' }
+    }, ['targetLabel', 'checked']),
     tool('click_element', 'Clique un élément sûr et visible de la carte DOM courante. N’annonce jamais la réussite avant le résultat vérifié.', {
       elementId, contextVersion, targetLabel,
       explicitRequest: { type: 'boolean', description: 'Vrai uniquement si le tour utilisateur demande explicitement cette action.' }
     }, ['elementId', 'contextVersion', 'targetLabel', 'explicitRequest']),
-    tool('inspect_current_page', 'Relit immédiatement la page Limova et renvoie son état DOM actuel. À utiliser avant une action et après tout changement possible.'),
+    tool('set_control_state', 'Fixe l’état d’une case, d’un bouton radio ou d’un interrupteur explicitement demandé. Préfère cet outil à un clic pour afficher un agenda ; une sélection déjà correcte est conservée.', {
+      elementId, contextVersion, targetLabel, checked: { type: 'boolean' }
+    }, ['elementId', 'contextVersion', 'targetLabel', 'checked']),
+    tool('inspect_current_page', 'Relit immédiatement la page active et renvoie son état DOM actuel. À utiliser avant une action et après tout changement possible.'),
+    tool('open_page', 'Ouvre une adresse web explicitement demandée par l’utilisateur et renvoie la nouvelle page. Pour un lien visible, utilise son identifiant DOM.', {
+      url: { type: 'string' }, newTab: { type: 'boolean' }
+    }, ['url']),
     tool('capture_current_view', 'Prend une capture temporaire masquée pour lever une ambiguïté visuelle.', {
       reason: { type: 'string' }
     }, ['reason']),
@@ -987,8 +996,13 @@ function openAiLiveTools(evaluationMode) {
     }, ['elementId', 'contextVersion', 'targetLabel']),
     tool('verify_expected_result', 'Relit la page après une action et vérifie le résultat attendu avant toute confirmation orale.', {
       expectation: { type: 'string' },
+      conditions: { type: 'array', minItems: 1, maxItems: 10, items: {
+        type: 'object', additionalProperties: false,
+        properties: { kind: { type: 'string', enum: ['text_present', 'url_path', 'control_checked'] },
+          text: { type: 'string' }, path: { type: 'string' }, targetLabel, checked: { type: 'boolean' } }, required: ['kind']
+      } },
       contextVersion
-    }, ['expectation', 'contextVersion'])
+    }, ['expectation', 'conditions', 'contextVersion'])
   ];
 }
 
@@ -1210,9 +1224,13 @@ app.post('/api/live-token', verifyAssistantAuth, track('server_voice_session_iss
                 type: 'OBJECT',
                 properties: {
                   expectation: { type: 'STRING' },
+                  conditions: { type: 'ARRAY', items: { type: 'OBJECT', properties: {
+                    kind: { type: 'STRING', enum: ['text_present', 'url_path', 'control_checked'] },
+                    text: { type: 'STRING' }, path: { type: 'STRING' }, targetLabel: { type: 'STRING' }, checked: { type: 'BOOLEAN' }
+                  }, required: ['kind'] } },
                   contextVersion: { type: 'INTEGER' }
                 },
-                required: ['expectation', 'contextVersion']
+                required: ['expectation', 'conditions', 'contextVersion']
               }
             }]
           }] } : {})
@@ -1251,9 +1269,10 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
   const evaluationContext = evaluationCode ? await evaluationContextFor(evaluationCode) : null;
   if (evaluationCode && !evaluationContext) return res.status(410).json({ error: 'Evaluation expired', requestId });
   const evaluationMode = Boolean(evaluationContext);
-  const pageContext = trainingMode ? '' : String(req.body?.pageContext || '').slice(0, 12_000);
+  const pageContext = trainingMode ? '' : String(req.body?.pageContext || '');
+  const browserMode = AUTH_DISABLED && process.env.CHARLY_LOCAL_BROWSER_MODE === 'true';
   const history = trainingMode || evaluationMode ? '' : formatConversationHistory(req.body?.history);
-  const onboardingTemplate = trainingMode || evaluationMode ? null : await fetchPublishedOnboardingTemplate(requestId);
+  const onboardingTemplate = trainingMode || evaluationMode || browserMode ? null : await fetchPublishedOnboardingTemplate(requestId);
   const onboardingTemplateText = formatOnboardingTemplate(onboardingTemplate);
   const lastUserMessage = trainingMode || evaluationMode ? '' : [...(Array.isArray(req.body?.history) ? req.body.history : [])]
     .reverse().find(item => item?.role === 'user')?.content || '';
@@ -1288,8 +1307,14 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
     'La trame publiée est une source de parcours possibles, pas une checklist. Ne présente jamais tout Limova par défaut.'
   ].join(' ');
   const actionInstruction = [
-    'Pour toute action DOM : inspecte la page juste avant, utilise uniquement un identifiant de la version courante, puis attends le résultat de l’outil.',
-    'Après un clic, relis la page jusqu’à obtenir un état stable et appelle verify_expected_result avant d’annoncer la réussite.',
+    'CHEMIN DIRECT : pour sélectionner un contrôle nommé (par exemple afficher l’agenda d’Anthony), appelle immédiatement select_control avec targetLabel et checked. L’outil cherche la cible dans la page fraîche, applique l’état et vérifie la sélection ; il n’a besoin d’aucun identifiant DOM. Ne précède pas cet outil d’une inspection, d’une capture ou d’un défilement. Sa preuve confirmed suffit à annoncer la sélection ; ne relance pas une vérification identique. Si le résultat est ambigu, demande le libellé précis.',
+    'Tu pilotes réellement le navigateur de l’utilisateur via les outils de cette extension Charly. Consulter des informations et afficher ces informations dans sa page sont deux résultats distincts. Pour « affiche son agenda », appelle select_control directement avec le nom de la personne. Ne remplace pas une action demandée par un lien inventé ou des instructions manuelles.',
+    'Si la demande comporte plusieurs étapes, conserve son objectif complet et exécute les étapes autorisées dans l’ordre jusqu’au résultat demandé. Une inspection ou un clic intermédiaire ne termine pas la demande. Après chaque changement de page, relis son état avant de poursuivre ; n’utilise jamais les identifiants de la page précédente.',
+    'Pour les autres actions DOM utilisant un identifiant : utilise la carte fraîche retournée par le dernier outil. Inspecte seulement si elle manque ou si la page a changé. Attends le résultat de l’outil.',
+    'Après un clic ordinaire, utilise la carte fraîche du résultat et appelle verify_expected_result avant d’annoncer la réussite. select_control inclut déjà sa propre vérification de sélection.',
+    'verify_expected_result exige des conditions observables : texte réellement attendu, chemin exact ou état coché d’un contrôle unique. Une simple relecture ou un changement quelconque du DOM ne confirme pas l’objectif. Pour une case utilise control_checked avec son libellé exact ; pour afficher un agenda vérifie aussi un marqueur pertinent de la vue si disponible.',
+    'Après un défilement sans mouvement ou à la fin de la zone, ne répète pas le même défilement. Change de zone ou explique précisément la cible manquante. Si plusieurs agendas portent le même nom, demande une clarification.',
+    'Un résultat cancelled appartient à une consigne remplacée. Repars de la dernière demande et de la page actuelle, sans poursuivre les anciennes actions.',
     'Si la route, une modale ou le DOM ne change pas comme prévu, dis que le résultat n’est pas confirmé et tente au maximum une récupération avec un contexte frais.',
     'Ne meuble pas le temps d’exécution avec une fausse confirmation : dis simplement que tu vérifies.'
   ].join(' ');
@@ -1298,11 +1323,11 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
     SERVER_PROMPT,
     `Tu es Charly, l'assistante dédiée à l'onboarding Limova. Tu peux comprendre, expliquer et piloter la page avec les outils autorisés. Réponds avec précision et concision. ${languageInstruction}`,
     discoveryInstruction,
-    adaptiveOnboardingInstruction,
+    browserMode ? 'MODE PILOTAGE LOCAL : l’utilisateur teste une tâche concrète dans son navigateur. Exécute sa demande et réponds brièvement. Ne lance aucun questionnaire d’onboarding, ne te représente pas, n’explore pas son activité professionnelle.' : adaptiveOnboardingInstruction,
     actionInstruction,
     evaluationMode ? '' : onboardingTemplateText || 'Si aucun objectif précis n’a été exprimé, commence par demander ce que l’utilisateur veut accomplir aujourd’hui. Pose une seule question par tour.',
     'La carte DOM la plus récente est la seule source fiable pour les éléments visibles. N’invente jamais un contrôle, un état, un identifiant ou le succès d’une action.',
-    'Appelle inspect_current_page avant toute observation de l’écran et après une navigation. Une source user_click, user_input ou user_scroll signifie que l’utilisateur a déjà agi : ne répète pas son geste.',
+    'La page active peut être Limova ou un autre site. Son URL, son titre et la carte DOM font foi : ne suppose jamais que l’utilisateur est sur Limova. Pour une observation générale sans carte fraîche, appelle inspect_current_page. Pour select_control, aucune inspection préalable n’est nécessaire : cet outil lit et vérifie lui-même l’état actuel. Une source user_click, user_input ou user_scroll signifie que l’utilisateur a déjà agi : ne répète pas son geste.',
     evaluationMode
       ? 'Pendant ce test, le brouillon isolé est l’unique source produit.'
       : 'Pour les explications produit absentes du DOM, appelle search_knowledge_base.',
@@ -1318,25 +1343,26 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
     : [
         `Tu es Charly, l’assistante vocale d’onboarding Limova. ${languageInstruction} Parle naturellement, brièvement et guide une étape à la fois.`,
         discoveryInstruction,
-        adaptiveOnboardingInstruction,
+        browserMode ? 'MODE PILOTAGE : attends la demande de navigation de l’utilisateur. Un salut bref suffit. Ne présente pas ton rôle, ne récite aucun onboarding et ne demande pas son métier. Pour une action claire, délègue directement puis annonce le résultat vérifié en une phrase.' : adaptiveOnboardingInstruction,
         'Backchannel policy: Utilise de rares acquiescements très courts sans interrompre l’utilisateur.',
         'Interruption policy: Arrête de parler dès que l’utilisateur t’interrompt et écoute sa correction.',
         [
           'Delegation policy:',
           'Backend tools:',
-          '- Lire l’état DOM actuel de la page Limova et identifier les contrôles visibles.',
+          '- Lire l’état DOM actuel de la page active et identifier les contrôles visibles, sur Limova ou un autre site.',
           '- Cliquer un élément, naviguer, faire défiler la page et écrire dans un champ non sensible.',
           '- Vérifier le résultat réel d’une action avant de l’annoncer.',
           '- Rechercher la documentation produit Limova.',
-          'Delegate to the backend when:',
-          '- L’utilisateur demande de regarder, trouver, montrer, ouvrir, cliquer, sélectionner, naviguer, faire défiler, remplir ou écrire quelque chose dans Limova.',
+          'Generate <|SpawnThinking|> when:',
+          '- L’utilisateur demande de regarder, trouver, montrer, ouvrir, cliquer, sélectionner, naviguer, faire défiler, remplir ou écrire quelque chose sur la page active.',
           '- La réponse dépend de l’état actuel de la page, du DOM ou de la documentation produit.',
           '- Une correction modifie une action déjà demandée.',
           '- Tu dois vérifier qu’une action a réellement réussi.',
-          'Do not delegate to the backend when:',
+          'Do not generate <|SpawnThinking|> when:',
           '- L’utilisateur te salue, demande de répéter un résultat déjà obtenu ou répond à une question de clarification.',
           '- La demande est trop ambiguë pour agir : pose alors une seule question courte.',
-          'Délègue avant toute réponse dépendant de la page ou d’une action. N’affirme jamais que tu ne peux pas cliquer ou écrire.',
+          'Generate <|SpawnThinking|> before giving an answer that depends on backend work.',
+          'Tu es Charly dans une extension qui peut cliquer et écrire dans la page active via le backend. Ne te présente pas comme l’extension officielle de ChatGPT, n’invente pas un besoin de passer en mode Work. Si un outil échoue, explique son motif concret. Une promesse orale n’est pas une action : attends un résultat vérifié avant d’annoncer la réussite.',
           'Pendant la délégation, dis seulement que tu vérifies si un retour oral est utile. Attends le résultat du backend et ne devine jamais le résultat.'
         ].join('\n')
       ].join('\n\n');

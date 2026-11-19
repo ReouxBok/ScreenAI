@@ -145,14 +145,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.type === 'EXECUTE_ELEMENT_ACTION') {
-    executeElementActionWithCursor(request.id, request.contextVersion)
+    executeElementActionWithCursor(request.id, request.contextVersion, request)
       .then(sendResponse)
       .catch(() => sendResponse({ ok: false, error: 'Le clic automatique a échoué.' }));
     return true;
   }
 
+  if (request.type === 'VOICE_TASK_REVISION') {
+    if (Number.isSafeInteger(request.revision)) voiceTaskRevision = Math.max(voiceTaskRevision, request.revision);
+    sendResponse({ ok: true });
+    return;
+  }
+
   if (request.type === 'TYPE_ELEMENT_TEXT') {
-    executeElementTextInputWithCursor(request.id, request.contextVersion, request.text)
+    executeElementTextInputWithCursor(request.id, request.contextVersion, request.text, request)
       .then(sendResponse)
       .catch(() => sendResponse({ ok: false, error: 'La saisie automatique a échoué.' }));
     return true;
@@ -825,6 +831,27 @@ function getElementByLid(id) {
   return document.querySelector(`[data-lid="${id}"]`);
 }
 
+function selectionActivationSurface(element) {
+  const rendered = node => {
+    if (!(node instanceof HTMLElement)) return false;
+    const style = getComputedStyle(node), rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+  };
+  for (let parent = element; parent && parent !== document.body; parent = parent.parentElement) {
+    const style = getComputedStyle(parent);
+    if (parent.hidden || parent.hasAttribute('inert') || parent.getAttribute('aria-hidden') === 'true'
+      || style.display === 'none' || style.visibility === 'hidden' || (parent !== element && style.opacity === '0')) return null;
+  }
+  if (!(element instanceof HTMLInputElement) || !['checkbox', 'radio'].includes(element.type) || getComputedStyle(element).opacity !== '0') return element;
+  const label = [...(element.labels || [])].find(rendered);
+  if (label) return label;
+  const parent = element.parentElement;
+  const labelled = element.hasAttribute('aria-label') || element.hasAttribute('aria-labelledby');
+  const oneControl = parent?.querySelectorAll('input, [role="checkbox"], [role="radio"], [role="switch"]').length === 1;
+  const painted = [...(parent?.children || [])].some(child => child !== element && rendered(child));
+  return labelled && oneControl && painted && rendered(parent) ? parent : null;
+}
+
 function resolveElementAction(id, contextVersion, options = {}) {
   if (!Number.isInteger(id) || id < 1) return { ok: false, error: 'Identifiant invalide.' };
   if (document.documentElement.dataset.limovaContextVersion !== String(contextVersion)) {
@@ -833,22 +860,25 @@ function resolveElementAction(id, contextVersion, options = {}) {
 
   const element = getElementByLid(id);
   if (!(element instanceof HTMLElement)) return { ok: false, error: 'Élément introuvable.' };
-  const style = window.getComputedStyle(element);
-  const rect = element.getBoundingClientRect();
+  const activationElement = selectionActivationSurface(element);
+  if (!activationElement) return { ok: false, error: 'Contrôle sans surface visible.' };
+  const style = window.getComputedStyle(activationElement);
+  const rect = activationElement.getBoundingClientRect();
   const disabled = element.matches(':disabled, [aria-disabled="true"]');
   const actionable = element.matches(
     'button, a[href], [role="button"], [role="tab"], [role="menuitem"], [role="link"], ' +
+    'input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"], ' +
     'input[type="submit"], input[type="button"], [tabindex="0"], [class*="btn"], ' +
     '[onclick], [class*="cursor-pointer"], [class*="clickable"]'
   );
   if (!actionable || disabled || style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0) {
     return { ok: false, error: 'Élément non disponible.' };
   }
-  if (!isElementOnActiveSurface(element, options)) {
+  if (!isElementOnActiveSurface(activationElement, options)) {
     return { ok: false, status: 'unexpected', error: 'Une fenêtre au premier plan bloque cet élément.' };
   }
 
-  return { ok: true, element };
+  return { ok: true, element, activationElement };
 }
 
 function executeElementAction(id, contextVersion) {
@@ -975,6 +1005,7 @@ const AGENT_POINTER_ID = 'limova-computer-use-pointer';
 const AGENT_POINTER_SVG = '<span class="limova-pointer-halo"></span><svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M5 3.5v22.8l6.5-6.2 4.2 8.4 4.1-2-4.1-8.1 8.8-.9L5 3.5Z" fill="#1D1D1E" stroke="#fff" stroke-width="2" stroke-linejoin="round"/></svg>';
 let agentPresenceActive = false;
 let agentStopRequested = false;
+let voiceTaskRevision = 0;
 
 // While Charly is acting, the pointer stays on screen and glides from one
 // target to the next instead of reappearing from the corner for every action.
@@ -1065,27 +1096,40 @@ function ensurePointerStyles() {
   document.head.appendChild(style);
 }
 
-async function executeElementActionWithCursor(id, contextVersion) {
+async function executeElementActionWithCursor(id, contextVersion, options = {}) {
+  if (Number.isSafeInteger(options.taskRevision) && options.taskRevision > voiceTaskRevision) voiceTaskRevision = options.taskRevision;
+  const current = () => options.taskRevision === undefined || options.taskRevision === voiceTaskRevision;
+  if (!current()) return { ok: false, cancelled: true, error: 'Demande vocale remplacée.' };
   let resolved = resolveElementAction(id, contextVersion, { allowOffscreen: true });
   if (!resolved.ok) return resolved;
-  const target = resolved.element;
+  const target = resolved.activationElement;
   suppressAssistantScrollUntil = Date.now() + 1_000;
   target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
   await waitForPointerDelay(220);
 
+  if (!current()) return { ok: false, cancelled: true, error: 'Demande vocale remplacée.' };
+
   resolved = resolveElementAction(id, contextVersion);
   if (!resolved.ok) return resolved;
-  const rect = resolved.element.getBoundingClientRect();
+  const rect = resolved.activationElement.getBoundingClientRect();
   const targetX = Math.round(rect.left + rect.width / 2 - 4);
   const targetY = Math.round(rect.top + rect.height / 2 - 3);
   await glideAgentPointer(targetX, targetY);
+
+  if (!current()) { releaseAgentPointer(); return { ok: false, cancelled: true, error: 'Demande vocale remplacée.' }; }
 
   resolved = resolveElementAction(id, contextVersion);
   if (!resolved.ok) {
     releaseAgentPointer();
     return resolved;
   }
-  const clickRect = resolved.element.getBoundingClientRect();
+  const clickRect = resolved.activationElement.getBoundingClientRect();
+  const readChecked = element => element instanceof HTMLInputElement
+    ? (element.indeterminate ? 'mixed' : element.checked)
+    : element.getAttribute('aria-checked') === 'true' ? true : element.getAttribute('aria-checked') === 'false' ? false : 'mixed';
+  if (typeof options.desiredChecked === 'boolean' && readChecked(resolved.element) === options.desiredChecked) {
+    releaseAgentPointer(); return { ok: true, unchanged: true, checked: options.desiredChecked };
+  }
   showAgentClickRipple(clickRect.left + clickRect.width / 2, clickRect.top + clickRect.height / 2);
   const click = dispatchCompletePointerClick(
     resolved.element,
@@ -1094,6 +1138,11 @@ async function executeElementActionWithCursor(id, contextVersion) {
   );
   releaseAgentPointer();
   if (!click.ok) return click;
+  if (typeof options.desiredChecked === 'boolean') {
+    await waitForPointerDelay(150);
+    const checked = readChecked(resolved.element);
+    if (checked !== options.desiredChecked) return { ok: false, verificationRequired: true, error: 'L’état demandé n’est pas confirmé.' };
+  }
   return {
     ok: true,
     visualized: true,
@@ -1104,7 +1153,10 @@ async function executeElementActionWithCursor(id, contextVersion) {
   };
 }
 
-async function executeElementTextInputWithCursor(id, contextVersion, text) {
+async function executeElementTextInputWithCursor(id, contextVersion, text, options = {}) {
+  if (Number.isSafeInteger(options.taskRevision) && options.taskRevision > voiceTaskRevision) voiceTaskRevision = options.taskRevision;
+  const current = () => options.taskRevision === undefined || options.taskRevision === voiceTaskRevision;
+  if (!current()) return { ok: false, cancelled: true, error: 'Demande vocale remplacée.' };
   let resolved = resolveTextInput(id, contextVersion, { allowOffscreen: true });
   if (!resolved.ok) return resolved;
   suppressAssistantScrollUntil = Date.now() + 1_000;
@@ -1118,6 +1170,7 @@ async function executeElementTextInputWithCursor(id, contextVersion, text) {
   const targetY = Math.round(rect.top + rect.height / 2 - 3);
   await glideAgentPointer(targetX, targetY);
 
+  if (!current()) { releaseAgentPointer(); return { ok: false, cancelled: true, error: 'Demande vocale remplacée.' }; }
   const result = setElementText(id, contextVersion, text);
   if (!result.ok) {
     releaseAgentPointer();
@@ -1173,6 +1226,8 @@ function primaryScrollContainer() {
 }
 
 async function executePageScroll(request = {}) {
+  if (Number.isSafeInteger(request.taskRevision) && request.taskRevision > voiceTaskRevision) voiceTaskRevision = request.taskRevision;
+  if (request.taskRevision !== undefined && request.taskRevision !== voiceTaskRevision) return { ok: false, cancelled: true, error: 'Demande vocale remplacée.' };
   const direction = ['up', 'down', 'top', 'bottom'].includes(request.direction) ? request.direction : '';
   const amount = ['small', 'medium', 'large'].includes(request.amount) ? request.amount : 'medium';
   const contextVersion = Number(request.contextVersion);
