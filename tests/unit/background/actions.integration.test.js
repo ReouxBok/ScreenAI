@@ -211,6 +211,71 @@ describe('controlled page actions', () => {
     }
   });
 
+  async function showPage(html) {
+    document.body.innerHTML = html;
+    const context = await background.getPageContext(17);
+    background.lockTab(17);
+    chromeMock.tabs.sendMessage.mockClear();
+    sidebarMessages.length = 0;
+    return label => Number(context.match(new RegExp(`\\[(\\d+)\\] clickable\\([a-z]+\\) "${label}"`))?.[1]);
+  }
+
+  const clicked = id => expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(17, expect.objectContaining({
+    type: 'EXECUTE_ELEMENT_ACTION', id
+  }));
+  const notClicked = () => expect(chromeMock.tabs.sendMessage).not.toHaveBeenCalledWith(17, expect.objectContaining({
+    type: 'EXECUTE_ELEMENT_ACTION'
+  }));
+
+  it.each(['Envoie le formulaire', 'Envoie le message', 'Clique sur Envoyer', 'Envoie'])(
+    'sends a form of another site on an explicit request: %s',
+    async wording => {
+      const idOf = await showPage('<form><label for="m">Message</label><textarea id="m"></textarea><button type="submit">Envoyer</button></form>');
+      const result = await background.proposeOrExecuteAction(idOf('Envoyer'), wording);
+      expect(result).toMatchObject({ ok: true });
+      clicked(idOf('Envoyer'));
+    }
+  );
+
+  it('asks which form to send when the page holds several send buttons', async () => {
+    const idOf = await showPage(`
+      <form><input aria-label="Email newsletter"><button type="submit">S’abonner</button></form>
+      <form><textarea aria-label="Message"></textarea><button type="submit">Envoyer</button></form>
+    `);
+    const result = await background.proposeOrExecuteAction(idOf('Envoyer'), 'Envoie le formulaire');
+    expect(result).toMatchObject({ ok: false, status: 'blocked' });
+    notClicked();
+  });
+
+  it('never sends a form the user did not ask to send', async () => {
+    const idOf = await showPage('<form><textarea aria-label="Message"></textarea><button type="submit">Envoyer</button></form>');
+    const result = await background.proposeOrExecuteAction(idOf('Envoyer'), 'Que contient cette page ?');
+    expect(result).toMatchObject({ ok: false, status: 'blocked' });
+    notClicked();
+  });
+
+  it('does not treat a bare "clique" as explicit for a consequential button', async () => {
+    const idOf = await showPage('<button type="button">Supprimer le brouillon</button>');
+    const vague = await background.proposeOrExecuteAction(idOf('Supprimer le brouillon'), 'Clique');
+    expect(vague).toMatchObject({ ok: false, status: 'blocked' });
+    notClicked();
+    const named = await background.proposeOrExecuteAction(idOf('Supprimer le brouillon'), 'Clique sur Supprimer le brouillon');
+    expect(named.ok).toBe(true);
+  });
+
+  it('accepts a voice tool click on a consequential button only after a real request', async () => {
+    const idOf = await showPage('<button type="button">Payer maintenant</button>');
+    const question = await background.proposeOrExecuteAction(idOf('Payer maintenant'), 'C’est quoi ce bouton ?', {
+      toolExplicitRequest: true, targetLabel: 'Payer maintenant'
+    });
+    expect(question).toMatchObject({ ok: false, status: 'blocked' });
+    notClicked();
+    const confirmation = await background.proposeOrExecuteAction(idOf('Payer maintenant'), 'Oui vas-y', {
+      toolExplicitRequest: true, targetLabel: 'Payer maintenant'
+    });
+    expect(confirmation.ok).toBe(true);
+  });
+
   it('executes a safe action marker without showing a confirmation card', async () => {
     const result = await background.proposeOrExecuteAction(1, 'Que contient cette page ?');
     expect(result.ok).toBe(true);
@@ -415,6 +480,41 @@ describe('controlled page actions', () => {
     expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(17, expect.objectContaining({
       type: 'EXECUTE_ELEMENT_ACTION', id: sendId
     }));
+  });
+
+  it('recognises the Limova 3 arrow named "Envoyer" as the chat send button, only on Limova', async () => {
+    const limova3Composer = `
+      <div id="composer">
+        <textarea placeholder="Dis-moi ce que tu as en tête..."></textarea>
+        <button type="button" aria-label="Ajouter une pièce jointe" title="Ajouter une pièce jointe"><svg></svg></button>
+        <button title="Cliquez pour parler"><svg></svg></button>
+        <button type="button" aria-label="Envoyer"><svg></svg></button>
+      </div>
+    `;
+    const previousUrl = window.location.href;
+    try {
+      jsdom.reconfigure({ url: 'https://staging.new.limova.ai/organizations/o/workspaces/w/chat/new' });
+      document.body.innerHTML = limova3Composer;
+      const context = await background.getPageContext(17);
+      const sendId = Number(context.match(/\[(\d+)\] clickable\(button\) "Envoyer le message"/)?.[1]);
+      expect(sendId).toBeGreaterThan(0);
+      expect(context).not.toMatch(/clickable\(button\) "Envoyer"(?! le message)/);
+      chromeMock.tabs.sendMessage.mockClear();
+
+      const result = await background.proposeOrExecuteAction(sendId, 'Envoie le message');
+      expect(result.ok).toBe(true);
+      expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(17, expect.objectContaining({
+        type: 'EXECUTE_ELEMENT_ACTION', id: sendId
+      }));
+
+      jsdom.reconfigure({ url: 'https://outside.example/contact' });
+      document.body.innerHTML = limova3Composer;
+      const outsideContext = await background.getPageContext(17);
+      expect(outsideContext).toMatch(/clickable\(button\) "Envoyer"/);
+      expect(outsideContext).not.toMatch(/"Envoyer le message"/);
+    } finally {
+      jsdom.reconfigure({ url: previousUrl });
+    }
   });
 
   it('honors an indirect voice confirmation when the tool names the exact send target', async () => {

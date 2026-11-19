@@ -256,25 +256,40 @@ describe('background privacy boundaries', () => {
     })).toMatchObject({ level: 'low', reason: 'visible_control' });
   });
 
-  it('opens a plain link to another site only when the user explicitly asks for it', () => {
-    const instagramPost = { type: 'clickable', text: 'https://www.instagram.com/p/abc', external: true, inForm: false };
-    const searchResult = { type: 'clickable', text: 'Limova — Assistants IA pour les entreprises', external: true, inForm: false };
-    for (const element of [instagramPost, searchResult]) {
+  it('opens a link to another site only on a strictly explicit request', () => {
+    for (const element of [
+      { type: 'clickable', text: 'https://www.instagram.com/p/abc', external: true, inForm: false },
+      { type: 'clickable', text: 'Limova — Assistants IA pour les entreprises', external: true, inForm: false },
+      { type: 'clickable', text: 'Continuer vers le paiement', external: true, inForm: true },
+      { type: 'clickable', text: 'Payer maintenant', external: true, inForm: false }
+    ]) {
       expect(background.classifyActionRisk(element)).toMatchObject({ level: 'sensitive', reason: 'external_action' });
+      expect(background.classifyActionRisk(element, { explicitRequest: true, strictExplicitRequest: false }).level)
+        .toBe('sensitive');
       expect(background.classifyActionRisk(element, { explicitRequest: true }))
         .toMatchObject({ level: 'low', reason: 'explicit_external_navigation' });
     }
-    for (const element of [
-      { type: 'clickable', text: 'Continuer vers le paiement', external: true, inForm: true },
-      { type: 'clickable', text: 'Valider', external: true, buttonType: 'submit' },
-      { type: 'clickable', text: 'Payer maintenant', external: true, inForm: false },
-      { type: 'clickable', text: 'Autoriser l’accès', external: true, inForm: false },
-      { type: 'clickable', text: 'Supprimer le compte', external: true, inForm: false },
-      { type: 'clickable', text: 'Voir la page', external: true, inForm: false, disabled: true },
-      { type: 'clickable', text: 'Envoyer le message', external: true, inForm: false, actionKind: 'message_send' }
-    ]) {
-      expect(background.classifyActionRisk(element, { explicitRequest: true }).level).toBe('sensitive');
-    }
+    expect(background.classifyActionRisk(
+      { type: 'clickable', text: 'Voir la page', external: true, disabled: true },
+      { explicitRequest: true }
+    ).level).toBe('sensitive');
+  });
+
+  it('requires a strictly explicit request for a consequential control', () => {
+    const deleteButton = { type: 'clickable', text: 'Supprimer le brouillon', buttonType: 'button', inForm: false };
+    expect(background.classifyActionRisk(deleteButton, { explicitRequest: true, strictExplicitRequest: false }).level)
+      .toBe('sensitive');
+    expect(background.classifyActionRisk(deleteButton, { explicitRequest: true }))
+      .toMatchObject({ level: 'low', reason: 'explicit_consequential_control' });
+  });
+
+  it('recognises send and submit buttons of any site', () => {
+    expect(background.isSendLikeControl({ type: 'clickable', text: 'Envoyer' })).toBe(true);
+    expect(background.isSendLikeControl({ type: 'clickable', text: 'Valider', buttonType: 'submit' })).toBe(true);
+    expect(background.isSendLikeControl({ type: 'clickable', text: 'Publier le commentaire' })).toBe(true);
+    expect(background.isSendLikeControl({ type: 'clickable', text: 'Envoyer', disabled: true })).toBe(false);
+    expect(background.isSendLikeControl({ type: 'clickable', text: 'Ajouter une pièce jointe' })).toBe(false);
+    expect(background.isSendLikeControl({ type: 'clickable', text: 'Envoi gratuit dès 50 €', external: true })).toBe(false);
   });
 
   it('allows only the preparatory connection step outside forms', () => {

@@ -2965,6 +2965,21 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           return false;
         }
 
+        // Limova 3 names its chat arrow "Envoyer" (aria-label only). On Limova,
+        // an icon button named "Envoyer"/"Send" next to the chat editor is the
+        // chat send button, so it gets the same name as the older interface.
+        function isLimovaComposerSendButton(el) {
+          if (!/^(?:staging\.)?new\.limova\.ai$/.test(window.location.hostname)) return false;
+          if (!el.matches('button, [role="button"], input[type="submit"]')) return false;
+          if (sanitizeVisibleText(el.textContent, 80)) return false;
+          if (!/^(?:envoyer|send)$/i.test(sanitizeVisibleText(getExplicitLabel(el), 80))) return false;
+          let scope = el.parentElement;
+          for (let depth = 0; scope && depth < 6; depth += 1, scope = scope.parentElement) {
+            if (scope.querySelector('textarea, [contenteditable="true"]')) return true;
+          }
+          return false;
+        }
+
         // Helper: get meaningful label for an element
         function getLabel(el) {
           // Limova integration tiles are keyboard-clickable <div tabindex="0">
@@ -2986,6 +3001,7 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           text = text.trim().replace(/\s+/g, ' ');
           if (text.length > 0 && text.length < 80) return text;
           // Fallback: aria-label, title, alt (for icon buttons)
+          if (isLimovaComposerSendButton(el)) return 'Envoyer le message';
           return getExplicitLabel(el)
             || (isInferredMessageSendButton(el) ? 'Envoyer le message' : '')
             || (el.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 80)
@@ -4858,7 +4874,63 @@ function isMessageSendRequest(message, element = null, assistantText) {
     && resolveActionIntent(message, element, assistantText).explicit;
 }
 
-function classifyActionRisk(element, { explicitRequest = false, userMessage = '', messageSendRequest = false } = {}) {
+// Consequential clicks (send, submit, pay, delete, authorize) and links to
+// another site need a strictly explicit request: the user named the target,
+// confirmed the exact target Charly had just named, or the voice tool bound a
+// matching target to a real request (not a question about the page).
+const SEND_CONTROL_PATTERN = /(?:^|\s)(?:envoyer|envoie|send|submit|soumettre|publier|publish|poster)(?:\s|$)/;
+const SEND_REQUEST_GENERIC_TOKENS = new Set([
+  'envoie', 'envoyer', 'envoi', 'envoies', 'soumettre', 'publier', 'publish', 'submit', 'poster',
+  'formulaire', 'form', 'message', 'mail', 'email', 'demande', 'reponse'
+]);
+
+// A send or submit button of any site (a contact form, a comment box). The
+// Limova chat send icon keeps its own exact message_send target.
+function isSendLikeControl(element) {
+  if (element?.type !== 'clickable' || element.disabled) return false;
+  if (element.actionKind === 'message_send' || element.buttonType === 'submit') return true;
+  // A link ("Envoi gratuit", "Publier une annonce") navigates; it sends nothing.
+  if (element.external || element.hrefPath) return false;
+  const aliases = Array.isArray(element.aliases) ? element.aliases.join(' ') : '';
+  return SEND_CONTROL_PATTERN.test(normalizeActionLanguage(`${element.text || ''} ${aliases}`));
+}
+
+// "Envoie le formulaire" names no label, so it designates a send button only
+// when the page holds a single one, or when the other words of the request
+// (or the voice tool's declared label) match this button.
+function sendTargetConfirmed(userMessage, element, { toolTargetMatched = false, intent = null } = {}) {
+  if (!isDirectMessageSendRequest(userMessage)) return false;
+  if (!isSendLikeControl(element)) return false;
+  if (toolTargetMatched) return true;
+  // "Clique sur Envoyer" names this exact button.
+  if (intent?.kind === 'direct' && intent.targetMatched && intent.requestedTokenCount > 0) return true;
+  const specificTokens = actionTargetTokens(userMessage).filter(token => !SEND_REQUEST_GENERIC_TOKENS.has(token));
+  if (specificTokens.length > 0) {
+    const elementTokens = elementActionTokens(element);
+    return specificTokens.some(token => elementTokens.some(elementToken => actionTokenMatches(token, elementToken)));
+  }
+  let sendControls = 0;
+  for (const candidate of lastPageElements.values()) {
+    if (isSendLikeControl(candidate)) sendControls += 1;
+  }
+  return sendControls === 1;
+}
+
+const SHORT_AFFIRMATIVE_PATTERN = /^(?:oui|yes|ok|okay|d accord|daccord|vas y|go|si|vale|bien sur|c est bon|parfait)(?: (?:oui|vas y|go|merci|stp|s il te plait|please|fais le|clique))*$/;
+
+function isStrictExplicitRequest(intent, { toolExplicitRequest = false, toolTargetMatched = false, userMessage = '' } = {}) {
+  if (intent.kind === 'direct' && intent.targetMatched && (intent.requestedTokenCount > 0 || toolTargetMatched)) return true;
+  if (intent.kind === 'referential' && intent.assistantMatched) return true;
+  return toolExplicitRequest
+    && (intent.kind !== 'implicit' || SHORT_AFFIRMATIVE_PATTERN.test(normalizeActionLanguage(userMessage)));
+}
+
+function classifyActionRisk(element, {
+  explicitRequest = false,
+  strictExplicitRequest = explicitRequest,
+  userMessage = '',
+  messageSendRequest = false
+} = {}) {
   const label = String(element?.text || 'cet élément');
   const consequential = element?.buttonType === 'submit'
     || /supprim|delete|remove|payer|payment|achat|buy|purchase|send|envoyer|publish|publier|autoriser|authorize|allow|grant|confirmer|confirm|valider|save|sauveg|enregistr|submit|invite|déconnect|disconnect|revoke|révoqu/i.test(label);
@@ -4886,22 +4958,17 @@ function classifyActionRisk(element, { explicitRequest = false, userMessage = ''
     && !element.disabled
     && (messageSendRequest || isDirectMessageSendRequest(userMessage));
   const autonomousVisibleControl = clickableControl && !consequential;
-  const explicitConsequentialControl = explicitRequest
+  const explicitConsequentialControl = strictExplicitRequest
     && clickableControl
     && consequential
     && element?.actionKind !== 'message_send';
-  // Charly works on any site, so a plain link to another domain (a search
-  // result, the Instagram post Limova just published) is ordinary navigation.
-  // It still needs an explicit request matching this link, and never covers
-  // forms, submit buttons, message sending or consequential labels.
-  const explicitExternalNavigation = explicitRequest
+  // Charly works on any site, so a link to another domain (a search result,
+  // the Instagram post Limova just published) is ordinary navigation once the
+  // user strictly asked for that link.
+  const explicitExternalNavigation = strictExplicitRequest
     && element?.type === 'clickable'
     && element.external === true
-    && !element.inForm
-    && !element.disabled
-    && element.buttonType !== 'submit'
-    && element.actionKind !== 'message_send'
-    && !consequential;
+    && !element.disabled;
   if (lowRiskNavigation) return { level: 'low', label, reason: 'internal_navigation' };
   if (explicitExternalNavigation) return { level: 'low', label, reason: 'explicit_external_navigation' };
   if (preparatoryConnection) return { level: 'low', label, reason: 'connection_setup' };
@@ -4970,6 +5037,9 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
   );
   const toolExplicitRequest = options.toolExplicitRequest === true && toolTargetMatched;
   const explicitRequest = intent.explicit || toolExplicitRequest;
+  const confirmedSendTarget = sendTargetConfirmed(userMessage, element, { toolTargetMatched, intent });
+  const strictExplicitRequest = confirmedSendTarget
+    || isStrictExplicitRequest(intent, { toolExplicitRequest, toolTargetMatched, userMessage });
   // A voice tool call is already bound to the user's current turn and is only
   // considered explicit after its declared label matches the current DOM
   // target. Preserve that verified intent for the exact message-send control;
@@ -4978,7 +5048,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
   const verifiedToolMessageSend = toolExplicitRequest && element.actionKind === 'message_send';
   const messageSendRequest = verifiedToolMessageSend
     || isMessageSendRequest(userMessage, element, assistantText);
-  if (isDirectMessageSendRequest(userMessage) && element.actionKind !== 'message_send') {
+  if (isDirectMessageSendRequest(userMessage) && element.actionKind !== 'message_send' && !confirmedSendTarget) {
     let payload = {
       ok: false,
       status: 'blocked',
@@ -5006,7 +5076,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
     if (!payload.retryWithFreshContext) broadcastToSidebar({ type: 'ACTION_RESULT', ...payload });
     return payload;
   }
-  if ((intent.kind === 'direct' && !intent.targetMatched && !intent.safeIntermediateNavigation && !toolExplicitRequest)
+  if ((intent.kind === 'direct' && !intent.targetMatched && !intent.safeIntermediateNavigation && !toolExplicitRequest && !confirmedSendTarget)
     || (intent.kind === 'referential' && !intent.assistantMatched && !toolExplicitRequest)) {
     let payload = {
       ok: false,
@@ -5041,12 +5111,14 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
     if (!payload.retryWithFreshContext) broadcastToSidebar({ type: 'ACTION_RESULT', ...payload });
     return payload;
   }
-  const risk = classifyActionRisk(element, { explicitRequest, userMessage, messageSendRequest });
+  const risk = classifyActionRisk(element, { explicitRequest, strictExplicitRequest, userMessage, messageSendRequest });
   Logger.event('action', 'ACTION_CLASSIFIED', {
     elementId,
     risk: risk.level,
     reason: risk.reason,
     explicitRequest,
+    strictExplicitRequest,
+    confirmedSendTarget,
     labelLength: risk.label.length,
     elementType: element.type,
     buttonType: element.buttonType || null,
@@ -5728,6 +5800,8 @@ export {
   boundedConversationHistory,
   capturePageAnalysis,
   classifyActionRisk,
+  isSendLikeControl,
+  isStrictExplicitRequest,
   clearCharlyAuthSession,
   confirmPendingAction,
   ensureRemoteCopilotSession,

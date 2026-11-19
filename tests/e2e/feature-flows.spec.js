@@ -958,6 +958,44 @@ test.describe('Packaged extension — complete user flows', () => {
     });
   }
 
+  test('sends a form on another website only once the user explicitly asks to send it', async ({ context, extensionId }) => {
+    await context.route('https://outside.example/**', route => route.fulfill({
+      status: 200,
+      contentType: 'text/html',
+      body: `<!doctype html><title>Contact</title><main><h1>Nous contacter</h1>
+        <form onsubmit="event.preventDefault(); document.body.dataset.sent = String(Number(document.body.dataset.sent || 0) + 1)">
+          <label for="msg">Votre message</label><textarea id="msg"></textarea>
+          <button type="submit">Envoyer</button>
+        </form></main>`
+    }));
+    const { sidebar } = await openExtensionHarness(context, extensionId, {
+      geminiReply: ({ body }) => {
+        const prompt = body.systemInstruction.parts[0].text;
+        const sendId = prompt.match(/\[(\d+)\] clickable\(button\) "Envoyer"/)?.[1];
+        return sendId ? `J’envoie le formulaire. {{ACTION:${sendId}}}` : 'Session prête.';
+      }
+    });
+    await grantAIConsent(sidebar);
+    await sidebar.locator('#userInput').fill('Bonjour');
+    await sidebar.locator('#sendBtn').click();
+    await expect(sidebar.locator('.message.assistant .message-content').first()).toBeVisible();
+
+    const outside = await context.newPage();
+    await outside.goto('https://outside.example/contact');
+    await outside.bringToFront();
+    await expect.poll(async () => (await sidebar.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_LOGS' }))).logs)
+      .toContain('ASSISTANT_FOLLOWED_ACTIVE_TAB');
+
+    await sidebar.locator('#userInput').fill('Que dit cette page ?');
+    await sidebar.locator('#sendBtn').click();
+    await expect(sidebar.locator('.message.error .message-content').last()).toContainText('sensible');
+    expect(await outside.evaluate(() => document.body.dataset.sent || '0')).toBe('0');
+
+    await sidebar.locator('#userInput').fill('Envoie le formulaire');
+    await sidebar.locator('#sendBtn').click();
+    await expect.poll(() => outside.evaluate(() => document.body.dataset.sent || '0')).toBe('1');
+  });
+
   test('assistant markdown cannot inject executable HTML or unsafe links', async ({ context, extensionId }) => {
     const malicious = '<img src=x onerror="document.body.dataset.xss=\'yes\'"> [Piège](javascript:alert(1)) **Texte sûr**';
     const { sidebar } = await openExtensionHarness(context, extensionId, { geminiReply: malicious });
