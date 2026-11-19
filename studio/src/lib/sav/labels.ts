@@ -3,9 +3,6 @@ import type {
   savActionKind,
   savActionStatus,
   savDecisionKind,
-  savLearningStatus,
-  savPilotBatchStatus,
-  savPilotItemStatus,
   savPilotVerdict,
   savThreadStatus,
 } from "@/db/schema";
@@ -81,15 +78,6 @@ export const savToolStatusLabels = {
   blocked: "Bloquée",
 } as const satisfies Record<SavAgentToolTrace["status"], string>;
 
-export const savProcessLabels = {
-  human_review: "Vérification humaine",
-  create_ticket: "Création de ticket proposée",
-  link_ticket: "Rattachement à un ticket proposé",
-  product_step: "Étape dans le produit",
-  review_reply: "Relecture du brouillon",
-  verify_outcome: "Vérification du résultat",
-} as const satisfies Record<SavStructuredProposal["process"][number]["kind"], string>;
-
 export const savRunStatusLabels = {
   pending: "En attente",
   running: "En cours",
@@ -100,13 +88,6 @@ export const savRunStatusLabels = {
   fallback: "Analyse de repli",
   shadow: "Analyse de simulation",
   cancelled: "Analyse annulée",
-} as const;
-
-export const savAnalysisStatusLabels = {
-  pending: "À analyser",
-  processing: "Analyse en cours",
-  done: "Analyse terminée",
-  failed: "Échec de l’analyse",
 } as const;
 
 export const savRoutingLabels = {
@@ -139,52 +120,6 @@ export const savVerdictLabels = {
   incorrect: "Incorrect",
   critical: "Critique",
 } as const satisfies Record<(typeof savPilotVerdict.enumValues)[number], string>;
-
-export const savReviewStatusLabels = {
-  pending: "À revoir",
-  approved: "Validée",
-  rejected: "Refusée",
-} as const;
-
-export const savLearningStatusLabels = {
-  pending: "À examiner",
-  approved: "Approuvée",
-  rejected: "Refusée",
-} as const satisfies Record<(typeof savLearningStatus.enumValues)[number], string>;
-
-export const savPilotBatchStatusLabels = {
-  processing: "Analyse en cours",
-  reviewing: "À examiner",
-  completed: "Terminé",
-  cancelled: "Annulé",
-} as const satisfies Record<(typeof savPilotBatchStatus.enumValues)[number], string>;
-
-export const savPilotItemStatusLabels = {
-  pending: "En attente",
-  processing: "Analyse en cours",
-  ready: "Prêt à examiner",
-  reviewed: "Examiné",
-  error: "Erreur",
-} as const satisfies Record<(typeof savPilotItemStatus.enumValues)[number], string>;
-
-export const savReusabilityLabels = {
-  none: "Évaluation seulement",
-  tone_only: "Ton uniquement",
-  customer_specific: "Cas propre à ce client",
-  reusable: "Procédure réutilisable à proposer à Ugo",
-} as const;
-
-export const savSourceLabels = {
-  knowledge: "Connaissance",
-  hubspot_ticket: "Ticket HubSpot",
-  gmail_thread: "Conversation email",
-  rule: "Règle de qualification",
-} as const;
-
-export const savDirectionLabels = {
-  inbound: "Email reçu",
-  outbound: "Email envoyé",
-} as const;
 
 /** Never expose an unknown internal enum or a prototype property as UI text. */
 export function savLabel(labels: Readonly<Record<string, string>>, value: string | null | undefined, fallback = "État non reconnu") {

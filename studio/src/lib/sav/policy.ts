@@ -1,12 +1,9 @@
 import { z } from "zod";
-import { cleanSavModelDraft, isSavAiAuthoredReply, LEGACY_AI_CHOICES, LEGACY_AI_DISCLOSURE, LEGACY_AI_NOTICE, renderSavOutboundReply } from "./reply-format";
+import { cleanSavModelDraft, isSavAiAuthoredReply, LEGACY_AI_DISCLOSURE, renderSavOutboundReply } from "./reply-format";
 
 export const HUMAN_SLA_DAYS = 3;
-export const FOLLOWUP_DAY_OFFSETS = [2, 5, 10] as const;
 
 export const AI_DISCLOSURE = LEGACY_AI_DISCLOSURE;
-export const AI_HANDOFF_NOTICE = LEGACY_AI_NOTICE;
-export const AI_HANDOFF_CHOICES = LEGACY_AI_CHOICES;
 
 export const decisionKindSchema = z.enum([
   "ticket_pending",
@@ -67,10 +64,6 @@ export function humanDueAt(requestedAt: Date, slaDays = HUMAN_SLA_DAYS) {
   return new Date(requestedAt.getTime() + slaDays * 24 * 60 * 60 * 1_000);
 }
 
-export function followupDates(from: Date) {
-  return FOLLOWUP_DAY_OFFSETS.map((days) => new Date(from.getTime() + days * 24 * 60 * 60 * 1_000));
-}
-
 export function ensureAiTransparency(body: string, language: "fr" | "en" | "unknown" = "fr") {
   return renderSavOutboundReply(cleanSavModelDraft(body), language, "automated");
 }
@@ -112,13 +105,6 @@ export function isSavOutboundRecipientAllowed(
 
 export function assertSavOutboundRecipientAllowed(email: string) {
   if (!isSavOutboundRecipientAllowed(email)) throw new Error("SAV_TEST_OUTBOUND_RECIPIENT_BLOCKED");
-}
-
-export function isSavPilotHubspotActionAllowed(kind: string) {
-  // A pilot batch is a strict simulation: proposed HubSpot actions are kept in
-  // sav.actions for review, but no external mutation is ever authorized.
-  void kind;
-  return false;
 }
 
 export function assertSavPilotReplyApprovalAllowed(pilotBatchId: string | null | undefined) {
