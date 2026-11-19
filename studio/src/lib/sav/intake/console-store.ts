@@ -11,7 +11,8 @@ import { historicalMessageSql, historicalThreadSql, intakeMessageHistorical } fr
 import type { IntakeRuntimePayload } from "./runtime-contract";
 import { savIntakeViewSchema, type SavIntakeView } from "./contract";
 import { intakeConsoleInstalled } from "./console-capability";
-import { SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKED_AFTER_MINUTES, intakeActiveBlockSql, intakeRescueConsumedSql } from "./attempt-policy";
+import { noReadRecoverySql } from "./read-recovery-store";
+import { SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKED_AFTER_MINUTES, intakeActiveBlockSql, intakeCountedAttemptsSql, intakeRescueConsumedSql, intakeRescueOpenSql } from "./attempt-policy";
 import { readSavAgentPause, type SavAgentPauseState } from "./agent-pause";
 import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 import { intakeDossierSensitive } from "./observation-binding";
@@ -156,9 +157,14 @@ export function intakeBlockedCauseSql(threadId: ReturnType<typeof sql>, pause: I
   // SAV-88: a version re-created (deployment) after the message already used its one rescue is never claimed again: "à traiter à la main".
   const rescueUsed = sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and br.state in ('pending', 'waiting')
     and ${intakeRescueConsumedSql(sql`br.message_id`)} and not ${intakeRescueConsumedSql(sql`br.message_id`, sql`br.id`)}
-    and (select coalesce(sum(s.attempts), 0) from sav.intake_runs s where s.message_id = br.message_id) >= ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage})`;
+    and ${intakeCountedAttemptsSql(sql`br.message_id`)} >= ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage})`;
+  // A version re-created after the attempt caps is never scheduled, so it never gets its marker: it is exhausted, not
+  // "waiting for the next pass". Same lifetime total as the scheduler's bound; an open rescue lifts it.
+  const exhaustedUnmarked = sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and br.state in ('pending', 'waiting')
+    and ${intakeCountedAttemptsSql(sql`br.message_id`)} >= ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage}
+    and not ${intakeRescueOpenSql(sql`br.id`, sql`br.message_id`)} and ${noReadRecoverySql(sql`br.id`)})`;
   return sql<string | null>`case when ${marker("rescue_failed")} or ${rescueUsed} then 'manual_required' when ${marker("private_resource_unavailable")} then 'private_resource_unavailable'
-    when ${marker("other_evidence_unavailable")} then 'other_evidence_unavailable' when ${marker("forwarded_origin_unverified")} then 'forwarded_origin_unverified' when ${marker("attempts_exhausted")} then 'attempts_exhausted' when ${marker("deterministic_block")} then 'input_invalid'
+    when ${marker("other_evidence_unavailable")} then 'other_evidence_unavailable' when ${marker("forwarded_origin_unverified")} then 'forwarded_origin_unverified' when ${marker("attempts_exhausted")} or ${exhaustedUnmarked} then 'attempts_exhausted' when ${marker("deterministic_block")} then 'input_invalid'
     when ${marker("source_invalid")} then 'source_invalid' when ${intakeBlockedRunSql(threadId, pause)} then 'technical_wait' when ${paused} then 'agent_paused' else null end`;
 }
 /** Due time of a scheduled automatic retry of the current run, if any. */

@@ -6,7 +6,7 @@ import { readIntakeOperatorInformation } from "./operator-information";
 import { writeReadRecoveryMarker,readRecoverySql,noReadRecoverySql } from "./read-recovery-store";
 import { holdIntakeResume, noResumeHoldSql, recordIntakeResumeProgress } from "./resume-progress-store";
 import { intakeResumeDecision, parseIntakeResumeProof, withoutIntakeResumeProof, intakeResumeProofKey, type IntakeResumeDecision, type IntakeResumeProof, type IntakeResumeProbe } from "./resume-progress";
-import { intakeAttemptBudget, intakeActiveBlockSql, intakeRescueOpenSql, intakeRescueConsumedSql, SAV_INTAKE_RESCUE_KINDS, SAV_INTAKE_ANALYSIS_TIMING, SAV_INTAKE_DISPATCH_LANES, SAV_INTAKE_ATTEMPT_POLICY, intakeCallBlocksDispatch, intakeInFlightCallSql, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_CALL_POLICY, SAV_INTAKE_TRANSIENT_RETRY } from "./attempt-policy";
+import { intakeAttemptBudget, intakeActiveBlockSql, intakeRescueOpenSql, intakeRescueConsumedSql, SAV_INTAKE_RESCUE_KINDS, SAV_INTAKE_ANALYSIS_TIMING, SAV_INTAKE_DISPATCH_LANES, SAV_INTAKE_ATTEMPT_POLICY, intakeCallBlocksDispatch, intakeInFlightCallSql, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_CALL_POLICY, SAV_INTAKE_TRANSIENT_RETRY, SAV_INTAKE_RELEASE_REANALYSIS_KIND, intakeReleaseReanalysisSql, intakeCountedAttemptsSql } from "./attempt-policy";
 import { findSavExternalCompletion, hasUnsettledSavHumanAction, hasUnsettledSavIntakeWork, readSavExternalCompletion, listSavExternalCompletionMessageIds, savExternalCompletionEvents, savExternalDisposition } from "../external-completion";
 import "server-only";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
@@ -120,8 +120,8 @@ const rescueConsumed = async (tx: Tx, runId: string, onRun = false) => (await tx
   .where(and(eq(savIntakeRuns.id, runId), intakeRescueConsumedSql(sql`${savIntakeRuns.messageId}`, onRun ? sql`${savIntakeRuns.id}` : undefined))).limit(1)).length > 0;
 /** The attempt budget ran out: a run that already consumed its rescue ends "à traiter à la main", never a second rescue. */
 const exhaustionKind = async (tx: Tx, runId: string) => await rescueConsumed(tx, runId) ? SAV_INTAKE_RESCUE_KINDS.failed : "attempts_exhausted";
-const attemptRows = (tx: Tx, messageId: string) => tx.select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext })
-  .from(savIntakeRuns).where(eq(savIntakeRuns.messageId, messageId));
+const attemptRows = (tx: Tx, messageId: string) => tx.select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext,
+  releaseOnly: sql<boolean>`${intakeReleaseReanalysisSql(sql`${savIntakeRuns.id}`)}` }).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, messageId));
 export const SAV_INTAKE_SOURCE_REVISION = "sav-intake-source.v2";
 /** Exchanged content only: supportContext, attachmentRead and other derived fields are excluded. */
 function intakeSourceContentHash(bodyCiphertext: string) {
@@ -258,6 +258,27 @@ const noCommittedExecutionFor = (messageId: ReturnType<typeof sql>) => sql`not e
   and (e.state in ('confirmed','refused') or exists(select 1 from sav.intake_effects f where f.execution_id=e.id
     and (f.state<>'planned' or f.dispatched_at is not null or f.dispatch_token is not null or f.ack_ciphertext is not null or f.verification_ciphertext is not null or f.confirmed_at is not null))))`;
 const noCommittedExecution = noCommittedExecutionFor(sql`${savMessages.id}`);
+/** A release still re-creates the version of an open dossier, decided ones included: a human command (reclassifying an
+ * acknowledgement or an Autre) and an execution are bound to the current configuration, so leaving a decided dossier on
+ * an older configuration would leave such a command waiting forever (Astra, review of cd1d47eb). What a release no longer
+ * does is consume the lifetime attempt budget.
+ * The run a new version of this same mail would only re-run because of a release: the latest version that holds an
+ * accepted analysis, on sources that still match, without human decision or blocking marker. Versions created by
+ * earlier releases and never claimed are skipped (they inherit the same anchor). Any failed, blocked or changed run: null. */
+async function releaseReanalysisAnchor(tx: Tx, message: typeof savMessages.$inferSelect) {
+  const runs = await tx.select({ id: savIntakeRuns.id, version: savIntakeRuns.version, configHash: savIntakeRuns.configHash, attempts: savIntakeRuns.attempts, sourceHash: savIntakeRuns.sourceHash,
+    humanChoiceCiphertext: savIntakeRuns.humanChoiceCiphertext, payloadCiphertext: savIntakeRuns.payloadCiphertext, releaseOnly: sql<boolean>`${intakeReleaseReanalysisSql(sql`${savIntakeRuns.id}`)}` })
+    .from(savIntakeRuns).where(eq(savIntakeRuns.messageId, message.id)).orderBy(desc(savIntakeRuns.version)).limit(20);
+  for (const run of runs) {
+    if (await blockedRun(tx, run.id)) return null;
+    let analysed: boolean;
+    try { analysed = Boolean(decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext).plan); } catch { return null; }
+    if (run.releaseOnly && run.attempts === 0 && !analysed) continue;
+    if (!analysed || !run.sourceHash || run.humanChoiceCiphertext) return null;
+    try { return intakeSourceMatches(await savIntakeSourceSnapshot(tx, message, new Date()), run.sourceHash) ? run : null; } catch { return null; }
+  }
+  return null;
+}
 const eligible = (message: typeof savMessages.$inferSelect, config: IntakeRuntimeConfig) => message.direction === "inbound" && message.mailboxId === config.mailboxId
   && message.receivedAt.getTime() > Date.parse(config.receivedAfter) && message.createdAt.getTime() > Date.parse(config.createdAfter);
 /** Called after durable mail insertion. Recovery finds an interrupted enqueue. */
@@ -272,6 +293,7 @@ export async function enqueueSavIntakeMessage(messageId: string, config: IntakeR
     const [same] = await tx.select().from(savIntakeRuns).where(and(eq(savIntakeRuns.messageId, message.id), eq(savIntakeRuns.configHash, config.configHash)));
     if (same) return same.id;
     if (await intakeHasHumanDecision(messageId, tx)) return null;
+    const anchor = await releaseReanalysisAnchor(tx, message);
     // Atomic ownership claim races safely with the legacy pending->processing UPDATE.
     const owned = await tx.update(savMessages).set({ analysisStatus: "intake_pending" }).where(and(eq(savMessages.id, message.id),
       or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`))).returning({ id: savMessages.id });
@@ -287,6 +309,7 @@ export async function enqueueSavIntakeMessage(messageId: string, config: IntakeR
       configHash: config.configHash, policyHash: config.policyHash, ...(due?.leaseUntil ? { leaseUntil: due.leaseUntil } : {}), payloadCiphertext: encryptSavPayload({ revision: SAV_INTAKE_RUNTIME_REVISION, effects: "not_connected",
         ...(config.pipeline === "simple" ? { pipeline: "simple" } : {}) }) }).returning();
     await journal(tx, run.id, "queued", { messageId: message.id, version: run.version, configHash: config.configHash, pipeline: config.pipeline ?? "current" });
+    if (anchor) await journal(tx, run.id, SAV_INTAKE_RELEASE_REANALYSIS_KIND, { anchorRunId: anchor.id, anchorVersion: anchor.version, anchorConfigHash: anchor.configHash, sourceHash: anchor.sourceHash });
     return run.id;
   });
 }
@@ -558,7 +581,7 @@ export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = ne
     or(sql`not ${intakeActiveBlockSql(sql`${savIntakeRuns.id}`)}`, and(intakeRescueOpenSql(sql`${savIntakeRuns.id}`, sql`${savIntakeRuns.messageId}`), sql`not ${intakeActiveBlockSql(sql`${savIntakeRuns.id}`, SAV_INTAKE_BLOCKING_JOURNAL_KINDS.filter(k => k !== "attempts_exhausted"))}`)),
     or(and(lt(savIntakeRuns.attempts, 2),legacy), recovery), noHuman, notCompleted, schedulingFilter, noCommittedExecutionFor(sql`${savIntakeRuns.messageId}`), noResumeHoldSql(sql`${savIntakeRuns.id}`, now),
     // Coarse lifetime bound in SQL; the claim applies the full per-version/failed/total policy.
-    or(sql`(select coalesce(sum(s.attempts),0) from sav.intake_runs s where s.message_id = ${savIntakeRuns.messageId}) < ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage}`, recovery, intakeRescueOpenSql(sql`${savIntakeRuns.id}`, sql`${savIntakeRuns.messageId}`)),
+    or(sql`${intakeCountedAttemptsSql(sql`${savIntakeRuns.messageId}`)} < ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage}`, recovery, intakeRescueOpenSql(sql`${savIntakeRuns.id}`, sql`${savIntakeRuns.messageId}`)),
     sql`exists (select 1 from sav.threads t where t.id = ${savIntakeRuns.threadId} and not t.ai_paused)`,
     // A scheduled transient retry carries its due time in leaseUntil (no lease token): not before then.
     or(and(inArray(savIntakeRuns.state, ["pending", "waiting"]), or(isNull(savIntakeRuns.leaseUntil), lte(savIntakeRuns.leaseUntil, now))),

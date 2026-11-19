@@ -1,6 +1,6 @@
 import "server-only";
 import { SAV_INTAKE_NOISE_GUARDS, SAV_INTAKE_NOISE_REASONS } from "./noise-filter";
-import { intakeAttemptExhaustion, intakeRunAnalysed, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS } from "./attempt-policy";
+import { intakeAttemptExhaustion, intakeCountedAttemptsSql, intakeRunAnalysed, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS } from "./attempt-policy";
 import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savIntakeEffectJournal, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeModelCalls, savIntakeObservationBindings, savIntakeRuns, savMessages, savResolutionObservations } from "@/db/schema";
@@ -177,6 +177,8 @@ export async function readIntakeRunDiagnostics(threadId: string) {
       .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     if (!message) return null;
     const [total] = await tx.select({ attempts: sql<number>`coalesce(sum(${savIntakeRuns.attempts}),0)::int` }).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, message.id));
+    // The lifetime cap ignores release re-analyses (attempt-policy.ts); totalAttempts still shows every attempt.
+    const [lifetime] = await tx.select({ attempts: sql<number>`${intakeCountedAttemptsSql(sql`${message.id}::uuid`)}::int` }).from(savMessages).where(eq(savMessages.id, message.id));
     const rows = await tx.select({ id: savIntakeRuns.id, version: savIntakeRuns.version, isCurrent: savIntakeRuns.isCurrent, state: savIntakeRuns.state,
       attempts: savIntakeRuns.attempts, createdAt: savIntakeRuns.createdAt, updatedAt: savIntakeRuns.updatedAt,
       payloadCiphertext: sql<string>`case when octet_length(${savIntakeRuns.payloadCiphertext}) <= 262144 then ${savIntakeRuns.payloadCiphertext} else '' end` }).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, message.id))
@@ -206,10 +208,11 @@ export async function readIntakeRunDiagnostics(threadId: string) {
       if (!analysed) failed += r.attempts;
     }
     const unknown = Math.max(0, exactTotal - counted);
-    const known = current ? intakeAttemptExhaustion({ runAttempts: current.attempts, failed, total: exactTotal }) : false;
+    const lifetimeTotal = Number(lifetime?.attempts ?? exactTotal);
+    const known = current ? intakeAttemptExhaustion({ runAttempts: current.attempts, failed, total: lifetimeTotal }) : false;
     // Unknown attempts that could reach the failed cap leave the verdict undetermined.
     const undetermined = current && !known && failed + unknown >= SAV_INTAKE_ATTEMPT_POLICY.failedPerMessage;
-    const budget = current ? { runAttempts: current.attempts, failed, unknown, total: exactTotal, exhausted: undetermined ? "undetermined" as const : known || null,
+    const budget = current ? { runAttempts: current.attempts, failed, unknown, total: lifetimeTotal, exhausted: undetermined ? "undetermined" as const : known || null,
       policy: SAV_INTAKE_ATTEMPT_POLICY } : null;
     const [marker] = current ? await tx.select({ kind: savIntakeJournal.kind }).from(savIntakeJournal)
       .where(and(eq(savIntakeJournal.runId, current.id), inArray(savIntakeJournal.kind, [...SAV_INTAKE_BLOCKING_JOURNAL_KINDS]))).orderBy(desc(savIntakeJournal.createdAt), desc(savIntakeJournal.id)).limit(1) : [];
