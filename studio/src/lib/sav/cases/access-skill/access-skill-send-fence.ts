@@ -15,6 +15,10 @@ import { SAV_ENTRY_SKILL_BLOCKS } from "../blocks/registry";
  * Switch `off` and no skill admission: nothing here, exactly as before.
  * Chantier « 3 blocs »: a case admitted by ANOTHER block's skill (`<blockId>-entry-skill`) is answered only while that block is still registered, `on`
  * at the entry switch, at the SAME skill revision, with its pinned prompt; otherwise it is cancelled the same way (`CANCELLED_ACCESS_SKILL_CHANGED`).
+ * KNOWN DIVERGENCE (assembly 19/11, root decision: documented, NOT changed): the policy's revision lifecycle says « a case admitted under N-1 ends under
+ * N-1 » (`previous: true`, `caseAdmissionRuleStage`), but this fence cancels any reply of a case admitted at another revision than the code's (Access and
+ * every block alike). After a skill revision is deployed, open N-1 cases therefore get no automatic reply (cancelled, then the team) instead of
+ * finishing under N-1. Access's production behaviour is kept as is; aligning the two is a later, separate decision for Ugo.
  */
 
 type Env = Readonly<Record<string, string | undefined>>;

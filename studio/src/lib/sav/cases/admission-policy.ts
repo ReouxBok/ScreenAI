@@ -40,6 +40,20 @@ export function caseAdmissionRuleStage(qualification: Pick<CaseAdmissionQualific
   return stages.includes("withdrawn") ? "withdrawn" : stages.includes(null) ? null : stages.includes("previous") ? "previous" : "current";
 }
 
+/**
+ * Revision lifecycle (19/11, assembly): a FRESH reading of a mail by the entry is admitted under the current revision N only. A rule provenance that
+ * stands only on a policy entry marked `previous` (N-1) proves nothing for it: that row is dropped, so the request keeps its V1 hint (which never
+ * admits) and the mail goes to the team. Reachable only when the running code's rule revision is the one the approved policy already marks
+ * `previous` (a policy approved before its code is deployed). A case already admitted under N-1 is not read here: it keeps its stored admission
+ * (`caseAdmissionRuleStage`, the policy sweep). A policy with no `previous` entry, or missing or unreadable: the qualification is returned unchanged.
+ */
+export function caseFreshQualificationUnderCurrent(qualification: CaseAdmissionQualification, policy: unknown): CaseAdmissionQualification {
+  const parsed = policy === null || policy === undefined ? null : caseAdmissionPolicySchema.safeParse(policy);
+  if (!parsed?.success || !parsed.data.qualifiedRules.some(rule => rule.previous)) return qualification;
+  const previousOnly = (row: CaseAdmissionQualification["requests"][number]) => row.provenance.kind === "qualified_rule" && caseAdmissionRuleStage({ requests: [row] }, parsed.data) === "previous";
+  return qualification.requests.some(previousOnly) ? { ...qualification, requests: qualification.requests.filter(row => !previousOnly(row)) } : qualification;
+}
+
 /** Whether a human or a rule the policy lists proves this request's family (v8: the family a
  * relayed request is recorded with). A model hint proves nothing, and neither does `unknown`. */
 export function caseRequestFamilyProven(request: CaseAdmissionQualification["requests"][number], policy: unknown) {
