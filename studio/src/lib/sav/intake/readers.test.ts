@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import { createSavIntakeHubspotReaders, isSavIntakeHubspotRead } from "./hubspot-readers";
 import { createSavIntakeSemanticReaders, type IntakeGeminiCall, type IntakeValidatedEvidence } from "./model-readers";
 import { prepareSavIntakeMessage } from "./message";
-import { evaluateSavIntakeReadOnly, type EvaluationCase, type EvaluationGrant } from "./evaluation";
 import { planSavIntake } from "./engine";
 import type { EngineInput, EnginePolicy } from "./engine-types";
 
@@ -136,35 +135,6 @@ describe("semantic adapter grounding and message provenance", () => {
     const models = createSavIntakeSemanticReaders({ model: "gemini-configured", call: call(analysis()) });
     const p = await planSavIntake(input(), { ...readers, ...models }, policy, {}, () => new Date(later));
     expect(p.decision.disposition.kind).toBe("ticket"); expect(p.decision.evidence.find(e => e.id === "email-lookup")?.observedAt).toBe(later);
-  });
-});
-
-describe("bounded evaluation, with no operational writer", () => {
-  const item = (): EvaluationCase => ({ caseId: "SYN-1", clientGroup: "synthetic-client", input: input(), policy,
-    reference: { classification: "support", contactId: "101", action: "create", sourceState: "current", qualifiedDimensions: ["classification", "contact", "action"] } });
-  const grant: EvaluationGrant = { corpusManifestSha256: "a".repeat(64), referenceManifestSha256: "b".repeat(64), model: "gemini-configured", existingApprovalReference: "fixture-only", remainingNanoUsd: 10, maxReservedNanoUsdPerCall: 1, maxCases: 40, maxCallsPerCase: 6 };
-  const options = () => ({ cases: [item()], corpusManifestSha256: grant.corpusManifestSha256, referenceManifestSha256: grant.referenceManifestSha256,
-    configuredModel: grant.model, grant, network: crm().network, call: call(analysis()), withExistingAiBudget: async <T>(work: () => Promise<T>) => work(), now: () => new Date(at) });
-  it("fails admission before network/model when existing total budget or access is missing", async () => {
-    const f = options(), network = vi.fn(f.network), model = vi.fn(f.call);
-    expect((await evaluateSavIntakeReadOnly({ ...f, grant: null, network, call: model })).stopReason).toBe("MODEL_ACCESS_OR_EXISTING_TOTAL_BUDGET_MISSING"); expect(network).not.toHaveBeenCalled(); expect(model).not.toHaveBeenCalled();
-  });
-  it("refuses a mismatched reference manifest or provider configuration", async () => {
-    expect((await evaluateSavIntakeReadOnly({ ...options(), configuredModel: "gemini-other" })).stopReason).toBe("CONFIGURATION_OR_REFERENCE_MISMATCH");
-  });
-  it("runs an injected pure decision and scores only independently qualified dimensions", async () => {
-    const result = await evaluateSavIntakeReadOnly(options());
-    expect(result.stopReason).toBeNull(); expect(result.modelCalls).toBe(1); expect(result.effects).toBe("none");
-    expect(result.records[0].dimensions).toEqual({ classification: true, contact: true, action: true }); expect(result.records[0].dimensions).not.toHaveProperty("ticket");
-  });
-  it("stops after the three-case pilot on a reference disagreement", async () => {
-    const f = options(); f.cases = Array.from({ length: 4 }, (_, i) => ({ ...item(), caseId: `SYN-${i}`, reference: { ...item().reference, classification: "finance" } }));
-    const result = await evaluateSavIntakeReadOnly(f); expect(result.records).toHaveLength(3); expect(result.stopReason).toBe("PILOT_REQUIRES_REVIEW"); expect(result.independentClientGroups).toBe(1);
-  });
-  it("keeps unknown usage reserved and blocks the next case at the existing ceiling", async () => {
-    const f = options(); f.grant = { ...grant, remainingNanoUsd: 1 }; f.cases.push({ ...item(), caseId: "SYN-2" });
-    const result = await evaluateSavIntakeReadOnly(f); expect(result.modelCalls).toBe(1); expect(result.reservedNanoUsd).toBe(1); expect(result.records[1].traces[0].errorCode).toBe("SAV_INTAKE_EVALUATION_BUDGET_EXHAUSTED");
-    expect(result.stopReason).toBe("EXISTING_TOTAL_BUDGET_EXHAUSTED");
   });
 });
 

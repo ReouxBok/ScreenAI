@@ -85,20 +85,20 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
   return <>
     <PageHeader back={<BackLink fallback={fallback}>Retour</BackLink>} title={`Ticket ${view.ticketId}`} status={<>{reviewable ? <Badge tone="warning">Réponse à valider</Badge> : <Badge>Lecture seule</Badge>}{view.sensitive ? <Badge tone="danger">Sensible : équipe</Badge> : null}</>}
       description={`${view.owner} · ${view.phase} · version ${view.version}, mise à jour ${date(view.updatedAt)}`}/>
-    {view.humanHold?.state === "taken" ? <p className={styles.notice} role="status">Ticket pris par une personne de l’équipe le {date(view.humanHold.since)} : l’agent V2 n’investigue pas, ne propose rien, ne répond pas et ne relance pas, même après un nouveau mail du client. Cette page l’affiche seulement.</p>
-      : view.humanHold?.state === "team_not_taken" ? <p className={styles.notice} role="status">Dossier confié à l’équipe, pas encore pris par une personne : l’agent V2 n’agit pas sur ce dossier. Cette page l’affiche seulement.</p>
+    {view.humanHold?.state === "taken" ? <p className={styles.notice} role="status">Ticket pris par une personne de l’équipe le {date(view.humanHold.since)} : l’Agent SAV n’investigue pas, ne propose rien, ne répond pas et ne relance pas, même après un nouveau mail du client. Cette page l’affiche seulement.</p>
+      : view.humanHold?.state === "team_not_taken" ? <p className={styles.notice} role="status">Dossier confié à l’équipe, pas encore pris par une personne : l’Agent SAV n’agit pas sur ce dossier. Cette page l’affiche seulement.</p>
       : null}
 
     <section className={styles.card} aria-labelledby="v2-situation"><h2 id="v2-situation">Où en est le dossier</h2>
-      {continuationStop === undefined ? <p className={styles.notice} role="status">Arrêts V2 : lecture indisponible. L’absence d’arrêt ne peut pas être confirmée ; un administrateur SAV doit vérifier le diagnostic.</p> : null}
+      {continuationStop === undefined ? <p className={styles.notice} role="status">Arrêts de l’Agent SAV : lecture indisponible. L’absence d’arrêt ne peut pas être confirmée ; un administrateur SAV doit vérifier le diagnostic.</p> : null}
       <p><Status tone={view.situation.tone}>{view.situation.title}</Status>{view.situation.detail ? <span className={styles.small}> {view.situation.detail}</span> : null}</p>
       {notice ? <div id="v2-notice"><p><Status tone={notice.tone}>{notice.line}</Status>{notice.link ? <> <a href={notice.link} target="_blank" rel="noreferrer">Voir le message</a></> : null}</p>
         <p><strong>Action suivante :</strong> {notice.next}</p></div> : null}
       <p><Status tone={repliesSummary.tone}>{repliesSummary.line}</Status></p>
       {repliesSummary.uncertain ? <p className={styles.notice} role="status">{repliesSummary.uncertain} envoi{repliesSummary.uncertain > 1 ? "s" : ""} incertain{repliesSummary.uncertain > 1 ? "s" : ""} sur cette page : à ne compter ni comme envoyé ni comme non envoyé.</p> : null}
-      <h3 id="v2-engines">V1 et V2</h3>
-      <p><strong>V2 :</strong> {view.engines.v2}</p>
-      {view.engines.v1.length ? <ul>{view.engines.v1.map((row, i) => <li key={i}><strong>V1 :</strong> {row.label} <span className={styles.small}>Mail du {date(row.at)}.</span></li>)}</ul> : <p><strong>V1 :</strong> aucun mail client confirmé dans le journal de ce dossier.</p>}
+      <h3 id="v2-engines">Agent de tri et Agent SAV</h3>
+      <p><strong>Agent SAV :</strong> {view.engines.v2}</p>
+      {view.engines.v1.length ? <ul>{view.engines.v1.map((row, i) => <li key={i}><strong>Agent de tri :</strong> {row.label} <span className={styles.small}>Mail du {date(row.at)}.</span></li>)}</ul> : <p><strong>Agent de tri :</strong> aucun mail client confirmé dans le journal de ce dossier.</p>}
     </section>
 
     <section className={styles.card} aria-labelledby="v2-mail"><h2 id="v2-mail">Mail du client</h2>
@@ -130,7 +130,7 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
     </section>
 
     <section className={styles.card} aria-labelledby="v2-admission"><h2 id="v2-admission">Propriétaire et admission</h2>
-      <p>Responsable du dossier : <strong>{view.owner}</strong> <span className={styles.small}>(tel qu’enregistré dans le dossier V2 ; ce n’est pas une lecture HubSpot en direct)</span></p>
+      <p>Responsable du dossier : <strong>{view.owner}</strong> <span className={styles.small}>(tel qu’enregistré dans le dossier de l’Agent SAV ; ce n’est pas une lecture HubSpot en direct)</span></p>
       {view.admission.state === "unknown" ? <p role="status">{view.admission.label}</p> : <>
         <p><Status tone={view.admission.state === "admitted" ? "neutral" : "warning"}>{view.admission.label}</Status> <span className={styles.small}>décidée le {date(view.admission.decidedAt)}, version {view.admission.version}, politique {view.admission.policyRevision ?? "non enregistrée"}.</span></p>
         {view.admission.state === "refused" ? <ul>{view.admission.reasons.map((reason, i) => <li key={i}>{reason}</li>)}</ul> : null}
@@ -145,7 +145,7 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
     <section className={styles.card} aria-labelledby="v2-request"><h2 id="v2-request">Demandes retenues</h2>
       {view.original ? <p>Premier mail reçu le {date(view.original.at)}.</p> : null}
       {view.requests.length ? <ul>{view.requests.map((request, i) => <li key={i}>{request.summary} <span className={styles.small}>{request.family} · {request.status} · depuis {date(request.openedAt)}</span>
-        <br/>{"text" in request.subject ? <>Sujet : {request.subject.text} <span className={styles.small}>(analyse V1 acceptée le {date(request.subject.acceptedAt)})</span></> : <span className={styles.small}>Pas de sujet recherchable : {request.subject.missing}.</span>}
+        <br/>{"text" in request.subject ? <>Sujet : {request.subject.text} <span className={styles.small}>(analyse de l’Agent de tri acceptée le {date(request.subject.acceptedAt)})</span></> : <span className={styles.small}>Pas de sujet recherchable : {request.subject.missing}.</span>}
         {request.knowledge ? <><br/><span className={styles.small}>Connaissances : {request.knowledge.label}</span></> : null}</li>)}</ul> : <p>Aucune demande ouverte enregistrée.</p>}
     </section>
 
@@ -205,7 +205,7 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
     </section>
 
     <section className={styles.card} aria-labelledby="v2-effects"><h2 id="v2-effects">Réponse préparée ou envoyée, et preuves</h2>
-      <p>Envois de l’agent V2 sur cet environnement : <strong>{effects.mode === "supervised" ? "mode supervisé demandé" : "désactivés"}</strong>{effects.ignored ? " (réglage non reconnu, traité comme désactivé)" : ""}.</p>
+      <p>Envois de l’Agent SAV sur cet environnement : <strong>{effects.mode === "supervised" ? "mode supervisé demandé" : "désactivés"}</strong>{effects.ignored ? " (réglage non reconnu, traité comme désactivé)" : ""}.</p>
       <h3 id="v2-replies">Réponses préparées et leur suivi</h3>
       {replies.state === "absent" ? <p>Le registre des réponses validées n’est pas branché sur cette version : ne rien voir ici ne veut pas dire qu’aucune réponse n’existe, et aucun envoi n’est affiché comme envoyé ou confirmé.</p>
         : replies.state === "unavailable" ? <p role="alert">Registre des réponses indisponible : la lecture a échoué, ce n’est pas une liste vide. Aucun envoi n’est affiché comme envoyé ou confirmé.</p>

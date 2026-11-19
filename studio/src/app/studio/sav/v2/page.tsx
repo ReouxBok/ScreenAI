@@ -37,30 +37,30 @@ export default async function SavV2PilotPage({ searchParams }: { searchParams: P
   const here = query({ phase, owner, cursor: cursor ?? undefined }), first = query({ phase, owner });
   const caseHref = (ticket: string, anchor: string) => `/studio/sav/v2/${ticket}?${new URLSearchParams({ returnTo: `${anchor}#case-${ticket}` })}`;
   return <>
-    <PageHeader title="Pilote V2 supervisé" description="Dossiers suivis par l’agent V2. Consultation seulement : cette page n’envoie rien, ne lance aucune analyse et ne modifie aucun dossier."/>
-    {!savCaseRecordingEnabled() ? <p className={styles.notice} role="status">Enregistrement des dossiers V2 désactivé sur cet environnement : aucun nouveau dossier n’est créé.</p> : null}
+    <PageHeader title="Agent SAV supervisé" description="Dossiers suivis par l’Agent SAV. Consultation seulement : cette page n’envoie rien, ne lance aucune analyse et ne modifie aucun dossier."/>
+    {!savCaseRecordingEnabled() ? <p className={styles.notice} role="status">Enregistrement des dossiers de l’Agent SAV désactivé sur cet environnement : aucun nouveau dossier n’est créé.</p> : null}
 
     <form className={styles.search} role="search" action="/studio/sav/v2">
       <TextInput type="search" name="ticket" inputMode="numeric" defaultValue={ticketId} maxLength={30} placeholder="Numéro de ticket HubSpot" aria-label="Numéro de ticket HubSpot"/>
       <Button type="submit">Ouvrir</Button>
     </form>
     {ticketId && !valid ? <p className={styles.notice} role="alert">Un numéro de ticket HubSpot ne contient que des chiffres.</p> : null}
-    {valid && !found ? <EmptyState title="Aucun dossier V2 pour ce ticket">Le ticket n’a pas été relayé à l’agent V2, ou le numéro est incorrect.</EmptyState> : null}
+    {valid && !found ? <EmptyState title="Aucun dossier de l’Agent SAV pour ce ticket">Le ticket n’a pas été relayé à l’Agent SAV, ou le numéro est incorrect.</EmptyState> : null}
     {found ? <Link className={styles.result} href={`/studio/sav/v2/${ticketId}?${new URLSearchParams({ returnTo: `/studio/sav/v2?ticket=${ticketId}` })}`}>
       <strong>Ticket {ticketId}</strong>
       <span>{ownerLabel(found.owner)} · {phaseLabel(found.phase)} · version {found.version}</span>
     </Link> : null}
 
     <section aria-labelledby="v2-list-heading">
-      <h2 id="v2-list-heading" className={styles.heading}>Dossiers V2</h2>
-      <form className={styles.filters} action="/studio/sav/v2" aria-label="Filtrer les dossiers V2">
+      <h2 id="v2-list-heading" className={styles.heading}>Dossiers de l’Agent SAV</h2>
+      <form className={styles.filters} action="/studio/sav/v2" aria-label="Filtrer les dossiers de l’Agent SAV">
         <Select name="phase" defaultValue={phase ?? ""} aria-label="Étape"><option value="">Toutes les étapes</option>{SAV_CASE_PHASES.map(value => <option key={value} value={value}>{casePhaseLabels[value]}</option>)}</Select>
         <Select name="owner" defaultValue={owner ?? ""} aria-label="Responsable"><option value="">Tous les responsables</option>{SAV_CASE_OWNERS.map(value => <option key={value} value={value}>{caseOwnerLabels[value]}</option>)}</Select>
         <Button type="submit">Filtrer</Button>
       </form>
-      {list.state === "unavailable" ? <ErrorState title="Liste des dossiers V2 indisponible">La lecture a échoué : ce n’est pas une liste vide. Rien n’a été modifié. Rechargez la page, ou ouvrez un dossier par son numéro de ticket.</ErrorState>
+      {list.state === "unavailable" ? <ErrorState title="Liste des dossiers de l’Agent SAV indisponible">La lecture a échoué : ce n’est pas une liste vide. Rien n’a été modifié. Rechargez la page, ou ouvrez un dossier par son numéro de ticket.</ErrorState>
         : list.state === "invalid" ? <ErrorState title="Filtre ou page invalide" actions={<ButtonLink href="/studio/sav/v2">Revenir à la liste complète</ButtonLink>}>Ce filtre ou ce lien de page n’est pas reconnu, ou il a été fait pour d’autres filtres.</ErrorState>
-        : !list.items.length ? <EmptyState title={cursor ? "Plus aucun dossier sur cette page" : phase || owner ? "Aucun dossier V2 pour ces filtres" : "Aucun dossier V2 enregistré"}>{cursor ? <Link href={first}>Revenir au début</Link> : null}</EmptyState>
+        : !list.items.length ? <EmptyState title={cursor ? "Plus aucun dossier sur cette page" : phase || owner ? "Aucun dossier de l’Agent SAV pour ces filtres" : "Aucun dossier de l’Agent SAV enregistré"}>{cursor ? <Link href={first}>Revenir au début</Link> : null}</EmptyState>
         : <>
           <ul className={styles.list}>{list.items.map(item => <li key={item.caseId} id={`case-${item.ticketId}`}>
             <Link className={styles.result} href={caseHref(item.ticketId, here)}>
@@ -69,7 +69,7 @@ export default async function SavV2PilotPage({ searchParams }: { searchParams: P
               {item.sensitivity !== "none" ? <Badge tone="danger">Sensible : équipe</Badge> : null}
             </Link>
           </li>)}</ul>
-          <nav className={styles.pager} aria-label="Pages de dossiers V2">
+          <nav className={styles.pager} aria-label="Pages de dossiers de l’Agent SAV">
             {cursor ? <Link href={first}>Revenir au début</Link> : null}
             {list.nextCursor ? <Link href={query({ phase, owner, cursor: list.nextCursor })}>Page suivante</Link> : <span className={styles.small}>Fin de la liste</span>}
           </nav>

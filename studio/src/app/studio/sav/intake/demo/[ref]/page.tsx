@@ -32,7 +32,7 @@ export default async function SavDemoCasePage({ params, searchParams }: { params
           <p><span className={pilot.hand} data-hand={c.pilot.hand}>{pilotHandLabels[c.pilot.hand]}</span></p>
           <dl><div><dt>Lecture du propriétaire</dt><dd>{pilotReadingLabels[c.pilot.reading]}</dd></div>
             <div><dt>{c.pilot.cause ? "Cause de non-prise" : "Pourquoi l’agent"}</dt><dd>{c.ownerWhy}</dd></div></dl></section>
-        <section className={styles.decision} aria-labelledby="demo-flow"><h2 id="demo-flow">Parcours : mail V1, admission, puis SAV Pilote ou équipe</h2>
+        <section className={styles.decision} aria-labelledby="demo-flow"><h2 id="demo-flow">Parcours : mail de l’Agent de tri, admission, puis SAV Pilote ou équipe</h2>
           <ol className={pilot.flow}>{c.pilot.flow.map(f => <li key={f.step}><div><strong>{f.step}</strong><p>{f.value}</p>
             <span className={pilot.basis} data-basis={f.basis}>{demoBasisLabels[f.basis]}</span></div></li>)}</ol></section>
         <section className={styles.decision} aria-labelledby="demo-today"><h2 id="demo-today">Production, raccord testé, suite de C</h2>
@@ -56,8 +56,8 @@ export default async function SavDemoCasePage({ params, searchParams }: { params
         {c.rules.map(r => <p key={r}>{r}</p>)}</section>
       : <section className={styles.decision} aria-labelledby="demo-proofs"><h2 id="demo-proofs">Preuves (déclarées par la démonstration)</h2>
         <ul className={styles.evidence}>{c.proofs.map(p => <li key={p}>{p}</li>)}</ul></section>}
-      {c.machine && <section className={styles.decision} aria-labelledby="demo-agent"><h2 id="demo-agent">Ce que l’agent V2 a fait</h2>
-        <ul><li>{c.machine.admitted ? "Dossier admis en V2." : "Dossier non admis en V2."}</li>
+      {c.machine && <section className={styles.decision} aria-labelledby="demo-agent"><h2 id="demo-agent">Ce que l’Agent SAV a fait</h2>
+        <ul><li>{c.machine.admitted ? "Dossier admis par l’Agent SAV." : "Dossier non admis par l’Agent SAV."}</li>
           <li>Consultations de connaissances : {c.machine.knowledgeReads}</li><li>Réponses générées : {c.machine.generations}</li><li>Envois : {c.machine.sends}</li></ul>
         <p>Chiffres écrits dans la démonstration : aucun n’est mesuré.</p>
         {c.rules.map(r => <p key={r}>{r}</p>)}</section>}

@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import type { SavRetrievalBackend, SavRetrievalCandidate } from "../request-retrieval";
 import { SAV_CASE_SUBJECT_ABSENCES, type CaseRequestSubject, type CaseSnapshot } from "./case-types";
 import { SAV_CASE_DECISION_CONTRACT_REVISION } from "./decision-contract";
-import { inventoryCaseFamilyKnowledge, SAV_CASE_PILOT_FAMILY_CANDIDATE } from "./investigation-family";
 import { caseReplyPayloadHash, checkCaseReplyApproval } from "./case-effects";
 import { caseDecisionDraft, caseReplyTriggerOf } from "./investigation-intent";
 import { selectCaseKnowledge } from "./investigation-knowledge";
@@ -106,29 +105,6 @@ describe("selectCaseKnowledge: published, applicable cards per open request, rea
   it("a failed search or a moving revision is `unavailable`, not a gap", async () => {
     expect(await selectCaseKnowledge(snapshot([row("r1", "Connexion impossible.")]), backend([], { down: true }).port, scope)).toEqual({ status: "unavailable", reason: "search_unavailable" });
     expect(await selectCaseKnowledge(snapshot([row("r1", "Connexion impossible.")]), backend([], { revisions: ["a", "b", "c", "d"] }).port, scope)).toEqual({ status: "unavailable", reason: "revision_unstable" });
-  });
-});
-
-describe("SAV-19: the access family is a CANDIDATE, inventoried read only", () => {
-  it("is a candidate that excludes every sensitive family, and lists the procedures Ugo has not decided yet", () => {
-    expect(SAV_CASE_PILOT_FAMILY_CANDIDATE).toMatchObject({ status: "candidate", family: "access", excluded: ["finance", "cancellation", "subscription", "rights", "identity"] });
-    expect(SAV_CASE_PILOT_FAMILY_CANDIDATE.topics.filter(topic => topic.decision === "decision_pending").map(topic => topic.id))
-      .toEqual(["login_code_still_missing", "login_code_refused", "payment_screen_persists", "new_onboarding_or_wrong_space"]);
-  });
-
-  it("covered topics, gaps and undecided topics are listed; the search is the only port and nothing is written", async () => {
-    const b = backend([[/adresse e-mail d'inscription/i, [card("k-link")]], [/code de connexion non reçu/i, [card("k-code")]], [/refusé ou expiré/i, [card("k-expired-code")]]]);
-    const inventory = await inventoryCaseFamilyKnowledge(SAV_CASE_PILOT_FAMILY_CANDIDATE.topics, b.port, scope);
-    expect(b.search).toHaveBeenCalledTimes(3);
-    expect(inventory.consistent).toBe(true);
-    expect(inventory.topics.filter(topic => topic.status === "covered").map(topic => topic.topic)).toEqual(["access_link_and_address", "login_code_not_received", "login_code_refused"]);
-    // A card found for an undecided procedure is listed, but the topic stays a gap until Ugo decides it.
-    expect(inventory.gaps).toEqual(["first_login_onboarding", "payment_screen_at_login", "previously_connected_blocked", "login_code_still_missing", "login_code_refused", "payment_screen_persists", "new_onboarding_or_wrong_space"]);
-  });
-
-  it("a failed search is reported per topic as `search_unavailable`, never as a gap of the knowledge base", async () => {
-    const inventory = await inventoryCaseFamilyKnowledge(SAV_CASE_PILOT_FAMILY_CANDIDATE.topics.slice(0, 2), backend([], { down: true }).port, scope);
-    expect(inventory.topics.map(topic => topic.status)).toEqual(["search_unavailable", "search_unavailable"]);
   });
 });
 

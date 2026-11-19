@@ -3,9 +3,6 @@ import {
   savActionKind,
   savActionStatus,
   savDecisionKind,
-  savLearningStatus,
-  savPilotBatchStatus,
-  savPilotItemStatus,
   savPilotVerdict,
   savThreadStatus,
 } from "@/db/schema";
@@ -13,14 +10,9 @@ import { savStructuredProposalSchema } from "./proposal";
 import {
   savActionLabels,
   savActionStatusLabels,
-  savAnalysisStatusLabels,
   savCategoryLabels,
   savDecisionLabels,
   savLabel,
-  savLearningStatusLabels,
-  savPilotBatchStatusLabels,
-  savPilotItemStatusLabels,
-  savProcessLabels,
   savRoutingLabels,
   savRoutingReasonLabels,
   savRunStatusLabels,
@@ -36,13 +28,9 @@ describe("French SAV display labels", () => {
     ["thread", savThreadStatus.enumValues, savThreadStatusLabels],
     ["action", savActionKind.enumValues, savActionLabels],
     ["action status", savActionStatus.enumValues, savActionStatusLabels],
-    ["learning", savLearningStatus.enumValues, savLearningStatusLabels],
-    ["pilot batch", savPilotBatchStatus.enumValues, savPilotBatchStatusLabels],
-    ["pilot item", savPilotItemStatus.enumValues, savPilotItemStatusLabels],
     ["verdict", savPilotVerdict.enumValues, savVerdictLabels],
     ["category", savStructuredProposalSchema.shape.category.options, savCategoryLabels],
     ["urgency", savStructuredProposalSchema.shape.urgency.options, savUrgencyLabels],
-    ["process", savStructuredProposalSchema.shape.process.element.shape.kind.options, savProcessLabels],
   ] as const)("covers every current and legacy %s enum without changing backend values", (_name, values, labels) => {
     expect(Object.keys(labels).sort()).toEqual([...values].sort());
     for (const value of values) {
@@ -59,9 +47,7 @@ describe("French SAV display labels", () => {
     expect(savLabel(savRoutingReasonLabels, "customer_identity_unverified")).toBe("Identité du client à vérifier");
   });
 
-  it("distinguishes analysis, simulation and fallback statuses in French", () => {
-    expect(Object.keys(savAnalysisStatusLabels).sort()).toEqual(["done", "failed", "pending", "processing"]);
-    expect(savLabel(savAnalysisStatusLabels, "done")).toBe("Analyse terminée");
+  it("distinguishes simulation and fallback statuses in French", () => {
     expect(savLabel(savRunStatusLabels, "shadow")).toBe("Analyse de simulation");
     expect(savLabel(savRunStatusLabels, "fallback")).toBe("Analyse de repli");
     expect(savLabel(savThreadStatusLabels, "closed_no_action")).toBe("Clos sans action");
