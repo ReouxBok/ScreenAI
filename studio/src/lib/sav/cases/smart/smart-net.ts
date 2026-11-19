@@ -28,8 +28,6 @@ export const SAV_SMART_SUBJECT_MAX_CHARS = 300;
 
 export type SmartNetResult = Readonly<{ stop: false; hints: readonly string[] }> | Readonly<{ stop: true; reasons: readonly string[] }>;
 
-/** Letters left in the body once greetings are removed, under which the subject alone says what is asked. */
-const SUBJECT_ONLY_MIN_CHARS = 25;
 const norm = (value: string) => normalizeSensitiveText(value).replace(/[ \t]+/g, " ");
 
 /** The start of quoted history: « Le lun. 18 nov. a écrit : », « On ... wrote: », « -----Message d'origine----- », an Outlook « De : » header, or a « > » line. */
@@ -67,9 +65,9 @@ const OWN_BILLING_REQUESTS: ReadonlyArray<readonly [string, RegExp]> = [
   ["rights", /\b(?:rgpd|donnees personnelles|droit d'acces|suppression de (?:mes|nos) donnees)\b/],
   ["identity", /\b(?:changer (?:le|de) (?:proprietaire|titulaire)|transferer (?:le|mon) compte|usurp\w*|pirat\w*|compte (?:vole|hacke))\b/],
 ];
-/** Topic words: in the subject they stop (the subject names the topic); in the body alone they are only a hint for the model's reading. */
+/** Topic words: in the customer's new request (subject and fresh text, ordinary uses removed) they send the mail to the team, point. */
 const TOPIC_WORDS: ReadonlyArray<readonly [string, RegExp]> = [
-  ["finance", /\b(?:rembours\w*|factur\w*|paiement\w*|prelev\w*|debit\w*|impaye\w*|tarif\w*|prix|avoir(?:s)? (?:sur|de|commercial)|litige)\b/],
+  ["finance", /\b(?:rembours\w*|factur\w*|paiement\w*|prelev\w*|debit\w*|impaye\w*|tarif\w*|prix|avoirs? (?:sur (?:ma|la|votre|notre|cette) facture|commercial)|un avoir\b|litige)\b/],
   ["subscription", /\b(?:abonnement\w*|offre|forfait|essai gratuit|upgrade|downgrade)\b/],
   ["cancellation", /\b(?:resili\w*|desabonn\w*)\b/],
   ["rights", /\b(?:rgpd|donnees personnelles)\b/],
@@ -77,19 +75,19 @@ const TOPIC_WORDS: ReadonlyArray<readonly [string, RegExp]> = [
 ];
 
 /**
- * Barrier 2 (server, after the model's reading): a hint raised by the net is explained away only when the model says « aucune » AND quotes, word
- * for word from the mail, a proof that carries the hinted word in another subject (the customer's own clients' invoices, a tutorial...). The proof
- * must itself pass this net (a proof that is a sensitive request explains nothing).
+ * The customer's ORDINARY business, decided by the net itself, never by the model (Astra, third review): their own clients' invoices, automating
+ * or chasing invoices or quotes, the billing or the prices of their clients, products or services. These spans are removed before the topic
+ * words are read; anything left is a sensitive hint and goes to the team.
  */
-export function smartHintsExplained(hints: readonly string[], proof: string): boolean {
-  if (!hints.length) return true;
-  const value = norm(proof);
-  if (!value.trim() || smartSafetyNet({ subject: "", body: proof }).stop) return false;
-  return hints.every(hint => {
-    const family = hint.replace(/^hint:/, ""), topic = TOPIC_WORDS.find(([name]) => name === family);
-    return Boolean(topic && topic[1].test(value));
-  });
-}
+const CLIENTS = String.raw`(?:mes |nos |ses |leurs |les |des )?(?:clients?|fournisseurs?|patients?|eleves?|adherents?|prospects?|locataires?)`;
+const ORDINARY_USES: readonly RegExp[] = [
+  new RegExp(String.raw`\b(?:les |des |ses |leurs |mes |nos |la |une )?(?:factur|devis|paiement|reglement|impaye|tarif|prix|relance)\w*(?: \w+){0,2} (?:de|d'|a|aux|des|pour|par|chez) ${CLIENTS}`, "g"),
+  new RegExp(String.raw`\b(?:automatis|relanc|gener|cre|edit|prepar|rempli|suivr|suiv|classe|archiv|numerot|envoie|envoient|envoyer a)\w* (?:\w+ ){0,3}(?:factur|devis|relance)\w*`, "g"),
+  /\b(?:mon|son|l'|cet|un) assistant (?:\w+ ){0,6}(?:factur|devis|tarif|prix)\w*/g,
+  /\b(?:prix|tarifs?) (?:de |des |d')(?:mes |nos )?(?:prestations?|produits?|services?|articles?|chambres?|menus?|seances?|cours)\b/g,
+  /\bgrille tarifaire\b/g,
+];
+const withoutOrdinaryUses = (text: string) => ORDINARY_USES.reduce((value, pattern) => value.replace(pattern, " "), text);
 
 /** The customer's own new words: quoted history removed, boilerplate lines removed, signature labels removed (a PS or a speaking line kept). */
 export function smartFreshText(body: string): string {
@@ -117,14 +115,16 @@ export function smartSafetyNet(input: Readonly<{ subject: string; body: string }
   const reasons = [
     ...accessSkillKernelHits(subject, withoutBoilerplate(body)).map(id => `kernel:${id}`),
     ...OWN_BILLING_REQUESTS.filter(([, pattern]) => pattern.test(fresh) || pattern.test(subjectNorm)).map(([family]) => `sensitive:${family}`),
-    // A topic word in the subject stops only when the body is too thin to say what is asked (« Question tarif » / « Bonjour »).
-    ...(fresh.replace(/\b(?:bonjour|bonsoir|hello|merci|voir (?:le )?(?:sujet|objet))\b|[^a-z]/g, "").length < SUBJECT_ONLY_MIN_CHARS
-      ? TOPIC_WORDS.filter(([, pattern]) => pattern.test(subjectNorm)).map(([family]) => `sensitive:${family}`) : []),
+    // A sensitive topic word left in the new request (subject or fresh words, the customer's ordinary business removed): the team, point.
+    // The subject alone (« Facture ») is explained only when the fresh words carry that topic in an ordinary use and nowhere else.
+    ...TOPIC_WORDS.filter(([, pattern]) => pattern.test(withoutOrdinaryUses(fresh))
+      || (pattern.test(withoutOrdinaryUses(subjectNorm)) && !pattern.test(fresh))).map(([family]) => `sensitive:${family}`),
   ];
   if (containsPromptInjection(`${subject}\n${body}`)) reasons.push("instruction_in_mail");
   if (!body.trim() && !subject.trim()) reasons.push("empty");
   if (smartMask(body).length > SAV_SMART_MAIL_MAX_CHARS || smartMask(subject).length > SAV_SMART_SUBJECT_MAX_CHARS) reasons.push("too_long");
   if (reasons.length) return { stop: true, reasons: [...new Set(reasons)] };
+  // Hints: topic words seen only outside the new request (quoted history, signature, footer) or in an ordinary use. Informational (shadow report).
   const whole = norm(body);
   return { stop: false, hints: [...new Set(TOPIC_WORDS.filter(([, pattern]) => pattern.test(whole) || pattern.test(subjectNorm)).map(([family]) => `hint:${family}`))] };
 }

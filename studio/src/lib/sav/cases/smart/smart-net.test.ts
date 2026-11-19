@@ -151,15 +151,38 @@ describe("contre-revue d'Astra (20/11) : double barrière", () => {
     for (const sensible of [null, { famille: "peut-etre", preuve: "" }]) {
       const { result } = await turn("Bonjour, comment synchroniser mon calendrier Google avec mon Assistant ?", { sensible });
       expect(result).toMatchObject({ outcome: "team_sensitive", replyWithFooter: null });
-      expect(result.reasons).toContain("understand:sensible_missing");
+      expect(result.reasons.some(reason => reason === "understand:sensible_missing" || reason.startsWith("understand:sensible_"))).toBe(true);
     }
   });
-  it("couche 2 : indice levé, modèle « aucune » sans preuve, avec une preuve inventée, ou une preuve sans le mot → équipe", async () => {
-    const body = "Bonjour, mon Assistant doit relancer les factures impayées de mes clients mais il ne trouve pas le fichier.";
-    for (const preuve of ["", "je veux relancer mes clients", "il ne trouve pas le fichier"]) {
-      const { result, kinds } = await turn(body, { sensible: { famille: "aucune", preuve } });
-      expect(result, preuve).toMatchObject({ outcome: "team_sensitive", replyWithFooter: null });
-      expect(result.reasons, preuve).toEqual(expect.arrayContaining(["hint:finance", "understand:hint_unexplained"]));
+  it("troisième revue : le paiement de 49 €, quelle que soit la « preuve » (message de l'agent, ligne citée, signature, mot exact) → team_sensitive, 0 appel", async () => {
+    const { runSmartTurn } = await import("./smart-agent");
+    const { smartScriptedModel, smartStaticKnowledge, smartReading, smartGoodDecision, SMART_CONFORME } = await import("./smart-test-doubles");
+    const ASK = "Bonjour, je ne peux plus me connecter. Pourquoi ce paiement Limova de 49 euros hier ?";
+    const OTHER = "Je souhaite automatiser les factures de mes clients.";
+    const cases: ReadonlyArray<readonly [string, string, ReadonlyArray<{ from: "customer" | "support"; at: string; text: string }>, string]> = [
+      ["preuve dans un ancien message de l'agent", ASK, [{ from: "support", at: "2026-11-19T10:00:00.000Z", text: OTHER }], OTHER],
+      ["preuve dans une ligne citée", `${ASK}\n\nLe mar. 19 nov. a écrit :\n> ${OTHER}`, [], OTHER],
+      ["preuve dans la signature", `${ASK}\nCordialement,\nJean Fictif\nService facturation`, [], "Service facturation"],
+      ["preuve = le mot exact de la demande", ASK, [], "paiement"],
+    ];
+    for (const [label, body, thread, preuve] of cases) {
+      const scripted = smartScriptedModel({ understand: { output: smartReading({ sensible: { famille: "aucune", preuve } }) }, decide: { output: smartGoodDecision() }, verify: { output: SMART_CONFORME } });
+      const result = await runSmartTurn({ subject: "Demande", body, thread }, { model: scripted.model, knowledge: smartStaticKnowledge(), maxInputBytes: 100_000, today: "2026-11-20" });
+      expect(result, label).toMatchObject({ outcome: "team_sensitive", sensitiveStop: "net", replyWithFooter: null });
+      expect(result.reasons, label).toContain("sensitive:finance");
+      expect(scripted.calls, label).toEqual([]);
+    }
+  });
+  it("troisième revue : contradiction (sensitiveFamilies non vide, sensitive « no », sensible « aucune ») = doute = équipe ; idem pour chaque champ seul", async () => {
+    const body = "Bonjour, je n'arrive pas à me connecter. Et ne reconduisez plus notre engagement s'il vous plaît.";
+    expect(smartSafetyNet({ subject: "Demande", body }).stop).toBe(false);
+    for (const reading of [
+      { sensitiveFamilies: ["cancellation"], sensitive: "no", sensible: { famille: "aucune", preuve: "je n'arrive pas à me connecter" } },
+      { sensitiveFamilies: [], sensitive: "doubt", sensible: { famille: "aucune", preuve: "" } },
+      { sensitiveFamilies: [], sensitive: "no", sensible: { famille: "resiliation", preuve: "ne reconduisez plus notre engagement" } },
+    ]) {
+      const { result, kinds } = await turn(body, reading);
+      expect(result, JSON.stringify(reading)).toMatchObject({ outcome: "team_sensitive", sensitiveStop: "understand", replyWithFooter: null, decision: null });
       expect(kinds).toEqual(["understand"]);
     }
   });

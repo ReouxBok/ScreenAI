@@ -10,8 +10,7 @@ import {
 } from "./smart-memory";
 import type { SmartCallResult, SmartModelPort } from "./smart-model";
 import { smartWireBytes } from "./smart-model";
-import { savEvidenceContains } from "../../evidence-text";
-import { smartHintsExplained, smartMask, smartSafetyNet } from "./smart-net";
+import { smartMask, smartSafetyNet } from "./smart-net";
 import { SAV_SMART_RESOURCES, smartCorrectionPrompt, smartDecidePrompt, smartUnderstandPrompt, smartVerifyPrompt } from "./smart-prompt";
 import { createSmartToolRunner, smartToolCatalogue, SAV_SMART_TOOL_LIMITS, SAV_SMART_TOOL_RESULTS_NOTE, type SmartToolOutcome } from "./smart-tools";
 import type { AcademyTool } from "./tools/academy";
@@ -21,8 +20,8 @@ import type { AcademyTool } from "./tools/academy";
  * (model, knowledge, tools, memory). No database, no clock of its own, no effect: it returns what it would do. The shadow stores it; the bench scores it.
  *
  *   0. filet      `smartSafetyNet` on the INTEGRAL raw texts: a real sensitive request (or an odd mail), the whole mail to the team, 0 call;
- *   1. comprendre one call: the needs (PS included), what the customer already did, and `sensible {famille, preuve}` (barrier 2): a family other
- *                 than « aucune », an absent field, or a hint of the net without a verbatim proof of another subject: the whole mail to the team;
+ *   1. comprendre one call: the needs (PS included), what the customer already did, and `sensible {famille, preuve}` (barrier 2): unless
+ *                 `sensitive`, `sensitiveFamilies` and `sensible` ALL say « nothing sensitive », the whole mail to the team (doubt = team);
  *   2. chercher   the existing search, through the knowledge port, at most 3 needs;
  *   3. décider    the BOUNDED LOOP: at most 3 passes. Each pass returns one step: « thinking », then read-only tool calls (`chercher_fiches`, Academy
  *                 when its switch is on; at most 4 calls per mail, 3 per pass, in parallel) or the final decision. Tool results come back as
@@ -162,18 +161,14 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const parsedReading = parseSmartOutput(smartReadingSchema, understood.output);
   if (!parsedReading.ok) return end("failed", ["understand:output_invalid"]);
   reading = parsedReading.value;
-  // Barrier 2, imposed by the server (Astra, 20/11): the model names the sensitive family with an exact quote. Not « aucune », absent or
-  // unreadable: the whole mail to the team. A hint of the net stands unless « aucune » comes with a verbatim proof of another subject.
+  // Barrier 2, imposed by the server (Astra, 20/11, simplified after the third review): the three fields must ALL say « nothing sensitive »
+  // (`sensitive: "no"`, no `sensitiveFamilies`, `sensible.famille: "aucune"`). Any contradiction, an absent or unreadable field: doubt = the team.
+  // The model never lifts a hint of the net: a sensitive word left in the new request already stopped the mail at step 0.
   const sensible = reading.sensible;
-  const stopSensible = (codes: readonly string[]) =>
-    end("team_sensitive", [...hints, ...codes], { sensitiveStop: "understand", note: null, noteText: smartSensitiveNote(sensible && sensible.famille !== "aucune" ? [sensible.famille] : hints) });
-  if (!sensible) return stopSensible(["understand:sensible_missing"]);
-  if (sensible.famille !== "aucune") return stopSensible([`understand:sensible_${sensible.famille}`]);
-  if (hints.length && !(sensible.preuve.trim() && savEvidenceContains(customerText, sensible.preuve) && smartHintsExplained(hints, sensible.preuve)))
-    return stopSensible(["understand:hint_unexplained"]);
-  if (reading.sensitive !== "no") {
-    const families = reading.sensitiveFamilies.map(family => `family:${family}`);
-    return end("team_sensitive", [...hints, `understand:sensitive_${reading.sensitive}`, ...families], { sensitiveStop: "understand", note: null, noteText: smartSensitiveNote(reading.sensitiveFamilies) });
+  const families = [...new Set([...(sensible && sensible.famille !== "aucune" ? [sensible.famille] : []), ...reading.sensitiveFamilies])];
+  if (!sensible || sensible.famille !== "aucune" || reading.sensitive !== "no" || reading.sensitiveFamilies.length) {
+    const codes = [!sensible ? "understand:sensible_missing" : `understand:sensible_${sensible.famille}`, `understand:sensitive_${reading.sensitive}`, ...reading.sensitiveFamilies.map(family => `family:${family}`)];
+    return end("team_sensitive", [...hints, ...codes], { sensitiveStop: "understand", note: null, noteText: smartSensitiveNote(families) });
   }
   if (reading.instructionInMail) return handoff([...hints, "understand:instruction_in_mail"], "other");
   if (reading.wantsHuman) return handoff([...hints, "understand:wants_human"], "wants_human");
