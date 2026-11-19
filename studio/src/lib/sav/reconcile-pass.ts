@@ -129,8 +129,20 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     const { runAccessSkillSelfTestPass } = await import("@/lib/sav/cases/access-skill/access-skill-selftest");
     return runAccessSkillSelfTestPass({ env: () => process.env, now: () => new Date(), deadlineMs: derivedDeadline });
   }) : undefined;
+  // Agent SAV intelligent (20/11): the new agent in SHADOW mode only, when SAV_V2_SMART_AGENT=shadow; its own capped ledger, no case, ticket, mail, HubSpot,
+  // Gmail or Slack, nothing queued. Any other value: absent from the payload, nothing loaded.
+  const smartShadow = process.env.SAV_V2_SMART_AGENT === "shadow" ? await runStep("v2_smart_shadow", async () => {
+    if (Date.now() + 90_000 > derivedDeadline) return { skipped: "deadline" };
+    const { runSmartShadowPass } = await import("@/lib/sav/cases/smart/smart-shadow");
+    return runSmartShadowPass({ env: () => process.env, now: () => new Date(), deadlineMs: derivedDeadline });
+  }) : undefined;
+  const smartBenchSelfTest = process.env.SAV_V2_SMART_BENCH_SELFTEST === "run" ? await runStep("v2_smart_bench_selftest", async () => {
+    if (Date.now() + 90_000 > derivedDeadline) return { skipped: "deadline" };
+    const { runSmartBenchSelfTestPass } = await import("@/lib/sav/cases/smart/smart-bench-selftest");
+    return runSmartBenchSelfTestPass({ env: () => process.env, now: () => new Date(), deadlineMs: derivedDeadline });
+  }) : undefined;
   // V2 effects (replies, handoff notices, ticket stages, closures) have their own worker: /api/cron/sav-v2-effects (11/11).
-  const payload = { ...(ownerHandoverPoll ? { ownerHandoverPoll } : {}), ...(ownerHandovers ? { ownerHandovers } : {}), ...(accessSkillSelfTest ? { accessSkillSelfTest } : {}), caseReminders, ticketSafetyNet, ackClosures, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { ...(ownerHandoverPoll ? { ownerHandoverPoll } : {}), ...(ownerHandovers ? { ownerHandovers } : {}), ...(accessSkillSelfTest ? { accessSkillSelfTest } : {}), ...(smartShadow ? { smartShadow } : {}), ...(smartBenchSelfTest ? { smartBenchSelfTest } : {}), caseReminders, ticketSafetyNet, ackClosures, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return { payload, hasStepFailure, pulseId };
