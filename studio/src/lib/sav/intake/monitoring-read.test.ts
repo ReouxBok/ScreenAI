@@ -33,6 +33,9 @@ it("authenticates before reading and never calls the owner budget reader for oth
  expect(result).toMatchObject({permission:"running",configuration:"restricted",activity:{state:"missing"}});
  expect(mocks.budget).not.toHaveBeenCalled();expect(await f.db.select().from(savSyncState)).toHaveLength(0);
 });
+it("reports the mark-read counter as off while the switch is off, without loading the read-receipt module", async () => {
+ mocks.db=f.db;expect((await readIntakeMonitoring()).gmailRead).toEqual({state:"off"});
+});
 it("owner configuration uses the canonical authorization without bypass or leaking values", async () => {
  mocks.staff.mockResolvedValue({email:"ugo@limova.ai"});mocks.budget.mockResolvedValue({email:"ugo@limova.ai"});mocks.config.mockReturnValue({privateValue:"secret"});
  expect((await readIntakeMonitoring()).configuration).toBe("verified");expect(mocks.budget).toHaveBeenCalledExactlyOnceWith();

@@ -36,7 +36,9 @@ export function projectMonitoringActivity(rows: Array<{ key: string; cursor: str
   } catch { result.collection = "unavailable"; }
   return result;
 }
-export type IntakeMonitoring = { readAt: string; permission: "running" | "actions_paused" | "fully_paused" | "unknown"; configuration: "verified" | "unavailable" | "restricted"; activity: MonitoringActivity };
+/** Gmail "mark read" counter: dossier counts only, never an address, subject or identifier. */
+export type IntakeGmailReadCounter = { state: "off" } | { state: "unavailable" } | { state: "available"; pending: number; parked: number };
+export type IntakeMonitoring = { readAt: string; permission: "running" | "actions_paused" | "fully_paused" | "unknown"; configuration: "verified" | "unavailable" | "restricted"; activity: MonitoringActivity; gmailRead?: IntakeGmailReadCounter };
 export async function readIntakeMonitoring(): Promise<IntakeMonitoring> {
   const staff = await requireIntakeConsoleStaff(); // Auth errors must not become an anonymous status panel.
   const now = new Date();
@@ -52,6 +54,9 @@ export async function readIntakeMonitoring(): Promise<IntakeMonitoring> {
       return projectMonitoringActivity(rows, now);
     }, { accessMode: "read only", isolationLevel: "repeatable read" });
   } catch { result.activity = { ...emptyActivity(), state: "unavailable", collection: "unavailable" }; }
+  // Loaded only when the switch is on: the counter module carries the whole read-receipt path.
+  result.gmailRead = process.env.SAV_INTAKE_GMAIL_MARK_READ !== "on" ? { state: "off" }
+    : await import("./gmail-read").then(module => module.readIntakeGmailReadBacklog()).catch(() => ({ state: "unavailable" as const }));
   if (staff.email === SAV_INTAKE_BUDGET_OWNER_EMAIL) {
     result.configuration = "unavailable";
     try {

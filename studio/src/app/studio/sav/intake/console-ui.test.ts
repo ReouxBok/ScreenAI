@@ -212,6 +212,17 @@ it("separates permission from absent activity and preserves filters on the read-
   expect(html).toContain('href="/studio/sav/intake?view=processing&amp;q=connexion&amp;sort=oldest&amp;page=1"');
   expect(mocks.action).not.toHaveBeenCalled();
 });
+it("shows the contact@ mark-read counter as counts only, and nothing when the reader gives none",async()=>{
+  expect(await renderList()).not.toContain("Mails lus dans contact@");
+  const base=await mocks.monitoring();
+  mocks.monitoring.mockResolvedValue({...base,gmailRead:{state:"available",pending:3,parked:1}});
+  const html=await renderList();
+  expect(html).toContain("Mails lus dans contact@");expect(html).toContain("3 dossiers terminés à marquer lus · dont 1 en échec répété (nouvel essai une fois par jour)");
+  expect(html).toContain("Les dossiers à valider, incertains ou bloqués restent volontairement non lus");
+  mocks.monitoring.mockResolvedValue({...base,gmailRead:{state:"off"}});expect(await renderList()).toContain("Désactivé");
+  mocks.monitoring.mockResolvedValue({...base,gmailRead:{state:"available",pending:1,parked:0}});
+  const one=await renderList();expect(one).toContain("1 dossier terminé à marquer lu<");expect(one).not.toContain("en échec répété");
+});
 it("names an uncertain execution as an external action to verify, never a generic uncertainty",async()=>{
  mocks.detail.mockResolvedValue({...detail,diagnostics:{messageId,totalAttempts:1,attemptsExhausted:false,runs:[],execution:{state:"uncertain",waitingPasses:0,lastPassAt:null,reason:"SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED"}}});
  const html=await renderDetail();
