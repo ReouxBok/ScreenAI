@@ -41,6 +41,11 @@ import { requestCaseSettleWake, type CaseSettleWakeStart } from "./case-v2-laten
 import { SAV_ACCESS_SKILL_REVISION, SAV_ACCESS_SKILL_RULE_ID } from "./access-skill/access-skill-guidelines";
 import { accessSkillLogFields, readOrComputeAccessSkill, type AccessSkillDeps, type AccessSkillReading } from "./access-skill/access-skill-judge";
 import { readAccessSkillMode } from "./access-skill/access-skill-rule";
+import type { EntrySkillBlock } from "../skills/entry-block";
+import { entryActiveSkillBlockCount, readEntrySwitch, type EntrySwitch } from "../skills/entry-switch";
+import { SAV_ENTRY_SKILL_BLOCKS } from "./blocks/registry";
+import { entrySkillCatalog } from "./entry-skills/entry-skill-rules";
+import { entrySkillLogFields, readOrComputeEntrySkills, recordEntrySkillShadow } from "./entry-skills/entry-skill-reading";
 
 type Env = Record<string, string | undefined>;
 export const savV2EntryEnabled = (env: Env) => env.SAV_V2_ENTRY === "on" && savCaseRecordingEnabled(env);
@@ -74,7 +79,9 @@ export type CaseEntryBlockModePort = (blockId: string) => Promise<CaseEntryBlock
  * never in shadow), `never` (the investigation's re-evaluation: it reads what the relay stored). Absent: `never`. `accessSkillDeps`: tests only. */
 export type CaseEntryAccessSkillCompute = "always" | "on_only" | "never";
 export type CaseEntrySource = { run?: { runId: string | null; runVersion: number | null }; readQuotes?: CaseRequestQuotesPort; blockMode?: CaseEntryBlockModePort;
-  accessSkillCompute?: CaseEntryAccessSkillCompute; accessSkillDeps?: Partial<AccessSkillDeps> };
+  accessSkillCompute?: CaseEntryAccessSkillCompute; accessSkillDeps?: Partial<AccessSkillDeps>;
+  /** Chantier « 3 blocs »: the blocks with a skill known to the entry (tests only; production reads `SAV_ENTRY_SKILL_BLOCKS`). */
+  skillBlocks?: readonly EntrySkillBlock[] };
 const entryBlockMode = (env: Env): CaseEntryBlockModePort => async blockId => {
   try { return savBlockEffectiveMode(await readSavBlockSwitch(requireDb(), blockId), env); } catch { return "off"; }
 };
@@ -97,10 +104,21 @@ const SENSITIVE_V1_KINDS = new Set(["finance", "cancellation"]);
 export async function firstBlockEvidence(env: Env, messageId: string, gmailMessageId: string, requests: CaseRelayRequest[], registry: readonly CaseBlockDetector[] = SAV_CASE_BLOCK_REGISTRY,
   source: CaseEntrySource = {}): Promise<CaseAdmissionQualification["requests"]> {
   const mode = readAccessSkillMode(env);
-  if (mode === "on") return accessSkillBlockEvidence(env, messageId, gmailMessageId, requests, registry, source);
-  const legacy = await legacyBlockEvidence(env, messageId, gmailMessageId, requests, registry, source);
-  if (mode === "shadow" && source.accessSkillCompute === "always") await shadowAccessSkill(env, messageId, gmailMessageId, requests, source, legacy);
-  return legacy;
+  // Chantier « 3 blocs »: absent `SAV_V2_ENTRY_BLOCKS_JSON` (or no registered block), this reads nothing else and every path below is the SAV-97 one.
+  const entry = readEntrySwitch(env, source.skillBlocks ?? SAV_ENTRY_SKILL_BLOCKS);
+  if (entry.problem || entry.ignored.length) console.error("sav_v2_entry_blocks_setting", { messageId, problem: entry.problem, ignored: entry.ignored });
+  if (mode === "on" && entryActiveSkillBlockCount(entry) >= 2) {
+    const routed = await routedBlockEvidence(env, messageId, gmailMessageId, requests, registry, source, entry);
+    if (routed !== "access_only") return routed;
+  }
+  let result: CaseAdmissionQualification["requests"];
+  if (mode === "on") result = await accessSkillBlockEvidence(env, messageId, gmailMessageId, requests, registry, source);
+  else {
+    result = await legacyBlockEvidence(env, messageId, gmailMessageId, requests, registry, source);
+    if (mode === "shadow" && source.accessSkillCompute === "always") await shadowAccessSkill(env, messageId, gmailMessageId, requests, source, result);
+  }
+  if (entry.shadow.length && source.accessSkillCompute === "always") await shadowEntrySkills(env, messageId, gmailMessageId, requests, source, entry, result);
+  return result;
 }
 
 /** SAV-97: the rules the detectors read (`off`, `shadow`): the skill's own rule is never a detector's candidate, so configuring it changes nothing there. */
@@ -215,6 +233,15 @@ async function storedEntryMail(messageId: string, gmailMessageId: string) {
  * stored mail answers an identification, and every V1 request with its verified words when there are several. `null` when the mail cannot be read.
  */
 async function readEntryAccessSkill(env: Env, messageId: string, gmailMessageId: string, requests: CaseRelayRequest[], source: CaseEntrySource, compute: boolean) {
+  const built = await entryMailInput(env, messageId, gmailMessageId, requests, source);
+  if (!built) return null;
+  const { mail, quotes, input } = built;
+  const reading = await readOrComputeAccessSkill({ env: () => env, now: () => new Date(), ...source.accessSkillDeps }, { purpose: "first_mail", messageId, input, compute });
+  return { mail, quotes, reading };
+}
+
+/** The input every entry skill reads (SAV-97's, unchanged): the stored mail, the original request, every V1 request with its verified words when several. */
+async function entryMailInput(env: Env, messageId: string, gmailMessageId: string, requests: CaseRelayRequest[], source: CaseEntrySource) {
   const mail = await storedEntryMail(messageId, gmailMessageId);
   if (!mail) return null;
   const original = await readOriginalRequestTicket(messageId, env);
@@ -226,8 +253,7 @@ async function readEntryAccessSkill(env: Env, messageId: string, gmailMessageId:
   }
   const input = { purpose: "first_mail" as const, subject: mail.subject, text: mail.text, originalRequest: original ? { subject: original.message.subject, text: original.text } : null,
     requests: requests.map(request => ({ requestId: request.requestId, kind: request.kind, words: quotes.get(request.requestId) ?? null })) };
-  const reading = await readOrComputeAccessSkill({ env: () => env, now: () => new Date(), ...source.accessSkillDeps }, { purpose: "first_mail", messageId, input, compute });
-  return { mail, quotes, reading };
+  return { mail, quotes, input };
 }
 
 /** SAV-97 `shadow`: the skill is computed, stored and compared with the detectors' decision, in the logs only (closed codes). It never changes the admission. */
@@ -294,6 +320,85 @@ async function accessSkillBlockEvidence(env: Env, messageId: string, gmailMessag
     admitted.push({ requestId: request.requestId, family: selected.rule.family, provenance: caseBlockRuleProvenance(selected.rule) });
   }
   return finishMultiRequestEvidence(env, messageId, admitted, parts, blocks, teamPart, source);
+}
+
+/**
+ * Chantier « 3 blocs » (19/11), the two-stage entry, used only when Access's skill is `on` AND at least one more block with a skill is `on` with its
+ * rule configured (`entrySkillCatalog`): the router elects a block per request, the elected block's own skill confirms (Access: its SAV-97 judge and
+ * counter-read, same stored reading), the shared counter-read follows (`entry-decision.ts`). Kept exactly as the Access path: V1's finance and cancellation
+ * requests, the stored mail, each request's verified quote and the prompt-injection check, each block's scope, several blocks' modes (SAV-92), the
+ * request limit and the team-part notice; then `decideCaseAdmission` and the approved policy (each block's rule `<blockId>-entry-skill` at its revision).
+ * `access_only`: once the rules are read, only Access can admit, so the caller takes the SAV-97 path, byte for byte.
+ */
+async function routedBlockEvidence(env: Env, messageId: string, gmailMessageId: string, requests: CaseRelayRequest[], _registry: readonly CaseBlockDetector[],
+  source: CaseEntrySource, entry: EntrySwitch): Promise<CaseAdmissionQualification["requests"] | "access_only"> {
+  const rules = parseEnvJson<CaseEntryRule[]>(env, "SAV_V2_ADMISSION_RULES_JSON") ?? [];
+  const { catalog, rules: ruleOf } = entrySkillCatalog(rules, entry, "real");
+  if (!catalog.blocks.length) return "access_only";
+  if (!requests.length || requests.some(request => SENSITIVE_V1_KINDS.has(request.kind)) || !requests.some(request => request.kind === "support")) return [];
+  const built = await entryMailInput(env, messageId, gmailMessageId, requests, source);
+  if (!built) return [];
+  const { mail, quotes, input } = built;
+  const compute = source.accessSkillCompute === "always" || source.accessSkillCompute === "on_only";
+  const reading = await readOrComputeEntrySkills({ env: () => env, now: () => new Date(), ...source.accessSkillDeps }, { purpose: "first_mail", messageId, input, catalog, compute });
+  console.info("sav_v2_entry_skill", { messageId, mode: "on", ...entrySkillLogFields(reading) });
+  if (reading.status !== "ready" || reading.verdict.outcome !== "admit") return [];
+  const routes = reading.verdict.requests;
+  const ruleFor = (requestId: string) => { const route = routes[requestId]; return route && "blockId" in route ? ruleOf.get(route.blockId) ?? null : null; };
+  const blockOfRule = (rule: CaseEntryRule) => caseRuleBlockId(rule) ?? "";
+  if (requests.length === 1) {
+    const [request] = requests, rule = request!.kind === "support" ? ruleFor(request!.requestId) : null;
+    if (!rule || !await blockScopeAvailable(env, messageId, blockOfRule(rule))) return [];
+    return [{ requestId: request!.requestId, family: rule.family, provenance: caseBlockRuleProvenance(rule) }];
+  }
+  const at = mail.receivedAt.toISOString(), scopes = new Map<string, boolean>();
+  const teamPart = (requestId: string, reason: CaseTeamPartReason) => ({ requestId, family: "unknown" as const, provenance: { kind: "team_part" as const, reason, at } });
+  const admitted: CaseAdmissionQualification["requests"] = [], parts: CaseAdmissionQualification["requests"] = [], blocks = new Set<string>();
+  for (const request of requests) {
+    if (request.kind !== "support") { parts.push(teamPart(request.requestId, "not_support")); continue; }
+    const quote = quotes.get(request.requestId);
+    if (!quote || !savEvidenceContains(mail.text, quote) || containsPromptInjection(quote)) { parts.push(teamPart(request.requestId, "request_text_unavailable")); continue; }
+    const route = routes[request.requestId], rule = ruleFor(request.requestId);
+    if (!route || !rule) { parts.push(teamPart(request.requestId, route && "teamPart" in route ? route.teamPart : "no_block_match")); continue; }
+    const blockId = blockOfRule(rule);
+    if (!scopes.has(blockId)) scopes.set(blockId, await blockScopeAvailable(env, messageId, blockId));
+    if (!scopes.get(blockId)) { parts.push(teamPart(request.requestId, "block_scope_unavailable")); continue; }
+    blocks.add(blockId);
+    admitted.push({ requestId: request.requestId, family: rule.family, provenance: caseBlockRuleProvenance(rule) });
+  }
+  return finishMultiRequestEvidence(env, messageId, admitted, parts, blocks, teamPart, source);
+}
+
+/** What one entry decided, per request, as closed codes (`<requestId>=<blockId>|team`), for the shadow comparison. */
+const entryOutcomeCodes = (requests: CaseRelayRequest[], rows: CaseAdmissionQualification["requests"]) => requests.map(request => {
+  const row = rows.find(item => item.requestId === request.requestId);
+  const blockId = row?.provenance.kind === "qualified_rule" ? caseRuleBlockId({ family: row.family as CaseEntryRule["family"], blockId: row.provenance.blockId }) : null;
+  return `${request.requestId.split("/").pop()}=${blockId ?? "team"}`;
+}).join(",");
+
+/**
+ * Chantier « 3 blocs » `shadow` (relay only, it pays): the two-stage entry with every `on` and `shadow` block (and Access when its skill is on or shadow)
+ * is computed and stored beside the real decision, and the comparison is stored and logged (closed codes). It never changes an admission.
+ */
+async function shadowEntrySkills(env: Env, messageId: string, gmailMessageId: string, requests: CaseRelayRequest[], source: CaseEntrySource, entry: EntrySwitch,
+  actual: CaseAdmissionQualification["requests"]) {
+  if (!requests.length || requests.some(request => SENSITIVE_V1_KINDS.has(request.kind)) || !requests.some(request => request.kind === "support")) return;
+  try {
+    const rules = parseEnvJson<CaseEntryRule[]>(env, "SAV_V2_ADMISSION_RULES_JSON") ?? [];
+    const { catalog } = entrySkillCatalog(rules, entry, "shadow");
+    const built = await entryMailInput(env, messageId, gmailMessageId, requests, source);
+    if (!built) return;
+    const reading = await readOrComputeEntrySkills({ env: () => env, now: () => new Date(), ...source.accessSkillDeps }, { purpose: "first_mail", messageId, input: built.input, catalog, compute: true });
+    const shadowRows: CaseAdmissionQualification["requests"] = reading.status === "ready" && reading.verdict.outcome === "admit"
+      ? Object.entries(reading.verdict.requests).flatMap(([requestId, route]) => "blockId" in route
+        ? [{ requestId, family: "usage" as const, provenance: { kind: "qualified_rule" as const, ruleId: "shadow", revision: "shadow", at: new Date(0).toISOString(), blockId: route.blockId } }] : [])
+      : [];
+    const actualCodes = entryOutcomeCodes(requests, actual), shadowCodes = entryOutcomeCodes(requests, shadowRows);
+    const disagree = reading.status === "ready"
+      ? await recordEntrySkillShadow({ purpose: "first_mail", messageId, packageSha256: reading.packageSha256, actual: actualCodes, shadow: shadowCodes, now: new Date() })
+      : actualCodes !== shadowCodes;
+    console.info("sav_v2_entry_skill_shadow", { messageId, actual: actualCodes, shadow: shadowCodes, disagree, ...entrySkillLogFields(reading) });
+  } catch { console.error("sav_v2_entry_skill_shadow", { messageId, entry: "failed" }); }
 }
 
 /** The relay's and the re-evaluation's rule port. SAV-97: only the relay (and the SAV-96 handover, which goes through it) may pay for the skill's reading. */
