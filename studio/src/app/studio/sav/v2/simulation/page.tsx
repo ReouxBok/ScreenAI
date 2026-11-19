@@ -20,7 +20,7 @@ export default async function SavV2SimulationPage() {
     try { input = await simulationReportSource(); read = readSimulationReport(input); } catch { read = { state: "unavailable" }; }
   }
   return <>
-    <PageHeader back={<BackLink fallback="/studio/sav/v2">Retour</BackLink>} title="Répétition V2 (simulation)" status={<><Badge>Lecture seule</Badge><Badge>Synthétique</Badge></>}
+    <PageHeader back={<BackLink fallback="/studio/sav/v2">Retour</BackLink>} title="Répétition de l’Agent SAV (simulation)" status={<><Badge>Lecture seule</Badge><Badge>Synthétique</Badge></>}
       description="Rapport de banc du pôle B sur des dossiers fictifs. Tous les envois sont simulés sur un Gmail synthétique : rien n’est parti, aucun client n’est concerné."/>
     {read.state === "absent" ? <p className={styles.notice} role="status">Aucun rapport de répétition n’est branché sur cette version : cela ne veut pas dire qu’aucun n’existe.</p>
       : read.state === "unavailable" ? <p className={styles.notice} role="alert">Rapport de répétition indisponible : la lecture a échoué. Ce n’est pas un rapport vide.</p>

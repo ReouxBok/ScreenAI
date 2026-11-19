@@ -9,6 +9,6 @@ export function UnifiedConsoleLine({ line, origin }: { line: UnifiedLine | undef
     <span>{line.stage}</span><span>{line.ticket}</span><span>Responsable : {line.owner}</span>{line.reply && <span>{line.reply}</span>}
     <span className={styles.next}>Prochaine action sûre : {line.next}</span>
     {line.paused && <span className={styles.paused}>Pause active</span>}
-    {line.v2Href && <Link href={`${line.v2Href}?${new URLSearchParams({ returnTo: origin })}`}>Ouvrir le dossier V2 de ce ticket</Link>}
+    {line.v2Href && <Link href={`${line.v2Href}?${new URLSearchParams({ returnTo: origin })}`}>Ouvrir le dossier Agent SAV de ce ticket</Link>}
   </div>;
 }

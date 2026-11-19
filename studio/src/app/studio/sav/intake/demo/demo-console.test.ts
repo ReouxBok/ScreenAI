@@ -77,14 +77,14 @@ describe("the three cases: owner, proof, next action; demonstration kept apart f
 
   it("case 1: admitted, one simulated knowledge read and generation, AI notice, zero send, and the invalidation rule", async () => {
     const html = await detail("demo-1");
-    for (const text of ["Agent V2, sous supervision", "Réponse proposée, en attente de validation humaine", "Proposition avec mention IA", "Dossier admis en V2.",
+    for (const text of ["Agent V2, sous supervision", "Réponse proposée, en attente de validation humaine", "Proposition avec mention IA", "Dossier admis par l’Agent SAV.",
       "Consultations de connaissances : 1", "Réponses générées : 1", "Envois : 0", "aucun n’est mesuré", "n’est plus valable", "Aucun : ce dossier est fictif."]) expect(html).toContain(text);
   });
 
   it("case 2: same mail on a human ticket, no V2 work at all; case 3: billing first, out of autonomy before investigation, zero work", async () => {
     const two = await detail("demo-2"), three = await detail("demo-3");
     expect(DEMO_CASES[1].message).toBe(DEMO_CASES[0].message);
-    for (const html of [two, three]) for (const text of ["Dossier non admis en V2.", "Consultations de connaissances : 0", "Réponses générées : 0", "Envois : 0"]) expect(html).toContain(text);
+    for (const html of [two, three]) for (const text of ["Dossier non admis par l’Agent SAV.", "Consultations de connaissances : 0", "Réponses générées : 0", "Envois : 0"]) expect(html).toContain(text);
     for (const text of ["Équipe : propriétaire humain du ticket", "Aucun traitement V2", "Admission : refusée, ticket humain.", "jamais traitée comme « sans propriétaire »"]) expect(two).toContain(text);
     for (const text of ["Équipe : hors autonomie", "Hors autonomie avant investigation", "La facturation prime sur tout le dossier", "Arrêt avant l’investigation.", "sans réponse IA ni apprentissage"]) expect(three).toContain(text);
   });
@@ -274,13 +274,13 @@ describe("access pilot read from the SYN evidence artifact: who has the hand, wh
     expect(html).toMatch(/data-status="unverified"><h3>Suite de B et C<\/h3><p>Résultat non vérifié/);
     for (const text of ["head fdb7199", "Pôle C · Livraison non commitée et non qualifiée", "confirmed: a ticket V1 created with the dedicated owner",
       "Propriétaire absent ne veut pas dire acquis", "La prise n’est jamais garantie", "Une réponse préparée n’est pas une réponse envoyée."]) expect(html).toContain(text);
-    expect(html).not.toContain("Ce que l’agent V2 a fait");
+    expect(html).not.toContain("Ce que l’Agent SAV a fait");
   });
 
   it("team cases: no unverified step, no agent work, the cause shown; access + billing and pause never read the owner", async () => {
     for (const c of acces.filter(x => x.pilot!.hand !== "agent")) {
       const html = await detail(c.ref);
-      expect(html).not.toContain("data-basis=\"non_verifie\""); expect(html).not.toContain("Ce que l’agent V2 a fait");
+      expect(html).not.toContain("data-basis=\"non_verifie\""); expect(html).not.toContain("Ce que l’Agent SAV a fait");
       if (c.pilot!.hand === "team") expect(html).toContain("Aucun dossier n’est donné à l’agent");
       expect(html).toContain(c.pilot!.cause!);
     }
