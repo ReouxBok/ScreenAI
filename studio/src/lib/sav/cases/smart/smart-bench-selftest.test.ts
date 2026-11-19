@@ -15,8 +15,9 @@ import { savBenchGeminiEnvelope } from "../../bench/bench-wire";
 import type { SavBenchAgent } from "../../bench/bench-types";
 import { accessSkillWireAnswer } from "../access-skill/access-skill-wire";
 import { createSavBenchAgent, smartBenchTurn } from "./smart-bench-agent";
+import { smartEmptyMemory } from "./smart-memory";
 import {
-  readSmartBenchSelfTestConfig, readSmartBenchSelfTestReport, readSmartBenchSelfTestRows, runSmartBenchSelfTestPass, smartBenchRunPattern, SAV_SMART_BENCH_NEW_CALLS, SAV_SMART_BENCH_SELFTEST_PREFIX, type SmartBenchSelfTestDeps,
+  readSmartBenchSelfTestConfig, readSmartBenchSelfTestReport, readSmartBenchSelfTestRows, runSmartBenchSelfTestPass, smartBenchRunPattern, SAV_SMART_BENCH_NEW_CALLS, SAV_SMART_BENCH_SELFTEST_CORPUS, SAV_SMART_BENCH_SELFTEST_PREFIX, type SmartBenchSelfTestDeps,
 } from "./smart-bench-selftest";
 import { readSmartLedger } from "./smart-ledger";
 import { SAV_SMART_SHADOW_MODEL_CALLS } from "./smart-shadow";
@@ -41,7 +42,7 @@ function network() {
     if (kind === "judge") return Response.json(savBenchGeminiEnvelope(Object.fromEntries(["issue", "faits_sources", "pas_de_promesse", "jamais_autre_plateforme", "pas_de_mot_de_passe",
       "pas_de_repetition", "fait_avancer"].map(c => [c, { verdict: "ok", justification: "ok" }])), { promptTokenCount: 1_000, candidatesTokenCount: 100 }));
     const output = kind === "understand" ? smartReading() : kind === "verify" ? SMART_CONFORME
-      : { outcome: "handoff", reply: null, teamNote: "note", handoffReason: "no_source", coverage: [{ needId: "n1", status: "handed" }], facts: [] };
+      : { action: "final", calls: [], decision: { outcome: "handoff", reply: null, teamNote: "note", handoffReason: "no_source", coverage: [{ needId: "n1", status: "handed" }], facts: [] } };
     return Response.json(accessSkillWireAnswer(output, { inputTokens: 1_000, outputTokens: 200 }));
   };
   return { fn, calls };
@@ -86,6 +87,9 @@ describe("interrupteurs", () => {
     expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_BATCH: "21" }))).toEqual({ mode: "refused", reason: "batch_invalid" });
     expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_MAX_MICRO_USD: "10000001" }))).toEqual({ mode: "refused", reason: "cap_invalid" });
     expect(SAV_SMART_BENCH_NEW_CALLS).toBe(SAV_SMART_SHADOW_MODEL_CALLS);
+    // v2: understand + 3 decide passes + verify + correct + reverify; the corpus is the 120 conversations plus the 12 multi-turn ones.
+    expect(SAV_SMART_BENCH_NEW_CALLS).toBe(7);
+    expect(SAV_SMART_BENCH_SELFTEST_CORPUS).toHaveLength(132);
   });
   it("le pas de rapprochement ne charge le module que sur « run », avec le saut sous 90 s", () => {
     const source = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../../reconcile-pass.ts"), "utf8");
@@ -156,7 +160,7 @@ describe("adaptateur du banc (--agent=new)", () => {
   });
   it("issues : sensible → équipe sans réponse, échec jamais une réponse, réponse avec mention IA", () => {
     const base = { reasons: ["x"], sensitiveStop: null, reading: null, decision: null, replyWithFooter: null, checks: { first: null, second: null }, verdicts: { first: null, second: null },
-      corrected: false, calls: [], sources: [], missing: [] };
+      corrected: false, calls: [], sources: [], missing: [], steps: [], teamNote: null, teamNoteText: null, memory: smartEmptyMemory(), progressed: true };
     expect(smartBenchTurn({ ...base, outcome: "team_sensitive" })).toMatchObject({ outcome: "equipe_sensible", reply: null });
     expect(smartBenchTurn({ ...base, outcome: "failed" })).toMatchObject({ outcome: "passer_la_main", reply: null, failure: "failed:x" });
     expect(smartBenchTurn({ ...base, outcome: "reply", replyWithFooter: "Bonjour\n—\nCharly", decision: smartGoodDecision() as never })).toMatchObject({ outcome: "repondre", citations: ["fiche-connexion"] });

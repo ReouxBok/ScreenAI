@@ -10,7 +10,10 @@ import { runSavBench, savBenchMetrics, type SavBenchConversationRow, type SavBen
 import type { SavBenchAgent, SavBenchConversation } from "../../bench/bench-types";
 import { resolveCaseV2GeminiKey, SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
 import { readCaseV2TransportPolicy } from "../investigation-v2-spend";
+import { SAV_SMART_MAX_MODEL_CALLS } from "./smart-agent";
 import { createSavBenchAgent } from "./smart-bench-agent";
+import { SAV_SMART_BENCH_MULTITURN, SAV_SMART_BENCH_MULTITURN_REVISION } from "./smart-bench-multiturn.fixture";
+import { getAcademyTools } from "./tools/academy";
 import { claimSmartItem, readSmartLedger, settleSmartItem, smartContainedErrorCode, smartItemKey, smartLedgerSpent } from "./smart-ledger";
 import { smartInputCap, smartPrices, smartUsageOf } from "./smart-model";
 import { SAV_SMART_PROMPT_REVISION, smartPromptPinned, smartPromptSha256 } from "./smart-prompt";
@@ -43,8 +46,11 @@ const RUN_ID = /^[A-Za-z0-9._-]{1,64}$/, INTEGER = /^[0-9]{1,12}$/;
 const STEP_MIN_MS = 90_000, CONVERSATION_MIN_MS = 150_000, CALL_MAX_MS = 45_000, CALL_MIN_MS = 8_000, CALL_MARGIN_MS = 3_000;
 const JUDGE_MAX_OUTPUT_TOKENS = 4_096;
 export type SmartBenchAgentName = "current" | "new";
-/** Ceilings per turn: V2's runner (`SAV_CASE_INVESTIGATION_MAX_CALLS`, 3) and the new agent (understand, decide, verify, correct, reverify). Tested equal. */
-export const SAV_SMART_BENCH_CURRENT_CALLS = 3, SAV_SMART_BENCH_NEW_CALLS = 5;
+/** Ceilings per turn: V2's runner (`SAV_CASE_INVESTIGATION_MAX_CALLS`, 3) and the new agent (understand, 3 decide passes, verify, correct, reverify). Tested equal. */
+export const SAV_SMART_BENCH_CURRENT_CALLS = 3, SAV_SMART_BENCH_NEW_CALLS = SAV_SMART_MAX_MODEL_CALLS;
+/** The self-test corpus: the 120 bench conversations, plus the new agent's multi-turn cases (memory and progress rule, 20/11). */
+export const SAV_SMART_BENCH_SELFTEST_CORPUS: readonly SavBenchConversation[] = [...SAV_BENCH_CORPUS, ...SAV_SMART_BENCH_MULTITURN];
+export const SAV_SMART_BENCH_SELFTEST_CORPUS_REVISION = `${SAV_BENCH_CORPUS_REVISION}+${SAV_SMART_BENCH_MULTITURN_REVISION}`;
 
 export type SmartBenchSelfTestConfig =
   | Readonly<{ mode: "off" }>
@@ -132,7 +138,7 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
   const inputCap = smartInputCap(env, now);
   if (inputCap === null) return { skipped: "price_unavailable" };
 
-  const corpus = deps.corpus ?? SAV_BENCH_CORPUS;
+  const corpus = deps.corpus ?? SAV_SMART_BENCH_SELFTEST_CORPUS;
   const claimed = new Set((await requireDb().select({ key: savSyncState.key }).from(savSyncState)
     .where(like(savSyncState.key, smartBenchRunPattern(config.runId)))).map(row => row.key));
   const todo = config.agents.flatMap(agent => corpus.map(conversation => ({ agent, conversation })))
@@ -168,18 +174,19 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
       return json === null ? new Response("not json", { status: 200 }) : Response.json(json);
     };
     const agent = deps.agents?.(agentName, meter) ?? (agentName === "new"
-      ? createSavBenchAgent({ dryRun: false, network: meter, env })
+      // Academy (off unless `SAV_V2_SMART_ACADEMY=on`) is a free public read: it does not go through the meter.
+      ? createSavBenchAgent({ dryRun: false, network: meter, env, academy: getAcademyTools() })
       : createSavBenchCurrentAgent({ model: createSavBenchCurrentModel({ env, network: meter, dryRun: false }), revision: `v2-decision:${model}` }));
     const judge = deps.judge?.(meter) ?? createSavBenchGeminiJudge({ network: meter, model, key: key.ok ? key.key : "", maxOutputTokens, maxInputBytes: inputCap });
     const startedAt = clock();
     let stored: SmartBenchStored;
     try {
       const report = await runSavBench({ conversations: [conversation], agent, judge, passes: 1, stopOnSensitiveAdmitted: true, shouldStop: () => meterStop });
-      stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, judgeRevision: SAV_BENCH_JUDGE_REVISION, corpusRevision: SAV_BENCH_CORPUS_REVISION, model,
+      stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, judgeRevision: SAV_BENCH_JUDGE_REVISION, corpusRevision: SAV_SMART_BENCH_SELFTEST_CORPUS_REVISION, model,
         codeSha: env.VERCEL_GIT_COMMIT_SHA?.slice(0, 40) ?? null, conversationId: conversation.id, costMicroUsd: cost, calls, durationMs: clock() - startedAt,
         stopped: meterStop ?? report.stopped?.reason ?? null, conversation: report.conversations[0] ?? null, turns: report.turns };
     } catch {
-      stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, judgeRevision: SAV_BENCH_JUDGE_REVISION, corpusRevision: SAV_BENCH_CORPUS_REVISION, model,
+      stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, judgeRevision: SAV_BENCH_JUDGE_REVISION, corpusRevision: SAV_SMART_BENCH_SELFTEST_CORPUS_REVISION, model,
         codeSha: null, conversationId: conversation.id, costMicroUsd: worst, calls, durationMs: clock() - startedAt, stopped: "crashed", conversation: null, turns: [] };
       cost = Math.max(cost, worst);
       stored = { ...stored, costMicroUsd: cost };

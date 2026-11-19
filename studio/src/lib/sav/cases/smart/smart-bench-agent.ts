@@ -1,13 +1,17 @@
 import type { SavBenchAgent, SavBenchAgentInput, SavBenchAgentTurn, SavBenchCard } from "../../bench/bench-types";
 import { runSmartTurn, type SmartKnowledgePort, type SmartTurnResult } from "./smart-agent";
 import type { SmartSource } from "./smart-checks";
+import { smartEmptyMemory, smartMaxExchanges, type SmartCaseMemory } from "./smart-memory";
+import type { AcademyTool } from "./tools/academy";
 import { SAV_SMART_PROMPT_REVISION, smartPromptSha256 } from "./smart-prompt";
 import { smartGeminiModel, smartInputCap, smartWireBody, type SmartModelPort } from "./smart-model";
 
 /*
- * Agent SAV intelligent (20/11): the NEW agent under the bench (`--agent=new --agent-module=<this file>`, and the prod self-test). One turn of
- * the bench = one `runSmartTurn` (net, understand, decide, verify, one correction), the bench cards standing in for the knowledge search
- * (given for every need; an expired temporary card is removed by the turn itself). The model goes through the bench's network (its wire: cache,
+ * Agent SAV intelligent (20/11, v2 the same day): the NEW agent under the bench (`--agent=new --agent-module=<this file>`, and the prod self-test).
+ * One turn of the bench = one `runSmartTurn` (net, understand, the bounded decide loop with its tools, verify, one correction), the bench cards
+ * standing in for the knowledge search (given for every need, and searched by `chercher_fiches`; an expired temporary card is removed by the turn).
+ * The case memory is kept per conversation across its turns (the bench's replies are « delivered » to the fictional customer, so the agent's
+ * questions and trials are recorded): this is where the memory and the progress rule are proven. The model goes through the bench's network (its wire: cache,
  * cap, dry-run). Dry-run: a deterministic script answers (the turn hands over for lack of a source) and each body is still sent to the wire,
  * which measures it for the estimate and answers nothing paid. No effect: no database, no writer.
  */
@@ -29,7 +33,7 @@ export function smartBenchTurn(result: SmartTurnResult): SavBenchAgentTurn {
     case "handoff": return { outcome: "passer_la_main", reply: null, citations, codes };
     case "reply": return { outcome: "repondre", reply: result.replyWithFooter, citations, codes };
     case "ask": return { outcome: "demander", reply: result.replyWithFooter, citations, codes };
-    default: return { outcome: "passer_la_main", reply: null, citations: [], codes, failure: `${result.outcome}:${result.reasons[0] ?? "unknown"}` };
+    default: return { outcome: "passer_la_main", reply: null, citations: [], codes, failure: `${result.outcome}:${result.reasons.find(reason => !reason.startsWith("hint:")) ?? result.reasons[0] ?? "unknown"}` };
   }
 }
 
@@ -39,9 +43,11 @@ function dryRunModel(network: Network, env: Env): SmartModelPort {
     const body = smartWireBody(system, payload, 8_192, temperature), inputBytes = Buffer.byteLength(body, "utf8");
     await network(`https://dry-run.invalid/${env.SAV_V2_MODEL ?? "model"}:generateContent`, { method: "POST", body }).catch(() => null);
     const needs = [{ id: "n1", ask: "demande du client", alreadyDone: [], theme: null, search: "aide" }];
+    const decision = { outcome: "handoff", reply: null, teamNote: { raison: "no_source", besoin: "Banc à blanc : pas de modèle." }, handoffReason: "no_source",
+      coverage: [{ needId: "n1", status: "handed" }], facts: [] };
     const output = kind === "understand" ? { needs, sensitive: "no", sensitiveFamilies: [], wantsHuman: false }
       : kind === "verify" || kind === "reverify" ? { verdict: "conforme", problems: [] }
-      : { outcome: "handoff", reply: null, teamNote: "Banc à blanc : pas de modèle.", handoffReason: "no_source", coverage: [{ needId: "n1", status: "handed" }], facts: [] };
+      : { thinking: "", action: "final", calls: [], decision };
     return { status: "ok", output, usage: { inputTokens: 0, outputTokens: 0 }, inputBytes };
   };
 }
@@ -52,7 +58,9 @@ export function smartBenchInput(input: SavBenchAgentInput) {
     thread: input.messages.slice(0, -1).map(message => ({ from: message.from === "client" ? "customer" as const : "support" as const, at: message.at, text: message.text })) };
 }
 
-export function createSavBenchAgent(context: Readonly<{ dryRun: boolean; network: Network; env: Env }>): SavBenchAgent {
+export function createSavBenchAgent(context: Readonly<{ dryRun: boolean; network: Network; env: Env; academy?: readonly AcademyTool[] }>): SavBenchAgent {
+  // The case memory of each conversation, across its turns (reset on its first turn).
+  const memories = new Map<string, SmartCaseMemory>();
   return {
     name: "new", revision: `${SAV_SMART_PROMPT_REVISION}:${smartPromptSha256().slice(0, 12)}:${context.env.SAV_V2_MODEL ?? "?"}`,
     async respond(input) {
@@ -60,7 +68,10 @@ export function createSavBenchAgent(context: Readonly<{ dryRun: boolean; network
       const model = context.dryRun ? dryRunModel(context.network, context.env)
         : smartGeminiModel({ env: () => context.env, now: () => now, network: context.network, timeoutMs: 60_000 });
       const knowledge: SmartKnowledgePort = async needs => ({ status: "ok", sources: input.knowledge.map(card => smartBenchSource(card, needs.map(need => need.id))), codes: [] });
-      const result = await runSmartTurn(smartBenchInput(input), { model, knowledge, maxInputBytes: smartInputCap(context.env, now) ?? 100_000, today: input.now.slice(0, 10) });
+      const memory = input.turn <= 1 ? smartEmptyMemory() : memories.get(input.conversationId) ?? smartEmptyMemory(input.messages.filter(row => row.from === "client").length - 1);
+      const result = await runSmartTurn({ ...smartBenchInput(input), memory }, { model, knowledge, maxInputBytes: smartInputCap(context.env, now) ?? 100_000, today: input.now.slice(0, 10),
+        academy: context.academy ?? [], recordOwn: true, maxExchanges: smartMaxExchanges(context.env) });
+      memories.set(input.conversationId, result.memory);
       return smartBenchTurn(result);
     },
   };
