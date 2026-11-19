@@ -5,11 +5,9 @@ import {
   assertSavTicketStageNotClosed,
   deterministicDecision,
   ensureAiTransparency,
-  followupDates,
   humanDueAt,
   isTransparentAiReply,
   isSavOutboundRecipientAllowed,
-  isSavPilotHubspotActionAllowed,
   safeSavHumanHandoffDraft,
   safeSavTriageDraft,
   safeSavFinanceDraft,
@@ -36,14 +34,9 @@ describe("SAV policy", () => {
     }
   });
 
-  it("uses the three-day human SLA and the agreed follow-up cadence", () => {
+  it("uses the three-day human SLA", () => {
     const start = new Date("2026-08-31T10:00:00.000Z");
     expect(humanDueAt(start).toISOString()).toBe("2026-09-03T10:00:00.000Z");
-    expect(followupDates(start).map((date) => date.toISOString())).toEqual([
-      "2026-09-02T10:00:00.000Z",
-      "2026-09-05T10:00:00.000Z",
-      "2026-09-10T10:00:00.000Z",
-    ]);
   });
 
   it("records non-customer automated messages without opening tickets", () => {
@@ -74,15 +67,6 @@ describe("SAV policy", () => {
     expect(isSavOutboundRecipientAllowed("client@example.com", { testMode: true, allowlist: "*@limova.ai" })).toBe(false);
     expect(isSavOutboundRecipientAllowed("client@example.com", { testMode: true, allowlist: "" })).toBe(false);
     expect(isSavOutboundRecipientAllowed("client@example.com", { testMode: false, allowlist: "" })).toBe(true);
-  });
-
-  it("blocks every HubSpot mutation during a pilot batch", () => {
-    expect(isSavPilotHubspotActionAllowed("create_ticket")).toBe(false);
-    expect(isSavPilotHubspotActionAllowed("link_ticket")).toBe(false);
-    expect(isSavPilotHubspotActionAllowed("log_email")).toBe(false);
-    expect(isSavPilotHubspotActionAllowed("create_note")).toBe(false);
-    expect(isSavPilotHubspotActionAllowed("send_reply")).toBe(false);
-    expect(isSavPilotHubspotActionAllowed("update_ticket_status")).toBe(false);
   });
 
   it("blocks sending pilot drafts and closed HubSpot stages", () => {

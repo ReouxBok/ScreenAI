@@ -183,7 +183,7 @@ describe("case page: read-only, no fake approval, true states, role-gated diagno
   it("an unavailable stop reader preserves the dossier and registry, with an explicit unknown diagnostic", async () => {
     // Keep the historical DB double without select: the additional read must not break the page.
     const html = await render();
-    expect(html).toContain("Arrêts V2 : lecture indisponible");
+    expect(html).toContain("Arrêts de l’Agent SAV : lecture indisponible");
     expect(html).toContain("L’absence d’arrêt ne peut pas être confirmée");
     expect(html).toContain(reply.text);
     expect(html).toContain("Demande d’accès synthétique");
@@ -198,7 +198,7 @@ describe("case page: read-only, no fake approval, true states, role-gated diagno
     mocks.db = { select: vi.fn(() => ({ from: () => ({ where }) })) };
     const html = await render();
     expect(where).toHaveBeenCalledTimes(3); // block hold, team-part wait, continuation stop
-    expect(html).not.toContain("Arrêts V2 : lecture indisponible");
+    expect(html).not.toContain("Arrêts de l’Agent SAV : lecture indisponible");
     expect(html).toContain(reply.text);
     if (present) {
       expect(html).toContain("Arrêt V2 : access_scope_changed");
@@ -382,12 +382,12 @@ describe("entry page", () => {
   it("an unreadable list is unavailable, never empty; an empty list says so; the last page has no next link", async () => {
     mocks.list.mockRejectedValueOnce(Error("connection refused"));
     const failed = await render();
-    expect(failed).toContain("Liste des dossiers V2 indisponible"); expect(failed).toContain("ce n’est pas une liste vide"); expect(failed).not.toMatch(/Aucun dossier/);
+    expect(failed).toContain("Liste des dossiers de l’Agent SAV indisponible"); expect(failed).toContain("ce n’est pas une liste vide"); expect(failed).not.toMatch(/Aucun dossier/);
     mocks.list.mockResolvedValueOnce({ items: [], nextCursor: null });
     const empty = await render();
-    expect(empty).toContain("Aucun dossier V2 enregistré"); expect(empty).not.toContain("indisponible");
+    expect(empty).toContain("Aucun dossier de l’Agent SAV enregistré"); expect(empty).not.toContain("indisponible");
     mocks.list.mockResolvedValueOnce({ items: [], nextCursor: null });
-    expect(await render({ owner: "human" })).toContain("Aucun dossier V2 pour ces filtres");
+    expect(await render({ owner: "human" })).toContain("Aucun dossier de l’Agent SAV pour ces filtres");
     mocks.list.mockResolvedValueOnce({ items: [listItem("123")], nextCursor: null });
     const last = await render(); expect(last).toContain("Fin de la liste"); expect(last).not.toContain("Page suivante");
   });
@@ -406,8 +406,8 @@ describe("entry page", () => {
   });
   it("invalid ticket, unknown ticket and recording off are explicit", async () => {
     const invalid = await render({ ticket: "12a" }); expect(invalid).toContain("ne contient que des chiffres"); expect(mocks.diagnostics).not.toHaveBeenCalled();
-    mocks.diagnostics.mockResolvedValueOnce(null); expect(await render({ ticket: "999" })).toContain("Aucun dossier V2 pour ce ticket");
-    mocks.recording.mockReturnValueOnce(false); expect(await render()).toContain("Enregistrement des dossiers V2 désactivé");
+    mocks.diagnostics.mockResolvedValueOnce(null); expect(await render({ ticket: "999" })).toContain("Aucun dossier de l’Agent SAV pour ce ticket");
+    mocks.recording.mockReturnValueOnce(false); expect(await render()).toContain("Enregistrement des dossiers de l’Agent SAV désactivé");
   });
 });
 
@@ -441,7 +441,7 @@ describe("operator raccord (UX night): owner and admission as stored, wiring of 
     expect(awaiting).toContain("En attente du propriétaire V2");
     mocks.byTicket.mockResolvedValueOnce(snapshot({ owner: "human", phase: "handoff_pending" }, { waiting: null, handoff: { reason: "decision_refused" } }));
     const handed = await render();
-    expect(handed).toContain("Dossier confié à l’équipe, pas encore pris par une personne : l’agent V2 n’agit pas sur ce dossier.");
+    expect(handed).toContain("Dossier confié à l’équipe, pas encore pris par une personne : l’Agent SAV n’agit pas sur ce dossier.");
     expect(handed).not.toContain("pris par une personne de l’équipe le");
     for (const html of [taken, awaiting, handed]) expect(html).not.toMatch(/<form|<button|type="submit"/);
     expect(mocks.write).not.toHaveBeenCalled();
@@ -499,7 +499,7 @@ describe("case owner as stored (UX lot 5)", () => {
   it("the owner is the V2 case's stored owner, stated as such: not a live HubSpot read", async () => {
     const html = renderToStaticMarkup(await CasePage({ params: Promise.resolve({ ticketId: "123" }), searchParams: Promise.resolve({}) }));
     expect(html).toContain("Responsable du dossier : <strong>Agent V2</strong>");
-    expect(html).toContain("tel qu’enregistré dans le dossier V2 ; ce n’est pas une lecture HubSpot en direct");
+    expect(html).toContain("tel qu’enregistré dans le dossier de l’Agent SAV ; ce n’est pas une lecture HubSpot en direct");
     expect(mocks.write).not.toHaveBeenCalled();
   });
 });

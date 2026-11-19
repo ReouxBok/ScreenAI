@@ -31,7 +31,7 @@ describe("rehearsal page: staff first, one fixed source, every state distinct, e
   it("real port → real r2 fixture: provenance, phases, totals, a red double send over two keys, per-key sends, unmeasured sends, simulated actions", async () => {
     const html = await render();
     expect(mocks.realCalls).toBe(1);
-    for (const text of ["Répétition V2 (simulation)", "Synthétique", "rien n’est parti", "Contrat sav-v2-simulation-report.common-1",
+    for (const text of ["Répétition de l’Agent SAV (simulation)", "Synthétique", "rien n’est parti", "Contrat sav-v2-simulation-report.common-1",
       "Attendus figés le 2026-10-31T00:29:59.309Z, passage lancé le 2026-10-31T00:29:59.316Z", "19ef4900a9e95c8008de94c60b4bc8b9dfffb827 (arbre 1f757e6c) : code exact qui a produit le rapport",
       "Empreinte du rapport relu", "Conformes : 6 · refus attendus obtenus : 1", "Différents : 1 · incohérents : 0", "Non comparables : 2 · non probants : 0 · invalides : 0",
       "Double envoi simulé dans 1 dossier", "Double envoi : 2 envois synthétiques sur 2 clés de réponse", "sends.total : attendu 1, obtenu 2",

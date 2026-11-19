@@ -1,5 +1,7 @@
 # Architecture — Limova AI (Charly)
 
+> **Glossaire SAV (noms d’interface)** : « Agent de tri » (anciennement « V1 ») et « Agent SAV » (anciennement « V2 »). Les noms de code, fichiers, URL (`/studio/sav/v2`), variables `SAV_V2_*`, valeurs en base et outils MCP gardent les anciens noms "v1"/"v2".
+
 Charly est une extension Manifest V3 composée d’un panneau latéral, d’un service worker et de deux scripts de contenu limités à `https://new.limova.ai/*`.
 
 ```text
