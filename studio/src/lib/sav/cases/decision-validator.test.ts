@@ -660,7 +660,12 @@ describe("SAV-6 purity", () => {
     const imports = (file: string) => [...readFileSync(path.join(dir, file), "utf8").matchAll(/from "([^"]+)"/g)].map(match => match[1]).sort();
     // `../message-context`: the shared, pure split of a mail into the customer's own words and what they quote (nothing behind it but the schema library).
     // SAV-97: the exclude-only kernel (pure phrases on OUR reply text) and the switch (pure env read), nothing else behind them but the sensitive word list.
-    expect(imports("decision-validator.ts")).toEqual(["../message-context", "../request-retrieval", "./access-skill/access-skill-kernel", "./access-skill/access-skill-mode", "./ask-before-handoff", "./decision-contract", "./investigation-access-scope", "./restored-access"]);
+    // 19/11: the Access rules moved verbatim to `decision-validator-access.ts`, the shared text primitives to `decision-validator-text.ts` (both pure, below);
+    // the resolution proof per block (`case-block-resolution.ts`, pure) and the Access block id (`case-types.ts`).
+    expect(imports("decision-validator.ts")).toEqual(["../request-retrieval", "./access-skill/access-skill-kernel", "./access-skill/access-skill-mode", "./ask-before-handoff", "./case-block-resolution", "./case-types", "./decision-contract", "./decision-validator-access", "./decision-validator-access", "./decision-validator-text", "./investigation-access-scope", "./restored-access"]);
+    expect(imports("decision-validator-access.ts")).toEqual(["../message-context", "./decision-contract", "./decision-validator-text", "./restored-access"]);
+    expect(imports("decision-validator-text.ts")).toEqual(["../message-context", "./decision-contract", "./restored-access"]);
+    expect(imports("case-block-resolution.ts")).toEqual(["./case-types", "./restored-access"]);
     expect(imports("access-skill/access-skill-kernel.ts")).toEqual(["../sensitive-words"]);
     expect(imports("access-skill/access-skill-mode.ts")).toEqual([]);
     expect(imports("sensitive-words.ts")).toEqual(["./case-types"]);

@@ -34,7 +34,9 @@ import { decideCaseReply } from "./case-reply-store";
 import { caseInvestigationReturnAwareQualify, type CaseReturnRulePort } from "./investigation-return-qualify";
 import { bindCaseInvestigationToReplyPlan, caseAccessAutoReplyAuthorizer, CASE_REPLY_PLAN_PORTS, passCaseInvestigationToReplyPlan, runCaseInvestigationToReplyPlan, type CaseReplyPassageDeps } from "./investigation-reply-passage";
 import { pilotProvenanceGate, type PilotProvenanceDeps } from "./pilot-passage-provenance";
-import { SAV_CASE_ACCESS_SCOPE_REVISION } from "./investigation-access-scope";
+import { SAV_CASE_ACCESS_SCOPE_REVISION, SAV_CASE_BLOCK_SCOPE_REVISION, SAV_CASE_BLOCK_SCOPES_BUNDLE } from "./investigation-access-scope";
+import { decideAutoApproval } from "./customer-return";
+import { caseRequestBlockId } from "./case-blocks";
 import type { CaseAdmissionQualification, CaseSnapshot, KnowledgeRef } from "./case-types";
 import { recordCaseAfterConfirmedIntake } from "./intake-boundary";
 import { type CaseInvestigationModelRequest, type CaseInvestigationPauseLevel, type CaseInvestigationTicketOwner } from "./investigation-runner";
@@ -59,7 +61,7 @@ const readQualification = async (input: { requests: { requestId: string }[] }): 
   ({ requests: input.requests.map(request => ruled(request.requestId)), identity: CONFIRMED, crmContext: "complete", teamSignals: [] });
 
 /** One stored V1 mail on a ticket, relayed by A. `ownerEffect`: V1's confirmed V2 owner effect on it (historic ledger row). */
-async function v1Mail(options: { ticketId?: string; threadId?: string; ownerEffect: boolean }) {
+async function v1Mail(options: { ticketId?: string; threadId?: string; ownerEffect: boolean; policy?: unknown; readQualification?: typeof readQualification }) {
   const ticketId = options.ticketId ?? String(++seq), threadId = options.threadId ?? randomUUID(), messageId = randomUUID();
   if (!options.threadId) await f.db.insert(savThreads).values({ id: threadId, mailboxId, gmailThreadId: `thread-${threadId}`, subject: "Synthétique", customerEmail: SENDER });
   await f.db.insert(savMessages).values({ id: messageId, threadId, mailboxId, direction: "inbound", fromEmail: SENDER, toEmails: ["support@example.invalid"], subject: "Synthétique",
@@ -79,7 +81,7 @@ async function v1Mail(options: { ticketId?: string; threadId?: string; ownerEffe
       intentHash: intakeRuntimeHash(intent), intentCiphertext: encryptSavPayload(intent), confirmedAt: new Date(), dispatchedAt: new Date() });
   }
   const relayed = await recordCaseAfterConfirmedIntake(messageId, { readProgress: async () => ({ state: "confirmed", ticketId, confirmed: true }),
-    readAdmissionPolicy: async () => POLICY, readQualification, env: ENV }) as { caseId: string; appended: boolean; owner: string };
+    readAdmissionPolicy: async () => options.policy ?? POLICY, readQualification: options.readQualification ?? readQualification, env: ENV }) as { caseId: string; appended: boolean; owner: string };
   return { ticketId, threadId, gmail: `gm-${messageId}`, caseId: relayed.caseId, relayed };
 }
 
@@ -366,3 +368,109 @@ describe("passage to the send plan (B): C's store, A's rule, nothing short of ev
     });
   });
 });
+
+/*
+ * 19/11, the allow-list of blocks (`block-auto-reply.ts`) on the REAL chain (only the transports are doubles): a synthetic block other than Access
+ * (`syn-widget`, family `usage`), admitted by its own approved rule, decided under its own scope, answers alone once it is listed AND switched to an
+ * explicit `auto`; listed nowhere it stays a person's; Access answers exactly as before under a longer list. The passage and A's approval decide the
+ * block through the same function: the same facts give the same reason.
+ */
+describe("allow-list of blocks: a block other than Access answers alone only when listed and switched to auto", () => {
+  const APPROVER = "30000000-0000-4000-8000-000000000043", BLOCK = "syn-widget";
+  const POLICY_BLOCKS = { ...POLICY, admittedFamilies: ["access", "usage"], qualifiedRules: [...POLICY.qualifiedRules, { ruleId: "rule-widget", revision: "r1", families: ["usage"], blockId: BLOCK }] };
+  const widgetRow = (requestId: string) => ({ requestId, family: "usage" as const, provenance: { kind: "qualified_rule" as const, ruleId: "rule-widget", revision: "r1", at: AT, blockId: BLOCK } });
+  const widgetQualification = async (input: { requests: { requestId: string }[] }): Promise<CaseAdmissionQualification> =>
+    ({ requests: input.requests.map(request => widgetRow(request.requestId)), identity: CONFIRMED, crmContext: "complete", teamSignals: [] });
+  const accessScope = { schema: SAV_CASE_ACCESS_SCOPE_REVISION, policyRevision: "policy-r1", revision: "syn-scope-r1", family: "access", sources: [{ knowledgeId: card.id, contentVersionId: card.contentVersionId, use: "answer" }] };
+  const widgetScope = { schema: SAV_CASE_BLOCK_SCOPE_REVISION, blockId: BLOCK, family: "usage", policyRevision: "policy-r1", revision: "syn-widget-r1", sources: [{ knowledgeId: card.id, contentVersionId: card.contentVersionId, use: "answer" }] };
+  const bundle = async () => ({ [SAV_CASE_BLOCK_SCOPES_BUNDLE]: true as const, access: { state: "read" as const, value: accessScope }, blocks: { state: "read" as const, value: [widgetScope] } });
+  const provenance: PilotProvenanceDeps = { accessScope: bundle, currentPolicyRevision: async () => "policy-r1", now: () => new Date(),
+    readActiveSource: async () => ({ active: true, title: card.title, content: card.content, verifiedAt: card.verifiedAt! }) };
+  const passage = (env: Record<string, string>): CaseReplyPassageDeps => ({
+    store: { env: () => ({ SAV_CASE_EFFECTS: "supervised", ...env }), currentPolicyRevision: async () => "policy-r1", readTicketOwner: async () => "v2", pilotProvenance: pilotProvenanceGate(provenance) },
+    provenance, policy: { id: policyId, hash: "fixture" },
+  });
+  const list = (value: string) => ({ SAV_V2_AUTO_REPLY: value, SAV_V2_AUTO_APPROVER_ID: APPROVER });
+  const setSwitch = async (blockId: string, mode: "off" | "draft" | "auto") => {
+    const values = { key: `sav-block-switch.v1:${blockId}`, status: "active", cursor: encryptSavPayload({ revision: "sav-block-switch.v1", blockId, mode, paused: false,
+      setBy: "admin@example.invalid", setAt: new Date().toISOString(), reason: "Réglage synthétique" }) };
+    await f.db.insert(savSyncState).values(values).onConflictDoUpdate({ target: savSyncState.key, set: values });
+  };
+  afterEach(async () => { await f.db.delete(savSyncState).where(eq(savSyncState.key, `sav-block-switch.v1:${BLOCK}`)); });
+
+  /** A V1 mail admitted by the block's rule, investigated under the block's scope, its answer accepted and recorded. */
+  async function blockAnswered() {
+    const mail = await v1Mail({ ownerEffect: true, policy: POLICY_BLOCKS, readQualification: widgetQualification });
+    const runtime = wiring().deps;
+    runtime.accessScope = bundle;
+    runtime.qualify = async (snapshot, events) => {
+      const latest = events.filter(event => event.kind === "inbound_confirmed").at(-1);
+      const requests = snapshot.body.openRequests.filter(row => row.status === "open").map(row => widgetRow(row.id));
+      return latest ? { admission: { policy: POLICY_BLOCKS, qualification: { requests, identity: CONFIRMED, crmContext: "complete" as const, teamSignals: [] } }, sourceRef: latest.sourceRef } : null;
+    };
+    runtime.model.provider = async request => {
+      const open = request.snapshot.body.openRequests.filter(row => row.status === "open");
+      return { status: "ok", output: { caseVersion: request.snapshot.version,
+        understanding: { requests: open.map(row => ({ id: row.id, summary: "Réglage du widget.", family: "usage", status: "open" })), newFacts: [] },
+        nextAction: { kind: "answer", requestIds: [open[0]!.id], steps: [{ text: "Suivre la fiche citée.", knowledge: ref }], expectedResult: "Le widget est réglé." },
+        reply: { text: "Bonjour, voici la marche à suivre : suivre la fiche.", citations: [ref], impossibilityClaims: [], accountAdvice: "none" } } };
+    };
+    expect(await runCaseInvestigationRuntime(mail.caseId, runtime)).toMatchObject({ status: "recorded", outcome: "accepted" });
+    const snapshot = (await readCase(mail.caseId))!;
+    expect(snapshot.body.openRequests.filter(row => row.status === "open").map(row => caseRequestBlockId(snapshot, row))).toEqual([BLOCK]);
+    return mail;
+  }
+
+  it("listed and switched to auto: answered alone once, under the rule's basis, then idempotent", async () => {
+    await setSwitch(BLOCK, "auto");
+    const mail = await blockAnswered();
+    expect(await passCaseInvestigationToReplyPlan(mail.caseId, passage(list(`access,${BLOCK}`)))).toMatchObject({ status: "queued", created: true });
+    const [row] = await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, mail.caseId));
+    expect(row).toMatchObject({ state: "approved", decidedBy: APPROVER, authorizationBasis: "auto_access.v1" });
+    expect(readCaseReplyDisclosure(decryptSavPayload<{ text: string }>(row!.proposalCiphertext).text)?.mode).toBe("automated");
+    expect(await passCaseInvestigationToReplyPlan(mail.caseId, passage(list(`access,${BLOCK}`)))).toMatchObject({ status: "queued", created: false });
+    expect(await sideEffects(mail.caseId)).toEqual({ effects: 1, validations: 1, timers: 0 });
+  });
+
+  it("not listed (today's `access`, or another block) stays a person's, with the same reason as A's approval on the same facts", async () => {
+    await setSwitch(BLOCK, "auto");
+    for (const [value, reason] of [["access", "not_access_only"], ["access,syn-other", "block_not_allowed"]] as const) {
+      const mail = await blockAnswered();
+      const report = await passCaseInvestigationToReplyPlan(mail.caseId, passage(list(value)));
+      expect(report).toMatchObject({ status: "awaiting_person", reasons: [reason] });
+      // Parity: A's approval, on the facts read the same way, refuses for the same reason.
+      const snapshot = (await readCase(mail.caseId))!, open = snapshot.body.openRequests.filter(r => r.status === "open");
+      const decided = decideAutoApproval({ config: (await import("./block-auto-reply")).readAutoReplyConfig(list(value)), action: "approve", approverId: APPROVER, purpose: "answer",
+        facts: { case: { owner: "agent", sensitivity: "none", admitted: true }, openFamilies: [...new Set(open.map(r => r.family))], openBlocks: open.map(r => ({ family: r.family, blockId: caseRequestBlockId(snapshot, r) })),
+          decision: { accepted: true, scopeCurrent: true, shownSourcesVerified: true, nextAction: "answer" }, ownerNow: "v2" } });
+      expect(decided).toEqual({ allowed: false, reason });
+      expect((await sideEffects(mail.caseId)).effects).toBe(0);
+    }
+  });
+
+  it("listed but its switch is draft, or absent (off): never the rule's; the listed block never inherits Access's legacy fallback", async () => {
+    await setSwitch(BLOCK, "draft");
+    const drafted = await blockAnswered();
+    expect(await passCaseInvestigationToReplyPlan(drafted.caseId, passage(list(`access,${BLOCK}`)))).toMatchObject({ status: "awaiting_person", reasons: ["block_draft"] });
+    await f.db.delete(savSyncState).where(eq(savSyncState.key, `sav-block-switch.v1:${BLOCK}`));
+    const off = await blockAnswered();
+    expect(await passCaseInvestigationToReplyPlan(off.caseId, passage(list(`access,${BLOCK}`)))).toMatchObject({ status: "block_held", blockId: BLOCK, reason: "block_off" });
+    expect((await sideEffects(drafted.caseId)).effects + (await sideEffects(off.caseId)).effects).toBe(0);
+  });
+
+  it("Access under a longer list answers exactly as under `access` alone; a list without Access leaves Access to a person", async () => {
+    const accessAuto = { SAV_V2_AUTO_APPROVER_ID: APPROVER };
+    const accessPassage = (value: string): CaseReplyPassageDeps => {
+      const base = { accessScope: () => wiring().deps.accessScope!(), currentPolicyRevision: async () => "policy-r1", now: () => new Date(),
+        readActiveSource: async () => ({ active: true, title: card.title, content: card.content, verifiedAt: card.verifiedAt! }) } satisfies PilotProvenanceDeps;
+      return { store: { env: () => ({ SAV_CASE_EFFECTS: "supervised", ...accessAuto, SAV_V2_AUTO_REPLY: value }), currentPolicyRevision: async () => "policy-r1", readTicketOwner: async () => "v2",
+        pilotProvenance: pilotProvenanceGate(base) }, provenance: base, policy: { id: policyId, hash: "fixture" } };
+    };
+    const longer = await answered();
+    expect(await passCaseInvestigationToReplyPlan(longer.caseId, accessPassage(`access, ${BLOCK}, access+${BLOCK}`))).toMatchObject({ status: "queued", created: true });
+    const without = await answered();
+    expect(await passCaseInvestigationToReplyPlan(without.caseId, accessPassage(BLOCK))).toMatchObject({ status: "awaiting_person", reasons: ["block_not_allowed"] });
+    expect((await sideEffects(without.caseId)).effects).toBe(0);
+  });
+});
+

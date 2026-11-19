@@ -1,18 +1,19 @@
 import "server-only";
 import { and, eq } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savCaseEffectExecutions, savIntakeEffects, savMessages } from "@/db/schema";
+import { savCaseEffectExecutions, savCases, savIntakeEffects, savMessages } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { readSavBlockSwitch, savBlockReplyGate } from "./block-switch";
-import { SAV_CASE_ACCESS_BLOCK_ID } from "./case-types";
+import { SAV_CASE_ACCESS_BLOCK_ID, type CaseBody } from "./case-types";
 import { caseReplyKey, caseReplyQuestions, type CaseReplyProposal } from "./case-effects";
 import type { CaseReplySendIntent } from "./case-effect-intents";
 import type { CaseEffectPayload } from "./case-reply-store";
 import { renderSavOutboundReply } from "../reply-format";
 import { caseReplyTextSafetyProblems } from "./decision-validator";
 import { caseReplyEditableBody, prepareCaseReplyText } from "./case-reply-outbound";
-import { readAccessAutoApprovalConfig } from "./customer-return";
+import { autoBlockProblem, readAutoReplyConfig, savAutoReplyLegacyAccessOnly, type SavAutoOpenBlock } from "./block-auto-reply";
+import { caseRequestBlockId } from "./case-blocks";
 import { readRequestSubjects } from "./intake-boundary";
 import { listCaseTimers, readCase } from "./case-store";
 import { revalidateJ2Timer } from "./timer-store";
@@ -107,12 +108,39 @@ export async function readJ2ReminderText(caseId: string, triggerEventId: string,
   return timer && current ? J2_REMINDER_TEXT : null;
 }
 
-export async function j2AutoGate(env: Record<string, string | undefined>, db: Parameters<typeof readSavBlockSwitch>[0] & Parameters<typeof readSavAgentPause>[0] = requireDb()): Promise<string | null> {
-  if (env.SAV_V2_J2_AUTO !== "on" || readAccessAutoApprovalConfig(env).mode !== "on") return "j2_auto_off";
-  const block = await readSavBlockSwitch(db, SAV_CASE_ACCESS_BLOCK_ID);
-  // The inherited shared switch has a permissive default: J2 requires an explicit setting.
-  const gate = savBlockReplyGate(block);
-  if (!block.setting || gate.send !== "rule") return gate.send === "rule" ? "block_off" : gate.code;
+type GateReader = Parameters<typeof readSavBlockSwitch>[0] & Parameters<typeof readSavAgentPause>[0];
+
+/** The family and block of each OPEN request of a case, read through `db` (the caller's transaction at the send gate); null: no such case. */
+export async function readCaseOpenBlocks(db: GateReader, caseId: string): Promise<SavAutoOpenBlock[] | null> {
+  const [row] = await db.select({ admission: savCases.admissionCiphertext, payload: savCases.payloadCiphertext }).from(savCases).where(eq(savCases.id, caseId));
+  if (!row?.payload) return null;
+  const body = decryptSavPayload<CaseBody>(row.payload), admission = row.admission ? decryptSavPayload<NonNullable<Parameters<typeof caseRequestBlockId>[0]["admission"]>>(row.admission) : null;
+  return body.openRequests.filter(request => request.status === "open").map(request => ({ family: request.family, blockId: caseRequestBlockId({ admission }, request) }));
+}
+
+/**
+ * J2 follows the same allow-list as the reply (`block-auto-reply.ts`): `SAV_V2_J2_AUTO=on`, the case's block(s) listed (`autoBlockProblem`: one block, or a
+ * qualified pair), each one's switch EXPLICITLY `auto` (the legacy Access fallback never counts here), not paused, and both agents running.
+ * `caseBlocks`: the open requests' blocks of the timer's case, read only when the list is more than `access`; never a default block.
+ * With the list `access` alone: exactly as before (the Access switch; A's rule still refuses a case that is not Access-only).
+ */
+export async function j2AutoGate(env: Record<string, string | undefined>, db: GateReader = requireDb(), caseBlocks?: () => Promise<readonly SavAutoOpenBlock[] | null>): Promise<string | null> {
+  const config = readAutoReplyConfig(env);
+  if (env.SAV_V2_J2_AUTO !== "on" || config.mode !== "on") return "j2_auto_off";
+  let blockIds: string[] = [SAV_CASE_ACCESS_BLOCK_ID];
+  if (!savAutoReplyLegacyAccessOnly(config)) {
+    let open: readonly SavAutoOpenBlock[] | null = null;
+    try { open = caseBlocks ? await caseBlocks() : null; } catch { open = null; }
+    const problem = autoBlockProblem({ openFamilies: (open ?? []).map(row => row.family), openBlocks: open ?? undefined }, config);
+    if (problem) return problem;
+    blockIds = [...new Set(open!.map(row => row.blockId!))].sort();
+  }
+  for (const blockId of blockIds) {
+    const block = await readSavBlockSwitch(db, blockId);
+    // The inherited shared switch has a permissive default: J2 requires an explicit setting.
+    const gate = savBlockReplyGate(block);
+    if (!block.setting || gate.send !== "rule") return gate.send === "rule" ? "block_off" : gate.code;
+  }
   for (const agent of ["intake", "v2"] as const) {
     const pause = await readSavAgentPause(db, agent);
     if (pause.invalid || pause.level !== "running") return "paused";

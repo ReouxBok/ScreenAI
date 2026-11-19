@@ -10,9 +10,10 @@ import type { AdmissionPolicyRecord } from "./admission-runtime";
 import { caseReplyKey, caseReplyPayloadHash, j2TriggerEventId, readCaseEffectsMode, type CaseReplyProposal } from "./case-effects";
 import { submitCaseReplyProposal, decideCaseReply, type CaseReplyStoreDeps } from "./case-reply-store";
 import { queueValidatedCaseReply } from "./case-runtime-effects";
-import { readJ2ReminderText, j2AutoGate, readJ2Origin } from "./j2-auto-reminder";
-import { accessAutoReplyAuthorizer } from "./customer-return-store";
-import { readAccessAutoApprovalConfig } from "./customer-return";
+import { readJ2ReminderText, j2AutoGate, readCaseOpenBlocks, readJ2Origin } from "./j2-auto-reminder";
+import { autoReplyAuthorizer } from "./customer-return-store";
+import { readAutoReplyConfig } from "./block-auto-reply";
+import { caseRequestBlockId } from "./case-blocks";
 import { judgeCurrentTicketOwner } from "./case-ticket-owner";
 import { caseAdmissionStatus } from "./admission-policy";
 import { readCase } from "./case-store";
@@ -72,11 +73,13 @@ export async function enqueueApprovedJ2(timer: Pick<J2Timer,"id"|"caseId">, case
   return result.ok ? (result.created ? "queued" : "already_queued") : result.code;
 }
 
-/** Authors the deterministic reminder, through the normal durable proposal, rule and queue. */
+/** Authors the deterministic reminder, through the normal durable proposal, rule and queue. The gate and the rule read the allow-list of blocks
+ * (`block-auto-reply.ts`) on the timer's own case: a case whose block is unknown or not listed gets no reminder (`block_unknown`, `block_not_allowed`). */
 export async function produceAutoJ2(timer: Pick<J2Timer,"id"|"caseId">, caseVersion: number, deps: CaseReplyStoreDeps) {
-  const blocked = await j2AutoGate(deps.env());
+  const caseBlocks = () => readCaseOpenBlocks(requireDb(), timer.caseId);
+  const blocked = await j2AutoGate(deps.env(), requireDb(), caseBlocks);
   if (blocked) return blocked;
-  const config = readAccessAutoApprovalConfig(deps.env());
+  const config = readAutoReplyConfig(deps.env());
   if (config.mode !== "on") return "j2_auto_off";
   const origin = await readJ2Origin(timer.caseId, j2TriggerEventId(timer.id), await deps.currentPolicyRevision(), new Date(), deps.env());
   if (!origin) return "reminder_origin_unproven";
@@ -89,19 +92,21 @@ export async function produceAutoJ2(timer: Pick<J2Timer,"id"|"caseId">, caseVers
   if (proposed.state === "approved") return "approved";
   const decided = await decideCaseReply({ action: "approve", validationId: proposed.id, approverId: config.approverId,
     seen: { payloadHash: caseReplyPayloadHash(proposal), caseVersion, recipient: proposal.recipient }, expectedCaseVersion: caseVersion, deps,
-    authorizer: accessAutoReplyAuthorizer({ env: deps.env(), readFacts: async () => {
-      if (await j2AutoGate(deps.env())) return null;
+    authorizer: autoReplyAuthorizer({ env: deps.env(), readFacts: async () => {
+      if (await j2AutoGate(deps.env(), requireDb(), caseBlocks)) return null;
       if (!await readJ2Origin(timer.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), new Date(), deps.env())) return null;
       const snapshot = await readCase(timer.caseId);
       if (!snapshot) return null;
       const owner = await judgeCurrentTicketOwner(deps.readTicketOwner, snapshot.ticketId);
       return { case: { owner: snapshot.owner, sensitivity: snapshot.sensitivity, admitted: caseAdmissionStatus(snapshot, await deps.currentPolicyRevision()).admitted },
-        openFamilies: snapshot.body.openRequests.filter(r => r.status === "open").map(r => r.family), decision: null, ownerNow: owner.ok ? "v2" : "unknown" };
+        openFamilies: snapshot.body.openRequests.filter(r => r.status === "open").map(r => r.family),
+        openBlocks: snapshot.body.openRequests.filter(r => r.status === "open").map(r => ({ family: r.family, blockId: caseRequestBlockId(snapshot, r) })),
+        decision: null, ownerNow: owner.ok ? "v2" : "unknown" };
     } }) });
   return decided.ok ? "approved" : decided.code;
 }
 
-/** A due wake authors and approves a reminder only under the dedicated opt-in and Access rule. */
+/** A due wake authors and approves a reminder only under the dedicated opt-in and A's rule on the allow-list of blocks. */
 export async function reconcileCaseJ2({env,deadlineMs,network,sendNow}:Tick) {
   if (!savV2EntryEnabled(env) || env.SAV_V2_J2 !== "on" || readCaseEffectsMode(env).mode !== "supervised") return { skipped:"j2_off" };
   if (env.SAV_V2_J2_AUTO !== "on") return { skipped: "j2_auto_off" };

@@ -12,9 +12,10 @@ import type { CaseAdmissionInput } from "./admission-policy";
 import { CaseVersionStaleError, listCaseEvents, readCase, recordCustomerReturn, savCaseRecordingEnabled, type CaseTx, type CustomerReturnRecord } from "./case-store";
 import { caseDedupeKey } from "./case-types";
 import {
-  customerMailOrder, customerReturnNeedsOwner, decideAccessAutoApproval, decideCustomerReturn, readAccessAutoApprovalConfig,
-  type AccessAutoApprovalFacts, type CustomerReturnFacts, type CustomerReturnOwnerNow, type CustomerReturnRoute,
+  customerMailOrder, customerReturnNeedsOwner, decideAutoApproval, decideCustomerReturn, readAccessAutoApprovalConfig,
+  type AccessAutoApprovalConfig, type AccessAutoApprovalFacts, type CustomerReturnFacts, type CustomerReturnOwnerNow, type CustomerReturnRoute,
 } from "./customer-return";
+import { readAutoReplyConfig, type AutoReplyConfig } from "./block-auto-reply";
 import type { CaseReplyAuthorizationRequest, CaseReplyAuthorizer } from "./case-reply-validation";
 import { readIntakeAcknowledgement, relayAdmissionInput, relayPaused, v2HubspotOwnerId, type CaseBoundaryDeps } from "./intake-boundary";
 
@@ -156,13 +157,25 @@ export async function routeCustomerReturn(messageId: string, deps: CustomerRetur
 }
 
 /** `CaseReplyAuthorizer` of the access rule: an explicit yes only from `decideAccessAutoApproval` on facts the injected port read just now. No port, a port that
- * fails, or any fact outside the rule is a refusal, and the reply waits for a person as before. */
+ * fails, or any fact outside the rule is a refusal, and the reply waits for a person as before. It reads Access's view of the allow-list
+ * (`readAccessAutoApprovalConfig`): an Access-only path (the threadless first mail) decides exactly as before, whatever other block is listed. */
 export function accessAutoReplyAuthorizer(deps: { env?: Env; readFacts?: (request: CaseReplyAuthorizationRequest) => Promise<AccessAutoApprovalFacts | null> }): CaseReplyAuthorizer {
+  return ruleAuthorizer(readAccessAutoApprovalConfig, deps);
+}
+
+/** The same authorizer on the whole allow-list (`block-auto-reply.ts`), for the paths that serve every block (the reply passage, J2). Its port must give
+ * `openBlocks` once the list is more than `access`; without them nothing is approved (`block_unknown`). With the list `access` alone: the access rule above. */
+export function autoReplyAuthorizer(deps: { env?: Env; readFacts?: (request: CaseReplyAuthorizationRequest) => Promise<AccessAutoApprovalFacts | null> }): CaseReplyAuthorizer {
+  return ruleAuthorizer(readAutoReplyConfig, deps);
+}
+
+function ruleAuthorizer(read: (env: Env) => AutoReplyConfig | AccessAutoApprovalConfig,
+  deps: { env?: Env; readFacts?: (request: CaseReplyAuthorizationRequest) => Promise<AccessAutoApprovalFacts | null> }): CaseReplyAuthorizer {
   return async request => {
-    const config = readAccessAutoApprovalConfig(deps.env ?? {});
+    const config = read(deps.env ?? {});
     let facts: AccessAutoApprovalFacts | null = null;
     if (config.mode === "on" && deps.readFacts) { try { facts = await deps.readFacts(request); } catch { facts = null; } }
-    const outcome = decideAccessAutoApproval({ config, action: request.action, approverId: request.approverId, purpose: request.purpose, env: deps.env, facts });
+    const outcome = decideAutoApproval({ config, action: request.action, approverId: request.approverId, purpose: request.purpose, env: deps.env, facts });
     return outcome.allowed ? { allowed: true, basis: outcome.basis } : { allowed: false, reason: outcome.reason };
   };
 }

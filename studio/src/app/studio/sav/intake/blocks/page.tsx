@@ -4,7 +4,7 @@ import { readSavBlockSwitchPanel } from "@/lib/sav/cases/block-switch-admin";
 import { BlockSwitchForm } from "./block-form";
 import styles from "../intake.module.css";
 export const dynamic = "force-dynamic";
-const BLOCK_LABELS: Record<string, string> = { access: "Accès (connexion)" };
+const BLOCK_LABELS: Record<string, string> = { access: "Accès (connexion)", collaborators: "Collaborateurs", charly_max: "Charly Max", integrations: "Intégrations" };
 const MODE_LABELS: Record<string, string> = { off: "arrêt", draft: "brouillon", auto: "automatique", paused: "en pause", invalid: "réglage illisible" };
 const stateLabel = (value: string) => value.split("+").map(part => MODE_LABELS[part] ?? part).join(" + ");
 export default async function BlockSwitchPage() {

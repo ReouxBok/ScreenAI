@@ -10,7 +10,7 @@ import type { SavIntakeDecision } from "../intake/contract";
 import type { ExecutionPayload } from "../intake/execution-types";
 import type { IntakeRuntimePayload } from "../intake/runtime-contract";
 import { readSavAgentPause } from "../intake/agent-pause";
-import { decideCaseAdmission } from "./admission-policy";
+import { caseFreshQualificationUnderCurrent, decideCaseAdmission } from "./admission-policy";
 import { savV2OwnerHandoverEnabled } from "./owner-handover-config";
 import { listCaseEvents, openCaseEvent, readCaseByTicket, savCaseRecordingEnabled, transitionCaseOwner, v1IntentHash, type CaseTx } from "./case-store";
 import {
@@ -472,8 +472,11 @@ async function relayToCase(input: {
 export async function relayAdmissionInput(input: { messageId: string; gmailMessageId: string; decision: Pick<SavIntakeDecision, "classification" | "requests">; confirmedTicket: boolean; deps: CaseBoundaryDeps; target?: CaseQualificationTarget }) {
   const policy = input.deps.readAdmissionPolicy ? await input.deps.readAdmissionPolicy() : null;
   const requests = caseRequestsOpenedByIntake(input.decision, input.gmailMessageId, input.confirmedTicket);
-  const proven = requests.length && input.deps.readQualification
+  const read = requests.length && input.deps.readQualification
     ? await input.deps.readQualification({ messageId: input.messageId, gmailMessageId: input.gmailMessageId, requests, ...(input.target ? { target: input.target } : {}) }) : null;
+  // Revision lifecycle (19/11): a fresh entry reading is admitted under the current revision N only, never under a `previous` (N-1) policy entry.
+  const proven = read ? caseFreshQualificationUnderCurrent(read, policy) : read;
+  if (read && proven !== read) console.info("sav_v2_entry_previous_revision", { messageId: input.messageId, dropped: read.requests.length - proven!.requests.length });
   return { admission: { policy, qualification: relayQualification(admissionQualificationFromIntake(input.decision, input.gmailMessageId), proven, requests) }, requests };
 }
 

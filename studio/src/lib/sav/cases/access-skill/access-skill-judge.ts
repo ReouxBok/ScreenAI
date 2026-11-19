@@ -41,19 +41,28 @@ const MODEL_ID = /^[a-z0-9][a-z0-9.-]{0,99}$/;
  */
 export function prepareAccessSkillCall(deps: AccessSkillDeps, kind: AccessSkillCallKind, input: AccessSkillInput):
   | Readonly<{ ok: true; send: () => Promise<AccessSkillWireResult> }> | Readonly<{ ok: false; call: AccessSkillCall }> {
+  return prepareV2SkillCall(deps, maxOutputTokens => accessSkillWireBody(kind, input, maxOutputTokens));
+}
+
+/**
+ * The same preparation for ANY body on the same envelope (chantier « 3 blocs »: the entry's router and block confirmations): V2's key resolution, model,
+ * transport bounds and size check, then `send` on the same endpoint. `body` receives the transport's `maxOutputTokens`.
+ */
+export function prepareV2SkillCall(deps: AccessSkillDeps, body: (maxOutputTokens: number) => string):
+  | Readonly<{ ok: true; send: () => Promise<AccessSkillWireResult> }> | Readonly<{ ok: false; call: AccessSkillCall }> {
   const env = deps.env(), key = resolveCaseV2GeminiKey(env), model = env[SAV_V2_MODEL_ENV] ?? "";
   const failed = (problem: string) => ({ ok: false as const, call: { status: "failed" as const, problem, uncertain: false } });
   if (!key.ok) return failed("key_unavailable");
   if (!MODEL_ID.test(model)) return failed("model_invalid");
   let bounds: ReturnType<typeof readCaseV2TransportPolicy>;
   try { bounds = readCaseV2TransportPolicy(env, deps.now()); } catch { return failed("policy_invalid"); }
-  const body = accessSkillWireBody(kind, input, bounds.maxOutputTokens);
-  if (Buffer.byteLength(body, "utf8") > bounds.maxInputBytes) return failed("input_too_large");
+  const wire = body(bounds.maxOutputTokens);
+  if (Buffer.byteLength(wire, "utf8") > bounds.maxInputBytes) return failed("input_too_large");
   const network = deps.network ?? ((url, init) => fetch(url, init));
   return { ok: true, send: async () => {
     try {
       const response = await network(`${SAV_ACCESS_SKILL_GEMINI_URL}/${encodeURIComponent(model)}:generateContent`, {
-        method: "POST", signal: AbortSignal.timeout(deps.timeoutMs ?? 25_000), headers: { "content-type": "application/json", "x-goog-api-key": key.key }, body,
+        method: "POST", signal: AbortSignal.timeout(deps.timeoutMs ?? 25_000), headers: { "content-type": "application/json", "x-goog-api-key": key.key }, body: wire,
       });
       if (!response.ok) {
         await response.body?.cancel();
@@ -69,7 +78,11 @@ export const accessSkillCallOf = (result: AccessSkillWireResult): AccessSkillCal
 
 /** One call behind V2's `model` budget: reserved before, settled after; released only when nothing was sent. */
 async function callModel(deps: AccessSkillDeps, kind: AccessSkillCallKind, callKey: string, input: AccessSkillInput): Promise<AccessSkillCall> {
-  const prepared = prepareAccessSkillCall(deps, kind, input);
+  return spendGatedV2SkillCall(deps, prepareAccessSkillCall(deps, kind, input), callKey);
+}
+
+/** A prepared call behind V2's `model` budget (shared by Access and the entry's other calls): reserved before, settled after; released only when nothing was sent. */
+export async function spendGatedV2SkillCall(deps: AccessSkillDeps, prepared: ReturnType<typeof prepareV2SkillCall>, callKey: string): Promise<AccessSkillCall> {
   if (!prepared.ok) return prepared.call;
   const env = deps.env();
   const reserved = await reserveCaseV2Spend({ env: deps.env, now: deps.now }, "model", callKey);

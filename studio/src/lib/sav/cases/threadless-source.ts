@@ -18,6 +18,11 @@ import { readOrComputeAccessSkill, type AccessSkillDeps, type AccessSkillReading
 import { SAV_ACCESS_SKILL_REVISION, SAV_ACCESS_SKILL_RULE_ID } from "./access-skill/access-skill-guidelines";
 import { readAccessSkillMode } from "./access-skill/access-skill-rule";
 import type { AccessSkillInput } from "./access-skill/access-skill-wire";
+import type { EntrySkillBlock } from "../skills/entry-block";
+import { entryActiveSkillBlockCount, readEntrySwitch } from "../skills/entry-switch";
+import { SAV_ENTRY_SKILL_BLOCKS } from "./blocks/registry";
+import { entrySkillCatalog } from "./entry-skills/entry-skill-rules";
+import { entrySkillLogFields, readOrComputeEntrySkills, recordEntrySkillShadow } from "./entry-skills/entry-skill-reading";
 
 type Env = Readonly<Record<string, string | undefined>>;
 export const SAV_THREADLESS_SOURCE_REVISION = "sav-hubspot-ticket-source.v1";
@@ -167,7 +172,9 @@ export function readThreadlessAccessSkill(source: ThreadlessTicketSource, env: E
     { purpose: "first_mail", messageId: threadlessAccessSkillMessageId(source), input: threadlessAccessSkillInput(source), compute });
 }
 
-export type ThreadlessQualifyOptions = Readonly<{ accessSkillCompute?: boolean; accessSkillDeps?: Partial<AccessSkillDeps> }>;
+export type ThreadlessQualifyOptions = Readonly<{ accessSkillCompute?: boolean; accessSkillDeps?: Partial<AccessSkillDeps>;
+  /** Chantier « 3 blocs »: the blocks with a skill known to the entry (tests only; production reads `SAV_ENTRY_SKILL_BLOCKS`). */
+  skillBlocks?: readonly EntrySkillBlock[] }>;
 
 /**
  * A subject or contact alone never admits a case. Only the whole CRM description can match the approved Access rule.
@@ -176,6 +183,55 @@ export type ThreadlessQualifyOptions = Readonly<{ accessSkillCompute?: boolean; 
  * Kept: the CRM billing and cancellation categories, the notes' alerts, the prompt-injection check, the identified contact and the approved policy.
  */
 export async function qualifyThreadlessTicket(source: ThreadlessTicketSource, env: Env, now = new Date(), options: ThreadlessQualifyOptions = {}): Promise<ThreadlessTicketQualification> {
+  const result = await qualifyThreadlessTicketOnce(source, env, now, options);
+  // Chantier « 3 blocs » `shadow`: only where the entry pays (`accessSkillCompute`), and never deciding anything.
+  if (options.accessSkillCompute === true && readSavV2QualificationScope(env, now).mode === "open") await shadowThreadlessEntry(source, env, options, result);
+  return result;
+}
+
+/**
+ * Chantier « 3 blocs » on a ticket without a mail: the same two-stage entry as a mail (`v2-entry.ts`), used only when Access's skill is `on` and at least
+ * one more block with a skill is `on` with its rule configured. The router's sensitive or unsure, a confirmation that refuses: the ticket waits for the
+ * team. Only Access is admitted on a ticket (the ticket's first mail, `threadless-first-mail.ts`, is Access's): a ticket elected and confirmed for another
+ * block is `out_of_scope` (`block_not_threadless`), visible, never admitted. Access alone: `null`, SAV-97's path below, byte for byte.
+ */
+async function routedThreadlessEntry(source: ThreadlessTicketSource, env: Env, rules: readonly CaseEntryRule[], options: ThreadlessQualifyOptions): Promise<ThreadlessTicketQualification | null> {
+  const entry = readEntrySwitch(env, options.skillBlocks ?? SAV_ENTRY_SKILL_BLOCKS);
+  if (entryActiveSkillBlockCount(entry) < 2) return null;
+  const { catalog } = entrySkillCatalog(rules, entry, "real");
+  if (!catalog.blocks.length || !catalog.access) return null;
+  const messageId = threadlessAccessSkillMessageId(source);
+  const reading = await readOrComputeEntrySkills({ env: () => env, now: () => new Date(), ...options.accessSkillDeps },
+    { purpose: "first_mail", messageId, input: threadlessAccessSkillInput(source), catalog, compute: options.accessSkillCompute === true });
+  console.info("sav_v2_threadless_entry_skill", { ticketId: source.ticketId, mode: "on", ...entrySkillLogFields(reading) });
+  if (reading.status !== "ready") return { status: "human_wait", reason: `entry_skill_${reading.reason}` };
+  const verdict = reading.verdict;
+  if (verdict.outcome === "team") return { status: "human_wait", reason: verdict.reasons.every(reason => reason === "no_block_elected" || reason === "no_block_confirmed") ? "not_access" : "sensitive_request" };
+  const route = verdict.requests[threadlessRequestId(source)];
+  if (!route || !("blockId" in route)) return { status: "out_of_scope", reason: "not_access" };
+  if (route.blockId !== SAV_CASE_ACCESS_BLOCK_ID) return { status: "out_of_scope", reason: "block_not_threadless" };
+  return null;
+}
+
+/** The shadow of a ticket's entry: the two-stage entry with every `on` and `shadow` block, compared with the real result (closed codes), stored and logged. */
+async function shadowThreadlessEntry(source: ThreadlessTicketSource, env: Env, options: ThreadlessQualifyOptions, actual: ThreadlessTicketQualification) {
+  const entry = readEntrySwitch(env, options.skillBlocks ?? SAV_ENTRY_SKILL_BLOCKS);
+  if (!entry.shadow.length) return;
+  try {
+    const rules = JSON.parse(env.SAV_V2_ADMISSION_RULES_JSON ?? "[]") as CaseEntryRule[];
+    const { catalog } = entrySkillCatalog(Array.isArray(rules) ? rules : [], entry, "shadow");
+    const reading = await readOrComputeEntrySkills({ env: () => env, now: () => new Date(), ...options.accessSkillDeps },
+      { purpose: "first_mail", messageId: threadlessAccessSkillMessageId(source), input: threadlessAccessSkillInput(source), catalog, compute: true });
+    const route = reading.status === "ready" && reading.verdict.outcome === "admit" ? reading.verdict.requests[threadlessRequestId(source)] : undefined;
+    const shadow = `r1=${route && "blockId" in route ? route.blockId : "team"}`, real = `r1=${actual.status === "admitted" ? SAV_CASE_ACCESS_BLOCK_ID : "team"}`;
+    const disagree = reading.status === "ready"
+      ? await recordEntrySkillShadow({ purpose: "first_mail", messageId: threadlessAccessSkillMessageId(source), packageSha256: reading.packageSha256, actual: real, shadow, now: new Date() })
+      : real !== shadow;
+    console.info("sav_v2_threadless_entry_skill_shadow", { ticketId: source.ticketId, actual: real, shadow, disagree, ...entrySkillLogFields(reading) });
+  } catch { console.error("sav_v2_threadless_entry_skill_shadow", { ticketId: source.ticketId, entry: "failed" }); }
+}
+
+async function qualifyThreadlessTicketOnce(source: ThreadlessTicketSource, env: Env, now: Date, options: ThreadlessQualifyOptions): Promise<ThreadlessTicketQualification> {
   if (readSavV2QualificationScope(env, now).mode !== "open") return { status: "out_of_scope", reason: "threadless_qualification_not_configured" };
   const description = threadlessTicketPlainDescription(source);
   const categories = source.categories.split(";").map(category => category.trim());
@@ -193,6 +249,8 @@ export async function qualifyThreadlessTicket(source: ThreadlessTicketSource, en
         && (row.blockId === undefined || row.blockId === SAV_CASE_ACCESS_BLOCK_ID));
       if (!own) return { status: "out_of_scope", reason: "no_block_rule" };
       if (!source.contact) return { status: "human_wait", reason: "identity_unconfirmed" };
+      const routed = await routedThreadlessEntry(source, env, rules, options);
+      if (routed) return routed;
       const reading = await readThreadlessAccessSkill(source, env, options.accessSkillCompute === true, options.accessSkillDeps);
       if (reading.status !== "ready") return { status: "human_wait", reason: `access_skill_${reading.reason}` };
       if (reading.verdict.outcome !== "admit") return { status: "human_wait", reason: reading.verdict.reasons.includes("no_access_request") && reading.verdict.reasons.length === 1 ? "not_access" : "sensitive_request" };

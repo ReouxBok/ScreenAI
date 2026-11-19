@@ -5,13 +5,13 @@ import type { requireDb } from "@/db";
 import { savSyncState } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_BLOCK_ID } from "./case-types";
-import { readAccessAutoApprovalConfig } from "./customer-return";
+import { readAutoReplyConfig, savAutoReplyBlockListed } from "./block-auto-reply";
 
 /*
  * Per-block switch (12/11, Ugo): each treatment block has a mode `off | draft | auto` and a pause, set by an administrator in the Studio,
  * stored like the agent pause (`sav-agent-pause.v1`): one encrypted row per block in `sav.sync_state`, actor, reason, timestamp, audited history.
- * Outside configHash: a change neither redeploys nor breaks continuity. It can only RESTRICT: the global automatic reply
- * (`SAV_V2_AUTO_REPLY=access` + approver) and every check of A's rule still apply first, so the effective mode is the stricter of the two.
+ * Outside configHash: a change neither redeploys nor breaks continuity. It can only RESTRICT: the allow-list of the automatic reply
+ * (`SAV_V2_AUTO_REPLY`, `block-auto-reply.ts`, + approver) and every check of A's rule still apply first, so the effective mode is the stricter of the two.
  *
  * No row = off, not paused; only the frozen legacy Access exception keeps `auto` until explicitly configured. `off` or paused: the block's reply is never proposed, approved or queued; its case waits
  * visibly with a closed code (`block_off`, `block_paused`). `draft`: the reply is proposed for a person, never approved by the rule.
@@ -54,11 +54,12 @@ export function savBlockReplyGate(state: Pick<SavBlockSwitchState, "mode" | "pau
   return { send: "rule" };
 }
 
-/** The effective mode, for the Studio: the stricter of the block's switch and the global automatic reply (which today exists for Access only). */
+/** The effective mode, for the Studio and the entry: the stricter of the block's switch and the allow-list of the automatic reply (`SAV_V2_AUTO_REPLY`,
+ * `block-auto-reply.ts`). A block switched to `auto` but not listed stays `draft`: the Studio shows the real reason. With the list `access` alone, as before. */
 export type SavBlockEffectiveMode = "off" | "paused" | "draft" | "auto";
 export function savBlockEffectiveMode(state: Pick<SavBlockSwitchState, "blockId" | "mode" | "paused" | "invalid">, env: Readonly<Record<string, string | undefined>>): SavBlockEffectiveMode {
   const gate = savBlockReplyGate(state);
   if (gate.send === "never") return gate.code === "block_paused" ? "paused" : "off";
   if (gate.send === "person") return "draft";
-  return state.blockId === SAV_CASE_ACCESS_BLOCK_ID && readAccessAutoApprovalConfig(env).mode === "on" ? "auto" : "draft";
+  return savAutoReplyBlockListed(readAutoReplyConfig(env), state.blockId) ? "auto" : "draft";
 }

@@ -5,7 +5,9 @@
 import "server-only";
 import { closeAfterConfirmedJ2 } from "./j2-confirmed-closure";
 import { isTerminalReply, closingHandoffReplyEnabled } from "./case-terminal-reply";
-import { j2AutoGate } from "./j2-auto-reminder";
+import { j2AutoGate, readCaseOpenBlocks } from "./j2-auto-reminder";
+import { autoReplyWithdrawnProblem, caseBlockReplyKernelProblem, readAutoReplyConfig, savAutoReplyLegacyAccessOnly } from "./block-auto-reply";
+import { ACCESS_AUTO_APPROVAL_BASIS } from "./customer-return";
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -24,7 +26,9 @@ import { enqueueCaseTicketStage } from "./case-ticket-stage-queue";
 import { enqueueCaseHandoffStage } from "./case-handoff-stage";
 import { caseHandoffStageEnabled, caseTicketStageKey } from "./customer-return";
 import { TICKET_STAGE_KEY_PREFIX } from "./case-ticket-stage";
-import { lockCaseForWrite } from "./case-store";
+import { lockCaseForWrite, transitionCaseOwner } from "./case-store";
+import { readSavBlockSwitch, savBlockEffectiveMode } from "./block-switch";
+import { SAV_CASE_ACCESS_BLOCK_ID } from "./case-types";
 import { caseReplyNoteEnabled, caseReplySummaryWithStage, isCaseReplySummary, type CaseReplySummaryStage } from "./case-reply-summary-note";
 import {
   caseNoteAssociationKey, caseNoteKey, caseRecipientCheck, caseReplyKey, checkCaseReplyApproval, decideCaseEffect, readCaseEffectsMode, SAV_CASE_EFFECT_PERMISSIONS,
@@ -40,6 +44,14 @@ import type { CaseEffectPayload } from "./case-reply-store";
 
 export type { CaseEffectPayload };
 const fault = (code: string): never => { throw Error(`SAV_CASE_EFFECT_${code}`); };
+/** Revue Astra P1: a rule-approved reply whose block the allow-list no longer lets answer alone. Final, like every cancellation; the case goes to the team. */
+const AUTO_REPLY_WITHDRAWN = "CANCELLED_AUTO_REPLY_WITHDRAWN";
+/** Contre-revue Astra: the same reply whose block the Studio switch no longer sets to `auto` (off, paused, draft, unreadable). Same handling. */
+const AUTO_REPLY_BLOCK_NOT_AUTO = "CANCELLED_AUTO_REPLY_BLOCK_NOT_AUTO";
+/** The cancellations that hand the case to the team, and the reason the case records. */
+const AUTO_REPLY_HANDOFF: Readonly<Record<string, string>> = {
+  [`SAV_CASE_EFFECT_${AUTO_REPLY_WITHDRAWN}`]: "auto_reply_withdrawn", [`SAV_CASE_EFFECT_${AUTO_REPLY_BLOCK_NOT_AUTO}`]: "auto_reply_block_not_auto",
+};
 const LEASE_MS = 80_000;
 /** A configuration that cannot be read now holds; a scope that excludes the case, or expired, cancels. */
 const QUALIFICATION_HOLD = new Set(["qualification_scope_mode_missing", "qualification_scope_mode_invalid", "qualification_scope_missing", "qualification_scope_invalid", "qualification_scope_not_open", "qualification_binding_unreadable"]);
@@ -213,7 +225,7 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     const { proposal } = payload;
     if (phase === "reply" && isTerminalReply(proposal.purpose) && !closingHandoffReplyEnabled(deps.env())) return fault("HOLD_EFFECTS_OFF");
     if (phase === "reply" && proposal.purpose === "reminder") {
-      const blocked = await j2AutoGate(deps.env(), tx);
+      const blocked = await j2AutoGate(deps.env(), tx, () => readCaseOpenBlocks(tx, proposal.caseId));
       if (blocked) return fault(`HOLD_${blocked.toUpperCase()}`);
     }
     const facts = await readCaseReplyFacts(tx, proposal, policyRevision, { lockCase: true });
@@ -229,6 +241,9 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     if (phase === "reply") {
       const skill = accessSkillSendProblem({ env: deps.env(), admission: facts.admissionRecord ?? null, text: proposal.text, purpose: proposal.purpose });
       if (skill) return fault(skill);
+      // 19/11: the same kernel on our text for a case a block other than Access admitted, whatever approved it (`block-auto-reply.ts`; none before such a block).
+      const kernel = caseBlockReplyKernelProblem({ admission: facts.admissionRecord ?? null, text: proposal.text, purpose: proposal.purpose });
+      if (kernel) return fault(kernel);
     }
     // A note describes an interaction that already happened: it is held by the mode, the pauses and the lease, not by what came after (but never by a LOCAL human).
     const live: CaseEffectLive = {
@@ -241,6 +256,29 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     if (decision.action === "hold") return fault(`HOLD_${decision.code.toUpperCase()}`);
     if (decision.action === "cancel") return fault(`CANCELLED_${decision.code.toUpperCase()}`);
     if (phase !== "reply" && facts.owner !== "agent") return fault(facts.owner === null ? "CASE_MISSING" : "CANCELLED_OWNER_CHANGED");
+    // Revue Astra P1 (19/11), last, once every other check lets the reply go: a reply the RULE approved leaves only while `SAV_V2_AUTO_REPLY` still lets the
+    // case's block(s), read in its admission, answer alone. A person's approval is not concerned; a J2 reminder re-reads the list at its own gate (`j2AutoGate`).
+    if (phase === "reply" && proposal.purpose !== "reminder" && approval?.basis === ACCESS_AUTO_APPROVAL_BASIS) {
+      const config = readAutoReplyConfig(deps.env());
+      let open: Awaited<ReturnType<typeof readCaseOpenBlocks>> = null;
+      if (config.mode === "on" && !savAutoReplyLegacyAccessOnly(config)) open = await readCaseOpenBlocks(tx, proposal.caseId).catch(() => null);
+      const withdrawn = autoReplyWithdrawnProblem(config, { admission: facts.admissionRecord ?? null, openBlocks: open });
+      if (withdrawn) {
+        console.info(JSON.stringify({ event: "sav_v2_auto_reply_withdrawn", caseId: proposal.caseId, executionId: lease.row.id, reason: withdrawn }));
+        return fault(AUTO_REPLY_WITHDRAWN);
+      }
+      // Contre-revue Astra (19/11): the Studio switch of EACH block of the case is read again too, under the same lock (`block-switch.ts`, the reading the passage
+      // uses: no saved row = off, except the frozen Access fallback `auto`, so Access without a setting behaves as today). The effective mode is the stricter of the
+      // list and the switch; only `auto` lets the rule's reply go. Off, paused, draft or an unreadable row: cancelled, the case goes to the team.
+      const blockIds = savAutoReplyLegacyAccessOnly(config) ? [SAV_CASE_ACCESS_BLOCK_ID] : [...new Set((open ?? []).map(row => row.blockId as string))].sort();
+      for (const blockId of blockIds) {
+        const mode = savBlockEffectiveMode(await readSavBlockSwitch(tx, blockId), deps.env());
+        if (mode !== "auto") {
+          console.info(JSON.stringify({ event: "sav_v2_auto_reply_block_not_auto", caseId: proposal.caseId, executionId: lease.row.id, blockId, mode }));
+          return fault(AUTO_REPLY_BLOCK_NOT_AUTO);
+        }
+      }
+    }
     return facts;
   }
 
@@ -499,6 +537,18 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
           state: cancelled ? "refused" : state, reason: reason.slice(0, 200), leaseToken: null, leaseUntil: null, updatedAt: new Date(),
         }).where(and(eq(savCaseEffectExecutions.id, lease.row.id), eq(savCaseEffectExecutions.leaseToken, lease.token))).returning({ id: savCaseEffectExecutions.id });
         await executionJournal(tx, lease.row.id, row ? (cancelled ? "case_effect_cancelled" : "pass_waiting") : "obsolete_pass", { state, reason });
+        // Revue Astra P1 (and its counter-review): never a silent case. The reply the rule approved will not leave: the case goes to the team, in the same transaction (execution, then
+        // case: the lock order of every path). Best effort inside a savepoint: a case already a person's, or moved, keeps the cancellation as it is.
+        const caseId = payloads.get(lease)?.proposal.caseId;
+        const handoffReason = Object.hasOwn(AUTO_REPLY_HANDOFF, reason) ? AUTO_REPLY_HANDOFF[reason] : undefined;
+        if (row && caseId && handoffReason) {
+          await tx.transaction(async savepoint => {
+            const snapshot = await lockCaseForWrite(savepoint, caseId);
+            if (snapshot.owner !== "agent") return;
+            await transitionCaseOwner({ caseId, expectedVersion: snapshot.version, transition: "handoff", actor: { type: "agent" },
+              commandKey: `auto-reply-withdrawn.${lease.row.id}`, reason: handoffReason }, savepoint);
+          }).catch(error => console.warn(JSON.stringify({ event: "sav_v2_auto_reply_withdrawn_handoff_failed", caseId, code: error instanceof Error ? error.message.slice(0, 120) : "unknown" })));
+        }
       });
     },
   };
