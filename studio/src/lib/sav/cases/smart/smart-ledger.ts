@@ -75,7 +75,10 @@ export async function settleSmartItem<T>(input: Readonly<{ prefix: string; scope
 
 /** The ledger of one scope (read only), or an empty one. */
 export async function readSmartLedger(prefix: string, scope: string): Promise<SmartLedgerState> {
-  const [row] = await requireDb().select().from(savSyncState).where(eq(savSyncState.key, smartLedgerKey(prefix, scope)));
+  const [row] = await requireDb().transaction(async tx => {
+    await boundTransaction(tx);
+    return tx.select().from(savSyncState).where(eq(savSyncState.key, smartLedgerKey(prefix, scope)));
+  });
   return row?.cursor ? JSON.parse(row.cursor) as SmartLedgerState : { version: 1, items: 0, settledMicroUsd: 0, open: {} };
 }
 
