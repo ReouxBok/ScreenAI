@@ -15,6 +15,7 @@ import { savCaseReplyValidations } from "./case-reply-validation-table";
 import { savV2NewThreadEnabled, THREADLESS_ADMIT_PERMISSION, THREADLESS_CRM_PERMISSION, THREADLESS_SEND_PERMISSION } from "./threadless-config";
 import { readThreadlessAuthority, threadlessAccessRevision, threadlessActionAllowed, threadlessAuthorityStillGranted, threadlessSchemaInstalled } from "./threadless-guard";
 import { qualifyThreadlessTicket, readThreadlessTicket } from "./threadless-source";
+import { threadlessAutoSendProblem } from "./first-mail/first-mail-rights";
 import { buildNewThreadSendIntent, THREADLESS_MAILBOX, type createThreadlessTransport, type NewThreadAck, type NewThreadReceipt, type NewThreadSendIntent, type ThreadlessCrmAck } from "./threadless-transport";
 import type { CaseRuntimeDeps } from "./case-runtime-effects";
 
@@ -36,7 +37,7 @@ export type ThreadlessEffectPorts = {
   readTicket?: typeof readThreadlessTicket;
   gmailPermissions: (mailbox: string, signal: AbortSignal) => Promise<void>;
 };
-type PassDeps = Pick<CaseRuntimeDeps, "env" | "deadlineMs" | "executionId"> & ThreadlessEffectPorts;
+type PassDeps = Pick<CaseRuntimeDeps, "env" | "deadlineMs" | "executionId" | "pilotProvenance"> & ThreadlessEffectPorts;
 
 async function updateParent(tx: ExecutionTx, id: string, state: Parent["state"], reason: string | null) {
   await tx.update(parents).set({ state, reason, updatedAt: new Date() }).where(eq(parents.id, id));
@@ -205,6 +206,21 @@ async function passOne(parent: Parent, deps: PassDeps) {
   const accessRevision = !gmail && (await qualifyThreadlessTicket(read.source, env)).status === "admitted"
     ? await threadlessAccessRevision(env, db) : null;
   if (!gmail && !accessRevision) return;
+  if (!gmail) {
+    // SAV-96 B: the last look before the marker, exactly as a thread reply (`case-effect-driver.ts`): the decision, its scope and every cited card
+    // re-proven now, under the PERSISTED basis. A card retired or changed since the approval: no POST, a person takes the ticket. An automated
+    // first mail is never sent without this port.
+    const [stored] = await db.select({ basis: savCaseReplyValidations.authorizationBasis }).from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, validationId));
+    const automated = caseReplyModeForBasis(stored?.basis) === "automated";
+    let unproven: string | null = null;
+    if (deps.pilotProvenance) {
+      try { unproven = await deps.pilotProvenance(proposal, { basis: stored?.basis ?? null }); } catch { unproven = "provenance_unreadable"; }
+    } else if (automated) unproven = "provenance_port_absent";
+    if (unproven) {
+      await waitBeforeSend(parent, "threadless_provenance_unproven", true);
+      return;
+    }
+  }
 
   const intent: SendIntent | CrmIntent = gmail
     ? { kind: CRM_KIND, key: `crm-email:${parent.replyKey}`, permission: THREADLESS_CRM_PERMISSION,
@@ -224,8 +240,11 @@ async function passOne(parent: Parent, deps: PassDeps) {
       const facts = await readCaseReplyFacts(tx, proposal, accessRevision, { lockCase: true });
       if (!facts.admission.admitted || facts.storedSender !== proposal.recipient || await hasLocalThreadForTicket(input.source.ticketId, tx)) return null;
       const [approval] = await tx.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, validationId)).for("share");
+      // SAV-96 B: an automated first mail is sent only while every right it was approved under still holds, read now under the same locks.
+      const automated = caseReplyModeForBasis(approval?.authorizationBasis) === "automated";
       if (approval?.state !== "approved" || approval.executionId !== parent.id || !approval.decidedAt || !approval.decidedBy
-          || caseReplyModeForBasis(approval.authorizationBasis) !== "manual_reviewed"
+          || (automated ? await threadlessAutoSendProblem(tx, deps.env(), { proposal, decidedBy: approval.decidedBy, admissionRecord: facts.admissionRecord }) !== null
+            : caseReplyModeForBasis(approval.authorizationBasis) !== "manual_reviewed")
           || caseReplyTextProblemForBasis(proposal.text, approval.authorizationBasis)
           || checkCaseReplyApproval(proposal, { payloadHash: approval.payloadHash, caseVersion: approval.caseVersion, recipient: approval.recipient,
             approvedBy: approval.decidedBy, approvedAt: approval.decidedAt.toISOString() }) !== "ok") return null;

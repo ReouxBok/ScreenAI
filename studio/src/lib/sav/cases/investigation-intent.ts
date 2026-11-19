@@ -56,6 +56,8 @@ export function caseReplyTriggerOf(events: readonly Pick<CaseEvent, "id" | "dire
   if (at < 0) return null;
   if (kind === "in") return mail(events[at]);
   if (kind === "back") return mail(events.slice(0, at).findLast(event => mail(event) !== null));
+  // SAV-96 B: the first mail of a ticket with no thread answers the ticket's own stored event (`ticket:<event id>`, `threadlessReplyShape`).
+  if (kind === "ticket") return events[at]!.direction === "internal" && events[at]!.sourceRef.type === "hubspot_object" ? `ticket:${id}` : null;
   return null;
 }
 
@@ -99,6 +101,13 @@ export function caseDecisionDraft(caseId: string, stored: CaseInvestigationStore
   }
   // A reply always answers one stored mail: without it there is nothing C could key or send.
   if (reply && !triggerEventId) { reply = null; replyLimit = "inbound_unknown"; }
+  // SAV-96 B: a first mail (ticket with no thread) is an answer, or ONE tracked-free question; no procedure ledger, no closing or hand-over notice
+  // (a hand-over leaves the whole ticket to the team, with no mail from the agent). The shape C stores for it is `threadlessReplyShape`.
+  if (reply && triggerEventId?.startsWith("ticket:")) {
+    if (reply.purpose === "answer") reply = { purpose: "answer", text: reply.text };
+    else if (reply.purpose === "question" && reply.question && !reply.questions) reply = { purpose: "question", text: reply.text, question: reply.question };
+    else { replyLimit = reply.purpose === "question" ? "several_questions" : "purpose_not_supported"; reply = null; }
+  }
   // Pilot ACCÈS (ROOT 3/11): a verdict is used only under the scope it was validated with, still in force. A decision the
   // pilot stamped, or any decision a pilot consumer reads (an older one has no stamp), gives no reply when either is unknown.
   const stamp = decision.accessScope;
