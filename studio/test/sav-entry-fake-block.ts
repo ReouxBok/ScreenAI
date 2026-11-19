@@ -49,6 +49,7 @@ export const FAKE_BLOCK: EntrySkillBlock = defineEntrySkillBlock({
   promptSha256: "1fac7bc37909877b179e9de6d29e7806238ace38afe1dcb9c55fca606489e7ba",
   corpus: FAKE_BLOCK_CORPUS,
   corpusMinimums: { positive: 1, neighbour: 1, sensitive: 1, mixed: 1, trap: 1 },
+  corpusRequestWords: { m01: { r1: "Comment imprimer le planning ?", r2: "le code de connexion n'arrive pas" } },
   initialMode: "off",
 });
 

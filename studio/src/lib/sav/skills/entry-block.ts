@@ -76,6 +76,11 @@ export type EntrySkillBlock = Readonly<{
   /** The fictional corpus of the block (N3 `CorpusCase`), linted by `lintCorpus`, replayed by the self-test. */
   corpus: readonly CorpusCase[];
   corpusMinimums: Readonly<Record<CorpusGroup, number>>;
+  /**
+   * Optional: for a corpus case of SEVERAL requests, each request's verbatim words in `text` (case id → request id → words), as V1 gives them to the
+   * entry. Without them a multi-request case is replayed with no words, and the rule sends it to the team (attribution unprovable).
+   */
+  corpusRequestWords?: Readonly<Record<string, Readonly<Record<string, string>>>>;
   /** Every block arrives `off`. The mode is set only by the entry switch (`SAV_V2_ENTRY_BLOCKS_JSON`), never by the code. */
   initialMode: "off";
 }>;

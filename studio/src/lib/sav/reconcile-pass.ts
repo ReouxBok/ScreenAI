@@ -126,8 +126,15 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     const { runAccessSkillSelfTestPass } = await import("@/lib/sav/cases/access-skill/access-skill-selftest");
     return runAccessSkillSelfTestPass({ env: () => process.env, now: () => new Date(), deadlineMs: derivedDeadline });
   }) : undefined;
+  // Chantier « 3 blocs » (19/11): the same self-test, generic, on the FICTIONAL corpus of one registered block (or Access's through the router): only when
+  // SAV_V2_ENTRY_SKILL_SELFTEST=run; its own capped ledger (≤ 10 USD), no case, ticket, mail, HubSpot or Gmail. Off: absent from the payload, nothing loaded.
+  const entrySkillSelfTest = process.env.SAV_V2_ENTRY_SKILL_SELFTEST === "run" ? await runStep("v2_entry_skill_selftest", async () => {
+    if (Date.now() + 90_000 > derivedDeadline) return { skipped: "deadline" };
+    const { runEntrySkillSelfTestPass } = await import("@/lib/sav/cases/entry-skills/entry-skill-selftest");
+    return runEntrySkillSelfTestPass({ env: () => process.env, now: () => new Date(), deadlineMs: derivedDeadline });
+  }) : undefined;
   // V2 effects (replies, handoff notices, ticket stages, closures) have their own worker: /api/cron/sav-v2-effects (11/11).
-  const payload = { ...(ownerHandovers ? { ownerHandovers } : {}), ...(accessSkillSelfTest ? { accessSkillSelfTest } : {}), caseReminders, ticketSafetyNet, ackClosures, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { ...(ownerHandovers ? { ownerHandovers } : {}), ...(accessSkillSelfTest ? { accessSkillSelfTest } : {}), ...(entrySkillSelfTest ? { entrySkillSelfTest } : {}), caseReminders, ticketSafetyNet, ackClosures, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return { payload, hasStepFailure, pulseId };
