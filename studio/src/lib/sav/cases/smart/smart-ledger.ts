@@ -1,5 +1,5 @@
 import "server-only";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savSyncState } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../../crypto";
@@ -13,7 +13,17 @@ import { decryptSavPayload, encryptSavPayload } from "../../crypto";
  *     (every call it may make) BEFORE any paid call. A second claimer finds it and never pays again.
  * Settling replaces the reservation by the measured cost (a call with an unknown or uncertain usage costs its full reservation). An item left
  * claimed (a crash, a call that never answered) keeps its whole reservation forever: never released, never paid twice, the cap stays true.
+ * A measured cost ABOVE the reservation is settled as measured (never clipped), so the next claim sees the real spend and is refused at the cap.
+ * Each transaction bounds its own waits (`SET LOCAL lock_timeout` / `statement_timeout`): a held lock fails fast, and the caller contains it.
  */
+
+/** Short bounds of every ledger transaction: a lock held by another pass, or a slow statement, fails in seconds instead of eating the pass. */
+export const SMART_LEDGER_LOCK_TIMEOUT_MS = 3_000, SMART_LEDGER_STATEMENT_TIMEOUT_MS = 5_000;
+type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
+async function boundTransaction(tx: Tx) {
+  await tx.execute(sql.raw(`set local lock_timeout = '${SMART_LEDGER_LOCK_TIMEOUT_MS}ms'`));
+  await tx.execute(sql.raw(`set local statement_timeout = '${SMART_LEDGER_STATEMENT_TIMEOUT_MS}ms'`));
+}
 
 export type SmartLedgerState = { version: 1; items: number; settledMicroUsd: number; open: Record<string, number> };
 export type SmartItemRow<T> = { version: 1; scope: string; reservedMicroUsd: number; costMicroUsd: number | null; result: T | null };
@@ -27,13 +37,15 @@ export const smartLedgerSpent = (state: SmartLedgerState) => state.settledMicroU
 export async function claimSmartItem(input: Readonly<{ prefix: string; scope: string; item: string; worstMicroUsd: number; capMicroUsd: number; maxItems: number | null; now: Date }>): Promise<SmartClaim> {
   const ledgerKey = smartLedgerKey(input.prefix, input.scope), itemKey = smartItemKey(input.prefix, input.item);
   return requireDb().transaction(async tx => {
+    await boundTransaction(tx);
     await tx.insert(savSyncState).values({ key: ledgerKey, status: "open", cursor: JSON.stringify({ version: 1, items: 0, settledMicroUsd: 0, open: {} } satisfies SmartLedgerState), startedAt: input.now }).onConflictDoNothing();
     const [row] = await tx.select().from(savSyncState).where(eq(savSyncState.key, ledgerKey)).for("update");
     const state = JSON.parse(row!.cursor ?? "null") as SmartLedgerState;
     const [existing] = await tx.select({ key: savSyncState.key }).from(savSyncState).where(eq(savSyncState.key, itemKey));
     if (existing) return { status: "refused", reason: "already_claimed" } as const;
     if (input.maxItems !== null && state.items >= input.maxItems) return { status: "refused", reason: "item_cap" } as const;
-    if (smartLedgerSpent(state) + input.worstMicroUsd > input.capMicroUsd) return { status: "refused", reason: "money_cap" } as const;
+    const spent = smartLedgerSpent(state);
+    if (spent >= input.capMicroUsd || spent + input.worstMicroUsd > input.capMicroUsd) return { status: "refused", reason: "money_cap" } as const;
     await tx.insert(savSyncState).values({ key: itemKey, status: "pending", startedAt: input.now,
       cursor: encryptSavPayload({ version: 1, scope: input.scope, reservedMicroUsd: input.worstMicroUsd, costMicroUsd: null, result: null } satisfies SmartItemRow<never>) });
     const next: SmartLedgerState = { ...state, items: state.items + 1, open: { ...state.open, [input.item]: input.worstMicroUsd } };
@@ -46,6 +58,7 @@ export async function claimSmartItem(input: Readonly<{ prefix: string; scope: st
 export async function settleSmartItem<T>(input: Readonly<{ prefix: string; scope: string; item: string; costMicroUsd: number; result: T; status: string; now: Date }>): Promise<boolean> {
   const ledgerKey = smartLedgerKey(input.prefix, input.scope), itemKey = smartItemKey(input.prefix, input.item);
   return requireDb().transaction(async tx => {
+    await boundTransaction(tx);
     const [row] = await tx.select().from(savSyncState).where(eq(savSyncState.key, ledgerKey)).for("update");
     const [item] = await tx.select().from(savSyncState).where(eq(savSyncState.key, itemKey)).for("update");
     if (!row || !item || item.status !== "pending") return false;
@@ -64,4 +77,16 @@ export async function settleSmartItem<T>(input: Readonly<{ prefix: string; scope
 export async function readSmartLedger(prefix: string, scope: string): Promise<SmartLedgerState> {
   const [row] = await requireDb().select().from(savSyncState).where(eq(savSyncState.key, smartLedgerKey(prefix, scope)));
   return row?.cursor ? JSON.parse(row.cursor) as SmartLedgerState : { version: 1, items: 0, settledMicroUsd: 0, open: {} };
+}
+
+/**
+ * The closed code of an error contained by the shadow or the bench self-test: a Postgres SQLSTATE when there is one (e.g. `55P03` lock
+ * not available, `57014` statement timeout), on the error or its cause; otherwise `unexpected`. Never the message (it may carry data).
+ */
+export function smartContainedErrorCode(error: unknown): string {
+  for (let current = error, depth = 0; current && typeof current === "object" && depth < 4; current = (current as { cause?: unknown }).cause, depth += 1) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)) return `sql_${code}`;
+  }
+  return "unexpected";
 }

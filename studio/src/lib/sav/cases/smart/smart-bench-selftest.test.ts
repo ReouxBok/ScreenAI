@@ -1,7 +1,7 @@
 import { like } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../../../test/sav-db";
-import { ACCESS_SKILL_TEST_PROVIDER_ENV } from "../../../../../test/sav-access-skill-double";
+import { ACCESS_SKILL_TEST_POLICY, ACCESS_SKILL_TEST_PROVIDER_ENV } from "../../../../../test/sav-access-skill-double";
 import { savCaseEffectExecutions, savCases, savIntakeEffects, savMessages, savSyncState } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
@@ -10,12 +10,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createSavBenchScriptedJudge } from "../../bench/bench-doubles";
 import { SAV_BENCH_CORPUS } from "../../bench/bench-corpus";
+import { createSavBenchGeminiJudge } from "../../bench/bench-judge";
 import { savBenchGeminiEnvelope } from "../../bench/bench-wire";
 import type { SavBenchAgent } from "../../bench/bench-types";
 import { accessSkillWireAnswer } from "../access-skill/access-skill-wire";
 import { createSavBenchAgent, smartBenchTurn } from "./smart-bench-agent";
 import {
-  readSmartBenchSelfTestConfig, readSmartBenchSelfTestReport, runSmartBenchSelfTestPass, SAV_SMART_BENCH_NEW_CALLS, SAV_SMART_BENCH_SELFTEST_PREFIX, type SmartBenchSelfTestDeps,
+  readSmartBenchSelfTestConfig, readSmartBenchSelfTestReport, readSmartBenchSelfTestRows, runSmartBenchSelfTestPass, smartBenchRunPattern, SAV_SMART_BENCH_NEW_CALLS, SAV_SMART_BENCH_SELFTEST_PREFIX, type SmartBenchSelfTestDeps,
 } from "./smart-bench-selftest";
 import { readSmartLedger } from "./smart-ledger";
 import { SAV_SMART_SHADOW_MODEL_CALLS } from "./smart-shadow";
@@ -159,5 +160,96 @@ describe("adaptateur du banc (--agent=new)", () => {
     expect(smartBenchTurn({ ...base, outcome: "team_sensitive" })).toMatchObject({ outcome: "equipe_sensible", reply: null });
     expect(smartBenchTurn({ ...base, outcome: "failed" })).toMatchObject({ outcome: "passer_la_main", reply: null, failure: "failed:x" });
     expect(smartBenchTurn({ ...base, outcome: "reply", replyWithFooter: "Bonjour\n—\nCharly", decision: smartGoodDecision() as never })).toMatchObject({ outcome: "repondre", citations: ["fiche-connexion"] });
+  });
+});
+
+describe("plafond de dépense garanti", () => {
+  /** A policy whose reservation (1 000 µUSD per call) is far above a normal measured cost (1 µUSD), to tell the two apart. */
+  const RESERVE = 1_000;
+  const POLICY_ENV = (extra: Record<string, string> = {}) => ENV({ SAV_V2_SMART_BENCH_SELFTEST_AGENT: "new",
+    SAV_V2_SPEND_POLICY_JSON: JSON.stringify({ ...ACCESS_SKILL_TEST_POLICY, model: { ...ACCESS_SKILL_TEST_POLICY.model, reserveMicroUsdPerCall: RESERVE } }), ...extra });
+  /** `perTurn` scripted agent calls per turn through the meter, each with a body of `bytes` bytes; never a reply (so no judge call). */
+  const scripted = (bytes = 100, perTurn = 1) => (_name: string, meter: (url: string, init: RequestInit) => Promise<Response>): SavBenchAgent => ({ name: "scripted", revision: "x", respond: async () => {
+    for (let call = 0; call < perTurn; call += 1)
+      await meter("https://generativelanguage.googleapis.com/v1beta/models/synthetic-model:generateContent", { method: "POST", body: "x".repeat(bytes) });
+    return { outcome: "passer_la_main", reply: null, citations: [], codes: [] };
+  } });
+  const answering = (usageMetadata: unknown) => {
+    const seen: string[] = [];
+    return { seen, fn: async (url: string) => { seen.push(url); return Response.json({ candidates: [{ content: { parts: [{ text: "{}" }] } }], usageMetadata }); } };
+  };
+
+  it("sortie absente ou usage illisible : chaque appel compté au prix de la réservation, jamais gratuit", async () => {
+    for (const [runId, usage] of [["miss-out", { promptTokenCount: 1_000 }], ["unreadable", "illisible"], ["absent", undefined], ["negative", { promptTokenCount: 1_000, candidatesTokenCount: -1 }]] as const) {
+      const net = answering(usage);
+      const result = await runSmartBenchSelfTestPass(deps(POLICY_ENV({ SAV_V2_SMART_BENCH_SELFTEST_ID: runId }), network(), { network: net.fn, corpus: CORPUS.slice(0, 1), agents: scripted() }));
+      expect(result).toMatchObject({ ran: 1 });
+      expect(net.seen.length).toBeGreaterThan(0);
+      expect(await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, runId)).toMatchObject({ settledMicroUsd: RESERVE * net.seen.length, open: {} });
+    }
+  });
+  it("usage complet : coût mesuré (1 µUSD), pas la réservation", async () => {
+    const net = answering({ promptTokenCount: 1_000, candidatesTokenCount: 200 });
+    await runSmartBenchSelfTestPass(deps(POLICY_ENV({ SAV_V2_SMART_BENCH_SELFTEST_ID: "measured" }), network(), { network: net.fn, corpus: CORPUS.slice(0, 1), agents: scripted() }));
+    expect((await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, "measured")).settledMicroUsd).toBe(net.seen.length);
+  });
+  it("coût mesuré au-dessus de la réservation : coût réel compté, puis l'appel suivant et la conversation suivante sont refusés", async () => {
+    // 10^13 input tokens at 1 µUSD per million = 10 000 000 µUSD: the whole cap, far above the conversation's reservation.
+    const net = answering({ promptTokenCount: 10_000_000_000_000, candidatesTokenCount: 0 });
+    const corpus = CORPUS.slice(0, 2);
+    const result = await runSmartBenchSelfTestPass(deps(POLICY_ENV({ SAV_V2_SMART_BENCH_SELFTEST_ID: "over" }), network(), { network: net.fn, corpus, agents: scripted(100, 2) }));
+    expect(net.seen).toHaveLength(1);
+    expect(result).toMatchObject({ ran: 1, stoppedBy: "money_cap", spentMicroUsd: 10_000_000 });
+    expect(await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, "over")).toMatchObject({ items: 1, settledMicroUsd: 10_000_000, open: {} });
+    const [row] = await readSmartBenchSelfTestRows("over");
+    expect(row).toMatchObject({ costMicroUsd: 10_000_000, calls: 1, stopped: "money_budget" });
+    // A later pass on the same run: the real spend has reached the cap, nothing is authorised.
+    expect(await runSmartBenchSelfTestPass(deps(POLICY_ENV({ SAV_V2_SMART_BENCH_SELFTEST_ID: "over" }), network(), { network: net.fn, corpus, agents: scripted(100, 2) })))
+      .toMatchObject({ ran: 0, stoppedBy: "money_cap" });
+    expect(net.seen).toHaveLength(1);
+  });
+  it("corps au-dessus de la limite d'entrée de la réservation : refusé sans envoi (agent et juge)", async () => {
+    const net = answering({ promptTokenCount: 1_000, candidatesTokenCount: 200 });
+    await runSmartBenchSelfTestPass(deps(POLICY_ENV({ SAV_V2_SMART_BENCH_SELFTEST_ID: "big" }), network(), { network: net.fn, corpus: CORPUS.slice(0, 1), agents: scripted(100_001) }));
+    expect(net.seen).toEqual([]);
+    expect((await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, "big")).settledMicroUsd).toBe(0);
+    const sent = vi.fn(async () => Response.json({}));
+    const judge = createSavBenchGeminiJudge({ network: sent, model: "synthetic-model", key: "k", maxOutputTokens: 100, maxInputBytes: 500 });
+    expect(await judge.judge({ conversationId: "c", turn: 1, messages: [{ from: "client", text: "x".repeat(600), at: "2026-11-20T09:00:00.000Z" }],
+      agent: { outcome: "repondre", reply: "ok", citations: [], codes: [] }, expect: { outcomes: [], keyFacts: [], forbidden: [] }, cards: [], previousReplies: [], now: "2026-11-20T09:05:00.000Z" }))
+      .toEqual({ status: "failed", problem: "judge_input_too_large" });
+    expect(sent).not.toHaveBeenCalled();
+  });
+});
+
+describe("pannes contenues : le cron de prod ne passe jamais en erreur à cause du banc", () => {
+  const failingStore = (code: string) => new Proxy(f.db as unknown as Record<string | symbol, unknown>, { get(target, prop) {
+    if (prop === "transaction") return async () => { throw Object.assign(new Error("synthetic failure, message never logged"), { code }); };
+    const value = Reflect.get(target, prop, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  it("erreur SQL à la réservation : résultat codé, rien n'est levé, 0 appel", async () => {
+    const net = network(), logs: unknown[] = [];
+    state.db = failingStore("XX000");
+    expect(await runSmartBenchSelfTestPass(deps(ENV({ SAV_V2_SMART_BENCH_SELFTEST_AGENT: "new" }), net, { log: (event, fields) => logs.push([event, fields]) })))
+      .toEqual({ skipped: "error_contained", code: "sql_XX000" });
+    expect(net.calls).toEqual([]);
+    expect(JSON.stringify(logs)).not.toContain("synthetic failure");
+  });
+  it("verrou tenu trop longtemps (55P03) : sortie propre et codée", async () => {
+    state.db = failingStore("55P03");
+    expect(await runSmartBenchSelfTestPass(deps(ENV({ SAV_V2_SMART_BENCH_SELFTEST_AGENT: "new" }), network()))).toEqual({ skipped: "error_contained", code: "sql_55P03" });
+  });
+});
+
+describe("rapport d'un run", () => {
+  it("`_` et `%` de l'identifiant pris à la lettre : le rapport de lot_1 n'inclut pas lotA1", async () => {
+    expect(smartBenchRunPattern("lot_1")).toBe("sav-v2-smart-bench-selftest.v1:item:lot\\_1:%");
+    expect(smartBenchRunPattern("a%b")).toBe("sav-v2-smart-bench-selftest.v1:item:a\\%b:%");
+    const net = network();
+    for (const runId of ["lot_1", "lotA1"])
+      await runSmartBenchSelfTestPass(deps(ENV({ SAV_V2_SMART_BENCH_SELFTEST_AGENT: "new", SAV_V2_SMART_BENCH_SELFTEST_ID: runId }), net, { corpus: CORPUS.slice(0, 1) }));
+    expect((await readSmartBenchSelfTestRows("lot_1")).map(row => row.runId)).toEqual(["lot_1"]);
+    expect((await readSmartBenchSelfTestRows("lotA1")).map(row => row.runId)).toEqual(["lotA1"]);
   });
 });

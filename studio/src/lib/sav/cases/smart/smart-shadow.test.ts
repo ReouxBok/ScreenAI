@@ -212,3 +212,45 @@ describe("rapport", () => {
     expect(JSON.stringify(report)).not.toMatch(/Yonos|résilier/);
   });
 });
+
+/** The real store, except its transactions: they fail with this Postgres error (a lock held too long, a SQL failure), or record their statements. */
+function storeWith(options: { failWith?: string; statements?: string[] }) {
+  const db = f.db as unknown as Record<string | symbol, unknown>;
+  return new Proxy(db, { get(target, prop) {
+    if (prop === "transaction") return async (fn: (tx: unknown) => Promise<unknown>) => {
+      if (options.failWith) throw Object.assign(new Error("synthetic failure, message never logged"), { code: options.failWith });
+      return f.db.transaction(tx => fn(new Proxy(tx as unknown as Record<string | symbol, unknown>, { get(txTarget, txProp) {
+        const value = Reflect.get(txTarget, txProp, txTarget);
+        if (txProp === "execute") return (query: unknown) => { options.statements?.push(JSON.stringify(query)); return (value as (q: unknown) => unknown).call(txTarget, query); };
+        return typeof value === "function" ? value.bind(txTarget) : value;
+      } })));
+    };
+    const value = Reflect.get(target, prop, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+}
+
+describe("pannes contenues : le cron de prod ne passe jamais en erreur à cause de l'ombre", () => {
+  it("erreur SQL à la réservation : résultat codé, rien n'est levé, 0 appel payé, aucun message dans le journal", async () => {
+    await v1Mail();
+    const logs: unknown[] = [], net = network();
+    state.db = storeWith({ failWith: "XX000" });
+    const result = await pass(ENV(), net, { log: (event, fields) => logs.push([event, fields]) });
+    expect(result).toEqual({ skipped: "error_contained", code: "sql_XX000" });
+    expect(net.calls).toEqual([]);
+    expect(JSON.stringify(logs)).not.toContain("synthetic failure");
+  });
+  it("verrou tenu trop longtemps (lock_timeout, 55P03) : sortie propre et codée", async () => {
+    await v1Mail();
+    state.db = storeWith({ failWith: "55P03" });
+    expect(await pass(ENV(), network())).toEqual({ skipped: "error_contained", code: "sql_55P03" });
+  });
+  it("chaque transaction du registre borne ses attentes : lock_timeout et statement_timeout courts", async () => {
+    await v1Mail();
+    const statements: string[] = [];
+    state.db = storeWith({ statements });
+    expect(await pass(ENV(), network())).toMatchObject({ ran: 1 });
+    expect(statements.filter(text => text.includes("set local lock_timeout = '3000ms'"))).toHaveLength(2);
+    expect(statements.filter(text => text.includes("set local statement_timeout = '5000ms'"))).toHaveLength(2);
+  });
+});

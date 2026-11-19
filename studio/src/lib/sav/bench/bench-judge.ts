@@ -128,15 +128,21 @@ export function combineSavBenchVerdicts(judge: SavBenchJudgeResult | null, check
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 export const SAV_BENCH_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models";
-export function createSavBenchGeminiJudge(options: Readonly<{ network: (url: string, init: RequestInit) => Promise<Response>; model: string; key: string; maxOutputTokens: number; timeoutMs?: number }>): SavBenchJudge {
+/**
+ * `maxInputBytes`: the input bound the caller's reservation was computed from; a body above it is refused BEFORE sending (`judge_input_too_large`),
+ * so a long history, reply or set of cards can never cost more than reserved.
+ */
+export function createSavBenchGeminiJudge(options: Readonly<{ network: (url: string, init: RequestInit) => Promise<Response>; model: string; key: string; maxOutputTokens: number; timeoutMs?: number; maxInputBytes?: number }>): SavBenchJudge {
   if (!/^[a-z0-9][a-z0-9.-]{0,99}$/.test(options.model)) throw new Error("SAV_BENCH_JUDGE_MODEL_INVALID");
   return {
     name: `gemini:${options.model}`, revision: SAV_BENCH_JUDGE_REVISION,
     async judge(input) {
+      const body = savBenchJudgeBody(input, options.maxOutputTokens);
+      if (options.maxInputBytes !== undefined && Buffer.byteLength(body, "utf8") > options.maxInputBytes) return { status: "failed", problem: "judge_input_too_large" };
       let response: Response;
       try {
         response = await options.network(`${SAV_BENCH_GEMINI_URL}/${encodeURIComponent(options.model)}:generateContent`, { method: "POST", signal: AbortSignal.timeout(options.timeoutMs ?? 60_000),
-          headers: { "content-type": "application/json", "x-goog-api-key": options.key }, body: savBenchJudgeBody(input, options.maxOutputTokens) });
+          headers: { "content-type": "application/json", "x-goog-api-key": options.key }, body });
       } catch { return { status: "failed", problem: "judge_network_failed" }; }
       if (!response.ok) return { status: "failed", problem: `judge_http_${response.status}` };
       return readSavBenchGeminiJudge(await response.json().catch(() => null));

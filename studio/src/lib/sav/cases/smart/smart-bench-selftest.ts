@@ -11,8 +11,8 @@ import type { SavBenchAgent, SavBenchConversation } from "../../bench/bench-type
 import { resolveCaseV2GeminiKey, SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
 import { readCaseV2TransportPolicy } from "../investigation-v2-spend";
 import { createSavBenchAgent } from "./smart-bench-agent";
-import { claimSmartItem, readSmartLedger, settleSmartItem, smartItemKey, smartLedgerSpent } from "./smart-ledger";
-import { smartPrices } from "./smart-model";
+import { claimSmartItem, readSmartLedger, settleSmartItem, smartContainedErrorCode, smartItemKey, smartLedgerSpent } from "./smart-ledger";
+import { smartInputCap, smartPrices, smartUsageOf } from "./smart-model";
 import { SAV_SMART_PROMPT_REVISION, smartPromptPinned, smartPromptSha256 } from "./smart-prompt";
 
 /*
@@ -93,13 +93,30 @@ export type SmartBenchSelfTestDeps = Readonly<{
 export type SmartBenchSelfTestPass =
   | Readonly<{ skipped: "off" | "deadline" | "prompt_unpinned" | "price_unavailable" | "model_invalid" | "key_unavailable" }>
   | Readonly<{ skipped: "refused"; reason: string }>
+  | Readonly<{ skipped: "error_contained"; code: string }>
   | Readonly<{ ran: number; stoppedBy: "batch" | "done" | "deadline" | "money_cap"; spentMicroUsd: number; remaining: number }>;
 
-/** One self-test batch. Never throws for a model failure (the conversation records it). */
+/** `LIKE` pattern of the rows of one run: `_` and `%` (and the escape) of the run id taken literally, so `lot_1` never matches `lotA1`. */
+export const smartBenchRunPattern = (runId: string) => `${smartItemKey(SAV_SMART_BENCH_SELFTEST_PREFIX, `${runId}:`).replace(/[\\%_]/g, char => `\\${char}`)}%`;
+
+/**
+ * One self-test batch. NEVER throws: any error (SQL at the reservation or the settlement, a lock held past its short bound, a bug) is contained
+ * and returned as `{ skipped: "error_contained", code }` (a closed code, never a message), so the reconcile pass never turns red because of it.
+ */
 export async function runSmartBenchSelfTestPass(deps: SmartBenchSelfTestDeps): Promise<SmartBenchSelfTestPass> {
   const config = readSmartBenchSelfTestConfig(deps.env());
   if (config.mode === "off") return { skipped: "off" };
   const log = deps.log ?? ((event, fields) => console.info(event, JSON.stringify(fields)));
+  try { return await runSmartBenchSelfTestPassUnsafe(deps, config, log); }
+  catch (error) {
+    const code = smartContainedErrorCode(error);
+    try { log("sav_smart_bench_selftest_error_contained", { code }); } catch { /* the log never fails the pass */ }
+    return { skipped: "error_contained", code };
+  }
+}
+
+async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, config: Exclude<SmartBenchSelfTestConfig, { mode: "off" }>,
+  log: (event: string, fields: Record<string, unknown>) => void): Promise<SmartBenchSelfTestPass> {
   if (config.mode === "refused") { log("sav_smart_bench_selftest_refused", { reason: config.reason }); return { skipped: "refused", reason: config.reason }; }
   const clock = deps.clock ?? Date.now, left = () => deps.deadlineMs === undefined ? Number.POSITIVE_INFINITY : deps.deadlineMs - clock();
   if (left() < STEP_MIN_MS) return { skipped: "deadline" };
@@ -111,10 +128,13 @@ export async function runSmartBenchSelfTestPass(deps: SmartBenchSelfTestDeps): P
   if (!key.ok && !deps.judge) return { skipped: "key_unavailable" };
   let maxOutputTokens = JUDGE_MAX_OUTPUT_TOKENS;
   try { maxOutputTokens = Math.min(JUDGE_MAX_OUTPUT_TOKENS, readCaseV2TransportPolicy(env, now).maxOutputTokens); } catch { return { skipped: "price_unavailable" }; }
+  // The input bound the reservation is computed from (V2's `maxInputBytes`, or the lower own cap): every body sent, judge included, fits it.
+  const inputCap = smartInputCap(env, now);
+  if (inputCap === null) return { skipped: "price_unavailable" };
 
   const corpus = deps.corpus ?? SAV_BENCH_CORPUS;
   const claimed = new Set((await requireDb().select({ key: savSyncState.key }).from(savSyncState)
-    .where(like(savSyncState.key, `${smartItemKey(SAV_SMART_BENCH_SELFTEST_PREFIX, `${config.runId}:`)}%`))).map(row => row.key));
+    .where(like(savSyncState.key, smartBenchRunPattern(config.runId)))).map(row => row.key));
   const todo = config.agents.flatMap(agent => corpus.map(conversation => ({ agent, conversation })))
     .filter(({ agent, conversation }) => !claimed.has(smartItemKey(SAV_SMART_BENCH_SELFTEST_PREFIX, smartBenchItem(config.runId, agent, conversation.id))));
   let ran = 0, stoppedBy: Extract<SmartBenchSelfTestPass, { ran: number }>["stoppedBy"] = todo.length ? "batch" : "done";
@@ -126,28 +146,31 @@ export async function runSmartBenchSelfTestPass(deps: SmartBenchSelfTestDeps): P
     const claim = await claimSmartItem({ prefix: SAV_SMART_BENCH_SELFTEST_PREFIX, scope: config.runId, item, worstMicroUsd: worst, capMicroUsd: config.capMicroUsd, maxItems: null, now: deps.now() });
     if (claim.status === "refused") { if (claim.reason === "already_claimed") continue; stoppedBy = "money_cap"; break; }
 
-    // The meter: every call of this conversation (agent and judge), refused beyond the reservation or the time left, costed at V2's prices.
+    // The meter: every call of this conversation (agent and judge), refused BEFORE sending when its body exceeds the input bound, when the
+    // conversation's spend plus one more reservation would pass its own reservation, or beyond the call count or the time left. Costed at
+    // V2's prices from a COMPLETE usage (measured, even above the reservation); an incomplete or unreadable usage costs the reservation.
     let cost = 0, calls = 0, meterStop: string | null = null;
     const send = deps.network ?? ((url, init) => fetch(url, init));
     const meter: CaseV2Network = async (url, init) => {
       const timeout = Math.min(CALL_MAX_MS, left() - CALL_MARGIN_MS);
       if (calls >= maxCalls) { meterStop ??= "call_budget"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_CALL_BUDGET" }); }
       if (timeout < CALL_MIN_MS) { meterStop ??= "deadline"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_DEADLINE" }); }
+      if (cost + prices.modelReserve > worst) { meterStop ??= "money_budget"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_MONEY_BUDGET" }); }
+      const bodyBytes = typeof init.body === "string" ? Buffer.byteLength(init.body, "utf8") : init.body == null ? 0 : Number.POSITIVE_INFINITY;
+      if (bodyBytes > inputCap) return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_INPUT_TOO_LARGE" });
       calls += 1;
       let response: Response;
       try { response = await send(url, { ...init, signal: AbortSignal.timeout(timeout) }); }
       catch (error) { cost += prices.modelReserve; throw error; }
       if (!response.ok) { cost += response.status >= 500 || response.status === 408 || response.status === 429 ? prices.modelReserve : 0; return response; }
-      const json = await response.json().catch(() => null) as { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; thoughtsTokenCount?: number } } | null;
-      const usage = json?.usageMetadata;
-      cost += usage && Number.isSafeInteger(usage.promptTokenCount)
-        ? prices.modelCost({ inputTokens: usage.promptTokenCount!, outputTokens: (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0) }) : prices.modelReserve;
+      const json = await response.json().catch(() => null) as { usageMetadata?: unknown } | null;
+      cost += prices.modelCost(smartUsageOf(json?.usageMetadata));
       return json === null ? new Response("not json", { status: 200 }) : Response.json(json);
     };
     const agent = deps.agents?.(agentName, meter) ?? (agentName === "new"
       ? createSavBenchAgent({ dryRun: false, network: meter, env })
       : createSavBenchCurrentAgent({ model: createSavBenchCurrentModel({ env, network: meter, dryRun: false }), revision: `v2-decision:${model}` }));
-    const judge = deps.judge?.(meter) ?? createSavBenchGeminiJudge({ network: meter, model, key: key.ok ? key.key : "", maxOutputTokens });
+    const judge = deps.judge?.(meter) ?? createSavBenchGeminiJudge({ network: meter, model, key: key.ok ? key.key : "", maxOutputTokens, maxInputBytes: inputCap });
     const startedAt = clock();
     let stored: SmartBenchStored;
     try {
@@ -158,9 +181,11 @@ export async function runSmartBenchSelfTestPass(deps: SmartBenchSelfTestDeps): P
     } catch {
       stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, judgeRevision: SAV_BENCH_JUDGE_REVISION, corpusRevision: SAV_BENCH_CORPUS_REVISION, model,
         codeSha: null, conversationId: conversation.id, costMicroUsd: worst, calls, durationMs: clock() - startedAt, stopped: "crashed", conversation: null, turns: [] };
-      cost = worst;
+      cost = Math.max(cost, worst);
+      stored = { ...stored, costMicroUsd: cost };
     }
-    await settleSmartItem({ prefix: SAV_SMART_BENCH_SELFTEST_PREFIX, scope: config.runId, item, costMicroUsd: Math.min(cost, worst), status: "done", now: deps.now(), result: stored });
+    // The measured cost, never clipped to the reservation: above it, the ledger sees the real spend and refuses the next claim at the cap.
+    await settleSmartItem({ prefix: SAV_SMART_BENCH_SELFTEST_PREFIX, scope: config.runId, item, costMicroUsd: cost, status: "done", now: deps.now(), result: stored });
     ran += 1;
     if (meterStop === "deadline") { stoppedBy = "deadline"; break; }
   }
@@ -199,7 +224,7 @@ export function aggregateSmartBenchSelfTest(rows: readonly SmartBenchStored[]) {
 }
 
 export async function readSmartBenchSelfTestRows(runId: string): Promise<SmartBenchStored[]> {
-  const rows = await requireDb().select().from(savSyncState).where(like(savSyncState.key, `${smartItemKey(SAV_SMART_BENCH_SELFTEST_PREFIX, `${runId}:`)}%`));
+  const rows = await requireDb().select().from(savSyncState).where(like(savSyncState.key, smartBenchRunPattern(runId)));
   return rows.flatMap(row => {
     if (row.status !== "done" || !row.cursor) return [];
     try { const stored = decryptSavPayload<{ result: SmartBenchStored | null }>(row.cursor).result; return stored ? [stored] : []; } catch { return []; }

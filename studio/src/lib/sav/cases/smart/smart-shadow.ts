@@ -8,7 +8,7 @@ import { SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-provid
 import { runSmartTurn, type SmartKnowledgePort, type SmartThreadMessage, type SmartTurnResult } from "./smart-agent";
 import { SAV_SMART_CONTRACT_REVISION } from "./smart-contract";
 import { smartDbKnowledge } from "./smart-knowledge";
-import { claimSmartItem, readSmartLedger, settleSmartItem, smartItemKey, smartLedgerSpent, type SmartItemRow } from "./smart-ledger";
+import { claimSmartItem, readSmartLedger, settleSmartItem, smartContainedErrorCode, smartItemKey, smartLedgerSpent, type SmartItemRow } from "./smart-ledger";
 import { smartGeminiEmbed, smartGeminiModel, smartInputCap, smartPrices, type SmartEmbedPort, type SmartModelPort } from "./smart-model";
 import { SAV_SMART_PROMPT_REVISION, smartPromptPinned, smartPromptSha256 } from "./smart-prompt";
 import { readSmartShadowConfig, SAV_SMART_SHADOW_LOOKBACK_MS } from "./smart-switch";
@@ -52,6 +52,7 @@ export type SmartShadowDeps = Readonly<{
 export type SmartShadowPass =
   | Readonly<{ skipped: "off" | "deadline" | "prompt_unpinned" | "price_unavailable" | "transport_invalid" | "model_invalid" }>
   | Readonly<{ skipped: "refused"; reason: string }>
+  | Readonly<{ skipped: "error_contained"; code: string }>
   | Readonly<{ ran: number; stoppedBy: "batch" | "no_mail" | "deadline" | "money_cap" | "item_cap"; outcomes: Record<string, number>; skippedMails: Record<string, number>; spentTodayMicroUsd: number }>;
 
 export const smartShadowItem = (messageId: string) => `mail:${messageId}`;
@@ -86,11 +87,24 @@ export async function readSmartShadowMail(input: Readonly<{ messageId: string; e
   return { ok: true, subject: mail.subject, body, thread, receivedAt: mail.receivedAt };
 }
 
-/** One shadow batch. Never throws for a model failure (the mail records it); never writes anything but its own rows. */
+/**
+ * One shadow batch. NEVER throws: any error (a SQL failure at the reservation or the settlement, a lock held past its short bound, a bug) is
+ * contained and returned as `{ skipped: "error_contained", code }`, so the reconcile pass never turns red because of the shadow. The code is
+ * closed (a Postgres SQLSTATE or a fixed word), never a message. A claimed mail whose settlement failed keeps its reservation (never repaid).
+ */
 export async function runSmartShadowPass(deps: SmartShadowDeps): Promise<SmartShadowPass> {
   const config = readSmartShadowConfig(deps.env());
   if (config.mode === "off") return { skipped: "off" };
   const log = deps.log ?? ((event, fields) => console.info(event, JSON.stringify(fields)));
+  try { return await runSmartShadowPassUnsafe(deps, config, log); }
+  catch (error) {
+    const code = smartContainedErrorCode(error);
+    try { log("sav_smart_shadow_error_contained", { code }); } catch { /* the log never fails the pass */ }
+    return { skipped: "error_contained", code };
+  }
+}
+
+async function runSmartShadowPassUnsafe(deps: SmartShadowDeps, config: Exclude<ReturnType<typeof readSmartShadowConfig>, { mode: "off" }>, log: (event: string, fields: unknown) => void): Promise<SmartShadowPass> {
   if (config.mode === "refused") { log("sav_smart_shadow_refused", { reason: config.reason }); return { skipped: "refused", reason: config.reason }; }
   const clock = deps.clock ?? Date.now, left = () => deps.deadlineMs === undefined ? Number.POSITIVE_INFINITY : deps.deadlineMs - clock();
   if (left() < STEP_MIN_MS) return { skipped: "deadline" };
@@ -127,6 +141,7 @@ export async function runSmartShadowPass(deps: SmartShadowDeps): Promise<SmartSh
     const modelPort: SmartModelPort = async request => {
       if (timeout() < CALL_MIN_MS) return { status: "failed", problem: "deadline", uncertain: false, usage: null, inputBytes: 0, sent: false };
       if (modelCalls >= SAV_SMART_SHADOW_MODEL_CALLS) return { status: "failed", problem: "call_budget", uncertain: false, usage: null, inputBytes: 0, sent: false };
+      if (cost + prices.modelReserve > worst) return { status: "failed", problem: "money_budget", uncertain: false, usage: null, inputBytes: 0, sent: false };
       modelCalls += 1;
       const result = await gemini(request);
       if (result.status === "ok") cost += prices.modelCost(result.usage);
@@ -137,6 +152,7 @@ export async function runSmartShadowPass(deps: SmartShadowDeps): Promise<SmartSh
     const embedPort: SmartEmbedPort = async texts => {
       if (timeout() < CALL_MIN_MS) return { status: "failed", problem: "deadline", sent: false };
       if (embedCalls >= SAV_SMART_SHADOW_EMBED_CALLS) return { status: "failed", problem: "call_budget", sent: false };
+      if (cost + prices.embeddingReserve > worst) return { status: "failed", problem: "money_budget", sent: false };
       embedCalls += 1;
       const result = await geminiEmbed(texts);
       if (result.status === "ok" || result.sent) cost += prices.embeddingReserve;
@@ -149,7 +165,7 @@ export async function runSmartShadowPass(deps: SmartShadowDeps): Promise<SmartSh
         { model: modelPort, knowledge: (deps.knowledge ?? (embed => smartDbKnowledge({ now: deps.now, embed })))(embedPort), maxInputBytes: cap, today: day });
     } catch {
       // Unexpected: the reservation is kept as spent (nothing is known of what was sent), the mail never retried.
-      await settleSmartItem({ prefix: SAV_SMART_SHADOW_PREFIX, scope: day, item, costMicroUsd: worst, status: "failed", now: deps.now(), result: null });
+      await settleSmartItem({ prefix: SAV_SMART_SHADOW_PREFIX, scope: day, item, costMicroUsd: Math.max(cost, worst), status: "failed", now: deps.now(), result: null });
       outcomes.crashed = (outcomes.crashed ?? 0) + 1; ran += 1; continue;
     }
     const stored: SmartShadowStored = { messageId: candidate.messageId, receivedAt: mail.receivedAt.toISOString(), startedAt: new Date(startedAt).toISOString(),

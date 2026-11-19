@@ -44,16 +44,33 @@ export function smartInputCap(env: Env, now: Date): number | null {
   return Number.isInteger(own) && own >= 4_000 ? Math.min(own, bounds.maxInputBytes) : null;
 }
 
-/** The prices of V2's approved policy (read only): what a call costs, from its usage, or its reservation when the usage is unknown. */
+/**
+ * The usage of one Gemini answer, only when it is COMPLETE: input and output counts both present, safe non-negative integers (thoughts optional,
+ * same rule). Anything else (absent output count, unreadable metadata) is null, and a null usage costs the full reservation, never zero.
+ */
+export function smartUsageOf(meta: unknown): AccessSkillUsage | null {
+  if (!meta || typeof meta !== "object") return null;
+  const { promptTokenCount: input, candidatesTokenCount: output, thoughtsTokenCount: thoughts } = meta as Record<string, unknown>;
+  const count = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+  if (!count(input) || !count(output) || (thoughts !== undefined && !count(thoughts))) return null;
+  return { inputTokens: input, outputTokens: output + (thoughts ?? 0) };
+}
+
+/**
+ * The prices of V2's approved policy (read only). A call costs its MEASURED cost from a complete usage, even above its reservation (never
+ * clipped: the ledger must see the real spend); an unknown or incomplete usage costs its reservation.
+ */
 export function smartPrices(env: Env) {
   const read = readCaseV2SpendPolicy(env);
   if (!read.ok) return null;
   const { model, embedding } = read.policy;
   return {
     modelReserve: model.reserveMicroUsdPerCall, embeddingReserve: embedding.reserveMicroUsdPerCall,
-    modelCost: (usage: AccessSkillUsage | null) => usage
-      ? Math.min(model.reserveMicroUsdPerCall, Math.ceil((usage.inputTokens * model.microUsdPerMillionInputTokens + usage.outputTokens * model.microUsdPerMillionOutputTokens) / 1_000_000))
-      : model.reserveMicroUsdPerCall,
+    modelCost: (usage: AccessSkillUsage | null) => {
+      if (!usage || !Number.isSafeInteger(usage.inputTokens) || !Number.isSafeInteger(usage.outputTokens) || usage.inputTokens < 0 || usage.outputTokens < 0) return model.reserveMicroUsdPerCall;
+      const measured = Math.ceil((usage.inputTokens * model.microUsdPerMillionInputTokens + usage.outputTokens * model.microUsdPerMillionOutputTokens) / 1_000_000);
+      return Number.isSafeInteger(measured) ? measured : model.reserveMicroUsdPerCall;
+    },
   };
 }
 
