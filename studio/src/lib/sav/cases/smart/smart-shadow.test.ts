@@ -208,6 +208,7 @@ describe("rapport", () => {
     expect(report).toMatchObject({ mails: 2, outcomes: { handoff: 1, team_sensitive: 1 }, sensitiveStopped: { net: 1, understand: 0 }, corrected: 1, refusedAfterCorrection: 1 });
     expect(report.serverRefusals.other_platform_recommended).toBe(2);
     expect(report.bytesByStage.decide?.count).toBe(1);
+    expect(report).toMatchObject({ tools: { calls: 0, mailsWithTools: 0, decidePasses: { 1: 1 } }, progressHandoffs: 0, withTeamNote: 1 });
     expect(report.costMicroUsd.total).toBeGreaterThan(0);
     expect(JSON.stringify(report)).not.toMatch(/Yonos|résilier/);
   });

@@ -202,7 +202,8 @@ const bump = (map: Record<string, number>, key: string) => { map[key] = (map[key
 export function aggregateSmartShadow(rows: readonly SmartShadowStored[]) {
   const outcomes: Record<string, number> = {}, refusals: Record<string, number> = {}, verifyRefusals: Record<string, number> = {}, stopReasons: Record<string, number> = {};
   const missingByTheme: Record<string, number> = {}, sensitiveStopped = { net: 0, understand: 0 }, bytes: Record<string, number[]> = {};
-  let corrected = 0, refusedAfterCorrection = 0, serverCaughtWhatVerifyPassed = 0;
+  let corrected = 0, refusedAfterCorrection = 0, serverCaughtWhatVerifyPassed = 0, toolCalls = 0, mailsWithTools = 0, progressHandoffs = 0, withTeamNote = 0;
+  const toolStatus: Record<string, number> = {}, decidePasses: Record<string, number> = {};
   for (const row of rows) {
     const turn = row.turn;
     bump(outcomes, turn.outcome);
@@ -215,6 +216,14 @@ export function aggregateSmartShadow(rows: readonly SmartShadowStored[]) {
     if (turn.reasons.includes("refused_after_correction")) refusedAfterCorrection += 1;
     for (const missing of turn.missing) bump(missingByTheme, missing.theme?.trim().toLowerCase() || "sans_theme");
     for (const call of turn.calls) (bytes[call.kind] ??= []).push(call.inputBytes);
+    // v2 (rows stored before the loop have no steps): tool calls by status, decide passes, handoffs forced by the progress rule, notes.
+    const steps = turn.steps ?? [], tools = steps.filter(step => step.kind === "tool");
+    toolCalls += tools.length; if (tools.length) mailsWithTools += 1;
+    for (const step of tools) bump(toolStatus, `${step.tool}:${step.status}`);
+    const passes = steps.filter(step => step.kind === "decide").length;
+    if (passes) bump(decidePasses, String(passes));
+    if (turn.reasons.some(reason => reason.startsWith("progress:"))) progressHandoffs += 1;
+    if (turn.teamNote) withTeamNote += 1;
   }
   return {
     mails: rows.length, outcomes, sensitiveStopped, stopReasons, serverRefusals: refusals, verifyRefusals, corrected, refusedAfterCorrection, serverCaughtWhatVerifyPassed,
@@ -222,6 +231,7 @@ export function aggregateSmartShadow(rows: readonly SmartShadowStored[]) {
     durationMs: spread(rows.map(row => row.durationMs)),
     bytesByStage: Object.fromEntries(Object.entries(bytes).map(([kind, values]) => [kind, spread(values)])),
     missingByTheme,
+    tools: { calls: toolCalls, mailsWithTools, byToolAndStatus: toolStatus, decidePasses }, progressHandoffs, withTeamNote,
     revisions: [...new Set(rows.map(row => `${row.revision}:${row.promptSha256.slice(0, 16)}:${row.model}:${row.codeSha ?? "?"}`))],
   };
 }
