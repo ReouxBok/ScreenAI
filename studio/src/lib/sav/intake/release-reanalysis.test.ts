@@ -4,9 +4,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeJournal } from "@/db/schema";
-const state = vi.hoisted(() => ({ db: null as unknown }));
+import { savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeHumanEvents, staffUsers } from "@/db/schema";
+const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
+vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }));
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import { catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, readSavIntakeCurrent } from "./runtime-store";
@@ -14,6 +15,10 @@ import { intakeBlockedCauseSql, refreshIntakeConsole } from "./console-store";
 import { intakeBlockedRowLabel } from "./console-presentation";
 import { readIntakeRunDiagnostics } from "./run-diagnostics";
 import { analyseSavIntakeRuntime } from "./runtime";
+import { recordIntakeHumanCommand } from "./human-commands";
+import { consumeIntakeHumanEvent } from "./human-worker";
+import { humanRevisionConfigHash } from "./human-binding";
+import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { SAV_INTAKE_ATTEMPT_POLICY } from "./attempt-policy";
 
 const KEY = "synthetic-intake-runtime-encryption-key";
@@ -84,17 +89,53 @@ describe("a decided acknowledgement (d691f0f4)", () => {
     return { m, id, fake };
   }
 
-  it("is never re-queued by three releases: one analysis, one attempt, no manual_required", async () => {
-    const { m, id, fake } = await decidedAck();
-    for (let n = 1; n <= 3; n++) {
-      const { config } = release(n);
-      expect(await catchupSavIntake(config)).toBe(0);
-      expect(await enqueueSavIntakeMessage(m.id, config)).toBeNull();
+  it("nine releases re-create its version under the current configuration without ever exhausting it (no manual_required)", async () => {
+    const { m, fake } = await decidedAck();
+    for (let n = 1; n <= SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage; n++) {
+      const current = release(n);
+      expect(await catchupSavIntake(current.config)).toBe(1);
+      const next = (await runsOf(m.id)).find(r => r.isCurrent)!;
+      expect(next.configHash).toBe(current.config.configHash);
+      expect(await kinds(next.id)).toContain("release_reanalysis");
+      await analyseSavIntakeRuntime(next.id, current.config, { env: () => current.env, network: fake.network });
+      expect((await readSavIntakeCurrent(threadId, current.config))?.payload.plan?.decision.disposition).toMatchObject({ kind: "no_ticket", reason: "acknowledgement_only" });
+      expect(await kinds(next.id)).not.toContain("attempts_exhausted");
     }
-    const runs = await runsOf(m.id);
-    expect(runs.map(r => [r.id, r.state, r.attempts, r.isCurrent])).toEqual([[id, "observed", 1, true]]);
-    expect(fake.calls()).toBe(1);
+    await refreshIntakeConsole();
     expect(await blockedCause()).toBeNull();
+    expect((await readIntakeRunDiagnostics(threadId))?.attemptBudget).toMatchObject({ total: 1, exhausted: null });
+  });
+
+  it("an operator's reclassification after a release is processed once, under the current configuration (Astra, cd1d47eb)", async () => {
+    const { m, fake } = await decidedAck();
+    const current = release(1);
+    // The release re-creates the version under the current configuration (release-only: no lifetime attempt).
+    expect(await catchupSavIntake(current.config)).toBe(1);
+    const next = (await runsOf(m.id)).find(r => r.isCurrent)!;
+    await analyseSavIntakeRuntime(next.id, current.config, { env: () => current.env, network: fake.network });
+    await refreshIntakeConsole();
+    const run = (await readSavIntakeCurrent(threadId, current.config))!;
+    expect(run.configHash).toBe(current.config.configHash);
+    // The operator reclassifies the acknowledgement as a support request on the version the console shows.
+    const [admin] = await f.db.insert(staffUsers).values({ clerkId: `synthetic-${randomUUID()}`, email: "ugo@limova.ai", name: "Synthetic", role: "admin", active: true }).returning();
+    state.user = { id: admin.clerkId, primaryEmailAddress: { emailAddress: admin.email, verification: { status: "verified" } } };
+    const saved = await recordIntakeHumanCommand({ commandKey: randomUUID(), threadId, messageId: m.id, runId: run.id, version: run.version, sourceHash: run.sourceHash!,
+      candidatesHash: intakeRuntimeHash([...(run.candidateContactIds ?? [])].sort()), kind: "classify", classification: "support", reason: "Synthetic verified operator evidence." });
+    const [event] = await f.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id, saved.eventId));
+    expect(event.baseConfigHash).toBe(current.config.configHash);
+    const readers = createSavIntakeHubspotReaders({ network: fake.network });
+    const result = await consumeIntakeHumanEvent(saved.eventId, current.config, readers);
+    expect(result).toHaveProperty("runId");
+    const [consumed] = await f.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id, saved.eventId));
+    expect(consumed.state).toBe("consumed");
+    // Processed once: a second pass finds nothing to do, one human revision only.
+    expect(await consumeIntakeHumanEvent(saved.eventId, current.config, readers)).toEqual({ skipped: "not_claimed" });
+    const runs = await runsOf(m.id);
+    expect(runs.filter(r => r.configHash === humanRevisionConfigHash(current.config.configHash, saved.eventId))).toHaveLength(1);
+    // Counters kept, no reset: every automatic attempt still recorded, only the first one counts in the lifetime cap.
+    expect(runs.reduce((sum, r) => sum + r.attempts, 0)).toBe(2);
+    expect((await readIntakeRunDiagnostics(threadId))?.attemptBudget).toMatchObject({ total: 1 });
+    state.user = null;
   });
 
   it("a new mail in the thread re-opens it", async () => {

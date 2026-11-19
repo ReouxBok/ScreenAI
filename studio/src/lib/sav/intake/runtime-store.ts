@@ -258,16 +258,11 @@ const noCommittedExecutionFor = (messageId: ReturnType<typeof sql>) => sql`not e
   and (e.state in ('confirmed','refused') or exists(select 1 from sav.intake_effects f where f.execution_id=e.id
     and (f.state<>'planned' or f.dispatched_at is not null or f.dispatch_token is not null or f.ack_ciphertext is not null or f.verification_ciphertext is not null or f.confirmed_at is not null))))`;
 const noCommittedExecution = noCommittedExecutionFor(sql`${savMessages.id}`);
-/** A decided dossier V1 has nothing left to do for: its current run is observed and the console, freshly projected on
- * that run (projection = sources still matching), shows a final classification that never leads to a V1 execution
- * (acknowledgement, qualified Autre). A new configuration or code revision alone never re-opens it; a new inbound
- * (different message), changed sources (the projection leaves these statuses) or a person (human events) still does.
- * Dossiers waiting for the team or for an execution keep their re-analysis: a human command and an execution are
- * bound to the current configuration. */
-const settledDecisionFor = (messageId: ReturnType<typeof sql>) => sql`exists(select 1 from sav.intake_runs sr join sav.intake_console sc on sc.run_id = sr.id and sc.message_id = sr.message_id
-  where sr.message_id = ${messageId} and sr.is_current and sr.state = 'observed' and sc.epoch = sc.projected_epoch
-  and ((sc.view = 'completed' and sc.status = 'acknowledgement_only') or (sc.view = 'other' and sc.status = 'qualified_other')))`;
-/** The run a new version of this same mail would only re-run because of a release: the latest version that holds an
+/** A release still re-creates the version of an open dossier, decided ones included: a human command (reclassifying an
+ * acknowledgement or an Autre) and an execution are bound to the current configuration, so leaving a decided dossier on
+ * an older configuration would leave such a command waiting forever (Astra, review of cd1d47eb). What a release no longer
+ * does is consume the lifetime attempt budget.
+ * The run a new version of this same mail would only re-run because of a release: the latest version that holds an
  * accepted analysis, on sources that still match, without human decision or blocking marker. Versions created by
  * earlier releases and never claimed are skipped (they inherit the same anchor). Any failed, blocked or changed run: null. */
 async function releaseReanalysisAnchor(tx: Tx, message: typeof savMessages.$inferSelect) {
@@ -298,7 +293,6 @@ export async function enqueueSavIntakeMessage(messageId: string, config: IntakeR
     const [same] = await tx.select().from(savIntakeRuns).where(and(eq(savIntakeRuns.messageId, message.id), eq(savIntakeRuns.configHash, config.configHash)));
     if (same) return same.id;
     if (await intakeHasHumanDecision(messageId, tx)) return null;
-    if (await intakeConsoleInstalled(tx) && (await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, message.id), settledDecisionFor(sql`${savMessages.id}`)))).length) return null;
     const anchor = await releaseReanalysisAnchor(tx, message);
     // Atomic ownership claim races safely with the legacy pending->processing UPDATE.
     const owned = await tx.update(savMessages).set({ analysisStatus: "intake_pending" }).where(and(eq(savMessages.id, message.id),
@@ -323,13 +317,10 @@ export async function enqueueSavIntakeMessage(messageId: string, config: IntakeR
 export async function catchupSavIntake(config: IntakeRuntimeConfig, limit = 4) {
   const completedIds = await listSavExternalCompletionMessageIds(requireDb(), false, config.mailboxId);
   const notCompleted = completedIds.length ? sql`${savMessages.id} not in (${sql.join(completedIds.map(id => sql`${id}::uuid`), sql`, `)})` : undefined;
-  const installed = await intakeConsoleInstalled();
-  const noHuman = installed ? sql`not exists(select 1 from sav.intake_human_events h where h.message_id=${savMessages.id})` : undefined;
-  // A decided dossier with nothing left to do is never re-queued by a release (same predicate as the enqueue).
-  const notSettled = installed ? sql`not ${settledDecisionFor(sql`${savMessages.id}`)}` : undefined;
+  const noHuman = await intakeConsoleInstalled() ? sql`not exists(select 1 from sav.intake_human_events h where h.message_id=${savMessages.id})` : undefined;
   const messages = await requireDb().select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.mailboxId, config.mailboxId), eq(savMessages.direction, "inbound"),
     gt(savMessages.receivedAt, new Date(config.receivedAfter)), gt(savMessages.createdAt, new Date(config.createdAfter)),
-    or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`), noHuman, notSettled, noCommittedExecution, notCompleted,
+    or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`), noHuman, noCommittedExecution, notCompleted,
     sql`not exists (select 1 from sav.intake_runs r where r.message_id = ${savMessages.id} and r.config_hash = ${config.configHash})`,
     sql`not exists (select 1 from sav.messages m where m.thread_id = ${savMessages.threadId} and m.direction = 'inbound' and (least(m.received_at,m.created_at),m.created_at,m.id) > (${savEffectiveReceivedAt},${savMessages.createdAt},${savMessages.id}))`))
     .orderBy(savMessages.createdAt).limit(Math.min(4, Math.max(1, limit)));
