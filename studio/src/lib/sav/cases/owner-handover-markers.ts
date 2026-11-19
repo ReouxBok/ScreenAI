@@ -8,13 +8,14 @@ import { v2HubspotOwnerId } from "./intake-boundary";
 import { savV2OwnerHandoverEnabled } from "./owner-handover-config";
 
 const PREFIX = "sav-v2-owner-handover:";
+export const ownerHandoverMarkerKey = (ticketId: string) => PREFIX + ticketId;
 export const OWNER_HANDOVER_DELAY_MS = 305_000;
 const LEASE_MS = 300_000;
 const RETRY_MS = 120_000;
 const MAX_ATTEMPTS = 5;
 const CRM_ID = /^\d{1,30}$/;
 
-type OwnerEvent = {
+export type OwnerEvent = {
   subscriptionType: string; propertyName?: string; objectId?: string | number; occurredAt?: number;
   portalId?: number; propertyValue?: string; changeSource?: string;
 };
