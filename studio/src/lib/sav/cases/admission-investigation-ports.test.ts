@@ -288,6 +288,22 @@ describe("qualify (contract §2): only the case's current relayed V1 mail, on th
     expect(rules.calls).toBe(0);
   });
 
+  it("SAV-99: a manually handed-over mail (no V1 execution) is qualified again from the case's own stored reading, under the current policy, with no V1 read", async () => {
+    const { deps, reads, rules } = sources();
+    const { caseId } = await staleAgentCase(deps);
+    reads.length = 0; rules.calls = 0;
+    const { snapshot, events } = await journal(caseId);
+    const input = latestInvestigationInput(events)!.slice(3);
+    const manual = events.map(event => event.id === input
+      ? { ...event, detail: { ...event.detail, relay: { kind: "owner_handover_mail", messageId: (event.detail as { messageId: string }).messageId, ticketId: snapshot.ticketId } } } as CaseEvent : event);
+    expect(await caseInvestigationQualify(deps)(snapshot, manual)).toEqual({ sourceRef: manual.find(event => event.id === input)!.sourceRef,
+      admission: { policy: SYN_POLICY, qualification: snapshot.admission!.qualification } });
+    // Another ticket than the proof's, or no stored reading: nothing is admitted.
+    expect(await caseInvestigationQualify(deps)({ ...snapshot, ticketId: String(++seq) }, manual)).toBeNull();
+    expect(await caseInvestigationQualify(deps)({ ...snapshot, admission: null }, manual)).toBeNull();
+    expect([reads, rules.calls]).toEqual([[], 0]);
+  });
+
   it("another ticket than V1's throws (A's port compares the whole target)", async () => {
     const { deps } = sources();
     const { caseId } = await staleAgentCase(deps);

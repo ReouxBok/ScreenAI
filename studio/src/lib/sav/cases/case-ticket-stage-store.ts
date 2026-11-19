@@ -25,12 +25,12 @@ import { buildTicketStageIntent, TICKET_STAGE_KEY_PREFIX, type TicketStagePayloa
 import { caseTeamPartPending, lastCustomerInboundAt, openHandoffVersion } from "./case-ticket-stage-queue";
 import { createCaseTicketStageAdapters, TICKET_STAGE_NOT_APPLIED_PREFIX } from "./case-ticket-stage-hubspot";
 import { v2HubspotOwnerId } from "./intake-boundary";
-import { lockCaseForWrite } from "./case-store";
+import { lockCaseForWrite, readCase } from "./case-store";
 import { readCaseTicketId, type CaseTicketOwnerPort } from "./case-ticket-owner";
 import { caseHandoffStageEnabled, decideCaseTicketStage, planCaseTicketStage, readCaseTicketStageConfig, type CustomerReturnOwnerNow } from "./customer-return";
 import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, type CaseNoteCreateIntent } from "./case-effect-intents";
 import { caseNoteAssociationKey, caseNoteKey, SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
-import { caseClosureNoteInteractionId, caseClosureNoteText, caseReplyNoteEnabled } from "./case-reply-summary-note";
+import { caseClosureNoteInteractionId, caseClosureNoteText, caseHandoffNoteInteractionId, caseReplyNoteEnabled, caseThreadlessHandoffNoteText } from "./case-reply-summary-note";
 import { createIntakeExecutorAdapters } from "../intake/execution-adapters";
 
 const NOTE_KINDS = new Set(["note_create", "note_associate"]);
@@ -40,6 +40,16 @@ const ackOf = (effect: Effect) => effect.ackCiphertext ? decryptSavPayload<{ id?
 export function closureNoteKeys(payload: TicketStagePayload, caseId: string) {
   if (payload.intent.target !== "closed" || payload.trigger.kind !== "resolution_recorded") return null;
   const interactionId = caseClosureNoteInteractionId(payload.trigger.cycle);
+  return { interactionId, create: caseNoteKey(caseId, interactionId), associate: caseNoteAssociationKey(caseId, interactionId) };
+}
+
+/**
+ * SAV-99 (19/11): the hand-over note's two ledger keys, for the « handoff » stage of a case WITHOUT any mail only (a ticket a person gave the agent and the agent
+ * did not take); null otherwise: a mail case's hand-over writes no note here, exactly as before.
+ */
+export function handoffNoteKeys(payload: TicketStagePayload, caseId: string, threadIds: readonly string[]) {
+  if (payload.intent.target !== "handoff" || payload.trigger.kind !== "handoff_recorded" || threadIds.length) return null;
+  const interactionId = caseHandoffNoteInteractionId(payload.trigger.caseVersion);
   return { interactionId, create: caseNoteKey(caseId, interactionId), associate: caseNoteAssociationKey(caseId, interactionId) };
 }
 
@@ -191,6 +201,37 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
     return buildCaseNoteAssociateIntent({ caseId, interactionId: keys.interactionId, created: effectIntent(created) as unknown as CaseNoteCreateIntent, createEffectId: created.id, objectId }) as unknown as EffectIntent;
   }
 
+  /**
+   * SAV-99 (Ugo 19/11): BEFORE the hand-over stage of a case without mail, ONE short note on the ticket with the reason the agent did not take it, through the
+   * existing case note effect (create, then associate). Before, not after: the stage removes the V2 owner, and every write of this driver needs the V2 owner on the
+   * ticket. Same rules as the closure note: a stored row is returned as stored, a NEW write needs `SAV_V2_REPLY_NOTE=on` and `append_case_note`; without them the
+   * stage goes on alone (the ticket must go back to the team whatever the note). Null: no note (anymore) before the stage.
+   */
+  async function nextHandoffNoteIntent(lease: ExecutionLease, effects: readonly Effect[], options: Parameters<PassDriver["nextIntent"]>[2]): Promise<EffectIntent | null> {
+    const payload = payloads.get(lease)!, caseId = caseIds.get(lease)!;
+    if (payload.trigger.kind !== "handoff_recorded") return null;
+    const snapshot = await readCase(caseId);
+    const keys = snapshot ? handoffNoteKeys(payload, caseId, snapshot.threadIds) : null;
+    if (!snapshot || !keys) return null;
+    const created = effects.find(effect => effect.businessKey === keys.create), associated = effects.find(effect => effect.businessKey === keys.associate);
+    const stopped = !caseReplyNoteEnabled(deps.env());
+    const newWrite = (effect: Effect | undefined) => !effect || effect.state === "planned";
+    if (!created || created.state !== "confirmed") {
+      if (stopped && newWrite(created)) return null;
+      if (created) return effectIntent(created);
+      const { policy } = await readIntakeExecutionAuthority(options.config);
+      if (!policy.mutations.includes(SAV_CASE_EFFECT_PERMISSIONS.note)) return null;
+      return buildCaseNoteIntent({ caseId, interactionId: keys.interactionId, ticketId: payload.intent.ticketId, sourceMessageId: caseId,
+        text: caseThreadlessHandoffNoteText(snapshot.body.handoff?.reason), at: new Date().toISOString() }) as unknown as EffectIntent;
+    }
+    if (associated?.state === "confirmed") return null;
+    if (stopped && newWrite(associated)) return null;
+    if (associated) return effectIntent(associated);
+    const objectId = ackOf(created)?.id;
+    if (!objectId) return fault("NOTE_ACK_MISSING");
+    return buildCaseNoteAssociateIntent({ caseId, interactionId: keys.interactionId, created: effectIntent(created) as unknown as CaseNoteCreateIntent, createEffectId: created.id, objectId }) as unknown as EffectIntent;
+  }
+
   const driver: PassDriver = {
     async claim(executionId) {
       return requireDb().transaction(async (tx): Promise<{ lease: ExecutionLease } | { blocked: "occupied" }> => {
@@ -227,6 +268,8 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
       if (existing) return existing.state === "confirmed" ? nextClosureNoteIntent(lease, effects, existing, options) : effectIntent(existing);
       if (readCaseTicketStageConfig(deps.env()).mode !== "on") return fault("HOLD_STAGES_OFF");
       if (payload.trigger.kind === "handoff_recorded" && !caseHandoffStageEnabled(deps.env())) return fault("HOLD_HANDOFF_STAGE_OFF");
+      const note = await nextHandoffNoteIntent(lease, effects, options);
+      if (note) return note;
       const owner = v2HubspotOwnerId(deps.env());
       if (!owner) return fault("HOLD_OWNER_ID_MISSING");
       return buildTicketStageIntent(payload.intent, owner);

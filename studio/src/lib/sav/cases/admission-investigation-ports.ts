@@ -108,6 +108,13 @@ export function caseInvestigationQualify(deps: AdmissionInvestigationDeps): Case
     const refuse = (code: CaseQualificationBlock, error: unknown) => new CaseQualificationUnavailableError({ code, inputKey, inputVersion, causeCode: caseQualificationCauseCode(error) });
     const failed: SourceFailure = (source, error) => { throw refuse(SOURCE_BLOCKS[source], error); };
     try {
+      // SAV-99 (Ugo 19/11): a mail a person's assignment handed over has no V1 context to read again. Its own reading, stored with the case's admission
+      // when it was relayed (block evidence on the mail, the ticket's contact), is decided again under the policy in force; none stored, nothing admitted.
+      if (relay.kind === "owner_handover_mail") {
+        const qualification = snapshot.admission?.qualification;
+        if (!qualification || relay.ticketId !== snapshot.ticketId) return null;
+        return { admission: { policy: await guarded(failed, "policy", policy), qualification }, sourceRef: event.sourceRef };
+      }
       const target: CaseQualificationTarget = { ticketId: snapshot.ticketId, executionId: relay.executionId, runId: relay.intakeRunId, runVersion: relay.intakeRunVersion };
       // The case's requests opened by this mail, as the relay recorded them (whatever their status since); the V1
       // decision read must open exactly these.

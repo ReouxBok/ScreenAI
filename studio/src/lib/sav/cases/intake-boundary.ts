@@ -93,7 +93,7 @@ async function confirmCreatedOwner(proof: CaseOwnerAtCreationProof, deps: CaseBo
  * overwritten, so no compare-and-set is needed. An empty owner is still not taken, a person keeps the ticket, and a case that does not wait (the agent's, the team's, a person's) is not
  * even read. A reading that is not one leaves the case waiting and never loses the mail: the sweep reads again. */
 async function ownerReadProof(input: { ticketId: string; messageId: string; admission: Awaited<ReturnType<typeof relayAdmissionInput>>["admission"]; deps: CaseBoundaryDeps;
-  onReading?: (reading: string | null | undefined) => void }): Promise<CaseAttributionProof | "pending"> {
+  onReading?: (reading: string | null | undefined) => void; manual?: true }): Promise<CaseAttributionProof | "pending"> {
   const { deps, ticketId } = input, ownerId = v2HubspotOwnerId(deps.env);
   if (!deps.readCreatedTicketOwner || !ownerId || await relayPaused(requireDb())) return "pending";
   const current = await readCaseByTicket(ticketId);
@@ -103,7 +103,7 @@ async function ownerReadProof(input: { ticketId: string; messageId: string; admi
   try { reading = await deps.readCreatedTicketOwner(ticketId); }
   catch (error) { if (deps.ownerHandover) throw error; return "pending"; }
   input.onReading?.(reading);
-  return reading === ownerId ? { kind: "hubspot_owner_read", messageId: input.messageId, ticketId, ownerId } : "pending";
+  return reading === ownerId ? { kind: "hubspot_owner_read", messageId: input.messageId, ticketId, ownerId, ...(input.manual ? { handover: "manual" as const } : {}) } : "pending";
 }
 
 /** Lot C (4/11): HubSpot has no conditional write, so the read that gave the case to the agent is not atomic with the commit. The owner is read once more AFTER the commit: a person
@@ -304,7 +304,7 @@ export async function readIntakeAcknowledgement(messageId: string): Promise<Inta
 
 export type CaseRelayResult =
   | { skipped: "recording_off" | "intake_not_confirmed" | "source_missing" | "no_case_for_thread" | "thread_case_ambiguous" | "before_case" | "customer_return_wait" | "customer_return_not_consumed"
-      | "owner_handover_off" | "owner_handover_out_of_scope" | "owner_handover_not_attributed" }
+      | "owner_handover_off" | "owner_handover_out_of_scope" | "owner_handover_not_attributed" | "owner_handover_ticket_mismatch" | "owner_handover_no_v1_execution" }
   | { caseId: string; version: number; created: boolean; appended: boolean; owner: string; relay: CaseRelayProof["kind"] | "v2_customer_return";
       admission: { target: string; reasons: string[] } | null; existingTicket?: SavV2ExistingTicketOwnerRule };
 
@@ -321,7 +321,13 @@ export async function recordCaseAfterConfirmedIntake(messageId: string, deps: Ca
   const readProgress = deps.readProgress ?? (await import("../intake/executor")).readIntakeExecutionProgress;
   const progress = await readProgress(messageId);
   if (deps.ownerHandover) {
-    return progress?.ticketId === deps.ownerHandover.ticketId ? relayConfirmedEffects(messageId, progress, deps) : { skipped: "intake_not_confirmed" };
+    if (progress?.ticketId === deps.ownerHandover.ticketId) return relayConfirmedEffects(messageId, progress, deps);
+    // SAV-99 (Ugo 19/11): V1 put this mail on ANOTHER ticket: two tickets for one thread is the team's to sort out.
+    if (progress?.ticketId) return { skipped: "owner_handover_ticket_mismatch" };
+    // V1 is still on it (an execution without its ticket yet): asked again later.
+    if (progress) return { skipped: "intake_not_confirmed" };
+    // No V1 execution at all (the team made the ticket outside the Studio, V1 never acted): the manual assignment is the proof (`relayOwnerHandoverMail`).
+    return { skipped: "owner_handover_no_v1_execution" };
   }
   // An execution with effects is the only proof for this message: confirmed or nothing.
   const engaged = progress && (progress.ticketId || progress.effects === undefined || progress.effects.length > 0);
@@ -349,6 +355,34 @@ async function relayConfirmedEffects(messageId: string, progress: NonNullable<In
       const [row] = await tx.select({ state: savIntakeExecutions.state, ticketId: savIntakeExecutions.ticketId }).from(savIntakeExecutions)
         .where(eq(savIntakeExecutions.id, executionId)).for("share");
       if (row?.state !== "confirmed" || row.ticketId !== ticketId) throw Error("SAV_CASE_INTAKE_NOT_CONFIRMED");
+    } });
+}
+
+/** SAV-99: the one request a manually handed-over mail opens (no V1 analysis to list them). */
+export const ownerHandoverMailRequest = (gmailMessageId: string): CaseRelayRequest => ({ requestId: caseRequestId(gmailMessageId, "owner-handover"), kind: "support" });
+
+/**
+ * SAV-99 (Ugo 19/11): a ticket a person gave the V2 agent, whose linked mail V1 never executed (the team made the ticket outside the Studio, « Traité hors
+ * Studio »): the person's assignment is the proof. The latest stored customer mail of the thread is relayed to the ticket's case with the caller's own reading of
+ * it (`qualification`: block evidence on the mail, identity from the ticket's contact), never V1's. Everything else is the ordinary relay: one event per
+ * (case, mail), the admission decided again by the store, the owner read now, the pause, and the caller's `assertFresh` (thread, claim, case).
+ */
+export async function relayOwnerHandoverMail(messageId: string, qualification: CaseAdmissionQualification, deps: CaseBoundaryDeps & { ownerHandover: NonNullable<CaseBoundaryDeps["ownerHandover"]> }): Promise<CaseRelayResult> {
+  if (!savCaseRecordingEnabled(deps.env)) return { skipped: "recording_off" };
+  if (!savV2OwnerHandoverEnabled(deps.env)) return { skipped: "owner_handover_off" };
+  const [message] = await requireDb().select().from(savMessages).where(eq(savMessages.id, messageId));
+  if (!message || message.direction !== "inbound" || !message.gmailMessageId) return { skipped: "source_missing" };
+  const request = ownerHandoverMailRequest(message.gmailMessageId);
+  if (qualification.requests.some(row => row.requestId !== request.requestId)) throw Error("SAV_CASE_QUALIFICATION_REQUEST_UNKNOWN");
+  const policy = deps.readAdmissionPolicy ? await deps.readAdmissionPolicy() : null;
+  const relay: CaseRelayProof = { kind: "owner_handover_mail", messageId, ticketId: deps.ownerHandover.ticketId };
+  return relayToCase({ ticketId: deps.ownerHandover.ticketId, threadId: message.threadId, gmailMessageId: message.gmailMessageId, receivedAt: message.receivedAt,
+    decision: { classification: "support", requests: [] }, relay, deps, confirmedTicket: true, attribution: "pending",
+    manual: { admission: { policy, qualification }, requests: [request] },
+    assertFresh: async tx => {
+      // V1 may not have engaged this mail since it was read: then its own proofs decide, on the next pass.
+      const [execution] = await tx.select({ id: savIntakeExecutions.id }).from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, messageId)).limit(1);
+      if (execution) throw Error("SAV_CASE_INTAKE_NOT_CONFIRMED");
     } });
 }
 
@@ -391,10 +425,13 @@ async function relayToCase(input: {
   relay: CaseRelayProof; deps: CaseBoundaryDeps; confirmedTicket: boolean; assertFresh: (tx: CaseTx) => Promise<void>; attribution: "pending" | CaseAttributionProof;
   /** 16/11: V1 linked or reopened an existing ticket (no creation). */
   existingTicket?: boolean;
+  /** SAV-99: the manual handover's own reading of the mail (`relayOwnerHandoverMail`); V1's proofs are never asked for it. */
+  manual?: { admission: Awaited<ReturnType<typeof relayAdmissionInput>>["admission"]; requests: CaseRelayRequest[] };
 }): Promise<CaseRelayResult> {
-  const target: CaseQualificationTarget = { ticketId: input.ticketId, executionId: input.relay.kind === "intake_effects_confirmed" ? input.relay.executionId : null,
-    runId: input.relay.intakeRunId, runVersion: input.relay.intakeRunVersion };
-  const { admission, requests } = await relayAdmissionInput({ messageId: input.relay.messageId, gmailMessageId: input.gmailMessageId, decision: input.decision, confirmedTicket: input.confirmedTicket, deps: input.deps, target });
+  const relayProof = input.relay;
+  const { admission, requests } = input.manual ?? await relayAdmissionInput({ messageId: relayProof.messageId, gmailMessageId: input.gmailMessageId, decision: input.decision,
+    confirmedTicket: input.confirmedTicket, deps: input.deps, target: relayProof.kind === "owner_handover_mail" ? undefined
+      : { ticketId: input.ticketId, executionId: relayProof.kind === "intake_effects_confirmed" ? relayProof.executionId : null, runId: relayProof.intakeRunId, runVersion: relayProof.intakeRunVersion } });
   const handover = input.deps.ownerHandover;
   if (handover && (!admission.qualification.requests.every(request => request.family === "access"
     && (request.provenance.kind === "human" || (request.provenance.kind === "qualified_rule" && (request.provenance.blockId ?? SAV_CASE_ACCESS_BLOCK_ID) === SAV_CASE_ACCESS_BLOCK_ID)))
@@ -415,6 +452,10 @@ async function relayToCase(input: {
   } else if (attribution !== "pending" && attribution.kind === "hubspot_owner_at_creation")
     attribution = decideCaseAdmission({ policy: admission.policy, qualification: admission.qualification, caseSensitivity: "none" }).target === "agent"
       ? await confirmCreatedOwner(attribution, deps).catch(error => { if (guardOrdinaryAttribution) return "pending" as const; throw error; }) : "pending";
+  // SAV-99: the manual handover of a mail V1 never executed: the owner as it reads now (the person's assignment) is the proof, inside the scope only.
+  else if (input.attribution === "pending" && input.relay.kind === "owner_handover_mail") {
+    if (inScope) attribution = await ownerReadProof({ ticketId: input.ticketId, messageId: input.relay.messageId, admission, deps, manual: true });
+  }
   // No V1 owner effect for this mail: the owner as it reads now is enough. An acknowledgement opens nothing and proves no ticket: it never takes this route.
   else if (input.attribution === "pending" && input.relay.kind === "intake_effects_confirmed") {
     // SAV-81: a mail V1 confirmed while no thread was bound (its subject did not match at the creation) is otherwise never attributed. Only through the
@@ -430,14 +471,15 @@ async function relayToCase(input: {
     }
   }
   if (handover && attribution === "pending") return { skipped: "owner_handover_not_attributed" };
-  const subjects = requests.length ? await readRequestSubjects({ runId: input.relay.intakeRunId, runVersion: input.relay.intakeRunVersion, messageId: input.relay.messageId,
+  const subjects = requests.length && relayProof.kind !== "owner_handover_mail" ? await readRequestSubjects({ runId: relayProof.intakeRunId, runVersion: relayProof.intakeRunVersion, messageId: relayProof.messageId,
     gmailMessageId: input.gmailMessageId, requestIds: input.decision.requests.filter(request => request.kind !== "acknowledgement").map(request => request.id) }) : new Map<string, CaseRequestSubject>();
   const result = await openCaseEvent({
     ticketId: input.ticketId, threadId: input.threadId, admissionMode: "exclusions_only", attribution, admission,
     ...(handover?.awaitCustomer ? { attributionPhase: "awaiting_customer" } : {}),
-    opens: requests.map(request => ({ id: request.requestId, summary: openedSummary(request, input.gmailMessageId),
-      // The `message` stand-in of a mail whose analysis listed no request has no V1 summary of its own.
-      subject: subjects.get(request.requestId) ?? { status: "absent" as const, reason: "not_in_summary" as const } })),
+    opens: requests.map(request => ({ id: request.requestId,
+      summary: relayProof.kind === "owner_handover_mail" ? `Demande du mail ${input.gmailMessageId}, reprise par l'attribution manuelle du ticket.` : openedSummary(request, input.gmailMessageId),
+      // The `message` stand-in of a mail whose analysis listed no request has no V1 summary of its own; a manual handover has no V1 analysis at all.
+      subject: subjects.get(request.requestId) ?? { status: "absent" as const, reason: relayProof.kind === "owner_handover_mail" ? "source_missing" as const : "not_in_summary" as const } })),
     kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(input.gmailMessageId),
     direction: "customer_inbound", occurredAt: input.receivedAt.toISOString(),
     sourceRef: { type: "email", id: input.gmailMessageId }, detail: { messageId: input.relay.messageId, relay: input.relay },

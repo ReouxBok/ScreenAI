@@ -28,6 +28,8 @@ const fixture = vi.hoisted(() => ({
   gmail: vi.fn(),
   continueCase: vi.fn(),
   threadless: vi.fn(),
+  handBack: vi.fn(),
+  blockEvidence: vi.fn(),
   relayDeps: {} as CaseBoundaryDeps,
 }));
 vi.mock("@/db", () => ({ requireDb: () => fixture.db }));
@@ -42,10 +44,12 @@ vi.mock("../observations", async original => ({
 vi.mock("../gmail", async original => ({ ...await original<typeof import("../gmail")>(), requestSavGmail: fixture.gmail }));
 vi.mock("./v2-entry", async original => ({
   ...await original<typeof import("./v2-entry")>(), v2EntryRelayDeps: () => fixture.relayDeps, continueCaseAfterCommit: fixture.continueCase,
+  firstBlockEvidence: fixture.blockEvidence,
 }));
+// The hand-back itself (team case, stage, note, Slack) is the flow of threadless-handback.flow.test.ts; here only who is handed back, why, and once.
 vi.mock("./threadless-entry", async original => {
   const { startV2FromThreadlessTicket } = await original<typeof import("./threadless-entry")>();
-  return { startV2FromThreadlessTicket: fixture.threadless.mockImplementation(startV2FromThreadlessTicket) };
+  return { startV2FromThreadlessTicket: fixture.threadless.mockImplementation(startV2FromThreadlessTicket), handBackOwnerHandoverTicket: fixture.handBack };
 });
 
 const MAILBOX = "contact@limova.ai", CLIENT = "client@example.invalid";
@@ -78,6 +82,8 @@ function liveTicket(ticketId: string, options: {
   paginateEmails?: boolean;
   conversations?: { active?: unknown[]; archived?: unknown[] };
   crmDenied?: boolean;
+  /** SAV-99: the ticket's one contact (manual handover of a mail V1 never executed). */
+  contact?: string;
 } = {}) {
   const owner = options.owner ?? OWNER, at = options.at ?? SETTLED_EVENT_AT;
   let ticketReads = 0;
@@ -94,6 +100,8 @@ function liveTicket(ticketId: string, options: {
       }
       return Response.json({ results });
     }
+    if (request.pathname === `/crm/v4/objects/tickets/${ticketId}/associations/contacts`) return Response.json({ results: options.contact ? [{ toObjectId: 901 }] : [] });
+    if (request.pathname === "/crm/v3/objects/contacts/901") return Response.json({ id: "901", properties: { email: options.contact } });
     if (request.pathname === "/crm/v3/objects/emails/batch/read") {
       expect(init?.method).toBe("POST");
       expect(JSON.parse(String(init?.body))).toMatchObject({
@@ -210,6 +218,9 @@ beforeEach(() => {
   fixture.start.mockResolvedValue({});
   fixture.after.length = 0;
   fixture.relayDeps = admission();
+  fixture.handBack.mockImplementation(async (_input: unknown, reason: string) => ({ status: "human_wait", caseId: randomUUID(), reason }));
+  fixture.blockEvidence.mockImplementation(async (_env: unknown, _messageId: string, _gmailId: string, requests: { requestId: string }[]) => requests.map(({ requestId }) =>
+    ({ requestId, family: "access", provenance: { kind: "human", staffUserId: administratorId, at: new Date(SETTLED_EVENT_AT).toISOString() } })));
   const env = {
     VERCEL_ENV: "production", SAV_CASE_RECORDING: "on", SAV_V2_ENTRY: "on", SAV_V2_OWNER_HANDOVER: "on",
     SAV_V2_HUBSPOT_OWNER_ID: OWNER, SAV_INTAKE_EXECUTION_MODE: "execute", SAV_INTAKE_EXECUTION_POLICY_ID: policyId, SAV_INTAKE_EXECUTION_POLICY_SHA256: policyHash,
@@ -431,17 +442,75 @@ describe("owner handover from HubSpot's existing webhook", () => {
     expect(oldMarker).toMatchObject({ status: "complete", lastError: null, processedCount: 1 });
   });
 
-  it("LIMIT (documented, not bypassed): a mail V1 never executed (dossier « Traité hors Studio ») is not taken: no V1-confirmed input to relay", async () => {
-    const input = await scheduled();
-    const mail = await storedMail(input.ticketId);
-    // « Traité hors Studio »: the team handled the mail outside the Studio; V1 has no confirmed execution for it.
+  /** « Traité hors Studio »: the team handled the mail outside the Studio; V1 has no execution for it at all. */
+  async function mailV1NeverExecuted(ticketId: string) {
+    const mail = await storedMail(ticketId);
     await database.db.delete(savIntakeEffects).where(inArray(savIntakeEffects.executionId,
       database.db.select({ id: savIntakeExecutions.id }).from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, mail.messageId))));
     await database.db.delete(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, mail.messageId));
-    liveTicket(input.ticketId);
-    await expect(wake(input)).resolves.toEqual({ status: "read_or_relay_failed" });
-    expect(await readCaseByTicket(input.ticketId)).toBeNull();
-    expect(fixture.threadless).not.toHaveBeenCalled();
+    return mail;
+  }
+
+  it("SAV-99 (Ugo 19/11, ticket 455114077405): a mail V1 never executed (« Traité hors Studio ») is TAKEN on its thread, no V1 proof asked; once, no duplicate", async () => {
+    const input = await scheduled();
+    const mail = await mailV1NeverExecuted(input.ticketId);
+    liveTicket(input.ticketId, { contact: CLIENT });
+    await expect(wake(input)).resolves.toEqual({ status: "relayed" });
+    const handed = await readCaseByTicket(input.ticketId);
+    expect(handed).toMatchObject({ owner: "agent", phase: "queued", threadIds: [mail.threadId] });
+    const events = await listCaseEvents(handed!.caseId);
+    const inbound = events.filter(event => event.kind === "inbound_confirmed");
+    expect(inbound).toHaveLength(1);
+    expect(inbound[0]!.detail).toMatchObject({ messageId: mail.messageId, relay: { kind: "owner_handover_mail", messageId: mail.messageId, ticketId: input.ticketId } });
+    // The agent's own reading of the mail (the V2 entry's block evidence on the stored mail), never V1's; the sender is the ticket's contact.
+    expect(fixture.blockEvidence).toHaveBeenCalledOnce();
+    expect(fixture.blockEvidence.mock.calls[0]!.slice(1, 4)).toEqual([mail.messageId, mail.gmailId, [{ requestId: `${mail.gmailId}/owner-handover`, kind: "support" }]]);
+    expect(fixture.continueCase).toHaveBeenCalledOnce();
+    expect(fixture.handBack).not.toHaveBeenCalled();
+    // Replays: the marker is done, a direct relay of the same mail appends nothing.
+    await expect(wake(input)).resolves.toEqual({ status: "not_due_or_claimed" });
+    expect((await listCaseEvents(handed!.caseId)).filter(event => event.kind === "inbound_confirmed")).toHaveLength(1);
+  });
+
+  it("SAV-99: a manual handover keeps its guards: the team's reply is the latest (awaits the customer), a sender who is not the ticket's contact, sensitive wording", async () => {
+    const waiting = await scheduled();
+    const mail = await mailV1NeverExecuted(waiting.ticketId);
+    fixture.gmail.mockResolvedValue({ id: mail.gmailThreadId, messages: [
+      { id: mail.gmailId, threadId: mail.gmailThreadId, internalDate: String(INBOUND_AT), payload: { headers: [{ name: "From", value: CLIENT }] } },
+      { id: "synthetic-sent", threadId: mail.gmailThreadId, labelIds: ["SENT"], internalDate: String(INBOUND_AT + 1000), payload: { headers: [{ name: "From", value: MAILBOX }] } },
+    ] });
+    liveTicket(waiting.ticketId, { contact: CLIENT });
+    await expect(wake(waiting)).resolves.toEqual({ status: "awaiting_customer" });
+    expect(fixture.continueCase).not.toHaveBeenCalled();
+
+    const stranger = await scheduled();
+    await mailV1NeverExecuted(stranger.ticketId);
+    liveTicket(stranger.ticketId, { contact: "someone-else@example.invalid" });
+    await expect(wake(stranger)).resolves.toEqual({ status: "handed_back:identity_mismatch" });
+    expect(await readCaseByTicket(stranger.ticketId)).toBeNull();
+
+    const sensitive = await scheduled();
+    const sensitiveMail = await mailV1NeverExecuted(sensitive.ticketId);
+    await database.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: "Je veux résilier mon abonnement et être remboursé." }) }).where(eq(savMessages.id, sensitiveMail.messageId));
+    liveTicket(sensitive.ticketId, { contact: CLIENT });
+    await expect(wake(sensitive)).resolves.toEqual({ status: "handed_back:sensitive_request" });
+    expect(await readCaseByTicket(sensitive.ticketId)).toBeNull();
+    expect(fixture.handBack.mock.calls.map(call => call[1])).toEqual(["identity_mismatch", "sensitive_request"]);
+  });
+
+  it("SAV-99: a thread tied to another ticket, or V1's execution on another ticket, goes back to the team", async () => {
+    const other = await scheduled();
+    const mail = await storedMail(other.ticketId);
+    await database.db.update(savIntakeExecutions).set({ ticketId: "999999999" }).where(eq(savIntakeExecutions.messageId, mail.messageId));
+    liveTicket(other.ticketId, { contact: CLIENT });
+    await expect(wake(other)).resolves.toEqual({ status: "handed_back:thread_ambiguous" });
+
+    const tied = await scheduled();
+    const tiedMail = await storedMail(tied.ticketId);
+    await database.db.update(savThreads).set({ hubspotTicketId: "999999998" }).where(eq(savThreads.id, tiedMail.threadId));
+    await database.db.update(savIntakeExecutions).set({ ticketId: tied.ticketId }).where(eq(savIntakeExecutions.messageId, tiedMail.messageId));
+    liveTicket(tied.ticketId);
+    await expect(wake(tied)).resolves.toEqual({ status: "handed_back:thread_ambiguous" });
     expect(fixture.continueCase).not.toHaveBeenCalled();
   });
 
@@ -500,7 +569,9 @@ describe("owner handover from HubSpot's existing webhook", () => {
     await storedMail(input.ticketId);
     liveTicket(input.ticketId);
     fixture.relayDeps = admission("usage");
-    await expect(wake(input)).resolves.toEqual({ status: "owner_handover_out_of_scope" });
+    // SAV-99 (Ugo 19/11): no longer left in the agent's name with nobody on it: given back to the team, once, with no mail.
+    await expect(wake(input)).resolves.toEqual({ status: "handed_back:out_of_scope" });
+    expect(fixture.handBack).toHaveBeenCalledExactlyOnceWith(input, "out_of_scope");
     expect(await readCaseByTicket(input.ticketId)).toBeNull();
     expect(fixture.continueCase).not.toHaveBeenCalled();
   });

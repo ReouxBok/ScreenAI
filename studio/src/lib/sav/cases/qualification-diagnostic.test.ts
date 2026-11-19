@@ -105,6 +105,8 @@ describe("caseQualificationPrecheck: the journal check shared by qualify and the
     ["an unreadable relay proof", [ev(3, { detail: { messageId, relay: { kind: "invented" } } })], 3, { outcome: "blocked", block: "relay_proof_invalid" }],
     ["a proof of another message", [ev(3, { detail: { messageId: randomUUID(), relay } })], 3, { outcome: "blocked", block: "relay_proof_invalid" }],
     ["a source that is not an email", [ev(3, { sourceRef: { type: "studio_command", id: "c" } })], 3, { outcome: "blocked", block: "relay_proof_invalid" }],
+    // SAV-99: a mail a person's assignment handed over (V1 never executed it) is an input like a V1-confirmed one.
+    ["a manually handed-over mail", [ev(3, { detail: { messageId, relay: { kind: "owner_handover_mail", messageId, ticketId: "455114077405" } } })], 3, { outcome: "eligible", gmailMessageId: "gm-3" }],
     ["an acknowledgement", [ev(3, { detail: { messageId, relay: { kind: "acknowledgement_on_case_thread", messageId, intakeRunId: runId, intakeRunVersion: 2, sourceHash: "syn" } } })], 3, { outcome: "blocked", block: "acknowledgement_input" }],
   ];
   it.each(cases)("%s", (_label, events, inputVersion, expected) => {

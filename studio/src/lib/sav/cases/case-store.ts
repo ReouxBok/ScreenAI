@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { and, asc, count, desc, eq, gt, gte, like, lte, max, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { savCaseEvents, savCaseReplyValidations, savCaseTimers, savCases, savIntakeEffects, savIntakeExecutions, savSyncState, savThreads } from "@/db/schema";
+import { savCaseEvents, savCaseReplyValidations, savCaseTimers, savCases, savIntakeEffects, savIntakeExecutions, savMessages, savSyncState, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { readCaseBlockHold } from "./case-block-hold";
@@ -264,6 +264,14 @@ async function attributionProven(tx: CaseTx, proof: CaseAttributionProof, ticket
   if (proof.ticketId !== ticketId) return false;
   // The owner read now (4/11): the reading is the relay's, one CRM GET just before this lock. What is checked here is that V1 really confirmed this mail on this very ticket:
   // a creation that stayed uncertain, or that acknowledged another ticket, is no confirmation, whoever the owner is.
+  if (proof.kind === "hubspot_owner_read" && proof.handover === "manual") {
+    // SAV-99: no V1 execution at all for this mail, and its thread is the one the ticket links (one thread, this ticket): the person's assignment is the proof.
+    const [execution] = await tx.select({ id: savIntakeExecutions.id }).from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, proof.messageId)).for("share");
+    if (execution) return false;
+    const [mail] = await tx.select({ ticketId: savThreads.hubspotTicketId }).from(savMessages).innerJoin(savThreads, eq(savThreads.id, savMessages.threadId))
+      .where(and(eq(savMessages.id, proof.messageId), eq(savMessages.direction, "inbound")));
+    return mail?.ticketId === ticketId;
+  }
   if (proof.kind === "hubspot_owner_read") {
     const [execution] = await tx.select({ id: savIntakeExecutions.id, ticketId: savIntakeExecutions.ticketId, state: savIntakeExecutions.state }).from(savIntakeExecutions)
       .where(eq(savIntakeExecutions.messageId, proof.messageId)).for("share");
@@ -380,6 +388,8 @@ type ThreadlessCaseStart = {
   source: ThreadlessTicketSource; ownerTransitionKey: string; observedAt: string;
   admission?: CaseAdmissionInput; request?: CaseOpenedRequest; waitReason?: string;
   env?: Env; assertFresh?: (tx: CaseTx) => Promise<boolean>;
+  /** SAV-99: a ticket handed back to the team (a wait reason only) may have local mail: its case is born with the team all the same, with no thread. */
+  handback?: boolean;
 };
 type ThreadlessCaseStartResult =
   | { status: "created" | "existing_case"; case: CaseSnapshot }
@@ -405,7 +415,7 @@ export async function openCaseFromHubspotTicket(input: ThreadlessCaseStart): Pro
     const pauses = await Promise.all([readSavAgentPause(tx, "intake"), readSavAgentPause(tx, "v2")]);
     if (pauses.some(pause => pause.invalid || pause.level !== "running")) return { status: "paused" };
     const [existing] = await tx.select().from(savCases).where(eq(savCases.ticketId, ticketId)).for("update");
-    if (existing?.threadIds.length || await hasLocalThreadForTicket(ticketId, tx)) return { status: "existing_thread" };
+    if (existing?.threadIds.length || (!(input.handback && detail.waitReason) && await hasLocalThreadForTicket(ticketId, tx))) return { status: "existing_thread" };
     if (existing) return { status: "existing_case", case: toSnapshot(existing) };
     if (input.assertFresh && !await input.assertFresh(tx)) return { status: "unavailable" };
     const body: CaseBody = { ...emptyCaseBody(), handoff: detail.waitReason ? { reason: detail.waitReason } : null,

@@ -85,7 +85,7 @@ export function serializeCaseQualificationUnavailable(error: unknown): CaseQuali
 }
 
 export type CaseQualificationPrecheck =
-  | { outcome: "eligible"; inputKey: string; inputVersion: number; event: CaseEvent; relay: Extract<CaseRelayProof, { kind: "intake_effects_confirmed" }>; gmailMessageId: string }
+  | { outcome: "eligible"; inputKey: string; inputVersion: number; event: CaseEvent; relay: Extract<CaseRelayProof, { kind: "intake_effects_confirmed" | "owner_handover_mail" }>; gmailMessageId: string }
   | { outcome: "null"; state: "no_customer_input" | "input_not_current"; inputKey: string | null; inputVersion: number }
   | { outcome: "blocked"; block: CaseJournalQualificationBlock; inputKey: string; inputVersion: number };
 
@@ -107,7 +107,8 @@ export function caseQualificationPrecheck(snapshot: Pick<CaseSnapshot, "admissio
   const relay = caseRelayProofSchema.safeParse(event.detail?.relay);
   if (!relay.success || event.detail?.messageId !== relay.data.messageId || event.sourceRef?.type !== "email")
     return { outcome: "blocked", block: "relay_proof_invalid", inputKey, inputVersion };
-  if (relay.data.kind !== "intake_effects_confirmed") return { outcome: "blocked", block: "acknowledgement_input", inputKey, inputVersion };
+  // SAV-99: a mail a person's assignment handed over (V1 never executed it) is an input like a V1-confirmed one; its reading is the handover's own.
+  if (relay.data.kind === "acknowledgement_on_case_thread") return { outcome: "blocked", block: "acknowledgement_input", inputKey, inputVersion };
   return { outcome: "eligible", inputKey, inputVersion, event, relay: relay.data, gmailMessageId: event.sourceRef.id };
 }
 

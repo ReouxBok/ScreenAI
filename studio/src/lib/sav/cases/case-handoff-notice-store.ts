@@ -26,11 +26,12 @@ import type { Effect, EffectIntent, Execution, ExecutionOptions, ExecutionPayloa
 import { savIntakeRuntimeConfig } from "../intake/runtime-contract";
 import { ownedExecution, settleVerification } from "./case-effect-driver";
 import { caseEffectSchemaInstalled } from "./case-effect-recovery";
+import { ticketHandbackSchemaInstalled } from "./case-schema-v11";
 import { createHandoffCrmReader, type HandoffCrmReader } from "./case-handoff-crm";
 import { nextSweepPage } from "./case-sweep-cursor";
 import {
   buildHandoffNoticeIntent, HANDOFF_NOTICE_CONTRACT, handoffNoteText, HANDOFF_NOTICE_KEY_PREFIX, awaitingHandoff, staleHandoffEventKinds, handoffNoticeFacts, handoffNoticeKey, handoffNoticeTrigger,
-  judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, teamPartNoticeTriggers, type HandoffNoticeFacts, type HandoffNoticeTrigger,
+  agentNotTakenNoticeTrigger, judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, teamPartNoticeTriggers, type HandoffNoticeFacts, type HandoffNoticeTrigger,
 } from "./case-handoff-notice";
 import { createHandoffSlackAdapters, SLACK_NOT_POSTED_PREFIX } from "./case-handoff-slack";
 import type { CaseHandoffReceived } from "./case-handoff-summary";
@@ -41,6 +42,7 @@ import { caseNoteAssociationKey, caseNoteKey, SAV_CASE_EFFECT_PERMISSIONS } from
 import { createIntakeExecutorAdapters } from "../intake/execution-adapters";
 import { investigationHandoffCommand } from "./investigation-record";
 import { lockCaseForWrite, listCaseEvents, readCase } from "./case-store";
+import { caseNotTakenWhy } from "./case-reply-summary-note";
 
 const LEASE_MS = 80_000;
 /** After this many refusals by Slack itself (nothing posted) the effect is no longer taken back: it is verified and left to a person. */
@@ -114,10 +116,14 @@ export async function enqueueHandoffNotice(input: Readonly<{ caseId: string; pol
   const events = await readJournal(snapshot.caseId), trigger = handoffNoticeTrigger(snapshot, events);
   // SAV-92 (review of batch 2, finding 1): the latest decision's notice, then every team part an earlier input still owes the team (same key per input: idempotent).
   const parts = teamPartNoticeTriggers(snapshot, events).filter(part => !trigger.ok || part.inputKey !== trigger.inputKey);
-  const all = [...(trigger.ok ? [trigger] : []), ...parts].filter(one => input.inputKey === undefined || one.inputKey === input.inputKey);
-  if (!all.length) return { ok: false, code: "no_trigger", why: trigger.ok ? "input_other" : trigger.why };
-  const threadId = snapshot.threadIds.at(-1);
-  if (!threadId) return { ok: false, code: "no_thread" };
+  // SAV-99 (Ugo 19/11): a ticket a person gave the agent, that the agent did not take, is born with the team: no investigation, its own fixed notice, and
+  // possibly no thread (a ticket without mail); its key is `handoff-notice:<case>:ticket:<event>` (0055 lets that one execution have no thread).
+  const notTaken = !trigger.ok && !parts.length ? agentNotTakenNoticeTrigger(snapshot, events, caseNotTakenWhy) : null;
+  const all = [...(trigger.ok ? [trigger] : []), ...parts, ...(notTaken?.ok ? [notTaken] : [])].filter(one => input.inputKey === undefined || one.inputKey === input.inputKey);
+  if (!all.length) return { ok: false, code: "no_trigger", why: trigger.ok ? "input_other" : notTaken?.ok === false && notTaken.why !== "not_handoff" ? notTaken.why : trigger.why };
+  const threadId = snapshot.threadIds.at(-1) ?? null;
+  if (!threadId && !(all.length === 1 && notTaken?.ok)) return { ok: false, code: "no_thread" };
+  if (!threadId && !await ticketHandbackSchemaInstalled(requireDb())) return { ok: false, code: "no_thread", why: "schema_v11_missing" };
   const attachments = await readReceivedAttachments(snapshot.threadIds);
   let first: EnqueueHandoffNoticeResult | null = null;
   for (const one of all) {
@@ -127,10 +133,11 @@ export async function enqueueHandoffNotice(input: Readonly<{ caseId: string; pol
   return first!;
 }
 
-async function admitHandoffNotice(trigger: Extract<HandoffNoticeTrigger, { ok: true }>, snapshot: NonNullable<Awaited<ReturnType<typeof readCase>>>, threadId: string,
+async function admitHandoffNotice(trigger: Extract<HandoffNoticeTrigger, { ok: true }>, snapshot: NonNullable<Awaited<ReturnType<typeof readCase>>>, threadId: string | null,
   attachments: Awaited<ReturnType<typeof readReceivedAttachments>>, teamOwnerId: string | null, policy: Readonly<{ id: string; hash: string }>): Promise<EnqueueHandoffNoticeResult> {
   const key = handoffNoticeKey(trigger.caseId, trigger.inputKey);
-  const facts = handoffNoticeFacts(trigger, snapshot.body, attachments), note = handoffNoteOf(facts, new Date().toISOString());
+  // SAV-99: a ticket the agent did not take already gets its one short note from its hand-over stage (`case-ticket-stage-store.ts`): no second note here.
+  const facts = handoffNoticeFacts(trigger, snapshot.body, attachments), note = trigger.reason === "agent_not_taken" ? undefined : handoffNoteOf(facts, new Date().toISOString());
   const payload: HandoffNoticePayload = { contract: HANDOFF_NOTICE_CONTRACT, key, facts, teamOwnerId, ...(note ? { note } : {}) };
   return requireDb().transaction(async (tx): Promise<EnqueueHandoffNoticeResult> => {
     const [created] = await tx.insert(savCaseEffectExecutions).values({
@@ -312,7 +319,8 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
       if (existing) return nextNoteIntent(lease, effects, options);
       const config = readHandoffNoticeConfig(deps.env());
       if (config.mode !== "on") return fault("HOLD_NOTICE_OFF");
-      const [thread] = await requireDb().select({ customerEmail: savThreads.customerEmail }).from(savThreads).where(eq(savThreads.id, lease.row.threadId));
+      // SAV-99: a notice without thread (a ticket without mail the agent did not take) has no customer address to verify the contact with.
+      const [thread] = lease.row.threadId ? await requireDb().select({ customerEmail: savThreads.customerEmail }).from(savThreads).where(eq(savThreads.id, lease.row.threadId)) : [];
       // The CRM reading happens outside any transaction and BEFORE the plan: a failed reading holds the pass (read again later), it never plans an unverified link.
       const reading = await deps.crm({ ticketId: payload.facts.ticketId }, AbortSignal.any([options.signal, AbortSignal.timeout(20_000)]));
       const render = renderHandoffNotice(payload.facts, judgeHandoffCrm(reading, { ticketId: payload.facts.ticketId, customerEmail: thread?.customerEmail ?? null }), config.portalId);

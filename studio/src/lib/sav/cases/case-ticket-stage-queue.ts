@@ -2,9 +2,10 @@
 // « Waiting for the customer » is queued INSIDE the transaction that records a confirmed reply (so a confirmed reply without its stage cannot exist, and a replay or a
 // recovery returns the same row); « closed » is queued by `case-resolution.ts`. This file depends on no driver: the reply driver calls it from its receipt.
 import "server-only";
-import { and, desc, eq, gt, max } from "drizzle-orm";
+import { and, asc, desc, eq, gt, max } from "drizzle-orm";
 import { savCaseEffectExecutions, savCaseEvents } from "@/db/schema";
 import { encryptSavPayload } from "../crypto";
+import { ticketHandbackSchemaInstalled } from "./case-schema-v11";
 import { executionJournal, type ExecutionTx } from "../intake/execution-store";
 import { TICKET_STAGE_CONTRACT, type TicketStagePayload } from "./case-ticket-stage";
 import { caseTeamPartRequests, SAV_CASE_AWAITING_V2_ATTRIBUTION, type CaseSnapshot } from "./case-types";
@@ -38,12 +39,17 @@ export async function lastCustomerInboundAt(tx: ExecutionTx, caseId: string): Pr
  * SAV-92 (17/11): the version of the V2 hand-over still in force, read in the caller's transaction: the case is with the team on a hand-over nobody took yet
  * (`human_takeover` sets `humanSince`; a case waiting for its V2 attribution is not a hand-over). The latest `owner_changed` is then that hand-over.
  */
-export async function openHandoffVersion(tx: ExecutionTx, snapshot: Pick<CaseSnapshot, "caseId" | "owner" | "phase" | "body">): Promise<number | undefined> {
+export async function openHandoffVersion(tx: ExecutionTx, snapshot: Pick<CaseSnapshot, "caseId" | "owner" | "phase" | "body"> & Partial<Pick<CaseSnapshot, "threadIds">>): Promise<number | undefined> {
   const handoff = snapshot.body.handoff;
   if (snapshot.owner !== "human" || snapshot.phase !== "handoff_pending" || !handoff || handoff.humanSince || handoff.reason === SAV_CASE_AWAITING_V2_ATTRIBUTION) return undefined;
   const [row] = await tx.select({ version: savCaseEvents.caseVersion }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, snapshot.caseId), eq(savCaseEvents.kind, "owner_changed")))
     .orderBy(desc(savCaseEvents.caseVersion)).limit(1);
-  return row?.version;
+  if (row || snapshot.threadIds?.length !== 0) return row?.version;
+  // SAV-99 (Ugo 19/11): a ticket a person gave the agent without any mail, that the agent did not take, is born with the team (`openCaseFromHubspotTicket`
+  // with a wait reason): no `owner_changed`, its hand-over is that birth, i.e. its one `crm_observed` input.
+  const [born] = await tx.select({ version: savCaseEvents.caseVersion }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, snapshot.caseId), eq(savCaseEvents.kind, "crm_observed")))
+    .orderBy(asc(savCaseEvents.caseVersion)).limit(1);
+  return born?.version;
 }
 
 /** A's rule on the facts read in the caller's transaction, exactly as the queue applies it (also read by the reply's summary note, SAV-92 16/11, so the
@@ -80,12 +86,14 @@ export async function enqueueCaseTicketStage(tx: ExecutionTx, input: Readonly<{
   if (!planned) return { ok: false, reason: "key_invalid" };
   if (!planned.plan) return { ok: false, reason: planned.reason };
   const threadId = input.threadId ?? snapshot.threadIds.at(-1);
-  if (!threadId) return { ok: false, reason: "no_thread" };
+  // SAV-99: the hand-over of a ticket without any mail (no thread) is the one stage that needs none; every other stage keeps its thread.
+  const threadless = input.trigger.kind === "handoff_recorded" && !snapshot.threadIds.length;
+  if (!threadId && (!threadless || !await ticketHandbackSchemaInstalled(tx))) return { ok: false, reason: "no_thread" };
   const key = planned.intent.key;
   const payload: TicketStagePayload = { contract: TICKET_STAGE_CONTRACT, intent: planned.intent, trigger: input.trigger,
     ...(planned.intent.target === "closed" && input.closureFamilies ? { closureFamilies: [...new Set(input.closureFamilies)].slice(0, 20) } : {}) };
   const [created] = await tx.insert(savCaseEffectExecutions).values({
-    caseId: snapshot.caseId, replyKey: key, threadId, policyId: input.policy.id, policyHash: input.policy.hash, payloadCiphertext: encryptSavPayload(payload),
+    caseId: snapshot.caseId, replyKey: key, threadId: threadId ?? null, policyId: input.policy.id, policyHash: input.policy.hash, payloadCiphertext: encryptSavPayload(payload),
   }).onConflictDoNothing().returning({ id: savCaseEffectExecutions.id });
   if (created) {
     await executionJournal(tx, created.id, "ticket_stage_admitted", { key, target: planned.intent.target, trigger: input.trigger.kind });

@@ -1,6 +1,6 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, isNull, or, sql } from "drizzle-orm";
+import { and, asc, eq, isNull, like, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savCaseEffectExecutions, savIntakeEffects, savMessages, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
@@ -276,6 +276,9 @@ export async function runThreadlessEffectsPass(deps: PassDeps) {
   const db = requireDb();
   if (!await threadlessSchemaInstalled(db)) return [];
   const rows = await db.select().from(parents).where(and(isNull(parents.threadId),
+    // SAV-99: only the first mail of a ticket (`reply:<case>:ticket:<event>`). The hand-over stage and notice of a ticket without mail (0055) have no thread
+    // either; they have their own passes (`case-ticket-stage-store.ts`, `case-handoff-notice-store.ts`).
+    like(parents.replyKey, "reply:%"),
     ...(deps.executionId ? [eq(parents.id, deps.executionId)] : []),
     sql`${parents.state} not in ('confirmed', 'refused')`,
     // OFF preserves only read-back of a previously written marker. An untouched deployment has no such rows.

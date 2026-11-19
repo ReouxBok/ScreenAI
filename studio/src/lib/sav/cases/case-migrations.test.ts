@@ -15,7 +15,7 @@ const MIGRATIONS = new URL("../../../../drizzle/", import.meta.url);
 const MCP = "0045_studio_mcp_tokens", TICKET_STAGE = "0053_sav_case_ticket_stage";
 const V2 = [
   "0046_sav_cases", "0047_sav_case_admission", "0048_sav_case_relay_claim_timers", "0049_sav_case_calls",
-  "0050_sav_case_effects", "0051_sav_case_reply_validations", "0052_sav_case_handoff_notice", TICKET_STAGE, "0054_sav_case_new_thread",
+  "0050_sav_case_effects", "0051_sav_case_reply_validations", "0052_sav_case_handoff_notice", TICKET_STAGE, "0054_sav_case_new_thread", "0055_sav_case_ticket_handback",
 ];
 const LAST = V2.at(-1)!;
 const MCP_MIGRATION_COUNT = 40, FULL_MIGRATION_COUNT = MCP_MIGRATION_COUNT + V2.length;
@@ -85,7 +85,7 @@ describe("V2 case migrations after MCP 0045", () => {
       expect(await applied(client)).toBe(FULL_MIGRATION_COUNT);
       for (const table of ["sav.cases", "sav.case_events", "sav.case_timers", "sav.case_calls", "sav.case_effect_executions", "sav.case_reply_validations"]) expect(await exists(client, table)).toBe(true);
       expect((await client.query("SELECT key FROM sav.sync_state WHERE key LIKE 'sav-case-schema-%' AND status = 'installed' ORDER BY key")).rows)
-        .toEqual([10, 2, 3, 4, 5, 6, 7, 8, 9].map(version => ({ key: `sav-case-schema-v${version}` })));
+        .toEqual([10, 11, 2, 3, 4, 5, 6, 7, 8, 9].map(version => ({ key: `sav-case-schema-v${version}` })));
       expect((await client.query("SELECT tgname FROM pg_trigger WHERE tgname LIKE 'sav\\_%' AND NOT tgisinternal AND tgname IN ('sav_case_events_append_only', 'sav_case_timers_guard', 'sav_case_calls_guard', 'sav_intake_effects_parent', 'sav_intake_effect_journal_parent', 'sav_intake_executions_effect_children', 'sav_case_effect_executions_effect_children', 'sav_case_reply_validations_guard', 'sav_intake_effects_parent_kind') ORDER BY tgname")).rows.map(r => (r as { tgname: string }).tgname))
         .toEqual(["sav_case_calls_guard", "sav_case_effect_executions_effect_children", "sav_case_events_append_only", "sav_case_reply_validations_guard", "sav_case_timers_guard", "sav_intake_effect_journal_parent", "sav_intake_effects_parent", "sav_intake_effects_parent_kind", "sav_intake_executions_effect_children"]);
       await client.query(`INSERT INTO sav.cases(id, ticket_id, owner, phase, contract_revision, payload_ciphertext) VALUES ('${CASE}', '42', 'human', 'human_owned', 'fixture', 'fixture')`);
@@ -104,7 +104,7 @@ describe("V2 case migrations after MCP 0045", () => {
     await withDb(async (client, root) => {
       const db = drizzle(client);
       await migrate(db, { migrationsFolder: await folderUpTo(root, TICKET_STAGE) });
-      expect(await applied(client)).toBe(FULL_MIGRATION_COUNT - 1);
+      expect(await applied(client)).toBe(FULL_MIGRATION_COUNT - 2);
       const ids = {
         policy: "30000000-0000-4000-8000-000000000031", thread: "30000000-0000-4000-8000-000000000032",
         oldExecution: "30000000-0000-4000-8000-000000000033", newExecution: "30000000-0000-4000-8000-000000000034",
@@ -139,6 +139,54 @@ describe("V2 case migrations after MCP 0045", () => {
       await insertEffect(ids.newExecution, `crm-email:${ticketKey}`, "new_thread_crm_email");
       await expect(insertEffect(ids.newExecution, "wrong-ticket-effect", "reply_send")).rejects.toThrow("cannot belong to this case execution");
       await expect(insertEffect(ids.oldExecution, "wrong-thread-effect", "new_thread_send")).rejects.toThrow("cannot belong to this case execution");
+    });
+  }, 60_000);
+
+  it("0055 (SAV-99) is additive: rows 0054 accepted stay valid, and only a ticket's hand-over stage and notice may have no thread, with their own effect kinds", async () => {
+    await withDb(async (client, root) => {
+      const db = drizzle(client);
+      await migrate(db, { migrationsFolder: await folderUpTo(root, "0054_sav_case_new_thread") });
+      const ids = { policy: "30000000-0000-4000-8000-000000000041", thread: "30000000-0000-4000-8000-000000000042", reply: "30000000-0000-4000-8000-000000000043",
+        ticket: "30000000-0000-4000-8000-000000000044", stage: "30000000-0000-4000-8000-000000000045", notice: "30000000-0000-4000-8000-000000000046",
+        event: "30000000-0000-4000-8000-000000000047", other: "30000000-0000-4000-8000-000000000048" };
+      await client.query(`INSERT INTO public.staff_users(id, clerk_id, email, role) VALUES ('${STAFF}', 'fixture-clerk', 'fixture@example.invalid', 'admin')`);
+      await client.query(`INSERT INTO sav.intake_execution_policies(id, revision, state, administrator_id, policy_hash, payload_ciphertext) VALUES ('${ids.policy}', 'fixture', 'approved', '${STAFF}', 'h', 'c')`);
+      await client.query(`INSERT INTO sav.cases(id, ticket_id, owner, phase, contract_revision, payload_ciphertext) VALUES ('${CASE}', '42', 'human', 'human_owned', 'fixture', 'fixture')`);
+      const insertExecution = (id: string, key: string, threadId: string | null) => client.query(
+        "INSERT INTO sav.case_effect_executions(id, case_id, reply_key, thread_id, policy_id, policy_hash, payload_ciphertext) VALUES ($1, $2, $3, $4, $5, 'h', 'c')", [id, CASE, key, threadId, ids.policy]);
+      const insertEffect = (execution: string, key: string, kind: string) => client.query(
+        "INSERT INTO sav.intake_effects(business_key, execution_id, kind, permission, intent_hash, intent_ciphertext) VALUES ($1, $2, $3, 'fixture', 'h', 'c')", [key, execution, kind]);
+      const stageKey = `case-stage:${CASE}:handoff:handoff-v2`, noticeKey = `handoff-notice:${CASE}:ticket:${ids.event}`, ticketKey = `reply:${CASE}:ticket:${ids.event}`;
+      // Before 0055: what the old code writes, and the two new shapes refused.
+      await insertExecution(ids.reply, `reply:${CASE}:inbound:fixture-mail`, ids.thread);
+      await insertEffect(ids.reply, "reply-effect", "reply_send");
+      await insertExecution(ids.ticket, ticketKey, null);
+      await insertEffect(ids.ticket, "first-mail", "new_thread_send");
+      await expect(insertExecution(ids.stage, stageKey, null)).rejects.toThrow("case_effect_executions_source_thread");
+
+      await migrate(db, { migrationsFolder: await folderUpTo(root, LAST) });
+      expect(await applied(client)).toBe(FULL_MIGRATION_COUNT);
+      expect((await client.query("SELECT id FROM sav.case_effect_executions ORDER BY id")).rows).toEqual([{ id: ids.reply }, { id: ids.ticket }]);
+      // The old code's writes are accepted exactly as before.
+      await insertEffect(ids.reply, "reply-note", "note_create");
+      await insertEffect(ids.ticket, "first-mail-crm", "new_thread_crm_email");
+      await expect(insertEffect(ids.ticket, "first-mail-reply", "reply_send")).rejects.toThrow("cannot belong to this case execution");
+      await expect(insertExecution(ids.other, `reply:${CASE}:inbound:other-fixture-mail`, null)).rejects.toThrow("case_effect_executions_source_thread");
+      await expect(insertExecution(ids.other, `case-stage:${CASE}:waiting_customer:fixture`, null)).rejects.toThrow("case_effect_executions_source_thread");
+      // The two new shapes: a hand-over stage and its notice without a thread, each with its own kinds only.
+      await insertExecution(ids.stage, stageKey, null);
+      await insertEffect(ids.stage, "stage-note", "note_create");
+      await insertEffect(ids.stage, "stage-note-link", "note_associate");
+      await insertEffect(ids.stage, stageKey, "ticket_stage");
+      await expect(insertEffect(ids.stage, "stage-mail", "new_thread_send")).rejects.toThrow("cannot belong to this case execution");
+      await expect(insertEffect(ids.stage, "stage-reply", "reply_send")).rejects.toThrow("cannot belong to this case execution");
+      await insertExecution(ids.notice, noticeKey, null);
+      await insertEffect(ids.notice, noticeKey, "handoff_notify");
+      await expect(insertEffect(ids.notice, "notice-stage", "ticket_stage")).rejects.toThrow("cannot belong to this case execution");
+      await expect(insertEffect(ids.notice, "notice-mail", "new_thread_send")).rejects.toThrow("cannot belong to this case execution");
+      // A second migrate changes nothing.
+      await migrate(db, { migrationsFolder: await folderUpTo(root, LAST) });
+      expect(await applied(client)).toBe(FULL_MIGRATION_COUNT);
     });
   }, 60_000);
 

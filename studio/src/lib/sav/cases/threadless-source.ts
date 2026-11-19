@@ -103,8 +103,12 @@ async function readContact(read: ReadHubspot, ticketUrl: string, env: Env): Prom
   return { contact: { id: contactId, email: address.data } };
 }
 
-/** Strict reads at the entry and the final send gate. An incomplete CRM read proves neither identity nor absence of a mail. */
-export async function readThreadlessTicket(ticketId: string, env: Env = process.env): Promise<ThreadlessTicketRead> {
+/**
+ * Strict reads at the entry and the final send gate. An incomplete CRM read proves neither identity nor absence of a mail.
+ * SAV-99 `handback` (Ugo 19/11): the read of a ticket the agent will NOT take, to give it back to the team (`handBackOwnerHandoverTicket`): a mail on the
+ * ticket, a ticket V1 made or a stage other than « Nouveau » / « en attente équipe » does not stop it (nothing is sent); support pipeline, open, V2 owner do.
+ */
+export async function readThreadlessTicket(ticketId: string, env: Env = process.env, options: Readonly<{ handback?: boolean }> = {}): Promise<ThreadlessTicketRead> {
   if (!savV2NewThreadEnabled(env)) return { status: "off" };
   const owner = v2OwnerConfiguration(env);
   if (!id.safeParse(ticketId).success || !owner.ok || !env.HUBSPOT_ACCESS_TOKEN) return { status: "unavailable" };
@@ -123,11 +127,13 @@ export async function readThreadlessTicket(ticketId: string, env: Env = process.
     if (properties.hs_pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId) return { status: "out_of_scope" };
     if (properties.hs_pipeline_stage === SAV_HUBSPOT_SUPPORT.stages.closed) return { status: "closed" };
     if (properties.hubspot_owner_id !== owner.ownerId) return { status: "owner_changed" };
-    const mailPage = associationsPage.parse(await read(`${ticketUrl}/associations/emails?limit=1`));
-    if (mailPage.results.length || mailPage.paging?.next) return { status: "existing_thread" };
-    if (properties.source_type === SAV_HUBSPOT_SUPPORT.source) return { status: "unavailable" };
-    if (![SAV_HUBSPOT_SUPPORT.stages.new, SAV_HUBSPOT_SUPPORT.stages.awaitingTeam].some(stage => stage === properties.hs_pipeline_stage))
-      return { status: "out_of_scope" };
+    if (!options.handback) {
+      const mailPage = associationsPage.parse(await read(`${ticketUrl}/associations/emails?limit=1`));
+      if (mailPage.results.length || mailPage.paging?.next) return { status: "existing_thread" };
+      if (properties.source_type === SAV_HUBSPOT_SUPPORT.source) return { status: "unavailable" };
+      if (![SAV_HUBSPOT_SUPPORT.stages.new, SAV_HUBSPOT_SUPPORT.stages.awaitingTeam].some(stage => stage === properties.hs_pipeline_stage))
+        return { status: "out_of_scope" };
+    }
     const notes = await readNotes(read, ticketUrl);
     const identity = await readContact(read, ticketUrl, env);
     const current = ticketRecord.parse(await read(ticketPath));
@@ -141,6 +147,18 @@ export async function readThreadlessTicket(ticketId: string, env: Env = process.
     };
     return "reason" in identity ? { status: "human_wait", reason: identity.reason, source } : { status: "ready", source };
   } catch { return { status: "unavailable" }; }
+}
+
+/**
+ * SAV-99 (Ugo 19/11): the ticket's one contact, for a mail a person's assignment handed over (V1 never identified its sender): the same strict read as a ticket
+ * without mail. Throws when HubSpot cannot be read (asked again later), never guesses.
+ */
+export async function readOwnerHandoverContact(ticketId: string, env: Env = process.env) {
+  if (!id.safeParse(ticketId).success || !env.HUBSPOT_ACCESS_TOKEN) throw Error("SAV_OWNER_HANDOVER_CONTACT_UNAVAILABLE");
+  const headers = { Authorization: `Bearer ${env.HUBSPOT_ACCESS_TOKEN}`, Accept: "application/json", "Content-Type": "application/json" };
+  const signal = AbortSignal.timeout(20_000);
+  const read: ReadHubspot = path => requestSavHubspot(path, { method: "GET", cache: "no-store", signal, headers }, status => `HUBSPOT_HTTP_${status}`);
+  return readContact(read, `/crm/v4/objects/tickets/${ticketId}`, env);
 }
 
 export function threadlessTicketSourceRef(source: ThreadlessTicketSource): SourceRef {

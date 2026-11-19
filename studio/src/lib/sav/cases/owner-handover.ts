@@ -9,9 +9,9 @@ import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "../intake/execution-policy";
 import { normalizeEmailAddress } from "../policy";
 import { readCaseByTicket, type CaseTx } from "./case-store";
-import { caseAwaitsV2Attribution, type CaseSnapshot } from "./case-types";
+import { caseAwaitsV2Attribution, type CaseAdmissionQualification, type CaseSnapshot } from "./case-types";
 import { readCaseTicketStageConfig } from "./customer-return";
-import { recordCaseAfterConfirmedIntake, relayPaused, v2HubspotOwnerId } from "./intake-boundary";
+import { ownerHandoverMailRequest, recordCaseAfterConfirmedIntake, relayOwnerHandoverMail, relayPaused, v2HubspotOwnerId } from "./intake-boundary";
 import { SAV_V2_OWNER_HANDOVER_PERMISSION, savV2OwnerHandoverEnabled } from "./owner-handover-config";
 import {
   claimOwnerHandover, finishOwnerHandover, isHumanOwnerChange, listDueOwnerHandovers, ownerHandoverClaimIsCurrent,
@@ -19,8 +19,13 @@ import {
 } from "./owner-handover-markers";
 import { ownerHandoverPollFloor } from "./owner-handover-poll";
 import { readSavV2QualificationScope } from "./qualification-scope";
-import { startV2FromThreadlessTicket } from "./threadless-entry";
-import { continueCaseAfterCommit, v2EntryRelayDeps } from "./v2-entry";
+import { handBackOwnerHandoverTicket, startV2FromThreadlessTicket } from "./threadless-entry";
+import { readOwnerHandoverContact } from "./threadless-source";
+import { continueCaseAfterCommit, firstBlockEvidence, v2EntryRelayDeps } from "./v2-entry";
+import { SAV_CASE_BLOCK_REGISTRY } from "./case-block-registry";
+import { savCaseSensitiveWording } from "./investigation-return-qualify";
+import { readAccessSkillMode } from "./access-skill/access-skill-rule";
+import { decryptSavPayload } from "../crypto";
 
 const MAILBOX = "contact@limova.ai";
 type Env = Record<string, string | undefined>;
@@ -95,6 +100,29 @@ async function openHandoverTicket(input: OwnerHandoverTransition, ownerId: strin
   return { ticket };
 }
 
+/**
+ * SAV-99 (Ugo 19/11): the agent's own reading of a handed-over mail V1 never executed. Sensitive wording, a sender who is not the ticket's one contact, or a mail
+ * no active block takes: the ticket goes back to the team. Otherwise the block evidence of the V2 entry (Access skill or detectors, block scope, approved rules)
+ * on the stored mail, and the identity of the ticket's contact. A HubSpot read that fails throws (asked again later).
+ */
+async function manualQualification(messageId: string, ticketId: string, env: Env): Promise<{ handBack: string } | { qualification: CaseAdmissionQualification }> {
+  const [message] = await requireDb().select({ gmailId: savMessages.gmailMessageId, from: savMessages.fromEmail, subject: savMessages.subject, body: savMessages.bodyCiphertext })
+    .from(savMessages).where(and(eq(savMessages.id, messageId), eq(savMessages.direction, "inbound")));
+  if (!message?.gmailId) return { handBack: "thread_unreadable" };
+  const text = decryptSavPayload<{ text?: unknown }>(message.body)?.text;
+  if (typeof text !== "string" || !text.trim()) return { handBack: "thread_unreadable" };
+  // As at every entry: under SAV-97 `on` the Access skill reads sensitivity itself (a sensitive reading admits nobody); before it, the lexical veto.
+  if (readAccessSkillMode(env) !== "on" && savCaseSensitiveWording(text, message.subject)) return { handBack: "sensitive_request" };
+  const read = await readOwnerHandoverContact(ticketId, env);
+  if (!read.contact) return { handBack: read.reason };
+  if (read.contact.email !== normalizeEmailAddress(message.from)) return { handBack: "identity_mismatch" };
+  const request = ownerHandoverMailRequest(message.gmailId);
+  const requests = await firstBlockEvidence(env, messageId, message.gmailId, [request], SAV_CASE_BLOCK_REGISTRY,
+    { run: { runId: null, runVersion: null }, accessSkillCompute: "always" });
+  if (requests.every(row => row.provenance.kind === "team_part")) return { handBack: "no_block_match" };
+  return { qualification: { requests, identity: { status: "confirmed", source: { type: "hubspot_object", id: read.contact.id } }, crmContext: "complete", teamSignals: [] } };
+}
+
 async function processOwnerHandover(input: OwnerHandoverTransition, claim: Claim, env: Env, options: Options): Promise<string> {
   const db = requireDb(), ownerId = v2HubspotOwnerId(env);
   if (!ownerId) return "owner_unconfigured";
@@ -110,33 +138,42 @@ async function processOwnerHandover(input: OwnerHandoverTransition, claim: Claim
   const { policy } = await readIntakeExecutionAuthority(config);
   if (!policy.mutations.includes(SAV_V2_OWNER_HANDOVER_PERMISSION)) return "permission_missing";
 
+  // SAV-99 (Ugo 19/11): a ticket the agent does not take goes back to the team, once, with no mail (`handBackOwnerHandoverTicket`).
+  const handBack = async (reason: string) => {
+    if (!await ownerHandoverClaimIsCurrent(claim) || await relayPaused(db)) return "superseded_or_paused";
+    const back = await handBackOwnerHandoverTicket(input, reason);
+    return back.status === "human_wait" ? `handed_back:${back.reason}` : `handback_${back.status}`;
+  };
   const linked = await linkedThreads(input.ticketId, current, db);
-  if (!linked || linked.length > 1) return "thread_unresolved";
+  // Several threads for one ticket, or (below) a thread tied to another ticket: the team sorts it out.
+  if (!linked || linked.length > 1) return handBack("thread_ambiguous");
   if (!linked.length) {
     if (scope.mode === "qualification") return "outside_scope";
     if (!await ownerHandoverClaimIsCurrent(claim) || await relayPaused(db)) return "superseded_or_paused";
-    return (await startV2FromThreadlessTicket(input)).status;
+    const started = (await startV2FromThreadlessTicket(input)).status;
+    // A mail on the ticket in HubSpot but no thread in contact@: nothing the agent can answer on, and no new thread over an existing exchange.
+    return started === "existing_thread" ? handBack("thread_unreadable") : started;
   }
 
   const { thread, mailbox } = linked[0]!;
-  if (thread.hubspotTicketId && thread.hubspotTicketId !== input.ticketId) return "thread_unresolved";
-  if (!mailbox.active || mailbox.email !== MAILBOX || mailbox.id !== policy.mailboxId || !thread.gmailThreadId) return "thread_unresolved";
+  if (thread.hubspotTicketId && thread.hubspotTicketId !== input.ticketId) return handBack("thread_ambiguous");
+  if (!mailbox.active || mailbox.email !== MAILBOX || mailbox.id !== policy.mailboxId || !thread.gmailThreadId) return handBack("thread_unreadable");
   if (thread.aiPaused) return "paused";
   const source = await lastStoredInbound(thread.id, db);
   const gmail = await readThreadEnd(thread.gmailThreadId);
-  if (!source || !gmail) return "thread_unresolved";
+  if (!source || !gmail) return handBack("thread_unreadable");
   if (source.gmailId !== gmail.lastInboundId) throw Error("SAV_OWNER_HANDOVER_INBOUND_NOT_SYNCED");
   const awaitCustomer = gmail.teamLast || !await crmAllowsLinkedOwnerHandoverReply(input.ticketId, gmail.lastInboundAt);
-  const relay = await recordCaseAfterConfirmedIntake(source.id, {
+  const deps = {
     ...v2EntryRelayDeps(env),
-    readCreatedTicketOwner: async ticketId => {
+    readCreatedTicketOwner: async (ticketId: string) => {
       if (ticketId !== input.ticketId) return undefined;
       const fresh = await openHandoverTicket(input, ownerId, env);
       return "ticket" in fresh ? ownerId : null;
     },
     ownerHandover: {
       ticketId: input.ticketId, awaitCustomer,
-      async assertFresh(tx) {
+      async assertFresh(tx: CaseTx) {
         const latest = await readCaseByTicket(input.ticketId, tx);
         const threads = await linkedThreads(input.ticketId, latest, tx);
         if (!await ownerHandoverClaimIsCurrent(claim, tx) || (latest && !caseAwaitsV2Attribution(latest))
@@ -144,9 +181,18 @@ async function processOwnerHandover(input: OwnerHandoverTransition, claim: Claim
           || (await lastStoredInbound(thread.id, tx))?.id !== source.id) throw Error("SAV_OWNER_HANDOVER_CHANGED");
       },
     },
-  });
+  };
+  let relay = await recordCaseAfterConfirmedIntake(source.id, deps);
+  // SAV-99 (Ugo 19/11): no V1 proof is required for a manual assignment. V1 never executed this mail: the agent reads it itself (`manualQualification`).
+  if ("skipped" in relay && relay.skipped === "owner_handover_no_v1_execution") {
+    const read = await manualQualification(source.id, input.ticketId, env);
+    if ("handBack" in read) return handBack(read.handBack);
+    relay = await relayOwnerHandoverMail(source.id, read.qualification, deps);
+  }
   if ("skipped" in relay) {
     if (relay.skipped === "intake_not_confirmed") throw Error("SAV_OWNER_HANDOVER_INTAKE_NOT_CONFIRMED");
+    if (relay.skipped === "owner_handover_ticket_mismatch") return handBack("thread_ambiguous");
+    if (relay.skipped === "owner_handover_out_of_scope") return handBack("out_of_scope");
     return relay.skipped;
   }
   if (relay.owner !== "agent") return "case_preserved";
