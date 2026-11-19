@@ -29,7 +29,7 @@ type Ctx = CaseDecisionValidationContext;
 function context(patch: Partial<Ctx> & { latest?: string; family?: string } = {}): Ctx {
   const { latest = "Bonjour, le widget fonctionne maintenant, merci.", family = "usage", ...rest } = patch;
   return { caseId: "case-syn", caseVersion: 3, owner: "agent", admission: { admitted: true }, locale: "fr-FR", audience: "support", sensitiveCategories: [],
-    requests: [{ id: "r1", family, status: "open" }],
+    requests: [{ id: "r1", family: family as Ctx["requests"][number]["family"], status: "open" }],
     sources: [{ ref: { type: "email", id: "m1" }, direction: "customer_inbound", at: "2026-11-18T08:00:00Z", order: 1 },
       { ref: { type: "email", id: "m2" }, direction: "customer_inbound", at: "2026-11-19T08:00:00Z", order: 2 }],
     customerTexts: { "email:m1": "Bonjour, je n'arrive pas à régler le widget.", "email:m2": latest },
