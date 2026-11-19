@@ -6,7 +6,8 @@ const state = vi.hoisted(() => ({ db: null as unknown, staff: null as unknown })
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 vi.mock("../intake/execution-policy", () => ({ executionAdministrator: async () => { if (!state.staff) throw Error("SAV_INTAKE_EXECUTION_UNAUTHORIZED"); return state.staff; } }));
 import { readSavBlockSwitch, savBlockEffectiveMode, savBlockReplyGate, SAV_BLOCK_SWITCH_DEFAULT } from "./block-switch";
-import { readSavBlockSwitchPanel, setSavBlockSwitch } from "./block-switch-admin";
+import { readSavBlockSwitchPanel, savBlockSwitchBlockIds, setSavBlockSwitch } from "./block-switch-admin";
+import { SAV_ENTRY_SKILL_BLOCKS } from "./blocks/registry";
 
 /*
  * Per-block switch (12/11): mode off | draft | auto and a pause per treatment block, stored like the agent pause (sav-agent-pause.v1):
@@ -89,8 +90,9 @@ it("stores the switch encrypted, audits actor, previous and next state and reaso
   expect(rows).toHaveLength(3);
   const panel = await readSavBlockSwitchPanel({ SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: "30000000-0000-4000-8000-000000000042" });
   expect(panel.globalAutoReply).toBe(true);
-  expect(panel.blocks).toEqual([expect.objectContaining({ blockId: "access", mode: "auto", paused: false, effective: "auto",
-    history: expect.arrayContaining([expect.objectContaining({ actor: admin.email, previous: "draft+paused", next: "auto", reason: "Retour normal" })]) })]);
+  expect(panel.blocks[0]).toEqual(expect.objectContaining({ blockId: "access", mode: "auto", paused: false, effective: "auto",
+    history: expect.arrayContaining([expect.objectContaining({ actor: admin.email, previous: "draft+paused", next: "auto", reason: "Retour normal" })]) }));
+  expect(panel.blocks.map(block => block.blockId)).toEqual(["access", "collaborators", "charly_max", "integrations"]);
   expect(JSON.stringify(panel)).not.toMatch(/USD|budget|cap/i);
 });
 
@@ -102,4 +104,32 @@ it("an unreadable row fails closed (never sends) and is replaced by the next cha
   await setSavBlockSwitch({ blockId: "access", mode: "auto", paused: false, reason: "Réparation du réglage" });
   expect((await audit())[0]!.technicalMetadata.previous).toBe("invalid");
   expect(savBlockReplyGate(await readSavBlockSwitch(f.db, "access"))).toEqual({ send: "rule" });
+});
+
+/*
+ * Revue Astra P2 (19/11): the Studio switch (panel + save action) knows the blocks of the ENTRY registry (`cases/blocks/registry.ts`) besides Access,
+ * whose behaviour is unchanged. Each one is saved and read back; without a row it is off (never the legacy Access fallback).
+ */
+const ON = { SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: "30000000-0000-4000-8000-000000000042" };
+it("the switch knows Access and every entry block, in that order, and nothing else", () => {
+  expect(savBlockSwitchBlockIds()).toEqual(["access", ...SAV_ENTRY_SKILL_BLOCKS.map(block => block.blockId)]);
+  expect(savBlockSwitchBlockIds()).toEqual(["access", "collaborators", "charly_max", "integrations"]);
+});
+it.each(["collaborators", "charly_max", "integrations"])("entry block %s: off by default in the panel, saved, read back, audited; Access untouched", async blockId => {
+  const before = (await readSavBlockSwitchPanel(ON)).blocks.find(block => block.blockId === blockId);
+  expect(before).toMatchObject({ blockId, mode: "off", paused: false, setting: null, invalid: false, effective: "off", history: [] });
+  await setSavBlockSwitch({ blockId, mode: "draft", paused: false, reason: "Essai en brouillon" });
+  expect(await readSavBlockSwitch(f.db, blockId)).toMatchObject({ blockId, mode: "draft", paused: false, invalid: false, setting: { blockId, setBy: admin.email, reason: "Essai en brouillon" } });
+  await setSavBlockSwitch({ blockId, mode: "auto", paused: true, reason: "Pause du bloc" });
+  const after = (await readSavBlockSwitchPanel(ON)).blocks.find(block => block.blockId === blockId);
+  expect(after).toMatchObject({ blockId, mode: "auto", paused: true, effective: "paused" });
+  expect(after!.history.map(entry => [entry.previous, entry.next, entry.reason])).toEqual(expect.arrayContaining([["off", "draft", "Essai en brouillon"], ["draft", "auto+paused", "Pause du bloc"]]));
+  await setSavBlockSwitch({ blockId, mode: "auto", paused: false, reason: "Auto mais non listé" });
+  // `auto` on the switch is never enough: not in SAV_V2_AUTO_REPLY, the block stays a person's.
+  expect((await readSavBlockSwitchPanel(ON)).blocks.find(block => block.blockId === blockId)).toMatchObject({ mode: "auto", effective: "draft" });
+  expect((await readSavBlockSwitchPanel({ ...ON, SAV_V2_AUTO_REPLY: `access,${blockId}` })).blocks.find(block => block.blockId === blockId)).toMatchObject({ effective: "auto" });
+  // Access keeps its legacy fallback and its effective mode, row-less, whatever was saved for the entry block.
+  expect(await readSavBlockSwitch(f.db, "access")).toEqual({ blockId: "access", mode: "auto", paused: false, setting: null, invalid: false });
+  expect((await readSavBlockSwitchPanel(ON)).blocks[0]).toMatchObject({ blockId: "access", mode: "auto", effective: "auto", history: [] });
+  expect((await audit()).every(row => row.entityId === blockId)).toBe(true);
 });
