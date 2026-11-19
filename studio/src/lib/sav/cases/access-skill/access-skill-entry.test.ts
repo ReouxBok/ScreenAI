@@ -267,13 +267,17 @@ describe("on : le skill décide l'Accès", () => {
 });
 
 describe("retour client requalifié par le même skill (on)", () => {
+  // The clock of the return is the real one, frozen once per run: a fixed date would put the V2 spend gate's day apart from the other tests' (red the day after).
+  const RETURN_NOW = new Date();
   const port = (text: string, families: Array<"access" | "finance"> = ["access"]) => ({ caseId: randomUUID(), messageId: randomUUID(), text, requests: families.map((family, index) => ({ requestId: `r${index + 1}`, family })) });
   const rule = (network: ReturnType<typeof accessSkillModelDouble>["network"], rules = [LEGACY, SKILL]) =>
-    accessSkillReturnRule({ env: () => env("on", rules), now: () => new Date("2026-11-18T10:00:00.000Z"), deps: { network } });
+    accessSkillReturnRule({ env: () => env("on", rules), now: () => RETURN_NOW, deps: { network } });
   it("toujours le même écran d'abonnement à la connexion : reste accès (qualified_rule du skill, daté après le mail)", async () => {
     const text = "J'ai essayé avec mon autre adresse, toujours l'écran qui me demande de choisir un abonnement à la connexion.";
     const model = accessSkillModelDouble(call => call.kind === "counter" ? { output: counterSays("no") } : { output: judgeSays("access", "toujours l'écran qui me demande de choisir un abonnement", { sensitive: "context_only" }) });
-    expect(await rule(model.network)(port(text))).toEqual([{ requestId: "r1", family: "access", provenance: { kind: "qualified_rule", ruleId: SAV_ACCESS_SKILL_RULE_ID, revision: SAV_ACCESS_SKILL_REVISION, at: "2026-11-18T10:00:00.000Z" } }]);
+    expect(await rule(model.network)(port(text))).toEqual([{ requestId: "r1", family: "access", provenance: { kind: "qualified_rule", ruleId: SAV_ACCESS_SKILL_RULE_ID, revision: SAV_ACCESS_SKILL_REVISION, at: RETURN_NOW.toISOString() } }]);
+    // Dated after the mail it requalifies (the return is read now, the mail was received at AT).
+    expect(RETURN_NOW.getTime()).toBeGreaterThan(Date.parse(AT));
     expect(model.calls[0]!.payload.purpose).toBe("return");
   });
   it("« c'est bon, par contre remboursez-moi » : retiré vers l'équipe (famille sensible), sans appel ; incertain : aucune règle", async () => {

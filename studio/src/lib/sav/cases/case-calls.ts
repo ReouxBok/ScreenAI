@@ -23,7 +23,7 @@ export type SavCaseCallReservation =
 const fault = (code: string): never => { throw Error(`SAV_CASE_CALL_${code}`); };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, CODE = /^[a-z0-9_.-]{1,80}$/;
 // B's inputKey, exactly as investigation-record.ts validates it: `in:` or `back:` then a reference.
-const CALL_KEY = /^(sav-case:([0-9a-f-]{36}):((?:in|back):[A-Za-z0-9._@<>=+-]{1,200})):call([1-9][0-9]{0,2})$/i;
+const CALL_KEY = /^(sav-case:([0-9a-f-]{36}):((?:in|back|ticket):[A-Za-z0-9._@<>=+-]{1,200})):call([1-9][0-9]{0,2})$/i;
 
 function parseKeys(input: { callKey: string; subjectKey?: string; caseId?: string }) {
   const call = CALL_KEY.exec(input.callKey);

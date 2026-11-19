@@ -13,7 +13,7 @@ import { latestInvestigationInput } from "./investigation-runner";
  */
 
 /** The runner's canonical input key (B's `SAV_CASE_INPUT_KEY`, same pattern; the test pins both). */
-export const SAV_CASE_QUALIFICATION_INPUT_KEY = /^(in|back):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export const SAV_CASE_QUALIFICATION_INPUT_KEY = /^(in|back|ticket):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** The only error codes of A's sources kept as a cause: exact constants, never a pattern a message could match. */
 export const SAV_CASE_QUALIFICATION_CAUSE_CODES = [
