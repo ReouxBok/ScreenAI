@@ -1420,6 +1420,33 @@ describe("SAV V1 unread: every inbound message, fair recovery and counter", () =
     expect(gone?.technicalMetadata).toMatchObject({gone:true,providerStatus:404,coveredByMessageId:messageId});
     expect(await syncHandledIntakeGmailRead(messageId,deps)).toEqual({skipped:"already_confirmed"});
   });
+  it("a 404 on the profile is not a deleted message: the pass stops, no receipt, and a later catch-up still reads the message", async () => {
+    await administrative();
+    await db.db.update(savThreads).set({gmailThreadId:"1a000"}).where(eq(savThreads.id,threadId));
+    await db.db.update(savMessages).set({gmailMessageId:"1a123"}).where(eq(savMessages.id,messageId));
+    const first=await message(threadId,new Date(Date.now()-60000));
+    await db.db.update(savMessages).set({gmailMessageId:"1a121"}).where(eq(savMessages.id,first.id));
+    await externalMarker();
+    let profileDown=true;const unread=new Set(["1a121","1a123"]),calls:string[]=[];
+    const gmail:GmailRequest=async<T>(_mailbox:string,path:string,init?:RequestInit)=>{
+      calls.push(path);
+      if(path==="profile"){if(profileDown)throw Error("GMAIL_HTTP_404");return {emailAddress:"contact@limova.ai"} as T;}
+      const id=path.split("/")[1].split("?")[0];
+      if(init?.method==="POST"){unread.delete(id);return {} as T;}
+      return {id,threadId:"1a000",labelIds:["INBOX",...unread.has(id)?["UNREAD"]:[]]} as T;
+    };
+    const deps={env:()=>({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}),gmail};
+    expect(await syncHandledIntakeGmailRead(messageId,deps)).toEqual({confirmed:false,errorCode:"SAV_INTAKE_GMAIL_READ_RETRY_REQUIRED"});
+    expect(calls).toEqual(["profile"]); // the whole thread stops at the first profile failure
+    expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_INTAKE_GMAIL_READ))).toHaveLength(0);
+    expect((await db.db.select().from(auditLogs).where(eq(auditLogs.action,FAILED))).map(r=>r.entityId)).toEqual([messageId]);
+    switchOn();expect(await readIntakeGmailReadBacklog()).toEqual({state:"available",pending:1,parked:0}); // still a recovery candidate
+    profileDown=false;
+    expect(await syncHandledIntakeGmailRead(messageId,deps)).toEqual({confirmed:true,earlierMessages:1});
+    expect(unread.size).toBe(0);
+    const receipts=await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_INTAKE_GMAIL_READ));
+    expect(receipts).toHaveLength(2);expect(receipts.some(r=>r.technicalMetadata.gone)).toBe(false);
+  });
   it("a failure on one earlier message never stops the next ones, and counts once on the case", async () => {
     await administrative();
     await db.db.update(savThreads).set({gmailThreadId:"1a000"}).where(eq(savThreads.id,threadId));

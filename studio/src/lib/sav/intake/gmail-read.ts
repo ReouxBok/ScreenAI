@@ -24,7 +24,11 @@ export async function markHandledGmailMessageRead(source: Source, gmail: GmailRe
   const profile = await gmail<{ emailAddress?: string }>(source.mailboxEmail, "profile");
   if (profile.emailAddress?.toLowerCase() !== source.mailboxEmail) throw Error("SAV_INTAKE_GMAIL_READ_MAILBOX_MISMATCH");
   const path = `messages/${source.gmailMessageId}`;
-  const read = () => gmail<Metadata>(source.mailboxEmail, `${path}?format=metadata&fields=id,threadId,labelIds`);
+  // Only a 404/410 on a call that targets this message proves it is gone; on the profile or any other call it stays a retriable failure.
+  const onMessage = <T>(call: Promise<T>) => call.catch((error: unknown) => {
+    throw error instanceof Error && /^GMAIL_HTTP_(404|410)$/.test(error.message) ? Error(`SAV_INTAKE_GMAIL_READ_MESSAGE_GONE_${error.message.slice(-3)}`) : error;
+  });
+  const read = () => onMessage(gmail<Metadata>(source.mailboxEmail, `${path}?format=metadata&fields=id,threadId,labelIds`));
   const validate = (message: Metadata) => {
     if (message.id !== source.gmailMessageId || message.threadId !== source.gmailThreadId || !Array.isArray(message.labelIds)
       || message.labelIds.some(x => typeof x !== "string") || message.labelIds.includes("DRAFT") || message.labelIds.includes("SENT")) throw Error("SAV_INTAKE_GMAIL_READ_SOURCE_MISMATCH");
@@ -32,7 +36,7 @@ export async function markHandledGmailMessageRead(source: Source, gmail: GmailRe
   const before = await read(); validate(before);
   if (!before.labelIds!.includes("UNREAD")) return { alreadyRead: true };
   await beforeModify();
-  await gmail(source.mailboxEmail, `${path}/modify`, { method: "POST", body: JSON.stringify({ removeLabelIds: ["UNREAD"] }) });
+  await onMessage(gmail(source.mailboxEmail, `${path}/modify`, { method: "POST", body: JSON.stringify({ removeLabelIds: ["UNREAD"] }) }));
   const after = await read(); validate(after);
   if (after.labelIds!.includes("UNREAD")) throw Error("SAV_INTAKE_GMAIL_READ_UNCONFIRMED");
   return { alreadyRead: false };
@@ -114,7 +118,7 @@ export async function syncHandledIntakeGmailRead(messageId: string, deps: { env?
       return "read" as const;
     } catch (error) {
       const message = error instanceof Error ? error.message : "";
-      if (/^GMAIL_HTTP_(404|410)$/.test(message)) {
+      if (/^SAV_INTAKE_GMAIL_READ_MESSAGE_GONE_(404|410)$/.test(message)) {
         await db.insert(auditLogs).values({ actorEmail: "studio-intake", action: SAV_INTAKE_GMAIL_READ, entityType: "sav_message", entityId,
           technicalMetadata: { version: 1, threadId: thread.id, ...proof, gone: true, providerStatus: Number(message.slice(-3)), ...extra } });
         goneMessages++; return "gone" as const;

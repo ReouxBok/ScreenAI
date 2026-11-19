@@ -42,6 +42,18 @@ it("an uncertain modify is recovered through metadata GET without a second mutat
   const p=provider({failAfterWrite:true});await expect(markHandledGmailMessageRead(source,p.request,async()=>{})).rejects.toThrow("TIMEOUT");
   expect(await markHandledGmailMessageRead(source,p.request,async()=>{})).toEqual({alreadyRead:true});expect(p.writes()).toBe(1);
 });
+it("only a 404/410 on the message itself is reported as gone; a profile 404 stays a provider failure",async()=>{
+  const failing=(target:"profile"|"get"|"modify",status:number):GmailRequest=>async<T>(_m:string,path:string,init?:RequestInit)=>{
+    const kind=path==="profile"?"profile":init?.method==="POST"?"modify":"get";
+    if(kind===target)throw Error(`GMAIL_HTTP_${status}`);
+    if(path==="profile")return {emailAddress:source.mailboxEmail} as T;
+    return {id:source.gmailMessageId,threadId:source.gmailThreadId,labelIds:["INBOX","UNREAD"]} as T;
+  };
+  await expect(markHandledGmailMessageRead(source,failing("profile",404),async()=>{})).rejects.toThrow(/^GMAIL_HTTP_404$/);
+  await expect(markHandledGmailMessageRead(source,failing("get",404),async()=>{})).rejects.toThrow(/^SAV_INTAKE_GMAIL_READ_MESSAGE_GONE_404$/);
+  await expect(markHandledGmailMessageRead(source,failing("modify",410),async()=>{})).rejects.toThrow(/^SAV_INTAKE_GMAIL_READ_MESSAGE_GONE_410$/);
+  await expect(markHandledGmailMessageRead(source,failing("get",500),async()=>{})).rejects.toThrow(/^GMAIL_HTTP_500$/);
+});
 it("disabled by default before database or network access",async()=>{
   const gmail=vi.fn();expect(await syncHandledIntakeGmailRead("unused",{env:()=>({}),gmail})).toEqual({skipped:"off"});expect(gmail).not.toHaveBeenCalled();
 });
