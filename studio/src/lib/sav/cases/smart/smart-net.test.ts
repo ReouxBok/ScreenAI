@@ -28,6 +28,11 @@ describe("vraie demande sensible : toujours à l'équipe (tolérance zéro)", ()
     ["sujet : tarif", "Question tarif", "Bonjour"],
     ["résiliation citée dans l'historique (demande du client restée dans le fil)", "Re: aide", "Ok merci\n\nLe lun. a écrit :\n> je veux résilier"],
     ["anglais : refund", "Question", "Hello, I want a refund for last month please."],
+    // Astra P1 (20/11): « pièce jointe » is not a footer; a copy of an invoice is a billing request.
+    ["résiliation avec courrier en pièce jointe (nous / notre)", "Demande", "Bonjour, la connexion échoue.\nNous souhaitons résilier notre abonnement, vous trouverez le courrier en pièce jointe."],
+    ["remboursement en pièce jointe", "Demande", "Bonjour, la connexion échoue.\nVous trouverez en pièce jointe la demande de remboursement signée."],
+    ["télécharger mes factures", "Demande", "Bonjour, où puis-je télécharger mes factures ?"],
+    ["la facture de novembre", "Demande", "Bonjour, où puis-je télécharger la facture de novembre ?"],
   ];
   for (const [label, subject, body] of REAL) it(label, () => expect(stops(subject, body)).toBe(true));
   it("les raisons restent des codes fermés", () => {
@@ -45,6 +50,7 @@ describe("mot seulement dans une signature, un pied de mail, l'historique cité 
     ["métier du client : ses propres factures", "Assistant comptable", "Bonjour, mon Assistant doit relancer les factures impayées de mes clients mais il ne trouve pas le fichier. Comment faire ?"],
     ["métier du client : ses prix et devis", "Assistant", "Bonjour, je voudrais que mon Assistant envoie mes devis avec les prix de mes prestations. C'est possible ?"],
     ["« avoir » verbe courant", "Aide", "Bonjour, je voudrais avoir de l'aide pour créer mon premier Assistant."],
+    ["métier du client : son Assistant envoie mes factures à mes clients", "Assistant", "Bonjour, mon Assistant doit envoyer mes factures à mes clients chaque lundi, il ne le fait plus."],
     ["disclaimer de confidentialité", "Partage", "Bonjour, comment partager un Assistant avec ma collègue ?\nCe message et ses pièces jointes sont confidentiels ; si vous n'êtes pas le destinataire, merci de le détruire. Pour toute réclamation de paiement, voir nos CGV."],
   ];
   for (const [label, subject, body] of INCIDENTAL) it(label, () => expect(smartSafetyNet({ subject, body })).toMatchObject({ stop: false }));
@@ -80,5 +86,31 @@ describe("sur le corpus du banc (120 conversations fictives)", () => {
     });
     expect({ sensitive, caught }).toEqual({ sensitive: 16, caught: 16 });
     expect(wrongStops).toEqual(["piege_injection", "piege_injection"]);
+  });
+});
+
+describe("revue d'Astra (20/11) : la demande sensible ne disparaît pas derrière une pièce jointe, une copie de facture est une demande", () => {
+  it("les deux mails « pièce jointe » : team_sensitive, 0 appel modèle, aucun texte client", async () => {
+    const { runSmartTurn } = await import("./smart-agent");
+    const { smartScriptedModel, smartStaticKnowledge, smartReading, smartGoodDecision, SMART_CONFORME } = await import("./smart-test-doubles");
+    for (const body of ["Bonjour, la connexion échoue.\nNous souhaitons résilier notre abonnement, vous trouverez le courrier en pièce jointe.",
+      "Bonjour, la connexion échoue.\nVous trouverez en pièce jointe la demande de remboursement signée."]) {
+      const scripted = smartScriptedModel({ understand: { output: smartReading() }, decide: { output: smartGoodDecision() }, verify: { output: SMART_CONFORME } });
+      const result = await runSmartTurn({ subject: "Demande", body, thread: [] }, { model: scripted.model, knowledge: smartStaticKnowledge(), maxInputBytes: 100_000, today: "2026-11-20" });
+      expect(result).toMatchObject({ outcome: "team_sensitive", sensitiveStop: "net", replyWithFooter: null, decision: null });
+      expect(scripted.calls).toEqual([]);
+    }
+  });
+  it("factures : « mes factures » et « la facture de novembre » arrêtées ; les factures des clients du demandeur, non (les trois ensemble)", () => {
+    expect([
+      smartSafetyNet({ subject: "Demande", body: "Bonjour, où puis-je télécharger mes factures ?" }).stop,
+      smartSafetyNet({ subject: "Demande", body: "Bonjour, où puis-je télécharger la facture de novembre ?" }).stop,
+      smartSafetyNet({ subject: "Assistant comptable", body: "Bonjour, mon Assistant doit relancer les factures impayées de mes clients mais il ne trouve pas le fichier." }).stop,
+    ]).toEqual([true, true, false]);
+  });
+  it("le vrai avertissement de confidentialité reste un pied de mail", () => {
+    expect(smartFreshText("Bonjour, comment partager un Assistant ?\nCe message et ses pièces jointes sont confidentiels ; si vous n'êtes pas le destinataire, merci de le détruire."))
+      .toBe("bonjour, comment partager un assistant ?");
+    expect(smartSafetyNet({ subject: "Partage", body: "Bonjour, comment partager un Assistant ?\nSi vous n'êtes pas le destinataire de ce message, merci de nous en informer." })).toMatchObject({ stop: false });
   });
 });

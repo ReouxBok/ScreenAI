@@ -34,19 +34,25 @@ const norm = (value: string) => normalizeSensitiveText(value).replace(/[ \t]+/g,
 
 /** The start of quoted history: « Le lun. 18 nov. a écrit : », « On ... wrote: », « -----Message d'origine----- », an Outlook « De : » header, or a « > » line. */
 const QUOTE_START = /^(?:>|(?:le|on) .{0,160}(?:a ecrit|wrote)\s*:?\s*$|-{2,}\s*(?:message d'origine|original message|message transfere|forwarded message)|de ?: .{1,160}$)/;
-/** Boilerplate lines: never a request, wherever they are. */
-const BOILERPLATE = /\b(?:confidentiel\w*|destinataire|pieces? jointes?|avant d'imprimer|imprimer ce|environnement|conformement|vous disposez d'un droit|politique de (?:confidentialite|protection)|mentions legales|pour (?:vous|se) desabonner|se desabonner|desinscri\w*|unsubscribe|gerer (?:vos|mes) preferences|cet e-?mail (?:a ete|vous a ete) envoye|this (?:e-?mail|message) (?:is|may|was)|siret|siren|rcs |capital (?:social )?de|tva intra\w*|envoye depuis|sent from my)\b/;
+/**
+ * Boilerplate lines: identifiable footer FORMULAS only (Astra, 20/11: a lone « pièce jointe » or « destinataire » is not a footer, « vous trouverez
+ * en pièce jointe la demande de remboursement » is a request). Confidentiality notice, print/environment notice, legal data notice, newsletter
+ * unsubscribe, « envoyé depuis », company registration.
+ */
+const BOILERPLATE = /\b(?:(?:ce|cet) (?:message|e-?mail|courriel|mail)(?: et (?:ses|les|toutes? (?:ses|les)) pieces? jointes?)? (?:est|sont|peut|peuvent)\b.{0,60}\bconfidentiel\w*|si vous n'etes pas (?:le|la|les) destinataires?|(?:information|message)s? confidentiel\w* (?:et|destine)|avant d'imprimer|imprimer ce (?:mail|message|courriel)|pensez a l'environnement|conformement (?:au rgpd|a la (?:loi|reglementation))[^.]{0,40}vous disposez|vous disposez d'un droit|politique de (?:confidentialite|protection)|mentions legales|pour (?:vous|se) desabonner|se desabonner|desinscri\w*|unsubscribe|gerer (?:vos|mes) preferences|cet e-?mail (?:a ete|vous a ete) envoye|this (?:e-?mail|message) (?:is|may|was)|siret|siren|rcs |capital (?:social )?de|tva intra\w*|envoye depuis|sent from my)\b/;
 /** Where a signature starts (the lines after it may be labels: « Service facturation », « Gérant | Tarifs sur demande »). */
 const SIGN_OFF = /^(?:--\s*|cordialement\b.*|bien (?:a vous|cordialement)\b.*|bonne (?:journee|soiree)\b.*|belle journee\b.*|merci d'avance\b.*|sinceres salutations\b.*|salutations\b.*|a bientot\b.*|regards?\b.*|best\b.*)$/;
 /** First person: a line where the customer speaks for themself is never boilerplate (« je souhaite, conformément au RGPD, ... »). */
-const FIRST_PERSON = /\b(?:je|j'|moi|mon|ma|mes)\b/;
+const FIRST_PERSON = /\b(?:je|j'|moi|mon|ma|mes|nous|notre)\b/;
 const isBoilerplate = (line: string) => BOILERPLATE.test(line) && !FIRST_PERSON.test(line);
 /** A line that speaks (first person, a request, a question): never a mere signature label. A PS always speaks. */
 const SPEAKS = /(?:^p\.? ?s\.?\b|\?|\b(?:je|j'|nous|on|vous|mon|ma|mes|notre|nos|pouvez|pourriez|voudrais|veux|souhaite|merci de|svp|stp)\b)/;
 
 /** Requests about the customer's OWN Limova bill, payment or subscription (normalized text: no accent, lower case). */
 const OWN_BILLING_REQUESTS: ReadonlyArray<readonly [string, RegExp]> = [
-  ["finance", /\b(?:ma|cette|votre|derniere) (?:derniere |premiere )?factur\w*(?! (?:de|a|pour) (?:mes|nos) clients)|\bfactur\w* (?:limova|de limova|du mois|de l'abonnement|de mon abonnement)\b/],
+  ["finance", /\b(?:ma|cette|votre|derniere) (?:derniere |premiere )?factur\w*\b(?! (?:de|a|aux|pour) (?:mes|nos) clients)|\bfactur\w* (?:limova|de limova|du mois|de l'abonnement|de mon abonnement)\b/],
+  // Getting a copy of one's invoices (« où télécharger mes factures ? », « la facture de novembre »), the invoices of the customer's OWN clients aside.
+  ["finance", /\b(?:mes|nos) factur\w*\b(?! (?:a|aux|de|des|pour) (?:mes |nos )?(?:clients|fournisseurs))|\b(?:telecharg|recuper|retrouv|obten|recevoir|consult|acced|trouv|voir|avoir)\w* (?:\w+ ){0,2}(?:la|les|une) factur\w*\b(?! (?:a|aux|de|des|pour) (?:mes |nos )?(?:clients|fournisseurs))|\bfactur\w* (?:de |d'|du mois (?:de |d'))?(?:janvier|fevrier|mars|avril|mai|juin|juillet|aout|septembre|octobre|novembre|decembre)\b/],
   ["finance", /\b(?:me |m'|nous )(?:envoyer|renvoyer|transmettre|faire parvenir|redonner)\w* (?:\w+ ){0,3}factur\w*/],
   ["finance", /\b(?:contest\w*|errone\w*|erreur (?:de|sur (?:la|ma)) factur\w*|double (?:prelevement|paiement|debit|facturation)|(?:preleve|debite|facture)\w* (?:deux|2|plusieurs) fois|trop (?:paye|preleve|facture))\b/],
   ["finance", /\b(?:j'ai ete|on m'a|vous m'avez|nous avons ete|j'ai encore ete) (?:preleve|debite|facture)\w*|\bprelevement\w*\b|\bcarte bancaire\b|\blitige\b/],
