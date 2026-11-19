@@ -256,7 +256,7 @@ describe('background privacy boundaries', () => {
     })).toMatchObject({ level: 'low', reason: 'visible_control' });
   });
 
-  it('opens a link to another site only on a strictly explicit request', () => {
+  it('opens a link to another site only on an explicit request', () => {
     for (const element of [
       { type: 'clickable', text: 'https://www.instagram.com/p/abc', external: true, inForm: false },
       { type: 'clickable', text: 'Limova — Assistants IA pour les entreprises', external: true, inForm: false },
@@ -264,9 +264,7 @@ describe('background privacy boundaries', () => {
       { type: 'clickable', text: 'Payer maintenant', external: true, inForm: false }
     ]) {
       expect(background.classifyActionRisk(element)).toMatchObject({ level: 'sensitive', reason: 'external_action' });
-      expect(background.classifyActionRisk(element, { explicitRequest: true, strictExplicitRequest: false }).level)
-        .toBe('sensitive');
-      expect(background.classifyActionRisk(element, { explicitRequest: true }))
+      expect(background.classifyActionRisk(element, { explicitRequest: true, strictExplicitRequest: false }))
         .toMatchObject({ level: 'low', reason: 'explicit_external_navigation' });
     }
     expect(background.classifyActionRisk(
@@ -281,6 +279,35 @@ describe('background privacy boundaries', () => {
       .toBe('sensitive');
     expect(background.classifyActionRisk(deleteButton, { explicitRequest: true }))
       .toMatchObject({ level: 'low', reason: 'explicit_consequential_control' });
+  });
+
+  it('understands natural spoken requests and short confirmations, not questions', () => {
+    const link = { type: 'clickable', text: 'Amazon.fr : livres, DVD, jeux vidéo', external: true, inForm: false };
+    const strict = (message, { assistantText = '', tool = false } = {}) => background.isStrictExplicitRequest(
+      background.resolveActionIntent(message, link, assistantText),
+      { toolExplicitRequest: tool, toolTargetMatched: tool, userMessage: message }
+    );
+    for (const message of ['Montre-moi le site Amazon', 'Emmène-moi sur Amazon', 'Je veux voir Amazon', 'Accède à Amazon', 'Rends-toi sur Amazon']) {
+      expect(strict(message), message).toBe(true);
+    }
+    // Spoken, the voice tool names the exact link.
+    for (const message of ['Vas-y montre-moi', 'Affiche le deuxième résultat', 'Oui vas-y', 'ok go']) {
+      expect(strict(message, { tool: true }), message).toBe(true);
+    }
+    // Written, a short yes confirms the link Charly has just proposed.
+    const proposal = 'Voulez-vous que je clique sur « Amazon.fr » ?';
+    for (const message of ['Oui', 'Oui vas-y', 'Oui clique', 'ok go']) {
+      expect(strict(message, { assistantText: proposal }), message).toBe(true);
+      expect(strict(message), `${message} sans proposition`).toBe(false);
+    }
+    // Written questions or a bare "clique" never open the link.
+    for (const message of ['C’est quoi ce lien ?', 'Il mène où ce lien ?', 'clique']) {
+      expect(strict(message), message).toBe(false);
+    }
+    // Spoken, the link opens on the matched voice tool target alone, even with
+    // a late or garbled transcript (explicitRequest, not the strict check).
+    expect(background.classifyActionRisk(link, { explicitRequest: true, strictExplicitRequest: false }))
+      .toMatchObject({ level: 'low', reason: 'explicit_external_navigation' });
   });
 
   it('recognises send and submit buttons of any site', () => {

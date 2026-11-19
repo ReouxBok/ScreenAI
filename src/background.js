@@ -4785,7 +4785,8 @@ const ACTION_TARGET_STOP_WORDS = new Set([
   'el', 'en', 'et', 'fais', 'go', 'hazlo', 'ici', 'il', 'je', 'juste', 'la', 'le', 'les', 'maintenant',
   'lance', 'lancer', 'me', 'mon', 'navigate', 'navigue', 'of', 'ok', 'on', 'open', 'ouvre', 'page', 'peux', 'please', 'pour',
   'press', 'publie', 'selectionne', 'select', 'send', 'soumet', 'sur', 'the', 'to', 'tu', 'un', 'une', 'va',
-  'vas', 'veux', 'voudrais', 'y', 'yes', 'oui', 'adelante', 'abre', 'elige', 'pulsa', 'selecciona', 've'
+  'vas', 'veux', 'voudrais', 'y', 'yes', 'oui', 'adelante', 'abre', 'elige', 'pulsa', 'selecciona', 've',
+  'moi', 'toi'
 ]);
 
 function actionTargetTokens(value) {
@@ -4829,6 +4830,11 @@ function isDirectMessageSendRequest(message) {
   return /(?:^|\s)(?:envoie|envoyer|envoi|send|soumet|soumettre|submit|publie|publier|publish)(?:\s|$)/.test(normalized);
 }
 
+// Natural spoken requests ("montre-moi le site", "emmène-moi sur Amazon",
+// "je veux voir la page"). They count only for the strict check of a
+// consequential click or a link to another site.
+const SPOKEN_ACTION_PATTERN = /(?:^|\s)(?:montre|montrer|affiche|afficher|accede|acceder|rends toi|rend toi|emmene|emmener|amene moi|consulte|consulter|visite|visiter|va voir|aller sur|aller voir|veux voir|voudrais voir|show me|take me)(?:\s|$)/;
+
 function resolveActionIntent(message, element, assistantText = recentAssistantActionText()) {
   const normalized = normalizeActionLanguage(message);
   const direct = /(?:^|\s)(?:clique|cliquer|click|ouvre|ouvrir|open|va sur|vas sur|allez sur|go to|navigue|naviguer|navigate|selectionne|selectionner|select|choisis|choisir|choose|appuie|press|active|activer|connecte|connecter|lance|lancer|demarre|demarrer|continue|continuer|confirme|confirmer|pulsa|abre|navega|selecciona|elige|continua)(?:\s|$)/.test(normalized)
@@ -4863,6 +4869,7 @@ function resolveActionIntent(message, element, assistantText = recentAssistantAc
     assistantMatched,
     safeIntermediateNavigation,
     requestedTokenCount: requestedTokens.length,
+    spoken: SPOKEN_ACTION_PATTERN.test(normalized),
     turnId: associatedTurn?.id || null,
     source: associatedTurn?.source || 'unknown'
   };
@@ -4921,8 +4928,12 @@ const SHORT_AFFIRMATIVE_PATTERN = /^(?:oui|yes|ok|okay|d accord|daccord|vas y|go
 function isStrictExplicitRequest(intent, { toolExplicitRequest = false, toolTargetMatched = false, userMessage = '' } = {}) {
   if (intent.kind === 'direct' && intent.targetMatched && (intent.requestedTokenCount > 0 || toolTargetMatched)) return true;
   if (intent.kind === 'referential' && intent.assistantMatched) return true;
+  if (intent.spoken && intent.targetMatched && intent.requestedTokenCount > 0) return true;
+  // "Oui", "ok go", "oui clique" right after Charly named this exact target.
+  if (intent.assistantMatched && intent.requestedTokenCount === 0
+    && (intent.kind === 'direct' || SHORT_AFFIRMATIVE_PATTERN.test(normalizeActionLanguage(userMessage)))) return true;
   return toolExplicitRequest
-    && (intent.kind !== 'implicit' || SHORT_AFFIRMATIVE_PATTERN.test(normalizeActionLanguage(userMessage)));
+    && (intent.kind !== 'implicit' || intent.spoken || SHORT_AFFIRMATIVE_PATTERN.test(normalizeActionLanguage(userMessage)));
 }
 
 function classifyActionRisk(element, {
@@ -4963,9 +4974,10 @@ function classifyActionRisk(element, {
     && consequential
     && element?.actionKind !== 'message_send';
   // Charly works on any site, so a link to another domain (a search result,
-  // the Instagram post Limova just published) is ordinary navigation once the
-  // user strictly asked for that link.
-  const explicitExternalNavigation = strictExplicitRequest
+  // the Instagram post Limova just published) is ordinary navigation: an
+  // explicit request is enough. In voice the matched tool target counts, as
+  // the spoken transcript often arrives late or garbled.
+  const explicitExternalNavigation = explicitRequest
     && element?.type === 'clickable'
     && element.external === true
     && !element.disabled;
