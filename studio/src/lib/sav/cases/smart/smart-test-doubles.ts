@@ -9,18 +9,22 @@ import type { SmartCallResult, SmartModelPort } from "./smart-model";
  */
 
 export type SmartScriptAnswer = Readonly<{ output: unknown }> | Readonly<{ fail: string; sent?: boolean; uncertain?: boolean }> | Readonly<{ deadline: true }>;
-export type SmartScript = Partial<Record<Exclude<SmartCallKind, "embed">, SmartScriptAnswer | ((payload: unknown) => SmartScriptAnswer)>>;
+export type SmartScript = Partial<Record<Exclude<SmartCallKind, "embed">, SmartScriptAnswer | ((payload: unknown) => SmartScriptAnswer) | SmartScriptAnswer[]>>;
 
 export function smartScriptedModel(script: SmartScript) {
   const calls: Array<{ kind: string; payload: unknown; system: string }> = [];
   const model: SmartModelPort = async ({ kind, payload, system }) => {
     calls.push({ kind, payload, system });
-    const entry = script[kind], answer = typeof entry === "function" ? entry(payload) : entry;
+    // An array answers successive calls of the same kind (the decide passes), the last one repeated.
+    const count = calls.filter(row => row.kind === kind).length;
+    const raw = script[kind], entry = Array.isArray(raw) ? raw[Math.min(count - 1, raw.length - 1)] : raw, answer = typeof entry === "function" ? entry(payload) : entry;
     const inputBytes = Buffer.byteLength(JSON.stringify(payload));
     if (!answer) return { status: "failed", problem: "unscripted", uncertain: false, usage: null, inputBytes, sent: false } satisfies SmartCallResult;
     if ("deadline" in answer) return { status: "failed", problem: "deadline", uncertain: false, usage: null, inputBytes, sent: false };
     if ("fail" in answer) return { status: "failed", problem: answer.fail, uncertain: answer.uncertain ?? false, usage: null, inputBytes, sent: answer.sent ?? true };
-    return { status: "ok", output: answer.output, usage: { inputTokens: 1_000, outputTokens: 200 }, inputBytes };
+    // A bare decision scripted for « decide » is wrapped as a final step (v2), so the v1 scenarios read the same.
+    const output = kind === "decide" && answer.output && typeof answer.output === "object" && !("action" in answer.output) ? { thinking: "", action: "final", calls: [], decision: answer.output } : answer.output;
+    return { status: "ok", output, usage: { inputTokens: 1_000, outputTokens: 200 }, inputBytes };
   };
   return { model, calls };
 }

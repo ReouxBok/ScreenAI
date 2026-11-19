@@ -41,7 +41,7 @@ function network(options: { onCall?: (kind: Kind) => void; decide?: unknown } = 
     const system: string = body.systemInstruction.parts[0].text, payload = JSON.parse(body.contents[0].parts[0].text);
     const kind: Kind = system.startsWith("Tu lis un mail") ? "understand" : system.startsWith("RELECTURE") ? "verify" : "decide";
     calls.push({ kind, payload }); options.onCall?.(kind);
-    const output = kind === "understand" ? smartReading() : kind === "verify" ? SMART_CONFORME : options.decide ?? smartGoodDecision();
+    const output = kind === "understand" ? smartReading() : kind === "verify" ? SMART_CONFORME : { thinking: "", action: "final", calls: [], decision: options.decide ?? smartGoodDecision() };
     return Response.json(accessSkillWireAnswer(output, { inputTokens: 1_000, outputTokens: 200 }));
   };
   return { fn, calls };

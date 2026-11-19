@@ -2,7 +2,9 @@ import { normalizeSavEvidenceText, savEvidenceContains } from "../../evidence-te
 import { accessSkillKernelHits } from "../access-skill/access-skill-kernel";
 import { requestsCredential } from "../decision-validator";
 import type { SmartCheckCode, SmartDecision, SmartReading } from "./smart-contract";
+import { smartRepeatCodes, type SmartCaseMemory } from "./smart-memory";
 import { SAV_SMART_RESOURCES } from "./smart-prompt";
+import type { SmartAcademyEvidence } from "./smart-tools";
 
 /*
  * Agent SAV intelligent, lot D3, server part (20/11): the checks WITHOUT any model on one decision. Pure: no model, network, database or clock.
@@ -34,6 +36,10 @@ export type SmartCheckInput = Readonly<{
   /** The customer's masked texts (subject, mail, thread) as given to the model. */
   customerText: string;
   sources: readonly SmartSource[];
+  /** Academy results of this turn, citable by their call id (v2). */
+  academy?: readonly SmartAcademyEvidence[];
+  /** The case memory before this turn: a question already answered or a trial already failed is refused (v2, the progress rule). */
+  memory?: SmartCaseMemory;
 }>;
 export type SmartCheckResult = Readonly<{ ok: boolean; codes: readonly SmartCheckCode[] }>;
 
@@ -89,14 +95,22 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   if (decision.outcome !== "handoff" && !reply) codes.add("reply_missing");
   if (decision.coverage.some(row => !needIds.has(row.needId)) || new Set(decision.coverage.map(row => row.needId)).size !== decision.coverage.length) codes.add("coverage_invalid");
   if ([...needIds].some(id => !decision.coverage.some(row => row.needId === id))) codes.add("need_not_covered");
-  if ((decision.outcome === "handoff" || decision.coverage.some(row => row.status === "handed")) && !decision.teamNote?.trim()) codes.add("team_note_missing");
+  if ((decision.outcome === "handoff" || decision.coverage.some(row => row.status === "handed")) && !decision.teamNote) codes.add("team_note_missing");
 
   // Facts and their sources.
-  const cited = new Map<string, SmartSource>();
+  const cited = new Map<string, SmartSource>(), citedAcademy = new Map<string, SmartAcademyEvidence>();
   for (const fact of decision.facts) {
     if (!needIds.has(fact.needId)) { codes.add("fact_source_invalid"); continue; }
     if (!savEvidenceContains(reply, fact.sentence) && !normalizeSavEvidenceText(reply).includes(normalizeSavEvidenceText(fact.sentence))) codes.add("fact_sentence_missing");
     if (fact.type === "fait_tiers") { codes.add("third_party_fact_unsourced"); continue; }
+    if ((fact.type === "fait_limova" || fact.type === "fait_temporaire") && fact.sourceKind === "academy") {
+      const evidence = (input.academy ?? []).find(row => row.callId === fact.toolCallId);
+      if (!fact.toolCallId || !fact.excerpt?.trim()) { codes.add("fact_source_invalid"); continue; }
+      if (!evidence || evidence.needId !== fact.needId) { codes.add("card_not_retrieved_for_need"); continue; }
+      citedAcademy.set(evidence.callId, evidence);
+      if (!savEvidenceContains(evidence.text, fact.excerpt)) codes.add("excerpt_not_found");
+      continue;
+    }
     if (fact.type === "fait_limova" || fact.type === "fait_temporaire") {
       if (fact.sourceKind !== "fiche" || !fact.cardId || !fact.version || !fact.excerpt?.trim()) { codes.add("fact_source_invalid"); continue; }
       const source = input.sources.find(row => row.cardId === fact.cardId && row.version === fact.version);
@@ -112,7 +126,7 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
     }
     // conseil: no source by definition; a source given to advice is ignored.
   }
-  const citedText = [...cited.values()].map(source => fold(cardText(source))).join("\n");
+  const citedText = [...[...cited.values()].map(source => fold(cardText(source))), ...[...citedAcademy.values()].map(row => fold(row.text))].join("\n");
   const allCardText = input.sources.map(source => cardText(source)).join("\n");
 
   // Links: resources, or a link written in a card given for the mail.
@@ -140,5 +154,6 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   }
   if (ACCOUNT_ACTION.test(foldedReply) || (decision.outcome !== "handoff" && HANDOFF_CLAIM.test(foldedReply))) codes.add("account_action_claimed");
   if (reply && accessSkillKernelHits(reply).length) codes.add("kernel_in_reply");
+  if (input.memory) for (const code of smartRepeatCodes(input.memory, decision)) codes.add(code);
   return { ok: codes.size === 0, codes: [...codes] };
 }
