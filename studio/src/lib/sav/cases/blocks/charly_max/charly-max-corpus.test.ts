@@ -11,7 +11,7 @@ import { CHARLY_MAX_DECISION_SKILL } from "./charly-max-skill-decision";
 import { CHARLY_MAX_ENTRY_SKILL } from "./charly-max-skill-entry";
 
 const EXAMPLES: readonly SkillExample[] = [...CHARLY_MAX_ENTRY_SKILL.examples, ...CHARLY_MAX_DECISION_SKILL.examples];
-const BLIND_SHA256 = "94a94e59f03afd3bb5651daa6b742cd64fc528ab22ed666fbc038af2a5abc9a6";
+const BLIND_SHA256 = "f9d47b57f9d2ec64b9ca9ce1c3c378ef422a5adfb4927ccc9d70b8c25716efba";
 const byId = new Map(CHARLY_MAX_CORPUS.map(row => [row.id, row]));
 const asExamples = (cases: readonly CorpusCase[]): SkillExample[] => cases.map(row => ({ id: row.id, subject: row.subject, text: row.text, verdict: "corpus", comment: "corpus" }));
 

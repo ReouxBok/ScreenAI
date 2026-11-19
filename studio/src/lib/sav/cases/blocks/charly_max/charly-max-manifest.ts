@@ -69,7 +69,8 @@ export const CHARLY_MAX_BLOCK_META = {
   prompts: { entrySha256: "388d1caf51eda26149b2685a84564f9cbaa84dd61b57ab02697329f91a591f47", decisionSha256: CHARLY_MAX_DECISION_SKILL_PROMPT_SHA256 },
   corpus: {
     fixture: "charly-max-corpus.fixture.ts",
+    /** Re-written at the assembly (19/11) by an independent agent that saw neither the skill nor the corpus; the author's set (94a94e59…) is burnt. One fictional first name replaced before any measure (frozen as c617452a…, then f9d47b57…). */
     blindSet: "charly-max-blind.fixture.ts",
-    blindSetSha256: "94a94e59f03afd3bb5651daa6b742cd64fc528ab22ed666fbc038af2a5abc9a6",
+    blindSetSha256: "f9d47b57f9d2ec64b9ca9ce1c3c378ef422a5adfb4927ccc9d70b8c25716efba",
   },
 } as const;
