@@ -5,7 +5,7 @@ import { savIntakeRuns, savMessages, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { listSavExternalCompletionMessageIds, readSavExternalCompletion } from "../external-completion";
 import { readSavAgentPause } from "./agent-pause";
-import { intakeActiveBlockSql, intakeAttemptBudget, intakeRescueConsumedSql, intakeRunAnalysed, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_RESCUE_KINDS } from "./attempt-policy";
+import { intakeActiveBlockSql, intakeAttemptBudget, intakeReleaseReanalysisSql, intakeRescueConsumedSql, intakeRunAnalysed, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_RESCUE_KINDS } from "./attempt-policy";
 import { savIntakeRuntimeConfig, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 
 /**
@@ -115,7 +115,7 @@ export async function listTicketSafetyNet(runtime: Pick<IntakeRuntimeConfig, "ma
  * attempts_exhausted marker. The exhaustion is derived from the same budget the V1 claim applies; a run that already
  * holds an analysis is a V1 decision, never an exhaustion. */
 async function lifetimeExhausted(runId: string, messageId: string, db: Pick<ReturnType<typeof requireDb>, "select"> = requireDb()) {
-  const siblings = await db.select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext }).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, messageId));
+  const siblings = await db.select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext, releaseOnly: sql<boolean>`${intakeReleaseReanalysisSql(sql`${savIntakeRuns.id}`)}` }).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, messageId));
   const current = siblings.find(s => s.id === runId);
   if (!current || intakeRunAnalysed(current.payloadCiphertext) !== false) return false;
   const exhausted = intakeAttemptBudget(runId, siblings).exhausted;
@@ -138,7 +138,7 @@ export async function grantIntakeRescue(messageId: string, runtime: IntakeRuntim
         ${intakeRescueConsumedSql(sql`${messageId}::uuid`)} as used,
         exists(select 1 from sav.intake_executions e where e.thread_id = ${thread.id}::uuid and (e.ticket_id is not null or e.state = 'confirmed')) as ticket`));
     if (!fresh || fresh.other || fresh.granted || fresh.used || fresh.ticket || !fresh.lifetime && !await lifetimeExhausted(run.id, messageId, tx)) return false;
-    const siblings = await tx.select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext }).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, messageId));
+    const siblings = await tx.select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext, releaseOnly: sql<boolean>`${intakeReleaseReanalysisSql(sql`${savIntakeRuns.id}`)}` }).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, messageId));
     const budget = intakeAttemptBudget(run.id, siblings);
     if (!budget.exhausted || budget.exhausted === "per_version") return false;
     await tx.execute(sql`insert into sav.intake_journal (run_id, kind, payload_ciphertext) values (${run.id}::uuid, ${SAV_INTAKE_RESCUE_KINDS.granted},

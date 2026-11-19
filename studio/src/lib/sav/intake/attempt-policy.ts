@@ -3,7 +3,8 @@ import { decryptSavPayload } from "../crypto";
 
 /** Analysis attempts are bounded per configuration version AND per message for
  * its whole life. A deployment may re-analyse an open dossier once more, but it
- * can never revive a dossier that kept failing, nor loop forever. */
+ * can never revive a dossier that kept failing, nor loop forever. A re-analysis
+ * caused only by a release does not count in the lifetime total (see below). */
 export const SAV_INTAKE_ATTEMPT_POLICY = Object.freeze({
   perVersion: 2,
   // Attempts that ended without any recorded analysis (plan), all versions together.
@@ -11,6 +12,18 @@ export const SAV_INTAKE_ATTEMPT_POLICY = Object.freeze({
   // Every attempt, successful or not, all versions together: survives deployments.
   totalPerMessage: 8,
 });
+/** A version created only because the code or launch configuration changed (same mail, accepted analysis on the same
+ * sources, no human decision): journal kind of the new run. Its attempts stay bounded per version (perVersion) and still
+ * count as failures when they end without an analysis, but they never count in the lifetime total: a release must not
+ * push a decided dossier to "à traiter à la main". Attempts recorded before this marker existed are never refunded. */
+export const SAV_INTAKE_RELEASE_REANALYSIS_KIND = "release_reanalysis";
+export function intakeReleaseReanalysisSql(runId: SQL) {
+  return sql`exists(select 1 from sav.intake_journal rr where rr.run_id = ${runId} and rr.kind = ${SAV_INTAKE_RELEASE_REANALYSIS_KIND})`;
+}
+/** SQL twin of the lifetime total of intakeAttemptBudget: every attempt of the message except those of release re-analyses. */
+export function intakeCountedAttemptsSql(messageId: SQL) {
+  return sql`(select coalesce(sum(ca.attempts), 0) from sav.intake_runs ca where ca.message_id = ${messageId} and not ${intakeReleaseReanalysisSql(sql`ca.id`)})`;
+}
 /** Durable markers that remove a run from scheduling; the dossier stays visible as blocked. */
 export const SAV_INTAKE_BLOCKING_JOURNAL_KINDS = ["source_invalid", "attempts_exhausted", "deterministic_block", "private_resource_unavailable", "forwarded_origin_unverified", "other_evidence_unavailable", "rescue_failed"] as const;
 /** SAV-88 rescue: ONE extra, recorded analysis attempt per message, through the normal V1 claim, never a reset.
@@ -80,7 +93,8 @@ export function intakeInFlightCallSql(messageId: SQL, now: Date) {
  * margin, so the pass ends within its 270 s budget whatever the batch. */
 export const SAV_INTAKE_DISPATCH_LANES = Object.freeze({ normalBatch: 4, catchUpBatch: 10, recentWindowMs: 6 * 3600_000, oldStockSlots: 1 });
 export const SAV_INTAKE_ANALYSIS_TIMING = Object.freeze({ modelMs: 60_000, analysisMs: 120_000, settlementMs: 15_000, leaseMs: 150_000, startMarginMs: 140_000 });
-export type IntakeAttemptRow = { id: string; attempts: number; payloadCiphertext: string | null };
+/** `releaseOnly`: the run carries the release re-analysis marker (see SAV_INTAKE_RELEASE_REANALYSIS_KIND). */
+export type IntakeAttemptRow = { id: string; attempts: number; payloadCiphertext: string | null; releaseOnly?: boolean };
 export type IntakeAttemptBudget = { runAttempts: number; failed: number; unknown: number; total: number;
   exhausted: false | "per_version" | "failed_per_message" | "total_per_message" };
 
@@ -91,7 +105,7 @@ export function intakeRunAnalysed(ciphertext: string | null): boolean | null {
 }
 export function intakeAttemptBudget(runId: string, siblings: IntakeAttemptRow[]): IntakeAttemptBudget {
   const run = siblings.find(s => s.id === runId);
-  const runAttempts = run?.attempts ?? 0, total = siblings.reduce((sum, s) => sum + s.attempts, 0);
+  const runAttempts = run?.attempts ?? 0, total = siblings.reduce((sum, s) => sum + (s.releaseOnly ? 0 : s.attempts), 0);
   let failed = 0, unknown = 0;
   for (const s of siblings) {
     if (!s.attempts) continue;
