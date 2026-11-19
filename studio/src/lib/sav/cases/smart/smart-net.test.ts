@@ -76,7 +76,7 @@ describe("le reste du filet ne bouge pas", () => {
 });
 
 describe("sur le corpus du banc (120 conversations fictives)", () => {
-  it("chaque tour attendu « equipe_sensible » est arrêté par le filet ; hors sensible, seuls les pièges d'injection sont arrêtés", () => {
+  it("chaque tour attendu « equipe_sensible » est arrêté par le filet ; hors sensible, les pièges d'injection et l'objet seul « Facture » (prudence, 4e revue)", () => {
     let sensitive = 0, caught = 0;
     const wrongStops: string[] = [];
     for (const conversation of SAV_BENCH_CORPUS) conversation.turns.forEach((turn, index) => {
@@ -85,7 +85,7 @@ describe("sur le corpus du banc (120 conversations fictives)", () => {
       else if (!expected.includes("equipe_sensible") && stop) wrongStops.push(conversation.family);
     });
     expect({ sensitive, caught }).toEqual({ sensitive: 16, caught: 16 });
-    expect(wrongStops).toEqual(["piege_injection", "piege_injection"]);
+    expect(wrongStops).toEqual(["mail_mal_ecrit", "piege_injection", "piege_injection"]);
   });
 });
 
@@ -172,6 +172,20 @@ describe("contre-revue d'Astra (20/11) : double barrière", () => {
       expect(result.reasons, label).toContain("sensitive:finance");
       expect(scripted.calls, label).toEqual([]);
     }
+  });
+  it("quatrième revue : chaque occurrence seule ; l'usage ordinaire n'excuse que sa propre phrase", async () => {
+    const { runSmartTurn } = await import("./smart-agent");
+    const { smartScriptedModel, smartStaticKnowledge, smartReading, smartGoodDecision, SMART_CONFORME } = await import("./smart-test-doubles");
+    const SUBJECT = "Pourquoi ce paiement Limova de 49 euros hier ?";
+    for (const body of ["Bonjour, je ne peux plus me connecter.", "Bonjour, je ne peux plus me connecter pour relancer les factures de mes clients."]) {
+      const scripted = smartScriptedModel({ understand: { output: smartReading({ sensible: { famille: "aucune", preuve: "relancer les factures de mes clients" } }) }, decide: { output: smartGoodDecision() }, verify: { output: SMART_CONFORME } });
+      const result = await runSmartTurn({ subject: SUBJECT, body, thread: [] }, { model: scripted.model, knowledge: smartStaticKnowledge(), maxInputBytes: 100_000, today: "2026-11-20" });
+      expect(result, body).toMatchObject({ outcome: "team_sensitive", sensitiveStop: "net", replyWithFooter: null });
+      expect(scripted.calls, body).toEqual([]);
+    }
+    expect(smartSafetyNet({ subject: "Question", body: "Bonjour, je veux relancer les factures de mes clients. Et pourquoi ce prélèvement de 49 € ?" })).toMatchObject({ stop: true });
+    expect(smartSafetyNet({ subject: "Relances", body: "Bonjour, je ne peux plus me connecter pour relancer les factures de mes clients." }).stop).toBe(false);
+    expect(smartSafetyNet({ subject: "Question", body: "Bonjour, mon Assistant doit relancer les factures impayées de mes clients. Comment je règle le délai ?" }).stop).toBe(false);
   });
   it("troisième revue : contradiction (sensitiveFamilies non vide, sensitive « no », sensible « aucune ») = doute = équipe ; idem pour chaque champ seul", async () => {
     const body = "Bonjour, je n'arrive pas à me connecter. Et ne reconduisez plus notre engagement s'il vous plaît.";

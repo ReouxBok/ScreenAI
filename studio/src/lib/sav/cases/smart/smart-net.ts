@@ -87,6 +87,8 @@ const ORDINARY_USES: readonly RegExp[] = [
   /\b(?:prix|tarifs?) (?:de |des |d')(?:mes |nos )?(?:prestations?|produits?|services?|articles?|chambres?|menus?|seances?|cours)\b/g,
   /\bgrille tarifaire\b/g,
 ];
+/** Sentences of a normalized text (end punctuation or a new line); decimals such as « 49.90 » are not cut. */
+const smartSentences = (text: string) => text.split(/(?<!\d)[.!?;]+|[.!?;]+(?!\d)|\n+/).map(part => part.trim()).filter(Boolean);
 const withoutOrdinaryUses = (text: string) => ORDINARY_USES.reduce((value, pattern) => value.replace(pattern, " "), text);
 
 /** The customer's own new words: quoted history removed, boilerplate lines removed, signature labels removed (a PS or a speaking line kept). */
@@ -116,9 +118,10 @@ export function smartSafetyNet(input: Readonly<{ subject: string; body: string }
     ...accessSkillKernelHits(subject, withoutBoilerplate(body)).map(id => `kernel:${id}`),
     ...OWN_BILLING_REQUESTS.filter(([, pattern]) => pattern.test(fresh) || pattern.test(subjectNorm)).map(([family]) => `sensitive:${family}`),
     // A sensitive topic word left in the new request (subject or fresh words, the customer's ordinary business removed): the team, point.
-    // The subject alone (« Facture ») is explained only when the fresh words carry that topic in an ordinary use and nowhere else.
-    ...TOPIC_WORDS.filter(([, pattern]) => pattern.test(withoutOrdinaryUses(fresh))
-      || (pattern.test(withoutOrdinaryUses(subjectNorm)) && !pattern.test(fresh))).map(([family]) => `sensitive:${family}`),
+    // Each occurrence on its own (Astra, fourth review): an ordinary use excuses only the occurrence in the SAME sentence; the subject is its
+    // own sentence. One sensitive occurrence left anywhere: the team.
+    ...TOPIC_WORDS.filter(([, pattern]) => smartSentences(`${subjectNorm}\n${fresh}`).some(sentence => pattern.test(withoutOrdinaryUses(sentence))))
+      .map(([family]) => `sensitive:${family}`),
   ];
   if (containsPromptInjection(`${subject}\n${body}`)) reasons.push("instruction_in_mail");
   if (!body.trim() && !subject.trim()) reasons.push("empty");
