@@ -359,6 +359,56 @@ describe('Gemini Live voice protocol', () => {
     }));
   });
 
+  it.each([{ code: 1006, wasClean: false }, { code: 1000, wasClean: true }])('reports a socket closed during startup ($code) and releases the microphone', async event => {
+    const session = new VoiceSession();
+    const starting = session.start();
+    const failed = expect(starting).rejects.toThrow('Connexion vocale fermée.');
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    FakeWebSocket.instances[0].emit('close', { ...event, reason: '' });
+    await failed;
+
+    expect(mediaTrack.stop).toHaveBeenCalledOnce();
+    expect(session.active).toBe(false);
+    expect(session.starting).toBe(false);
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'TRACK_EVENT', event: 'voice_session_failed', properties: { code: 'LIVE_SETUP_CLOSED' }
+    }));
+  });
+
+  it('reports a failed recovery rather than silently swallowing the closed replacement socket', async () => {
+    const { session, socket } = await startConnectedSession();
+    const emit = vi.spyOn(session, 'emit');
+    vi.useFakeTimers();
+    socket.emit('close', { code: 1006, wasClean: false, reason: '' });
+    await vi.advanceTimersByTimeAsync(500);
+    const replacement = FakeWebSocket.instances[1];
+    replacement.emit('close', { code: 1006, wasClean: false, reason: '' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(emit).toHaveBeenCalledWith('limova-voice-status', expect.objectContaining({ status: 'error' }));
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'VOICE_SESSION_STATE', active: false, reason: 'reconnect_failed'
+    }));
+    expect(session.active).toBe(false);
+    expect(mediaTrack.stop).toHaveBeenCalledOnce();
+  });
+
+  it('surfaces a server error received after setup instead of leaving the session listening', async () => {
+    const { session, socket } = await startConnectedSession();
+    const emit = vi.spyOn(session, 'emit');
+    socket.receive({ error: { code: 500, status: 'INTERNAL', message: 'private detail' } });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(session.ready).toBe(false);
+    expect(session.active).toBe(false);
+    expect(emit).toHaveBeenCalledWith('limova-voice-status', expect.objectContaining({ status: 'error' }));
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'DIAGNOSTIC_EVENT', code: 'LIVE_SERVER_ERROR', data: { serverCode: 500, serverStatus: 'INTERNAL' }
+    }));
+    expect(JSON.stringify(chromeMock.runtime.sendMessage.mock.calls)).not.toContain('private detail');
+  });
+
   it('requests microphone access before provisioning a short-lived token', async () => {
     const order = [];
     navigator.mediaDevices.getUserMedia.mockImplementationOnce(async () => {
@@ -1146,6 +1196,35 @@ describe('Gemini Live voice protocol', () => {
       code: 'VOICE_KB_SEARCH_SUCCEEDED',
       data: { queryLength: 25, resultCharacters: 55 }
     }));
+  });
+
+  it('reports an empty knowledge search as no result rather than a technical failure', async () => {
+    const { session, socket } = await startConnectedSession();
+    socket.sent.length = 0;
+    chromeMock.runtime.sendMessage.mockImplementation(async request => request.type === 'VOICE_KB_SEARCH'
+      ? { ok: false, status: 'not_found', failureCode: 'no_relevant_article', error: 'Aucun article pertinent trouvé.' }
+      : { ok: true });
+    await session.handleToolCalls([{ id: 'empty-kb', name: 'search_knowledge_base', args: { query: 'Question privée' } }]);
+    expect(socket.sent[0].toolResponse.functionResponses[0].response.status).toBe('not_found');
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'DIAGNOSTIC_EVENT', code: 'VOICE_KB_SEARCH_NO_RESULTS'
+    }));
+    expect(chromeMock.runtime.sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'DIAGNOSTIC_EVENT', code: 'VOICE_KB_SEARCH_FAILED'
+    }));
+    session.stop(false);
+  });
+
+  it('preserves an actionable background error code when voice provisioning fails', async () => {
+    chromeMock.runtime.sendMessage.mockImplementation(async request => request.type === 'GET_LIVE_TOKEN'
+      ? { ok: false, code: 'VOICE_CONTEXT_TAB_MISSING', error: 'Ouvre une page web.' }
+      : { ok: true });
+    const session = new VoiceSession();
+    await expect(session.start()).rejects.toThrow('Ouvre une page web.');
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'TRACK_EVENT', event: 'voice_session_failed', properties: { code: 'VOICE_CONTEXT_TAB_MISSING' }
+    }));
+    expect(mediaTrack.stop).toHaveBeenCalledOnce();
   });
 
   it('types dictated text into the selected field and returns the refreshed DOM without echoing values in diagnostics', async () => {

@@ -823,6 +823,7 @@ app.post('/api/copilot/voice-turn', verifyAssistantAuth, track('server_voice_tur
 app.post('/api/knowledge/search', verifyAssistantAuth, track('server_knowledge_search'), assistantLimiter, async (req, res) => {
   const requestId = crypto.randomUUID();
   if (!KNOWLEDGE_API_URL || !KNOWLEDGE_SERVICE_TOKEN) {
+    res.locals.analytics = { knowledge_outcome: 'configuration_unavailable' };
     return res.status(503).json({ error: 'Knowledge service unavailable', requestId });
   }
   const query = String(req.body?.query || '').trim();
@@ -833,6 +834,7 @@ app.post('/api/knowledge/search', verifyAssistantAuth, track('server_knowledge_s
     : ['article', 'onboarding'];
   const limit = Math.max(1, Math.min(10, Number(req.body?.limit) || 5));
   if (query.length < 2 || query.length > 2_000 || path.length > 1_000 || contentTypes.length === 0) {
+    res.locals.analytics = { knowledge_outcome: 'invalid_payload' };
     return res.status(400).json({ error: 'Invalid knowledge search payload', requestId });
   }
   const startedAt = Date.now();
@@ -843,7 +845,11 @@ app.post('/api/knowledge/search', verifyAssistantAuth, track('server_knowledge_s
       body: JSON.stringify({ query, path, locale, contentTypes, limit }),
       signal: AbortSignal.timeout(8_000)
     });
-    const data = await response.json().catch(() => ({ error: 'Invalid knowledge response' }));
+    let validJson = true;
+    const data = await response.json().catch(() => {
+      validJson = false;
+      return { error: 'Invalid knowledge response' };
+    });
     if (response.ok && data?.revision === 'kb_empty' && Array.isArray(data?.results) && data.results.length === 0) {
       // Installed extension versions still contain the historical embedded
       // fallback. Return an explicit empty-state result so those clients do
@@ -857,19 +863,30 @@ app.post('/api/knowledge/search', verifyAssistantAuth, track('server_knowledge_s
         verifiedAt: null
       }];
     }
-    res.locals.analytics = { result_count: Array.isArray(data?.results) ? data.results.length : 0 };
+    const resultCount = Array.isArray(data?.results) ? data.results.length : 0;
+    const knowledgeOutcome = !validJson ? 'invalid_response'
+      : !response.ok ? (response.status >= 500 ? 'upstream_5xx' : response.status >= 400 ? 'upstream_4xx' : 'upstream_http_error')
+        : !Array.isArray(data?.results) ? 'invalid_response'
+          : data.revision === 'kb_empty' ? 'empty_base'
+            : resultCount > 0 ? 'matched' : 'no_results';
+    res.locals.analytics = { result_count: resultCount, knowledge_outcome: knowledgeOutcome };
     console.info(JSON.stringify({ type: 'knowledge_search', requestId, status: response.status, revision: data?.revision || null, articleIds: Array.isArray(data?.results) ? data.results.map(result => result.id) : [], latencyMs: Date.now() - startedAt }));
     res.set('X-Request-Id', requestId);
     return res.status(response.status).json(data);
   } catch (error) {
+    res.locals.analytics = {
+      knowledge_outcome: ['TimeoutError', 'AbortError'].includes(error?.name)
+        ? 'upstream_timeout' : 'upstream_network_failure'
+    };
     console.error(JSON.stringify({ type: 'knowledge_error', requestId, message: error.message, latencyMs: Date.now() - startedAt }));
     return res.status(503).json({ error: 'Knowledge service unavailable', requestId });
   }
 });
 
-app.get('/api/onboarding/template', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.get('/api/onboarding/template', verifyAssistantAuth, track('server_onboarding_template'), assistantLimiter, async (req, res) => {
   const requestId = crypto.randomUUID();
   const template = await fetchPublishedOnboardingTemplate(requestId);
+  res.locals.analytics = { template_outcome: template ? 'available' : 'unavailable' };
   res.set('X-Request-Id', requestId);
   if (!template) return res.status(503).json({ error: 'Onboarding template unavailable', requestId });
   console.info(JSON.stringify({ type: 'onboarding_template', requestId, revision: template.revision || null, stepCount: template.steps.length }));
@@ -1031,7 +1048,7 @@ app.post('/api/live-token', verifyAssistantAuth, track('server_voice_session_iss
     'Les parcours peuvent contenir des « Empreintes d’action démontrées » : nom accessible, rôle, section, test-id/id stable, destination et résultat attendu. Utilise plusieurs de ces signaux pour retrouver une cible unique dans la carte DOM ACTUELLE, mais n’utilise jamais un ancien identifiant numérique ni un sélecteur brut. Si plusieurs contrôles restent plausibles, relis la page puis demande une clarification au lieu de deviner. Après chaque clic, appelle inspect_current_page et vérifie la route, la modale, les marqueurs visibles et les effets réseau attendus avant de poursuivre.',
     'Si une action est rejetée avec retryWithFreshContext, l’extension a automatiquement repris la carte DOM et une capture visuelle. Réévalue la cible avec ces deux sources et réessaie au maximum une fois. Si elle reste ambiguë ou absente, pose une seule question de clarification concise.',
     'Pour écrire à la place de l’utilisateur, appelle type_text_into_page uniquement si son intention désigne sans ambiguïté un seul champ non sensible et si le texte exact à saisir est connu. Si plusieurs champs conviennent, si la cible est incertaine ou si une valeur manque, n’appelle aucun outil et pose une seule question de clarification concise. N’invente jamais une donnée personnelle. La saisie ne valide et n’envoie jamais le formulaire.',
-    'Si l’utilisateur demande explicitement une action sûre sur la page, annonce brièvement l’action avec le libellé visible de la cible, puis appelle request_page_action avec l’ID exact présent dans la carte DOM la plus récente. Exemples : « Je sélectionne l’onglet « Conversation », situé en bas à gauche de l’écran. », « Je sélectionne l’onglet « Super-pouvoirs ». », « J’ouvre Intégrations. », « Je sélectionne l’image du rapport. ». Le libellé doit venir de la carte DOM actuelle ou d’une capture visuelle confirmée ; n’invente jamais le nom de la cible. Ne dis jamais « élément 5 », « #5 », « identifiant DOM », « elementId », « j’appelle un outil » ni aucun autre identifiant ou détail technique. Le numéro est transmis silencieusement à l’outil et ne doit jamais être prononcé. Un lien de navigation interne visible peut être une étape intermédiaire sûre même si son libellé diffère du but final — par exemple « connecter Gmail » commence par « Intégrations » — à condition de nommer cette étape dans ta réponse ; cette exception ne vaut jamais pour un bouton final, un formulaire ou un lien externe. « Fais-le », « vas-y », « go ahead » ou « hazlo » constituent une demande explicite uniquement si ton tour précédent nommait une cible unique encore présente dans la carte DOM ; sinon demande quel contrôle utiliser. Une carte d’intégration libellée « Connecter [nom] » est une cible préparatoire sûre : sélectionne celle dont le nom correspond exactement à la demande. Pour envoyer un message, n’agis que si la carte DOM contient exactement « Envoyer le message » et que l’utilisateur vient de demander explicitement l’envoi, directement ou par cette reprise non ambiguë. Ne remplace jamais cette cible par le micro, la pièce jointe ou un autre bouton ; si elle manque, relis la page puis demande une clarification. L’extension affichera un curseur et cliquera automatiquement : ne demande aucune confirmation et ne parle jamais de notification à valider. Après le résultat de l’outil, continue à partir de la nouvelle carte DOM et confirme brièvement la réussite avec le libellé humain de la cible. En cas d’échec, explique le problème sans révéler l’identifiant interne.',
+    'Si l’utilisateur demande explicitement une action sûre sur la page, annonce brièvement l’action avec le libellé visible de la cible, puis appelle request_page_action avec l’ID exact présent dans la carte DOM la plus récente. Exemples : « Je sélectionne l’onglet « Conversation », situé en bas à gauche de l’écran. », « Je sélectionne l’onglet « Super-pouvoirs ». », « J’ouvre Intégrations. », « Je sélectionne l’image du rapport. ». Le libellé doit venir de la carte DOM actuelle ou d’une capture visuelle confirmée ; n’invente jamais le nom de la cible. Ne dis jamais « élément 5 », « #5 », « identifiant DOM », « elementId », « j’appelle un outil » ni aucun autre identifiant ou détail technique. Le numéro est transmis silencieusement à l’outil et ne doit jamais être prononcé. Un lien de navigation interne visible peut être une étape intermédiaire sûre même si son libellé diffère du but final — par exemple « connecter Gmail » commence par « Intégrations » — à condition de nommer cette étape dans ta réponse ; cette exception ne vaut jamais pour un bouton final, un formulaire ou un lien externe. « Fais-le », « vas-y », « go ahead » ou « hazlo » constituent une demande explicite uniquement si ton tour précédent nommait une cible unique encore présente dans la carte DOM ; sinon demande quel contrôle utiliser. Une carte d’intégration libellée « Connecter [nom] » est une cible préparatoire sûre : sélectionne celle dont le nom correspond exactement à la demande. Pour envoyer un message dans le chat Limova, n’agis que si la carte DOM contient exactement « Envoyer le message » et que l’utilisateur vient de demander explicitement l’envoi, directement ou par cette reprise non ambiguë. Ne remplace jamais cette cible par le micro, la pièce jointe ou un autre bouton ; si elle manque, relis la page puis demande une clarification. Sur un autre site, envoyer un formulaire ou un message, valider, payer, supprimer ou ouvrir un lien vers un autre site n’est permis que si l’utilisateur le demande explicitement en nommant l’action ou la cible, ou confirme clairement la cible unique que tu viens de nommer ; jamais de ta propre initiative ni à partir d’une simple question. Utilise alors le bouton d’envoi de ce formulaire (Envoyer, Valider, Publier…) ; s’il y en a plusieurs, demande lequel. L’extension affichera un curseur et cliquera automatiquement : ne demande aucune confirmation et ne parle jamais de notification à valider. Après le résultat de l’outil, continue à partir de la nouvelle carte DOM et confirme brièvement la réussite avec le libellé humain de la cible. En cas d’échec, explique le problème sans révéler l’identifiant interne.',
     evaluationMode ? `MODE TEST DE FLOW ISOLÉ. Exécute un seul parcours continu de bout en bout à partir du brouillon ci-dessous. Ce brouillon remplace la base publiée pour ce test. Comprends l’objectif, demande une précision uniquement si une donnée réellement nécessaire manque, agis avec les outils sur chaque étape, puis appelle verify_expected_result avant d’annoncer la réussite. N’utilise aucune mémoire personnelle et ne transforme rien de ce test en souvenir.\n${evaluationContext.context}` : '',
     pageContext ? `Contexte DOM privé de la page:\n${pageContext}` : '',
     history ? `Conversation récente:\n${history}` : ''

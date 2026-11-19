@@ -122,6 +122,160 @@ describe('controlled page actions', () => {
     expect(sendOrder).toEqual(['click:1:v1', 'click:1:v2']);
   });
 
+  it.each([
+    ['chrome://settings/', 'Cannot access contents of the page', 'restricted_browser_page'],
+    ['https://chromewebstore.google.com/detail/example', 'Cannot access contents of the page', 'restricted_browser_page'],
+    ['https://private.example/document', 'Missing host permission for the tab', 'host_permission_denied'],
+    ['https://private.example/document', 'Frame with ID 0 was removed', 'navigation_race']
+  ])('categorizes a repair failure on %s without sending the URL or message to analytics', async (url, errorMessage, reason) => {
+    const track = vi.spyOn(background.analytics, 'trackError');
+    chromeMock.tabs.get.mockResolvedValue({ id: 17, url, active: true });
+    chromeMock.tabs.sendMessage.mockRejectedValue(new Error('Receiving end does not exist'));
+    chromeMock.scripting.executeScript.mockRejectedValue(new Error(errorMessage));
+    try {
+      const result = await background.proposeOrExecuteAction(1, 'Clique sur Documents');
+      expect(result.ok).toBe(false);
+      expect(track).toHaveBeenCalledWith('content_script', 'CONTENT_SCRIPT_REPAIR_FAILED', {
+        errorType: 'Error', failureReason: reason
+      });
+      expect(JSON.stringify(track.mock.calls)).not.toContain('private.example');
+      expect(JSON.stringify(track.mock.calls)).not.toContain(errorMessage);
+    } finally {
+      track.mockRestore();
+      chromeMock.tabs.get.mockResolvedValue({ id: 17, windowId: 1, url: 'https://new.limova.ai/home', active: true });
+    }
+  });
+
+  async function showOnlyExternalLink() {
+    document.body.innerHTML = '<a href="https://www.instagram.com/p/abc" target="_blank">Voir la publication Instagram</a>';
+    await background.getPageContext(17);
+    background.lockTab(17);
+    chromeMock.tabs.sendMessage.mockClear();
+    sidebarMessages.length = 0;
+  }
+
+  it('opens a link to another site when the user explicitly asks for it', async () => {
+    await showOnlyExternalLink();
+    const result = await background.proposeOrExecuteAction(1, 'Ouvre la publication Instagram');
+    expect(result.ok).toBe(true);
+    expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(17, expect.objectContaining({
+      type: 'EXECUTE_ELEMENT_ACTION', id: 1
+    }));
+  });
+
+  it('keeps a link to another site blocked when the user did not ask for it', async () => {
+    await showOnlyExternalLink();
+    const result = await background.proposeOrExecuteAction(1, 'Que contient cette page ?');
+    expect(result).toMatchObject({ ok: false, status: 'blocked' });
+    expect(chromeMock.tabs.sendMessage).not.toHaveBeenCalledWith(17, expect.objectContaining({
+      type: 'EXECUTE_ELEMENT_ACTION'
+    }));
+  });
+
+  it.each([
+    ['while the click is dispatched', 0],
+    ['while the click effect settles', 100]
+  ])('reports a link that opened a followed new tab as executed (%s)', async (_label, followDelayMs) => {
+    await showOnlyExternalLink();
+    chromeMock.tabs.sendMessage.mockImplementation(async (_tabId, message) => {
+      if (message.type !== 'EXECUTE_ELEMENT_ACTION') return { ok: true };
+      const follow = () => {
+        chromeMock._listeners.tabs.onCreated.forEach(listener => listener({ id: 18, openerTabId: 17, windowId: 1 }));
+        background.lockTab(18);
+      };
+      if (followDelayMs) setTimeout(follow, followDelayMs);
+      else follow();
+      return { ok: true, clickDispatched: true };
+    });
+    try {
+      const result = await background.proposeOrExecuteAction(1, 'Ouvre la publication Instagram');
+      expect(result).toMatchObject({ ok: true, effectObserved: true, effectEvidence: { newTabOpened: true } });
+      expect(result.cancelled).toBeUndefined();
+      expect(sidebarMessages).toContainEqual(expect.objectContaining({ type: 'ACTION_RESULT', ok: true }));
+    } finally {
+      background.lockTab(17);
+    }
+  });
+
+  it('still cancels a click when Charly moves to a tab the click did not open', async () => {
+    await showOnlyExternalLink();
+    chromeMock.tabs.sendMessage.mockImplementation(async (_tabId, message) => {
+      if (message.type === 'EXECUTE_ELEMENT_ACTION') background.lockTab(19);
+      return { ok: true, clickDispatched: true };
+    });
+    try {
+      const result = await background.proposeOrExecuteAction(1, 'Ouvre la publication Instagram');
+      expect(result).toMatchObject({ ok: false, cancelled: true });
+    } finally {
+      background.lockTab(17);
+    }
+  });
+
+  async function showPage(html) {
+    document.body.innerHTML = html;
+    const context = await background.getPageContext(17);
+    background.lockTab(17);
+    chromeMock.tabs.sendMessage.mockClear();
+    sidebarMessages.length = 0;
+    return label => Number(context.match(new RegExp(`\\[(\\d+)\\] clickable\\([a-z]+\\) "${label}"`))?.[1]);
+  }
+
+  const clicked = id => expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(17, expect.objectContaining({
+    type: 'EXECUTE_ELEMENT_ACTION', id
+  }));
+  const notClicked = () => expect(chromeMock.tabs.sendMessage).not.toHaveBeenCalledWith(17, expect.objectContaining({
+    type: 'EXECUTE_ELEMENT_ACTION'
+  }));
+
+  it.each(['Envoie le formulaire', 'Envoie le message', 'Clique sur Envoyer', 'Envoie'])(
+    'sends a form of another site on an explicit request: %s',
+    async wording => {
+      const idOf = await showPage('<form><label for="m">Message</label><textarea id="m"></textarea><button type="submit">Envoyer</button></form>');
+      const result = await background.proposeOrExecuteAction(idOf('Envoyer'), wording);
+      expect(result).toMatchObject({ ok: true });
+      clicked(idOf('Envoyer'));
+    }
+  );
+
+  it('asks which form to send when the page holds several send buttons', async () => {
+    const idOf = await showPage(`
+      <form><input aria-label="Email newsletter"><button type="submit">S’abonner</button></form>
+      <form><textarea aria-label="Message"></textarea><button type="submit">Envoyer</button></form>
+    `);
+    const result = await background.proposeOrExecuteAction(idOf('Envoyer'), 'Envoie le formulaire');
+    expect(result).toMatchObject({ ok: false, status: 'blocked' });
+    notClicked();
+  });
+
+  it('never sends a form the user did not ask to send', async () => {
+    const idOf = await showPage('<form><textarea aria-label="Message"></textarea><button type="submit">Envoyer</button></form>');
+    const result = await background.proposeOrExecuteAction(idOf('Envoyer'), 'Que contient cette page ?');
+    expect(result).toMatchObject({ ok: false, status: 'blocked' });
+    notClicked();
+  });
+
+  it('does not treat a bare "clique" as explicit for a consequential button', async () => {
+    const idOf = await showPage('<button type="button">Supprimer le brouillon</button>');
+    const vague = await background.proposeOrExecuteAction(idOf('Supprimer le brouillon'), 'Clique');
+    expect(vague).toMatchObject({ ok: false, status: 'blocked' });
+    notClicked();
+    const named = await background.proposeOrExecuteAction(idOf('Supprimer le brouillon'), 'Clique sur Supprimer le brouillon');
+    expect(named.ok).toBe(true);
+  });
+
+  it('accepts a voice tool click on a consequential button only after a real request', async () => {
+    const idOf = await showPage('<button type="button">Payer maintenant</button>');
+    const question = await background.proposeOrExecuteAction(idOf('Payer maintenant'), 'C’est quoi ce bouton ?', {
+      toolExplicitRequest: true, targetLabel: 'Payer maintenant'
+    });
+    expect(question).toMatchObject({ ok: false, status: 'blocked' });
+    notClicked();
+    const confirmation = await background.proposeOrExecuteAction(idOf('Payer maintenant'), 'Oui vas-y', {
+      toolExplicitRequest: true, targetLabel: 'Payer maintenant'
+    });
+    expect(confirmation.ok).toBe(true);
+  });
+
   it('executes a safe action marker without showing a confirmation card', async () => {
     const result = await background.proposeOrExecuteAction(1, 'Que contient cette page ?');
     expect(result.ok).toBe(true);
@@ -328,6 +482,41 @@ describe('controlled page actions', () => {
     }));
   });
 
+  it('recognises the Limova 3 arrow named "Envoyer" as the chat send button, only on Limova', async () => {
+    const limova3Composer = `
+      <div id="composer">
+        <textarea placeholder="Dis-moi ce que tu as en tête..."></textarea>
+        <button type="button" aria-label="Ajouter une pièce jointe" title="Ajouter une pièce jointe"><svg></svg></button>
+        <button title="Cliquez pour parler"><svg></svg></button>
+        <button type="button" aria-label="Envoyer"><svg></svg></button>
+      </div>
+    `;
+    const previousUrl = window.location.href;
+    try {
+      jsdom.reconfigure({ url: 'https://staging.new.limova.ai/organizations/o/workspaces/w/chat/new' });
+      document.body.innerHTML = limova3Composer;
+      const context = await background.getPageContext(17);
+      const sendId = Number(context.match(/\[(\d+)\] clickable\(button\) "Envoyer le message"/)?.[1]);
+      expect(sendId).toBeGreaterThan(0);
+      expect(context).not.toMatch(/clickable\(button\) "Envoyer"(?! le message)/);
+      chromeMock.tabs.sendMessage.mockClear();
+
+      const result = await background.proposeOrExecuteAction(sendId, 'Envoie le message');
+      expect(result.ok).toBe(true);
+      expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(17, expect.objectContaining({
+        type: 'EXECUTE_ELEMENT_ACTION', id: sendId
+      }));
+
+      jsdom.reconfigure({ url: 'https://outside.example/contact' });
+      document.body.innerHTML = limova3Composer;
+      const outsideContext = await background.getPageContext(17);
+      expect(outsideContext).toMatch(/clickable\(button\) "Envoyer"/);
+      expect(outsideContext).not.toMatch(/"Envoyer le message"/);
+    } finally {
+      jsdom.reconfigure({ url: previousUrl });
+    }
+  });
+
   it('honors an indirect voice confirmation when the tool names the exact send target', async () => {
     document.body.innerHTML = `
       <section id="composer">
@@ -362,6 +551,26 @@ describe('controlled page actions', () => {
       contextVersion: 1,
       text: 'Prépare un résumé concis'
     });
+  });
+
+  it('does not type after a text tool is superseded while checking consent', async () => {
+    let finishConsent;
+    const get = chromeMock.storage.local.get.getMockImplementation();
+    chromeMock.storage.local.get.mockImplementation(key => key === 'limova_ai_processing_consent_v1'
+      ? new Promise(resolve => { finishConsent = resolve; }) : get(key));
+    const controller = new AbortController();
+    try {
+      const pending = background.executeCopilotTool({
+        id: 'superseded-fill', name: 'fill_field', args: { elementId: 5, contextVersion: 1, text: 'Old instruction', targetLabel: 'Instructions' }
+      }, 'Remplis Instructions', 'old-turn', controller.signal);
+      await vi.waitFor(() => expect(finishConsent).toBeTypeOf('function'));
+      controller.abort();
+      finishConsent({ limova_ai_processing_consent_v1: true });
+      expect(await pending).toMatchObject({ cancelled: true });
+      expect(chromeMock.tabs.sendMessage).not.toHaveBeenCalledWith(17, expect.objectContaining({ type: 'TYPE_ELEMENT_TEXT' }));
+    } finally {
+      chromeMock.storage.local.get.mockImplementation(get);
+    }
   });
 
   it('refreshes and remaps a field once when the SPA replaced the original DOM node', async () => {

@@ -69,7 +69,7 @@ const TECHNICAL_ERROR_MESSAGES = [
   [/^(?:PROXY_NETWORK_FAILED|NETWORK_UNAVAILABLE)$/, 'Impossible de joindre le service Limova. Vérifie ta connexion internet puis réessaie.'],
   [/^(?:PROXY_REQUEST_TIMEOUT|REQUEST_TIMEOUT)$/, 'Charly met trop de temps à répondre. Réessaie dans un instant.'],
   [/^(?:GEMINI_HTTP_5XX|PROXY_RATE_LIMITED)$/, 'Le service est momentanément surchargé. Réessaie dans un instant.'],
-  [/^(?:GEMINI_HTTP_\d+|GEMINI_REQUEST_FAILED|UNEXPECTED_ERROR)$/, 'Charly n’a pas pu répondre. Réessaie dans un instant.']
+  [/^(?:GEMINI_HTTP_\d+|GEMINI_REQUEST_FAILED|UNEXPECTED_ERROR|MESSAGE_HANDLER_FAILED|USER_MESSAGE_FAILED|PAGE_ANALYSIS_FAILED|NEXT_STEP_FAILED|INVALID_SERVICE_RESPONSE|COPILOT_ADK_FAILED|COPILOT_INVALID_RESPONSE)$/, 'Charly n’a pas pu répondre. Réessaie dans un instant.']
 ];
 
 function userFacingErrorMessage(error, code) {
@@ -85,6 +85,9 @@ function isCancellation(error) {
 
 function errorCodeOf(error, fallback = 'UNEXPECTED_ERROR') {
   if (typeof error?.code === 'string' && /^[A-Z0-9_]{3,80}$/.test(error.code)) return error.code;
+  if (error?.name === 'TimeoutError') return 'PROXY_REQUEST_TIMEOUT';
+  if (isCancellation(error)) return 'PROXY_REQUEST_ABORTED';
+  if (error?.name === 'SyntaxError') return 'INVALID_SERVICE_RESPONSE';
   const message = String(error?.message || '');
   if (/connecte-toi|non authentifi|session.*expir/i.test(message)) return 'AUTH_SESSION_MISSING';
   if (/microphone|micro\b/i.test(message)) return 'MIC_PERMISSION_FAILED';
@@ -325,8 +328,29 @@ const initializationPromise = loggerInitializationPromise.then(() => Promise.all
 ]));
 
 Logger.onRecord = entry => {
-  if (entry.level === 'ERROR') analytics.trackError(entry.component, entry.code);
+  if (entry.level === 'ERROR') {
+    analytics.trackError(entry.component, entry.code, {
+      errorType: safeErrorType(entry.data?.name),
+      failureReason: safeFailureReason(entry.data?.failureReason || entry.data?.failureCode || entry.data?.reason)
+    });
+  }
 };
+
+const SAFE_ERROR_TYPES = new Set(['Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError', 'AbortError', 'TimeoutError', 'NetworkError', 'NotAllowedError', 'NotFoundError', 'InvalidStateError', 'SecurityError', 'NotReadableError']);
+const SAFE_FAILURE_REASONS = new Set([
+  'framework_reverted_input', 'sensitive_field', 'ambiguous_field', 'unsupported_field_type',
+  'stale_context', 'field_length_limit', 'missing_text', 'content_script_unavailable', 'field_unavailable', 'text_input_retry_failed',
+  'no_relevant_article', 'knowledge_unavailable',
+  'tab_closed', 'pdf_document', 'restricted_browser_page', 'host_permission_denied', 'navigation_race', 'injection_failed'
+]);
+
+function safeErrorType(value) {
+  return SAFE_ERROR_TYPES.has(value) ? value : null;
+}
+
+function safeFailureReason(value) {
+  return SAFE_FAILURE_REASONS.has(value) ? value : null;
+}
 
 globalThis.addEventListener?.('unhandledrejection', event => {
   Logger.error('service_worker', 'Unhandled promise rejection', event.reason, 'UNHANDLED_REJECTION');
@@ -474,7 +498,42 @@ function isFollowedPageUrl(tabId, url) {
   return isLimovaUrl(url) || (tabId === sessionState.lockedTabId && isAssistedUrl(url));
 }
 
+// Tabs opened by another tab. A link with target="_blank" (an Instagram post,
+// a search result) opens one and Charly follows it: that click succeeded and
+// must not be reported as a cancelled or unverified action.
+const openedChildTabs = new Map();
+const OPENED_CHILD_TAB_MAX_AGE_MS = 60_000;
+
+function recordOpenedChildTab(tab) {
+  if (!tab?.id || !Number.isInteger(tab.openerTabId)) return;
+  const now = Date.now();
+  for (const [tabId, entry] of openedChildTabs) {
+    if (now - entry.openedAt > OPENED_CHILD_TAB_MAX_AGE_MS) openedChildTabs.delete(tabId);
+  }
+  openedChildTabs.set(tab.id, { openerTabId: tab.openerTabId, openedAt: now });
+}
+
+function childTabOpenedSince(openerTabId, since) {
+  let latest = null;
+  for (const [tabId, entry] of openedChildTabs) {
+    if (entry.openerTabId === openerTabId && entry.openedAt >= since && (!latest || entry.openedAt > latest.openedAt)) {
+      latest = { tabId, openedAt: entry.openedAt };
+    }
+  }
+  return latest?.tabId ?? null;
+}
+
+// The operation is only stale because Charly followed the tab the click
+// opened; the session itself is unchanged.
+function followedTabOpenedByClick(operation, since) {
+  if (operation.generation !== sessionGeneration || operation.signal?.aborted) return null;
+  if (operation.voiceGeneration !== undefined && operation.voiceGeneration !== voiceSessionGeneration) return null;
+  const openedTabId = childTabOpenedSince(operation.tabId, since);
+  return openedTabId && openedTabId === sessionState.lockedTabId ? openedTabId : null;
+}
+
 chrome.tabs.onCreated.addListener((tab) => {
+  recordOpenedChildTab(tab);
   trackExternalPopup(tab).catch(error => Logger.warn('popup', 'External popup tracking failed', error));
 });
 
@@ -713,8 +772,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return false;
   }
   handleMessage(request, sender).then(sendResponse).catch(err => {
-    Logger.error('background', 'Message handler error', err);
-    sendResponse({ error: err.message });
+    const code = errorCodeOf(err, 'MESSAGE_HANDLER_FAILED');
+    if (!isCancellation(err)) Logger.error('background', 'Message handler error', err, code);
+    sendResponse({ ok: false, error: userFacingErrorMessage(err, code), code });
   });
   return true;
 });
@@ -1012,11 +1072,14 @@ function recordClientDiagnostic(request) {
     : 'extension_page';
   const code = String(request.code || 'CLIENT_EVENT').toUpperCase().replace(/[^A-Z0-9_]/g, '_').slice(0, 80);
   const data = request.data || null;
-  const errorCode = /(?:^|_)(?:FAILED|ERROR|TIMEOUT|DENIED|BLOCKED|UNAVAILABLE|INVALID)$/.test(code);
+  const expectedRefusal = code === 'VOICE_TEXT_INPUT_FAILED' && [
+    'sensitive_field', 'ambiguous_field', 'unsupported_field_type', 'missing_text', 'field_length_limit'
+  ].includes(data?.failureCode);
+  const errorCode = !expectedRefusal && /(?:^|_)(?:FAILED|ERROR|TIMEOUT|DENIED|BLOCKED|UNAVAILABLE|INVALID)$/.test(code);
   const warningCode = /(?:^|_)(?:DISMISSED|RETRY|RECOVERY_SCHEDULED|MISMATCH)$/.test(code)
     || (code === 'LIVE_WS_CLOSED' && data?.clean === false);
   Logger.record(
-    errorCode ? 'ERROR' : warningCode ? 'WARN' : 'INFO',
+    errorCode ? 'ERROR' : warningCode || expectedRefusal ? 'WARN' : 'INFO',
     component,
     code,
     code,
@@ -1265,8 +1328,11 @@ async function recordEvaluationEvent(event) {
 
 async function runEvaluatedVoiceTool(toolName, targetLabel, operation) {
   const result = await operation();
+  if (result?.cancelled) return result;
   const status = result?.retryWithFreshContext === true
     ? 'not_found'
+    : result?.status === 'not_found'
+      ? 'not_found'
     : result?.status === 'unexpected'
       ? 'unexpected'
       : result?.ok
@@ -1275,7 +1341,12 @@ async function runEvaluatedVoiceTool(toolName, targetLabel, operation) {
           ? 'ambiguous'
           : 'blocked';
   countVoiceAnalytics('toolsUsed');
-  analytics.track('tool_executed', { tool: toolName, status, channel: 'voice' });
+  const failureReason = safeFailureReason(result?.failureCode);
+  analytics.track('tool_executed', {
+    tool: toolName, status, channel: 'voice',
+    ...(failureReason ? { failure_reason: failureReason } : {}),
+    ...(result?.retryWithFreshContext ? { recovery_requested: true } : {})
+  });
   if (evaluationState.active) {
     await recordEvaluationEvent({
       kind: 'tool_result',
@@ -1539,14 +1610,16 @@ async function runUserMessage(text) {
   const generation = sessionGeneration;
   text = String(text || '').trim().slice(0, 8_000);
   if (!text) return { ok: false, error: 'Message vide.' };
-  rememberUserTurn(text, 'text');
+  const turn = rememberUserTurn(text, 'text');
+  activeAbortController?.abort();
+  const isCurrentTurn = () => generation === sessionGeneration && turn === lastUserTurn;
   if (!(await hasAIProcessingConsent())) {
-    if (generation !== sessionGeneration) return { ok: true };
+    if (!isCurrentTurn()) return { ok: true };
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
   const tab = await getActiveAssistedTab();
-  if (generation !== sessionGeneration) return { ok: true };
+  if (!isCurrentTurn()) return { ok: true };
   analytics.track('message_sent', {
     channel: 'text',
     history_length: sessionState.conversationHistory.length,
@@ -1554,6 +1627,7 @@ async function runUserMessage(text) {
     is_limova_page: isLimovaUrl(tab?.url)
   });
   if (tab && isExternalSiteUrl(tab.url)) await ensureContentScript(tab.id).catch(() => false);
+  if (!isCurrentTurn()) return { ok: true };
   if (tab && tab.id !== sessionState.lockedTabId) lockTab(tab.id);
   const operationId = Logger.createOperationId('chat');
 
@@ -1571,10 +1645,10 @@ async function runUserMessage(text) {
     // Initialize onboarding inside the guarded request flow so an expired
     // Limova session produces the same actionable error as every AI request.
     const { limova_onboarding_dismissed } = await chrome.storage.local.get('limova_onboarding_dismissed');
-    if (generation !== sessionGeneration) return { ok: true };
+    if (!isCurrentTurn()) return { ok: true };
     if (!sessionState.onboardingPlan && sessionState.conversationHistory.length === 0 && !limova_onboarding_dismissed) {
       const publishedTemplate = await getPublishedOnboardingTemplate();
-      if (generation !== sessionGeneration) return { ok: true };
+      if (!isCurrentTurn()) return { ok: true };
       sessionState.onboardingPlan = createOnboardingPlan(publishedTemplate);
       analytics.track('onboarding_started', onboardingAnalytics(sessionState.onboardingPlan));
       const current = sessionState.onboardingPlan.steps[0];
@@ -1583,7 +1657,7 @@ async function runUserMessage(text) {
       scheduleSave();
     }
     const copilot = await getCopilotBootstrap(false).catch(() => null);
-    if (generation !== sessionGeneration) return { ok: true };
+    if (!isCurrentTurn()) return { ok: true };
     if (copilot?.sessionId && !sessionState.remoteSessionId) {
       sessionState.remoteSessionId = copilot.sessionId;
       scheduleSave();
@@ -1594,13 +1668,14 @@ async function runUserMessage(text) {
 
     if (tab) {
       pageContext = await getPageContext(tab.id);
-      if (generation !== sessionGeneration) return { ok: true };
+      if (!isCurrentTurn()) return { ok: true };
       if (!copilot?.serverOrchestration) {
         pageAnalysis = await capturePageAnalysis(tab.id, operationId);
-        if (generation !== sessionGeneration) return { ok: true };
+        if (!isCurrentTurn()) return { ok: true };
         consoleLogs = await getConsoleLogs(tab.id);
       }
     }
+    if (!isCurrentTurn()) return { ok: true };
 
     if (copilot?.serverOrchestration) {
       await sendToCopilotV2({
@@ -1624,12 +1699,12 @@ async function runUserMessage(text) {
       _sessionGeneration: generation
     });
   } catch (error) {
-    if (generation !== sessionGeneration) return { ok: true };
+    if (!isCurrentTurn()) return { ok: true };
     if (isCancellation(error)) {
       Logger.event('background', 'USER_MESSAGE_SUPERSEDED', null, operationId);
       return { ok: true };
     }
-    const code = errorCodeOf(error);
+    const code = errorCodeOf(error, 'USER_MESSAGE_FAILED');
     analytics.track('assistant_failed', { trigger: 'user_message', error_code: code });
     Logger.error('background', 'User message handling failed', error, code, operationId);
     broadcastToSidebar({ type: 'ERROR', content: userFacingErrorMessage(error, code), code });
@@ -1710,6 +1785,10 @@ async function handleTakeScreenshot() {
     });
   } catch (error) {
     if (generation !== sessionGeneration) return { ok: true };
+    if (isCancellation(error)) {
+      Logger.event('background', 'PAGE_ANALYSIS_CANCELLED', null, operationId);
+      return { ok: true };
+    }
     const code = errorCodeOf(error, 'PAGE_ANALYSIS_FAILED');
     analytics.track('assistant_failed', { trigger: 'page_analysis_button', error_code: code });
     Logger.error('background', 'Page analysis failed', error, code, operationId);
@@ -1753,6 +1832,10 @@ async function handleNextStep() {
     });
   } catch (error) {
     if (generation !== sessionGeneration) return { ok: true };
+    if (isCancellation(error)) {
+      Logger.event('background', 'NEXT_STEP_CANCELLED', null, operationId);
+      return { ok: true };
+    }
     const code = errorCodeOf(error, 'NEXT_STEP_FAILED');
     analytics.track('assistant_failed', { trigger: 'next_step', error_code: code });
     Logger.error('background', 'Next step failed', error, code, operationId);
@@ -1828,7 +1911,7 @@ async function handleModalDetected(sender, modal = {}) {
       _sessionGeneration: generation
     });
   } catch (error) {
-    if (generation !== sessionGeneration) return { ok: true };
+    if (generation !== sessionGeneration || isCancellation(error)) return { ok: true };
     Logger.error('background', 'Modal detection handling failed', error, errorCodeOf(error, 'MODAL_ANALYSIS_FAILED'), operationId);
   }
 
@@ -1886,7 +1969,9 @@ function normalizedCopilotStatus(result) {
   return 'failed';
 }
 
-async function executeCopilotTool(call, userMessage, operationId) {
+async function executeCopilotTool(call, userMessage, operationId, signal) {
+  const operation = { ...captureVoiceOperation(), signal };
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   const args = call?.args || {};
   let result;
   if (!call?.id || typeof call.name !== 'string') {
@@ -1917,12 +2002,13 @@ async function executeCopilotTool(call, userMessage, operationId) {
     result = await proposeOrExecuteAction(Number(args.elementId), userMessage, {
       toolExplicitRequest: call.name === 'click_element' && args.explicitRequest === true,
       targetLabel: args.targetLabel,
-      requestedContextVersion: requestedVersion
+      requestedContextVersion: requestedVersion,
+      operation
     });
   } else if (call.name === 'fill_field') {
-    result = await typeVoiceText(Number(args.elementId), String(args.text || ''), requestedVersion, args.targetLabel);
+    result = await typeVoiceText(Number(args.elementId), String(args.text || ''), requestedVersion, args.targetLabel, operation);
   } else if (call.name === 'scroll_page') {
-    result = await scrollVoicePage(args.direction, args.amount, args.elementId, args.contextVersion);
+    result = await scrollVoicePage(args.direction, args.amount, args.elementId, args.contextVersion, operation);
   } else if (call.name === 'verify_expected_result') {
     const page = await currentCopilotPage(null);
     return {
@@ -1936,6 +2022,7 @@ async function executeCopilotTool(call, userMessage, operationId) {
     return { callId: call.id, status: 'failed', contextVersion: pageContextVersion, message: 'Outil non pris en charge.' };
   }
 
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   const status = result?.status === 'unexpected' ? 'unexpected' : normalizedCopilotStatus(result);
   let pageContext = result?.pageContext || '';
   if (!pageContext && sessionState.lockedTabId) pageContext = await getPageContext(sessionState.lockedTabId).catch(() => '');
@@ -1966,9 +2053,11 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
   activeAbortController = controller;
   const sessionId = await ensureRemoteCopilotSession(generation, controller.signal);
   if (generation !== sessionGeneration) return;
+  controller.signal.throwIfAborted();
   const idempotencyKey = `${operationId || 'text'}:${userTurnSequence}`;
   const page = await currentCopilotPage(tab, pageContext);
   if (generation !== sessionGeneration) return;
+  controller.signal.throwIfAborted();
   let response = await authorizedProxyFetch('/api/copilot/v2/turn', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1996,6 +2085,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
     signal: controller.signal
   });
   if (generation !== sessionGeneration) return;
+  controller.signal.throwIfAborted();
   if ([404, 409, 503].includes(response.status)) {
     copilotBootstrapCache = null;
     copilotBootstrapCacheExpiresAt = 0;
@@ -2003,6 +2093,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
     const fallbackCapture = tab?.id ? await capturePageAnalysis(tab.id, operationId) : null;
     if (generation !== sessionGeneration) return;
     const consoleLogs = tab?.id ? await getConsoleLogs(tab.id) : '';
+    controller.signal.throwIfAborted();
     return sendToGemini({
       pageAnalysis: fallbackCapture,
       url: privacySafeUrl(tab?.url),
@@ -2017,6 +2108,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
   }
   let data = await response.json().catch(() => ({}));
   if (generation !== sessionGeneration) return;
+  controller.signal.throwIfAborted();
   if (!response.ok) throw codedError('COPILOT_ADK_FAILED', data.error || 'Charly est temporairement indisponible.');
   let actionCount = 0;
   const presenceTabId = tab?.id || sessionState.lockedTabId;
@@ -2025,8 +2117,10 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
       actionCount += 1;
       if (actionCount > 6) throw codedError('COPILOT_ACTION_LIMIT', 'Charly s’est arrêtée pour éviter une boucle d’actions.');
       if (PAGE_ACTION_TOOLS.has(data.call?.name)) await showAgentPresence(presenceTabId);
-      const result = await executeCopilotTool(data.call, userMessage, operationId);
+      controller.signal.throwIfAborted();
+      const result = await executeCopilotTool(data.call, userMessage, operationId, controller.signal);
       if (generation !== sessionGeneration) return;
+      controller.signal.throwIfAborted();
       analytics.track('tool_executed', { tool: String(data.call?.name || 'unknown'), status: result.status, channel: 'text' });
       if (evaluationState.active) await recordEvaluationEvent({
         kind: 'tool_result',
@@ -2045,6 +2139,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
       });
       data = await response.json().catch(() => ({}));
       if (generation !== sessionGeneration) return;
+      controller.signal.throwIfAborted();
       if (!response.ok) throw codedError(response.status === 410 ? 'COPILOT_RUN_EXPIRED' : 'COPILOT_RUN_FAILED', data.error || 'L’action de Charly a expiré. Réessaie.');
     }
   } finally {
@@ -2052,8 +2147,10 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
   }
   if (data.type !== 'message' || typeof data.content !== 'string') throw codedError('COPILOT_INVALID_RESPONSE', 'Réponse Charly invalide.');
   const content = data.content.trim();
+  if (!content) throw codedError('COPILOT_INVALID_RESPONSE', 'Charly n’a pas reçu de réponse. Réessaie dans un instant.');
   if (evaluationState.active) await recordEvaluationEvent({ kind: 'response', status: 'ok', contextVersion: page.contextVersion });
   if (generation !== sessionGeneration) return;
+  controller.signal.throwIfAborted();
   sessionState.conversationHistory.push({ role: 'user', content: userMessage });
   sessionState.conversationHistory.push({ role: 'assistant', content });
   if (sessionState.conversationHistory.length > CONVERSATION_HISTORY_MAX_MESSAGES) {
@@ -2087,7 +2184,7 @@ async function sendToGemini({
   if (generation !== sessionGeneration) return;
   url = privacySafeUrl(url);
   const now = Date.now();
-  if (now - sessionState.lastAnalysisTime < MIN_API_INTERVAL) {
+  if (trigger === 'url_change' && now - sessionState.lastAnalysisTime < MIN_API_INTERVAL) {
     Logger.warn('background', 'API call rate limited');
     broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
     return;
@@ -2116,6 +2213,7 @@ async function sendToGemini({
       consoleLogs: consoleLogs || '',
       maxResults: 5,
       maxChars: 8000,
+      signal: controller.signal,
     });
     if (kbResults) {
       kbContext = (kbContext ? kbContext + '\n\n' : '') +
@@ -2123,6 +2221,7 @@ async function sendToGemini({
     }
   }
   if (generation !== sessionGeneration) return;
+  controller.signal.throwIfAborted();
 
   const systemPrompt = buildSystemPrompt({
     onboardingDocs: kbContext || null,
@@ -2202,6 +2301,7 @@ async function sendToGemini({
       signal: controller.signal
     });
     if (generation !== sessionGeneration) return;
+    controller.signal.throwIfAborted();
 
     if (!response.ok) {
       // Retry on 429 (rate limit) or 503 (high demand) — up to 2 retries
@@ -2211,6 +2311,7 @@ async function sendToGemini({
         broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'analyzing', text: 'Charly réfléchit...' });
         await new Promise(r => setTimeout(r, delay));
         if (generation !== sessionGeneration) return;
+        controller.signal.throwIfAborted();
         return sendToGemini({
           pageAnalysis,
           url,
@@ -2244,6 +2345,7 @@ async function sendToGemini({
 
     const json = await response.json();
     if (generation !== sessionGeneration) return;
+    controller.signal.throwIfAborted();
 
     // A voice session may have started while the legacy request was already
     // returning. Do not let that stale response speak, mutate history or click
@@ -2258,13 +2360,15 @@ async function sendToGemini({
 
     if (!json.candidates?.length) {
       if (json.promptFeedback?.blockReason) {
-        throw new Error(`Requête bloquée : ${json.promptFeedback.blockReason}`);
+        throw codedError('GEMINI_RESPONSE_BLOCKED', 'Charly ne peut pas répondre à cette demande. Essaie de la reformuler.');
       }
-      throw new Error('Pas de réponse de Gemini.');
+      throw codedError('GEMINI_EMPTY_RESPONSE', 'Charly n’a pas reçu de réponse. Réessaie dans un instant.');
     }
 
-    const responseText = json.candidates[0]?.content?.parts?.[0]?.text || '';
-    if (!responseText) throw new Error('Réponse vide de Gemini.');
+    const responseText = (json.candidates[0]?.content?.parts || [])
+      .filter(part => typeof part.text === 'string' && part.thought !== true)
+      .map(part => part.text).join('\n').trim();
+    if (!responseText) throw codedError('GEMINI_EMPTY_RESPONSE', 'Charly n’a pas reçu de réponse. Réessaie dans un instant.');
 
     const responseTime = Date.now() - startTime;
     Logger.logApiResponse({ success: true, status: response.status, responseTime, attempt: _retryCount + 1, operationId });
@@ -2371,7 +2475,7 @@ async function sendToGemini({
       Logger.log('background', `Highlight: ${resolvedHighlights.map(command => command.id).join(', ') || 'none'}`);
       resolvedHighlights.forEach((command, i) => {
         setTimeout(() => {
-          if (generation !== sessionGeneration) return;
+          if (generation !== sessionGeneration || controller.signal.aborted) return;
           highlightTabs.add(sessionState.lockedTabId);
           sendContentMessage(sessionState.lockedTabId, {
             type: 'HIGHLIGHT_ELEMENT',
@@ -2384,15 +2488,17 @@ async function sendToGemini({
 
     for (const elementId of actionCommands) {
       if (generation !== sessionGeneration) return;
+      controller.signal.throwIfAborted();
       const command = resolveElementCommand(elementId, _contextVersion, _elementSnapshot, 'action');
-      if (command) await proposeOrExecuteAction(command.id, userMessage || lastUserMessage);
+      if (command) await proposeOrExecuteAction(command.id, userMessage || lastUserMessage, {
+        operation: { generation, tabId: sessionState.lockedTabId, signal: controller.signal }
+      });
     }
 
   } catch (error) {
     if (generation !== sessionGeneration) return;
-    if (error.name === 'AbortError') {
+    if (isCancellation(error)) {
       Logger.log('background', 'API call aborted (superseded)');
-      broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
       return;
     }
     Logger.logApiResponse({
@@ -2859,6 +2965,21 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           return false;
         }
 
+        // Limova 3 names its chat arrow "Envoyer" (aria-label only). On Limova,
+        // an icon button named "Envoyer"/"Send" next to the chat editor is the
+        // chat send button, so it gets the same name as the older interface.
+        function isLimovaComposerSendButton(el) {
+          if (!/^(?:staging\.)?new\.limova\.ai$/.test(window.location.hostname)) return false;
+          if (!el.matches('button, [role="button"], input[type="submit"]')) return false;
+          if (sanitizeVisibleText(el.textContent, 80)) return false;
+          if (!/^(?:envoyer|send)$/i.test(sanitizeVisibleText(getExplicitLabel(el), 80))) return false;
+          let scope = el.parentElement;
+          for (let depth = 0; scope && depth < 6; depth += 1, scope = scope.parentElement) {
+            if (scope.querySelector('textarea, [contenteditable="true"]')) return true;
+          }
+          return false;
+        }
+
         // Helper: get meaningful label for an element
         function getLabel(el) {
           // Limova integration tiles are keyboard-clickable <div tabindex="0">
@@ -2880,6 +3001,7 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           text = text.trim().replace(/\s+/g, ' ');
           if (text.length > 0 && text.length < 80) return text;
           // Fallback: aria-label, title, alt (for icon buttons)
+          if (isLimovaComposerSendButton(el)) return 'Envoyer le message';
           return getExplicitLabel(el)
             || (isInferredMessageSendButton(el) ? 'Envoyer le message' : '')
             || (el.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 80)
@@ -3599,7 +3721,7 @@ async function authorizedProxyFetch(path, options = {}, retry = true) {
     timedOut = true;
     controller.abort();
   }, timeoutMs);
-  const forwardAbort = () => controller.abort();
+  const forwardAbort = () => controller.abort(options.signal.reason);
   options.signal?.addEventListener?.('abort', forwardAbort, { once: true });
   try {
     response = await fetch(`${PROXY_URL}${path}`, {
@@ -3608,9 +3730,13 @@ async function authorizedProxyFetch(path, options = {}, retry = true) {
       signal: controller.signal
     });
   } catch (cause) {
-    const code = timedOut ? 'PROXY_REQUEST_TIMEOUT' : cause?.name === 'AbortError' ? 'PROXY_REQUEST_ABORTED' : 'PROXY_NETWORK_FAILED';
-    const error = codedError(code, timedOut ? 'Le service Limova met trop de temps à répondre.' : cause?.message || 'Le proxy Limova est indisponible.', cause);
-    Logger.error('proxy', 'Proxy request failed before response', error, error.code, operationId);
+    const deadlineExpired = timedOut || options.signal?.reason?.name === 'TimeoutError' || cause?.name === 'TimeoutError';
+    const cancelled = options.signal?.aborted && !deadlineExpired;
+    const code = deadlineExpired ? 'PROXY_REQUEST_TIMEOUT' : cancelled ? 'PROXY_REQUEST_ABORTED' : 'PROXY_NETWORK_FAILED';
+    const error = codedError(code, deadlineExpired ? 'Le service Limova met trop de temps à répondre.' : cause?.message || 'Le proxy Limova est indisponible.', cause);
+    if (!cancelled) {
+      Logger.error('proxy', 'Proxy request failed before response', error, error.code, operationId);
+    }
     throw error;
   } finally {
     clearTimeout(timeout);
@@ -3974,7 +4100,7 @@ async function searchVoiceKnowledge(rawQuery) {
   if (!(await hasAIProcessingConsent())) return { ok: false, error: 'Consentement IA requis.' };
   const query = String(rawQuery || '').trim().slice(0, 500);
   if (query.length < 2) return { ok: false, error: 'Question trop courte.' };
-  const knowledge = await getKnowledgeContext(query, {
+  const { knowledge, status } = await getKnowledgeSearchResult(query, {
     url: sessionState.lastUrl || '',
     maxResults: 3,
     maxChars: 6_000
@@ -3986,7 +4112,9 @@ async function searchVoiceKnowledge(rawQuery) {
   });
   return knowledge
     ? { ok: true, knowledge }
-    : { ok: false, error: 'Aucun article pertinent trouvé.' };
+    : status === 'not_found'
+      ? { ok: false, status: 'not_found', failureCode: 'no_relevant_article', error: 'Aucun article pertinent trouvé.' }
+      : { ok: false, failureCode: 'knowledge_unavailable', error: 'La documentation Limova est momentanément indisponible.' };
 }
 
 function formatLearnedActionHints(rawHints) {
@@ -4028,32 +4156,51 @@ function formatRemoteKnowledge(results, maxChars) {
 }
 
 async function getKnowledgeContext(rawQuery, options = {}) {
+  return (await getKnowledgeSearchResult(rawQuery, options)).knowledge;
+}
+
+async function getKnowledgeSearchResult(rawQuery, options = {}) {
   const query = String(rawQuery || '').trim().slice(0, 2_000);
   const maxResults = Math.max(1, Math.min(10, Number(options.maxResults) || 5));
   const maxChars = Math.max(500, Math.min(12_000, Number(options.maxChars) || 8_000));
+  let remoteAvailable = false;
   if (query.length >= 2) {
+    options.signal?.throwIfAborted();
+    const deadline = AbortSignal.timeout(8_000);
+    const controller = new AbortController();
+    const forwardDeadline = () => controller.abort(deadline.reason);
+    const forwardCancellation = () => controller.abort(options.signal.reason);
+    deadline.addEventListener('abort', forwardDeadline, { once: true });
+    options.signal?.addEventListener('abort', forwardCancellation, { once: true });
     try {
       const response = await authorizedProxyFetch('/api/knowledge/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query, path: privacySafeUrl(options.url || sessionState.lastUrl || ''), locale: currentLang === 'fr' ? 'fr-FR' : currentLang === 'es' ? 'es-ES' : 'en-US', contentTypes: ['article', 'onboarding'], limit: maxResults }),
-        signal: AbortSignal.timeout(8_000)
+        signal: controller.signal
       });
       if (response.ok) {
         const data = await response.json();
+        remoteAvailable = Array.isArray(data?.results);
         const formatted = formatRemoteKnowledge(data.results, maxChars);
         if (formatted) {
           Logger.event('knowledge', 'REMOTE_KB_SEARCH_SUCCEEDED', { revision: data.revision || null, articleIds: data.results.map(result => result.id), resultCount: data.results.length });
-          return formatted;
+          return { knowledge: formatted, status: 'ok' };
         }
       }
-      Logger.warn('knowledge', 'Remote knowledge unavailable; embedded fallback used', { status: response.status });
+      if (!remoteAvailable) Logger.warn('knowledge', 'Remote knowledge unavailable; embedded fallback used', { status: response.status }, 'REMOTE_KB_UNAVAILABLE');
     } catch (error) {
+      if (options.signal?.aborted) throw options.signal.reason;
       if (String(error?.code || '').startsWith('AUTH_')) throw error;
-      Logger.warn('knowledge', 'Remote knowledge request failed; embedded fallback used', { error: error?.name || 'unknown' });
+      Logger.warn('knowledge', 'Remote knowledge request failed; embedded fallback used', { error: error?.name || 'unknown' }, 'REMOTE_KB_UNAVAILABLE');
+    } finally {
+      deadline.removeEventListener('abort', forwardDeadline);
+      options.signal?.removeEventListener('abort', forwardCancellation);
     }
   }
-  return searchKB(query, { url: options.url || '', consoleLogs: options.consoleLogs || '', maxResults, maxChars });
+  options.signal?.throwIfAborted();
+  const knowledge = searchKB(query, { url: options.url || '', consoleLogs: options.consoleLogs || '', maxResults, maxChars });
+  return { knowledge, status: knowledge ? 'ok' : remoteAvailable ? 'not_found' : 'unavailable' };
 }
 
 async function getPublishedOnboardingTemplate() {
@@ -4084,6 +4231,7 @@ function captureVoiceOperation() {
 
 function isCurrentOperation(operation) {
   return operation.generation === sessionGeneration
+    && !operation.signal?.aborted
     && (operation.voiceGeneration === undefined || operation.voiceGeneration === voiceSessionGeneration)
     && (operation.tabId == null || operation.tabId === sessionState.lockedTabId);
 }
@@ -4448,6 +4596,7 @@ async function typeVoiceText(elementId, rawText, requestedContextVersion, target
   const response = {
     ok: result?.ok === true,
     clarificationRequired: Boolean(result?.clarificationRequired),
+    failureCode: result?.ok === true ? undefined : safeFailureReason(result?.failureCode || textInputFailureCode(result?.error)),
     error: result?.error || (result?.ok === true ? undefined : 'La saisie a été refusée par la page.')
   };
   if (executedElementId !== elementId) {
@@ -4636,7 +4785,8 @@ const ACTION_TARGET_STOP_WORDS = new Set([
   'el', 'en', 'et', 'fais', 'go', 'hazlo', 'ici', 'il', 'je', 'juste', 'la', 'le', 'les', 'maintenant',
   'lance', 'lancer', 'me', 'mon', 'navigate', 'navigue', 'of', 'ok', 'on', 'open', 'ouvre', 'page', 'peux', 'please', 'pour',
   'press', 'publie', 'selectionne', 'select', 'send', 'soumet', 'sur', 'the', 'to', 'tu', 'un', 'une', 'va',
-  'vas', 'veux', 'voudrais', 'y', 'yes', 'oui', 'adelante', 'abre', 'elige', 'pulsa', 'selecciona', 've'
+  'vas', 'veux', 'voudrais', 'y', 'yes', 'oui', 'adelante', 'abre', 'elige', 'pulsa', 'selecciona', 've',
+  'moi', 'toi'
 ]);
 
 function actionTargetTokens(value) {
@@ -4680,6 +4830,11 @@ function isDirectMessageSendRequest(message) {
   return /(?:^|\s)(?:envoie|envoyer|envoi|send|soumet|soumettre|submit|publie|publier|publish)(?:\s|$)/.test(normalized);
 }
 
+// Natural spoken requests ("montre-moi le site", "emmène-moi sur Amazon",
+// "je veux voir la page"). They count only for the strict check of a
+// consequential click or a link to another site.
+const SPOKEN_ACTION_PATTERN = /(?:^|\s)(?:montre|montrer|affiche|afficher|accede|acceder|rends toi|rend toi|emmene|emmener|amene moi|consulte|consulter|visite|visiter|va voir|aller sur|aller voir|veux voir|voudrais voir|show me|take me)(?:\s|$)/;
+
 function resolveActionIntent(message, element, assistantText = recentAssistantActionText()) {
   const normalized = normalizeActionLanguage(message);
   const direct = /(?:^|\s)(?:clique|cliquer|click|ouvre|ouvrir|open|va sur|vas sur|allez sur|go to|navigue|naviguer|navigate|selectionne|selectionner|select|choisis|choisir|choose|appuie|press|active|activer|connecte|connecter|lance|lancer|demarre|demarrer|continue|continuer|confirme|confirmer|pulsa|abre|navega|selecciona|elige|continua)(?:\s|$)/.test(normalized)
@@ -4714,6 +4869,7 @@ function resolveActionIntent(message, element, assistantText = recentAssistantAc
     assistantMatched,
     safeIntermediateNavigation,
     requestedTokenCount: requestedTokens.length,
+    spoken: SPOKEN_ACTION_PATTERN.test(normalized),
     turnId: associatedTurn?.id || null,
     source: associatedTurn?.source || 'unknown'
   };
@@ -4725,7 +4881,67 @@ function isMessageSendRequest(message, element = null, assistantText) {
     && resolveActionIntent(message, element, assistantText).explicit;
 }
 
-function classifyActionRisk(element, { explicitRequest = false, userMessage = '', messageSendRequest = false } = {}) {
+// Consequential clicks (send, submit, pay, delete, authorize) and links to
+// another site need a strictly explicit request: the user named the target,
+// confirmed the exact target Charly had just named, or the voice tool bound a
+// matching target to a real request (not a question about the page).
+const SEND_CONTROL_PATTERN = /(?:^|\s)(?:envoyer|envoie|send|submit|soumettre|publier|publish|poster)(?:\s|$)/;
+const SEND_REQUEST_GENERIC_TOKENS = new Set([
+  'envoie', 'envoyer', 'envoi', 'envoies', 'soumettre', 'publier', 'publish', 'submit', 'poster',
+  'formulaire', 'form', 'message', 'mail', 'email', 'demande', 'reponse'
+]);
+
+// A send or submit button of any site (a contact form, a comment box). The
+// Limova chat send icon keeps its own exact message_send target.
+function isSendLikeControl(element) {
+  if (element?.type !== 'clickable' || element.disabled) return false;
+  if (element.actionKind === 'message_send' || element.buttonType === 'submit') return true;
+  // A link ("Envoi gratuit", "Publier une annonce") navigates; it sends nothing.
+  if (element.external || element.hrefPath) return false;
+  const aliases = Array.isArray(element.aliases) ? element.aliases.join(' ') : '';
+  return SEND_CONTROL_PATTERN.test(normalizeActionLanguage(`${element.text || ''} ${aliases}`));
+}
+
+// "Envoie le formulaire" names no label, so it designates a send button only
+// when the page holds a single one, or when the other words of the request
+// (or the voice tool's declared label) match this button.
+function sendTargetConfirmed(userMessage, element, { toolTargetMatched = false, intent = null } = {}) {
+  if (!isDirectMessageSendRequest(userMessage)) return false;
+  if (!isSendLikeControl(element)) return false;
+  if (toolTargetMatched) return true;
+  // "Clique sur Envoyer" names this exact button.
+  if (intent?.kind === 'direct' && intent.targetMatched && intent.requestedTokenCount > 0) return true;
+  const specificTokens = actionTargetTokens(userMessage).filter(token => !SEND_REQUEST_GENERIC_TOKENS.has(token));
+  if (specificTokens.length > 0) {
+    const elementTokens = elementActionTokens(element);
+    return specificTokens.some(token => elementTokens.some(elementToken => actionTokenMatches(token, elementToken)));
+  }
+  let sendControls = 0;
+  for (const candidate of lastPageElements.values()) {
+    if (isSendLikeControl(candidate)) sendControls += 1;
+  }
+  return sendControls === 1;
+}
+
+const SHORT_AFFIRMATIVE_PATTERN = /^(?:oui|yes|ok|okay|d accord|daccord|vas y|go|si|vale|bien sur|c est bon|parfait)(?: (?:oui|vas y|go|merci|stp|s il te plait|please|fais le|clique))*$/;
+
+function isStrictExplicitRequest(intent, { toolExplicitRequest = false, toolTargetMatched = false, userMessage = '' } = {}) {
+  if (intent.kind === 'direct' && intent.targetMatched && (intent.requestedTokenCount > 0 || toolTargetMatched)) return true;
+  if (intent.kind === 'referential' && intent.assistantMatched) return true;
+  if (intent.spoken && intent.targetMatched && intent.requestedTokenCount > 0) return true;
+  // "Oui", "ok go", "oui clique" right after Charly named this exact target.
+  if (intent.assistantMatched && intent.requestedTokenCount === 0
+    && (intent.kind === 'direct' || SHORT_AFFIRMATIVE_PATTERN.test(normalizeActionLanguage(userMessage)))) return true;
+  return toolExplicitRequest
+    && (intent.kind !== 'implicit' || intent.spoken || SHORT_AFFIRMATIVE_PATTERN.test(normalizeActionLanguage(userMessage)));
+}
+
+function classifyActionRisk(element, {
+  explicitRequest = false,
+  strictExplicitRequest = explicitRequest,
+  userMessage = '',
+  messageSendRequest = false
+} = {}) {
   const label = String(element?.text || 'cet élément');
   const consequential = element?.buttonType === 'submit'
     || /supprim|delete|remove|payer|payment|achat|buy|purchase|send|envoyer|publish|publier|autoriser|authorize|allow|grant|confirmer|confirm|valider|save|sauveg|enregistr|submit|invite|déconnect|disconnect|revoke|révoqu/i.test(label);
@@ -4753,11 +4969,20 @@ function classifyActionRisk(element, { explicitRequest = false, userMessage = ''
     && !element.disabled
     && (messageSendRequest || isDirectMessageSendRequest(userMessage));
   const autonomousVisibleControl = clickableControl && !consequential;
-  const explicitConsequentialControl = explicitRequest
+  const explicitConsequentialControl = strictExplicitRequest
     && clickableControl
     && consequential
     && element?.actionKind !== 'message_send';
+  // Charly works on any site, so a link to another domain (a search result,
+  // the Instagram post Limova just published) is ordinary navigation: an
+  // explicit request is enough. In voice the matched tool target counts, as
+  // the spoken transcript often arrives late or garbled.
+  const explicitExternalNavigation = explicitRequest
+    && element?.type === 'clickable'
+    && element.external === true
+    && !element.disabled;
   if (lowRiskNavigation) return { level: 'low', label, reason: 'internal_navigation' };
+  if (explicitExternalNavigation) return { level: 'low', label, reason: 'explicit_external_navigation' };
   if (preparatoryConnection) return { level: 'low', label, reason: 'connection_setup' };
   if (explicitMessageSend) return { level: 'low', label, reason: 'explicit_message_send' };
   if (explicitSafeControl) return { level: 'low', label, reason: 'explicit_visible_control' };
@@ -4824,6 +5049,9 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
   );
   const toolExplicitRequest = options.toolExplicitRequest === true && toolTargetMatched;
   const explicitRequest = intent.explicit || toolExplicitRequest;
+  const confirmedSendTarget = sendTargetConfirmed(userMessage, element, { toolTargetMatched, intent });
+  const strictExplicitRequest = confirmedSendTarget
+    || isStrictExplicitRequest(intent, { toolExplicitRequest, toolTargetMatched, userMessage });
   // A voice tool call is already bound to the user's current turn and is only
   // considered explicit after its declared label matches the current DOM
   // target. Preserve that verified intent for the exact message-send control;
@@ -4832,7 +5060,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
   const verifiedToolMessageSend = toolExplicitRequest && element.actionKind === 'message_send';
   const messageSendRequest = verifiedToolMessageSend
     || isMessageSendRequest(userMessage, element, assistantText);
-  if (isDirectMessageSendRequest(userMessage) && element.actionKind !== 'message_send') {
+  if (isDirectMessageSendRequest(userMessage) && element.actionKind !== 'message_send' && !confirmedSendTarget) {
     let payload = {
       ok: false,
       status: 'blocked',
@@ -4860,7 +5088,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
     if (!payload.retryWithFreshContext) broadcastToSidebar({ type: 'ACTION_RESULT', ...payload });
     return payload;
   }
-  if ((intent.kind === 'direct' && !intent.targetMatched && !intent.safeIntermediateNavigation && !toolExplicitRequest)
+  if ((intent.kind === 'direct' && !intent.targetMatched && !intent.safeIntermediateNavigation && !toolExplicitRequest && !confirmedSendTarget)
     || (intent.kind === 'referential' && !intent.assistantMatched && !toolExplicitRequest)) {
     let payload = {
       ok: false,
@@ -4895,12 +5123,14 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
     if (!payload.retryWithFreshContext) broadcastToSidebar({ type: 'ACTION_RESULT', ...payload });
     return payload;
   }
-  const risk = classifyActionRisk(element, { explicitRequest, userMessage, messageSendRequest });
+  const risk = classifyActionRisk(element, { explicitRequest, strictExplicitRequest, userMessage, messageSendRequest });
   Logger.event('action', 'ACTION_CLASSIFIED', {
     elementId,
     risk: risk.level,
     reason: risk.reason,
     explicitRequest,
+    strictExplicitRequest,
+    confirmedSendTarget,
     labelLength: risk.label.length,
     elementType: element.type,
     buttonType: element.buttonType || null,
@@ -4995,6 +5225,39 @@ async function executeElementAction(action) {
     return payload;
     }
   }
+  // The click opened a new tab and Charly moved there: report the click as
+  // executed instead of a cancelled command. The followed tab is analysed by
+  // the usual tab-change flow.
+  const reportClickOpenedFollowedTab = () => {
+    const openedTabId = followedTabOpenedByClick(operation, actionStartedAt);
+    if (!openedTabId) return cancelledOperation();
+    const payload = {
+      type: 'ACTION_RESULT',
+      ok: true,
+      label: activeAction.label,
+      effectObserved: true,
+      effectEvidence: { newTabOpened: true, followed: true }
+    };
+    broadcastToSidebar(payload);
+    analytics.track('action_executed', {
+      result: 'executed',
+      interaction_mode: result?.interactionMode || '',
+      risk: activeAction.risk || ''
+    });
+    Logger.event('action', 'ACTION_EXECUTED', {
+      elementId: activeAction.elementId,
+      requestedElementId: action.elementId,
+      ok: true,
+      effectObserved: true,
+      effectEvidence: payload.effectEvidence,
+      verificationRequired: false,
+      interactionMode: result?.interactionMode || null,
+      userTurnId: activeAction.userTurnId || null,
+      contextVersion: activeAction.contextVersion,
+      ...safeElementDiagnostic(activeAction.targetDescriptor)
+    }, activeAction.operationId);
+    return payload;
+  };
   let contextBeforeClick = lastPageContext;
   let tabBeforeClick = await chrome.tabs.get(operation.tabId).catch(() => null);
   if (!isCurrentOperation(operation)) return cancelledOperation();
@@ -5008,7 +5271,7 @@ async function executeElementAction(action) {
   } catch (_) {
     result = { ok: false, error: 'La page Limova ne répond plus.' };
   }
-  if (!isCurrentOperation(operation)) return cancelledOperation();
+  if (!isCurrentOperation(operation)) return result?.ok === true ? reportClickOpenedFollowedTab() : cancelledOperation();
   if (result?.ok !== true) {
     const recovery = await refreshAndRetryElementCommand({
       requestedId: activeAction.elementId,
@@ -5044,7 +5307,7 @@ async function executeElementAction(action) {
     // settle. The former 350 ms window incorrectly marked valid Limova clicks
     // as failed on components that update after a debounce.
     await new Promise(resolve => setTimeout(resolve, 700));
-    if (!isCurrentOperation(operation)) return cancelledOperation();
+    if (!isCurrentOperation(operation)) return reportClickOpenedFollowedTab();
     const [refreshedContext, technical] = await Promise.all([
       getPageContext(operation.tabId, operation).catch(() => ''),
       getPageTechnicalDiagnostics(operation.tabId, actionStartedAt)
@@ -5063,13 +5326,17 @@ async function executeElementAction(action) {
       const routeChanged = privacySafeUrl(tabBeforeClick?.url || '') !== privacySafeUrl(tabAfterClick?.url || '');
       const domChanged = Boolean(refreshedContext) && comparable(contextBeforeClick) !== comparable(refreshedContext);
       const popupObserved = Boolean(externalPopupFlow || externalPopupTabs.size);
+      // A link with target="_blank" leaves the clicked page unchanged while
+      // Charly is not following the new tab (for example sidebar closed).
+      const newTabOpened = Boolean(childTabOpenedSince(operation.tabId, actionStartedAt));
       const networkObserved = technical.network.length > 0;
       const networkFailed = technical.network.some(entry => entry.status === 0 || entry.status >= 400);
-      payload.effectObserved = routeChanged || domChanged || popupObserved || networkObserved;
+      payload.effectObserved = routeChanged || domChanged || popupObserved || newTabOpened || networkObserved;
       payload.effectEvidence = {
         routeChanged,
         domChanged,
         popupObserved,
+        newTabOpened,
         networkObserved,
         networkFailed,
         consoleErrorCount: technical.console.filter(entry => entry.level === 'error').length
@@ -5079,7 +5346,7 @@ async function executeElementAction(action) {
         payload.verificationRequired = true;
         payload.error = 'Le clic a été déclenché, mais aucun effet visible n’a encore été confirmé. Charly doit relire la page avant de continuer.';
         payload.visualCapture = await capturePageAnalysis(operation.tabId, activeAction.operationId);
-      } else if (networkFailed && !routeChanged && !domChanged && !popupObserved) {
+      } else if (networkFailed && !routeChanged && !domChanged && !popupObserved && !newTabOpened) {
         payload.status = 'unexpected';
         payload.verificationRequired = true;
         payload.error = 'Le clic a déclenché une requête en erreur. Charly doit vérifier l’état affiché avant de continuer.';
@@ -5174,12 +5441,33 @@ async function sendContentMessage(tabId, message, allowRepair = true, operation 
           error: 'Le pilote de page a été restauré ; la cible doit être relue avant l’action.'
         };
       }
-      return chrome.tabs.sendMessage(tabId, message);
+      return await chrome.tabs.sendMessage(tabId, message);
     } catch (repairError) {
-      Logger.error('content_script', 'Content script repair failed', repairError, 'CONTENT_SCRIPT_REPAIR_FAILED');
+      if (!isCurrentOperation(operation)) return cancelledOperation();
+      const failureReason = await contentScriptRepairFailureReason(tabId, repairError);
+      if (!isCurrentOperation(operation)) return cancelledOperation();
+      Logger.error('content_script', 'Content script repair failed', {
+        name: repairError?.name || 'Error',
+        message: repairError?.message,
+        stack: repairError?.stack,
+        failureReason
+      }, 'CONTENT_SCRIPT_REPAIR_FAILED');
       throw repairError;
     }
   }
+}
+
+async function contentScriptRepairFailureReason(tabId, error) {
+  const message = String(error?.message || '').toLowerCase();
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) return 'tab_closed';
+  let url;
+  try { url = new URL(tab.url || ''); } catch { return 'navigation_race'; }
+  if (/pdf/.test(message)) return 'pdf_document';
+  if (!isWebPageUrl(url.href)) return 'restricted_browser_page';
+  if (/permission|cannot access contents|host permission/.test(message)) return 'host_permission_denied';
+  if (/frame|navigation|tab was closed|no tab/.test(message)) return 'navigation_race';
+  return 'injection_failed';
 }
 
 async function confirmPendingAction(actionId) {
@@ -5524,6 +5812,8 @@ export {
   boundedConversationHistory,
   capturePageAnalysis,
   classifyActionRisk,
+  isSendLikeControl,
+  isStrictExplicitRequest,
   clearCharlyAuthSession,
   confirmPendingAction,
   ensureRemoteCopilotSession,

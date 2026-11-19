@@ -256,6 +256,41 @@ async function grantAIConsent(sidebar) {
 }
 
 test.describe('Packaged extension — complete user flows', () => {
+  test('a newer message from another open panel cancels the old request without an error', async ({ context, extensionId, serviceWorker }) => {
+    const { sidebar, limova } = await openExtensionHarness(context, extensionId);
+    await grantAIConsent(sidebar);
+    let heldRoute;
+    let requests = 0;
+    await context.route(`${PROXY_ORIGIN}/api/gemini`, async route => {
+      requests += 1;
+      if (requests === 1) { heldRoute = route; return; }
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'Réponse à la nouvelle demande.' }] } }]
+      }) });
+    });
+    await sidebar.locator('#userInput').fill('Première demande');
+    await sidebar.locator('#sendBtn').click();
+    await expect.poll(() => Boolean(heldRoute)).toBe(true);
+
+    const secondPanel = await context.newPage();
+    await secondPanel.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
+    await secondPanel.waitForFunction(() => document.documentElement.dataset.sidebarReady === 'true');
+    await limova.bringToFront();
+    await secondPanel.locator('#userInput').fill('Nouvelle demande');
+    await secondPanel.locator('#sendBtn').click();
+    await expect(secondPanel.locator('.message.assistant .message-content').last()).toContainText('nouvelle demande');
+    await expect(sidebar.locator('.message.error')).toHaveCount(0);
+    await expect(secondPanel.locator('.message.error')).toHaveCount(0);
+    expect(requests).toBe(2);
+    await expect.poll(() => heldRoute.request().failure()?.errorText || '').toMatch(/ABORTED/i);
+    const readLogs = () => serviceWorker.evaluate(async () => {
+      const stored = await chrome.storage.session.get('limova_diagnostic_logs_v2');
+      return stored.limova_diagnostic_logs_v2?.logs || [];
+    });
+    await expect.poll(async () => (await readLogs()).some(entry => entry.code === 'GEMINI_RESPONSE_ACCEPTED')).toBe(true);
+    expect((await readLogs()).filter(entry => entry.level === 'ERROR' && entry.code === 'PROXY_REQUEST_ABORTED')).toEqual([]);
+  });
+
   test('chat traverses sidebar, service worker, Limova DOM, auth and proxy without leaking private values', async ({ context, extensionId }) => {
     const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId);
     await grantAIConsent(sidebar);
@@ -890,6 +925,77 @@ test.describe('Packaged extension — complete user flows', () => {
     await expect(sidebar.locator('.message.system .message-content').last()).toContainText('Ouvrir mon profil');
   });
 
+  for (const opensNewTab of [false, true]) {
+    test(`an explicitly requested link to another site opens it${opensNewTab ? ' in a new tab' : ''} without a sensitive-action error`, async ({ context, extensionId }) => {
+      await context.route('https://outside.example/**', route => route.fulfill({
+        status: 200,
+        contentType: 'text/html',
+        body: '<!doctype html><title>Publication</title><h1>Publication Instagram</h1>'
+      }));
+      const { limova, sidebar } = await openExtensionHarness(context, extensionId, {
+        geminiReply: ({ body }) => {
+          const prompt = body.systemInstruction.parts[0].text;
+          const linkId = prompt.match(/\[(\d+)\] clickable\(a\) "Voir la publication Instagram"/)?.[1];
+          return `J’ouvre la publication. {{ACTION:${linkId}}}`;
+        }
+      });
+      await limova.evaluate(newTab => {
+        const link = document.createElement('a');
+        link.href = 'https://outside.example/p/abc';
+        link.textContent = 'Voir la publication Instagram';
+        if (newTab) link.target = '_blank';
+        document.querySelector('main').prepend(link);
+      }, opensNewTab);
+      await grantAIConsent(sidebar);
+      const newPage = opensNewTab ? context.waitForEvent('page') : null;
+      await sidebar.locator('#userInput').fill('Ouvre la publication Instagram');
+      await sidebar.locator('#sendBtn').click();
+
+      const opened = opensNewTab ? await newPage : limova;
+      await expect(opened).toHaveURL('https://outside.example/p/abc');
+      await expect(sidebar.locator('.message.system .message-content').last()).toContainText('Voir la publication Instagram');
+      await expect(sidebar.locator('.message.error')).toHaveCount(0);
+    });
+  }
+
+  test('sends a form on another website only once the user explicitly asks to send it', async ({ context, extensionId }) => {
+    await context.route('https://outside.example/**', route => route.fulfill({
+      status: 200,
+      contentType: 'text/html',
+      body: `<!doctype html><title>Contact</title><main><h1>Nous contacter</h1>
+        <form onsubmit="event.preventDefault(); document.body.dataset.sent = String(Number(document.body.dataset.sent || 0) + 1)">
+          <label for="msg">Votre message</label><textarea id="msg"></textarea>
+          <button type="submit">Envoyer</button>
+        </form></main>`
+    }));
+    const { sidebar } = await openExtensionHarness(context, extensionId, {
+      geminiReply: ({ body }) => {
+        const prompt = body.systemInstruction.parts[0].text;
+        const sendId = prompt.match(/\[(\d+)\] clickable\(button\) "Envoyer"/)?.[1];
+        return sendId ? `J’envoie le formulaire. {{ACTION:${sendId}}}` : 'Session prête.';
+      }
+    });
+    await grantAIConsent(sidebar);
+    await sidebar.locator('#userInput').fill('Bonjour');
+    await sidebar.locator('#sendBtn').click();
+    await expect(sidebar.locator('.message.assistant .message-content').first()).toBeVisible();
+
+    const outside = await context.newPage();
+    await outside.goto('https://outside.example/contact');
+    await outside.bringToFront();
+    await expect.poll(async () => (await sidebar.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_LOGS' }))).logs)
+      .toContain('ASSISTANT_FOLLOWED_ACTIVE_TAB');
+
+    await sidebar.locator('#userInput').fill('Que dit cette page ?');
+    await sidebar.locator('#sendBtn').click();
+    await expect(sidebar.locator('.message.error .message-content').last()).toContainText('sensible');
+    expect(await outside.evaluate(() => document.body.dataset.sent || '0')).toBe('0');
+
+    await sidebar.locator('#userInput').fill('Envoie le formulaire');
+    await sidebar.locator('#sendBtn').click();
+    await expect.poll(() => outside.evaluate(() => document.body.dataset.sent || '0')).toBe('1');
+  });
+
   test('assistant markdown cannot inject executable HTML or unsafe links', async ({ context, extensionId }) => {
     const malicious = '<img src=x onerror="document.body.dataset.xss=\'yes\'"> [Piège](javascript:alert(1)) **Texte sûr**';
     const { sidebar } = await openExtensionHarness(context, extensionId, { geminiReply: malicious });
@@ -1030,6 +1136,9 @@ test.describe('Packaged extension — complete user flows', () => {
       message.toolResponse?.functionResponses?.[0]?.id === 'scroll-e2e'
     ).toolResponse.functionResponses[0].response;
 
+    await context.route(`${PROXY_ORIGIN}/api/knowledge/search`, route => route.fulfill({
+      status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Knowledge service unavailable' })
+    }));
     liveSocket.send(JSON.stringify({
       toolCall: {
         functionCalls: [{
@@ -1047,8 +1156,30 @@ test.describe('Packaged extension — complete user flows', () => {
     const knowledgeResponse = socketMessages.find(message =>
       message.toolResponse?.functionResponses?.[0]?.id === 'kb-e2e'
     ).toolResponse.functionResponses[0].response;
-    expect(knowledgeResponse.reason).toContain('Aucun article pertinent');
+    expect(knowledgeResponse.reason).toContain('momentanément indisponible');
     expect(JSON.stringify(knowledgeResponse)).not.toContain('Connecter Gmail');
+
+    await context.route(`${PROXY_ORIGIN}/api/knowledge/search`, route => route.fulfill({
+      status: 200, contentType: 'application/json', body: JSON.stringify({ revision: 'kb_e2e', results: [] })
+    }));
+    liveSocket.send(JSON.stringify({ toolCall: { functionCalls: [{
+      id: 'kb-empty-e2e', name: 'search_knowledge_base', args: { query: 'Sujet sans article' }
+    }] } }));
+    await expect.poll(() => socketMessages.find(message =>
+      message.toolResponse?.functionResponses?.[0]?.id === 'kb-empty-e2e'
+    )?.toolResponse.functionResponses[0].response).toMatchObject({ status: 'not_found', reason: 'Aucun article pertinent trouvé.' });
+
+    await context.route(`${PROXY_ORIGIN}/api/knowledge/search`, route => route.fulfill({
+      status: 200, contentType: 'application/json', body: JSON.stringify({ revision: 'kb_e2e', results: [{
+        id: 'published-gmail', title: 'Connecter Gmail', source: 'gmail', content: 'Article publié utilisé pendant la session vocale.'
+      }] })
+    }));
+    liveSocket.send(JSON.stringify({ toolCall: { functionCalls: [{
+      id: 'kb-published-e2e', name: 'search_knowledge_base', args: { query: 'Comment connecter Gmail ?' }
+    }] } }));
+    await expect.poll(() => socketMessages.find(message =>
+      message.toolResponse?.functionResponses?.[0]?.id === 'kb-published-e2e'
+    )?.toolResponse.functionResponses[0].response).toMatchObject({ status: 'ok', knowledgeBase: expect.stringContaining('Article publié utilisé') });
 
     liveSocket.send(JSON.stringify({
       toolCall: {
@@ -1225,6 +1356,27 @@ test.describe('Packaged extension — complete user flows', () => {
     await expect.poll(() => sockets.length).toBe(2);
     await expect(sidebar.locator('#statusBadge')).toContainText(/Listening|écoute|escucho/i);
     expect(calls.liveToken).toHaveLength(1);
+    await sidebar.locator('#voiceBtn').click();
+  });
+
+  test('a voice setup closed by the server shows an error and allows a successful new start', async ({ mediaContext, mediaExtensionId }) => {
+    let connectionCount = 0;
+    await mediaContext.routeWebSocket(/generativelanguage\.googleapis\.com\/ws\//, socket => {
+      const connection = ++connectionCount;
+      socket.onMessage(raw => {
+        if (!JSON.parse(String(raw)).setup) return;
+        if (connection === 1) socket.close({ code: 1000, reason: 'setup-refused-fixture' });
+        else socket.send(JSON.stringify({ setupComplete: {} }));
+      });
+    });
+    const { calls, sidebar } = await openExtensionHarness(mediaContext, mediaExtensionId);
+    await grantAIConsent(sidebar);
+    await sidebar.locator('#voiceBtn').click();
+    await expect(sidebar.locator('.message.error .message-content').last()).toContainText('Connexion vocale fermée');
+    await expect(sidebar.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'false');
+    await sidebar.locator('#voiceBtn').click();
+    await expect(sidebar.locator('#statusBadge')).toContainText(/Listening|écoute|escucho/i);
+    expect(calls.liveToken).toHaveLength(2);
     await sidebar.locator('#voiceBtn').click();
   });
 

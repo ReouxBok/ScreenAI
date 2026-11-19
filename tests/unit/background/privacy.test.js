@@ -256,6 +256,69 @@ describe('background privacy boundaries', () => {
     })).toMatchObject({ level: 'low', reason: 'visible_control' });
   });
 
+  it('opens a link to another site only on an explicit request', () => {
+    for (const element of [
+      { type: 'clickable', text: 'https://www.instagram.com/p/abc', external: true, inForm: false },
+      { type: 'clickable', text: 'Limova — Assistants IA pour les entreprises', external: true, inForm: false },
+      { type: 'clickable', text: 'Continuer vers le paiement', external: true, inForm: true },
+      { type: 'clickable', text: 'Payer maintenant', external: true, inForm: false }
+    ]) {
+      expect(background.classifyActionRisk(element)).toMatchObject({ level: 'sensitive', reason: 'external_action' });
+      expect(background.classifyActionRisk(element, { explicitRequest: true, strictExplicitRequest: false }))
+        .toMatchObject({ level: 'low', reason: 'explicit_external_navigation' });
+    }
+    expect(background.classifyActionRisk(
+      { type: 'clickable', text: 'Voir la page', external: true, disabled: true },
+      { explicitRequest: true }
+    ).level).toBe('sensitive');
+  });
+
+  it('requires a strictly explicit request for a consequential control', () => {
+    const deleteButton = { type: 'clickable', text: 'Supprimer le brouillon', buttonType: 'button', inForm: false };
+    expect(background.classifyActionRisk(deleteButton, { explicitRequest: true, strictExplicitRequest: false }).level)
+      .toBe('sensitive');
+    expect(background.classifyActionRisk(deleteButton, { explicitRequest: true }))
+      .toMatchObject({ level: 'low', reason: 'explicit_consequential_control' });
+  });
+
+  it('understands natural spoken requests and short confirmations, not questions', () => {
+    const link = { type: 'clickable', text: 'Amazon.fr : livres, DVD, jeux vidéo', external: true, inForm: false };
+    const strict = (message, { assistantText = '', tool = false } = {}) => background.isStrictExplicitRequest(
+      background.resolveActionIntent(message, link, assistantText),
+      { toolExplicitRequest: tool, toolTargetMatched: tool, userMessage: message }
+    );
+    for (const message of ['Montre-moi le site Amazon', 'Emmène-moi sur Amazon', 'Je veux voir Amazon', 'Accède à Amazon', 'Rends-toi sur Amazon']) {
+      expect(strict(message), message).toBe(true);
+    }
+    // Spoken, the voice tool names the exact link.
+    for (const message of ['Vas-y montre-moi', 'Affiche le deuxième résultat', 'Oui vas-y', 'ok go']) {
+      expect(strict(message, { tool: true }), message).toBe(true);
+    }
+    // Written, a short yes confirms the link Charly has just proposed.
+    const proposal = 'Voulez-vous que je clique sur « Amazon.fr » ?';
+    for (const message of ['Oui', 'Oui vas-y', 'Oui clique', 'ok go']) {
+      expect(strict(message, { assistantText: proposal }), message).toBe(true);
+      expect(strict(message), `${message} sans proposition`).toBe(false);
+    }
+    // Written questions or a bare "clique" never open the link.
+    for (const message of ['C’est quoi ce lien ?', 'Il mène où ce lien ?', 'clique']) {
+      expect(strict(message), message).toBe(false);
+    }
+    // Spoken, the link opens on the matched voice tool target alone, even with
+    // a late or garbled transcript (explicitRequest, not the strict check).
+    expect(background.classifyActionRisk(link, { explicitRequest: true, strictExplicitRequest: false }))
+      .toMatchObject({ level: 'low', reason: 'explicit_external_navigation' });
+  });
+
+  it('recognises send and submit buttons of any site', () => {
+    expect(background.isSendLikeControl({ type: 'clickable', text: 'Envoyer' })).toBe(true);
+    expect(background.isSendLikeControl({ type: 'clickable', text: 'Valider', buttonType: 'submit' })).toBe(true);
+    expect(background.isSendLikeControl({ type: 'clickable', text: 'Publier le commentaire' })).toBe(true);
+    expect(background.isSendLikeControl({ type: 'clickable', text: 'Envoyer', disabled: true })).toBe(false);
+    expect(background.isSendLikeControl({ type: 'clickable', text: 'Ajouter une pièce jointe' })).toBe(false);
+    expect(background.isSendLikeControl({ type: 'clickable', text: 'Envoi gratuit dès 50 €', external: true })).toBe(false);
+  });
+
   it('allows only the preparatory connection step outside forms', () => {
     for (const text of ['Connecter Google Drive', 'Reconnecter HubSpot', 'Configurer cette intégration']) {
       expect(background.classifyActionRisk({
@@ -386,6 +449,15 @@ describe('background privacy boundaries', () => {
     globalThis.fetch.mockRejectedValueOnce(new Error('studio unavailable'));
     const result = await background.searchVoiceKnowledge('Comment connecter Gmail à Limova ?');
     expect(result.ok).toBe(false);
+    expect(result.error).toContain('momentanément indisponible');
+    expect(result.failureCode).toBe('knowledge_unavailable');
+    expect(result).not.toHaveProperty('knowledge');
+  });
+
+  it('distinguishes a working search with no relevant article from an outage', async () => {
+    globalThis.fetch.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ revision: 'kb_empty', results: [] }) });
+    const result = await background.searchVoiceKnowledge('Sujet sans documentation correspondante');
+    expect(result).toMatchObject({ ok: false, status: 'not_found', failureCode: 'no_relevant_article' });
     expect(result.error).toContain('Aucun article pertinent');
   });
 });

@@ -30,7 +30,7 @@ const CLIENT_EVENTS = {
   assistant_failed: ['engine', 'trigger', 'error_code'],
   page_analysis_requested: ['voice_active'],
   next_step_requested: [],
-  tool_executed: ['tool', 'status', 'channel'],
+  tool_executed: ['tool', 'status', 'channel', 'failure_reason', 'recovery_requested'],
   action_executed: ['result', 'interaction_mode', 'risk'],
   action_confirmation: ['decision', 'risk'],
   voice_session_started: ['training_mode', 'page_path'],
@@ -54,7 +54,17 @@ const CLIENT_EVENTS = {
   training_stopped: ['internal_tool', 'duration_ms'],
   evaluation_completed: ['internal_tool', 'verdict'],
   ui_clicked: ['target'],
-  extension_error: ['component', 'code']
+  extension_error: ['component', 'code', 'error_type', 'failure_reason']
+};
+
+const DIAGNOSTIC_PROPERTY_VALUES = {
+  error_type: new Set(['Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError', 'AbortError', 'TimeoutError', 'NetworkError', 'NotAllowedError', 'NotFoundError', 'InvalidStateError', 'SecurityError', 'NotReadableError']),
+  failure_reason: new Set([
+    'framework_reverted_input', 'sensitive_field', 'ambiguous_field', 'unsupported_field_type',
+    'stale_context', 'field_length_limit', 'missing_text', 'content_script_unavailable', 'field_unavailable', 'text_input_retry_failed',
+    'no_relevant_article', 'knowledge_unavailable',
+    'tab_closed', 'pdf_document', 'restricted_browser_page', 'host_permission_denied', 'navigation_race', 'injection_failed'
+  ])
 };
 
 function normalizeEmail(value) {
@@ -75,6 +85,7 @@ function sanitizeProperties(allowedKeys, properties) {
   const result = {};
   for (const key of allowedKeys) {
     const value = properties?.[key];
+    if (DIAGNOSTIC_PROPERTY_VALUES[key] && !DIAGNOSTIC_PROPERTY_VALUES[key].has(value)) continue;
     if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) result[key] = value;
     else if (typeof value === 'string' && value) {
       result[key] = key === 'page_path'

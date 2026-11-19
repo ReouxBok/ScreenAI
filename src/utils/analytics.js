@@ -118,13 +118,19 @@ export function createAnalytics({
       else scheduleFlush();
     },
 
-    // Technical errors, at most once per component/code every 10 minutes.
-    trackError(component, code) {
-      const key = `${component}:${code}`;
+    // Deduplicate a technical error per cause every 10 minutes; distinct
+    // categories remain visible even when they share a component/code.
+    trackError(component, code, details = {}) {
+      const key = `${component}:${code}:${details.failureReason || ''}`;
       const time = now();
       if (time - (lastErrorAt.get(key) || 0) < ERROR_DEDUPE_MS) return;
       lastErrorAt.set(key, time);
-      analytics.track('extension_error', { component, code });
+      analytics.track('extension_error', {
+        component,
+        code,
+        ...(typeof details.errorType === 'string' ? { error_type: details.errorType } : {}),
+        ...(typeof details.failureReason === 'string' ? { failure_reason: details.failureReason } : {})
+      });
     },
 
     async flush() {
