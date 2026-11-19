@@ -304,7 +304,6 @@ describe("owner handover from HubSpot's existing webhook", () => {
     ["owner_changed", { owner: HUMAN }],
     ["owner_transition_changed", { at: SETTLED_EVENT_AT + 1000 }],
     ["ticket_closed", { stage: "4" }],
-    ["outside_access", { category: SAV_HUBSPOT_SUPPORT.categories.billing }],
   ] as const)("refuses a fresh CRM read with the result %s", async (status, properties) => {
     const input = await scheduled();
     liveTicket(input.ticketId, properties);
@@ -366,27 +365,83 @@ describe("owner handover from HubSpot's existing webhook", () => {
     expect(fixture.continueCase).not.toHaveBeenCalled();
   });
 
+  // SAV-99 (Ugo 19/11): the HubSpot category is often wrong and never decides; the content does (V1's accepted analysis for a mail, the V2 entry).
   it.each([
     SAV_HUBSPOT_SUPPORT.categories.billing,
-    SAV_HUBSPOT_SUPPORT.categories.cancellation,
+    SAV_HUBSPOT_SUPPORT.categories.technical,
     `${ACCESS};${SAV_HUBSPOT_SUPPORT.categories.billing}`,
-  ])("blocks a Gmail-linked Access request reclassified in HubSpot as %s", async category => {
+    "",
+  ])("relays a Gmail-linked Access request whatever its HubSpot category (%j)", async category => {
     const input = await scheduled();
     await storedMail(input.ticketId);
     liveTicket(input.ticketId, { category });
-    await expect(wake(input)).resolves.toEqual({ status: "outside_access" });
-    expect(await readCaseByTicket(input.ticketId)).toBeNull();
-    expect(fixture.continueCase).not.toHaveBeenCalled();
+    await expect(wake(input)).resolves.toEqual({ status: "relayed" });
+    expect(await readCaseByTicket(input.ticketId)).toMatchObject({ owner: "agent" });
+    expect(fixture.continueCase).toHaveBeenCalledTimes(1);
     expect(fixture.threadless).not.toHaveBeenCalled();
-    expect(fixture.gmail).not.toHaveBeenCalled();
   });
 
-  it("blocks a linked ticket reclassified during the wake, before attribution", async () => {
+  it("does not stop a linked ticket recategorised during the wake", async () => {
     const input = await scheduled();
     await storedMail(input.ticketId);
     liveTicket(input.ticketId, { categoryOnRecheck: SAV_HUBSPOT_SUPPORT.categories.cancellation });
-    await expect(wake(input)).resolves.toEqual({ status: "owner_handover_not_attributed" });
+    await expect(wake(input)).resolves.toEqual({ status: "relayed" });
+    expect(await readCaseByTicket(input.ticketId)).toMatchObject({ owner: "agent" });
+  });
+
+  it("hands a ticket without mail to the content-based entry whatever its category", async () => {
+    const input = await scheduled();
+    liveTicket(input.ticketId, { category: SAV_HUBSPOT_SUPPORT.categories.other });
+    await expect(wake(input)).resolves.toEqual({ status: "off" });
+    expect(fixture.threadless).toHaveBeenCalledExactlyOnceWith(input);
+  });
+
+  it("re-evaluates ONCE a handover dropped before the fix (category), on the same transition and attempt counter, without a duplicate", async () => {
+    const input = await scheduled();
+    await storedMail(input.ticketId);
+    const key = `sav-v2-owner-handover:${input.ticketId}`;
+    // The production state before the fix: wake claimed once, ended `complete` (outside_access), no outcome stored.
+    await database.db.update(savSyncState).set({ status: "complete", processedCount: 1, lastError: null, completedAt: new Date(DUE), updatedAt: new Date(DUE) })
+      .where(eq(savSyncState.key, key));
+    liveTicket(input.ticketId, { category: SAV_HUBSPOT_SUPPORT.categories.billing });
+    await expect(sweepDueOwnerHandovers(Date.now() + 240_000)).resolves.toMatchObject({ reopened: 1, relayed: 1 });
+    expect(await readCaseByTicket(input.ticketId)).toMatchObject({ owner: "agent", phase: "queued" });
+    const [marker] = await database.db.select().from(savSyncState).where(eq(savSyncState.key, key));
+    expect(marker).toMatchObject({ status: "complete", processedCount: 2, lastError: "outcome:relayed", cursor: input.ownerTransitionKey });
+    // Replays: never reopened again, no second case, no second relay.
+    const again = await sweepDueOwnerHandovers(Date.now() + 240_000);
+    expect(again).not.toHaveProperty("reopened");
+    expect(again).not.toHaveProperty("relayed");
+    expect(fixture.continueCase).not.toHaveBeenCalled(); // the reconcile pass continues the queued case itself (catch-up)
+    const events = await listCaseEvents((await readCaseByTicket(input.ticketId))!.caseId);
+    expect(events.filter(event => event.kind === "inbound_confirmed")).toHaveLength(1);
+  });
+
+  it("never reopens a pre-fix handover whose owner changed since, nor one older than the poll's floor", async () => {
+    const moved = await scheduled(), old = await scheduled();
+    for (const input of [moved, old]) {
+      await database.db.update(savSyncState).set({ status: "complete", processedCount: 1, lastError: null, completedAt: new Date(DUE) })
+        .where(eq(savSyncState.key, `sav-v2-owner-handover:${input.ticketId}`));
+    }
+    await database.db.update(savSyncState).set({ startedAt: new Date(Date.now() - 25 * 3_600_000) }).where(eq(savSyncState.key, `sav-v2-owner-handover:${old.ticketId}`));
+    liveTicket(moved.ticketId, { owner: HUMAN });
+    await expect(sweepDueOwnerHandovers(Date.now() + 240_000)).resolves.toMatchObject({ reopened: 1, owner_changed: 1 });
+    expect(await readCaseByTicket(moved.ticketId)).toBeNull();
+    const [oldMarker] = await database.db.select().from(savSyncState).where(eq(savSyncState.key, `sav-v2-owner-handover:${old.ticketId}`));
+    expect(oldMarker).toMatchObject({ status: "complete", lastError: null, processedCount: 1 });
+  });
+
+  it("LIMIT (documented, not bypassed): a mail V1 never executed (dossier « Traité hors Studio ») is not taken: no V1-confirmed input to relay", async () => {
+    const input = await scheduled();
+    const mail = await storedMail(input.ticketId);
+    // « Traité hors Studio »: the team handled the mail outside the Studio; V1 has no confirmed execution for it.
+    await database.db.delete(savIntakeEffects).where(inArray(savIntakeEffects.executionId,
+      database.db.select({ id: savIntakeExecutions.id }).from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, mail.messageId))));
+    await database.db.delete(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, mail.messageId));
+    liveTicket(input.ticketId);
+    await expect(wake(input)).resolves.toEqual({ status: "read_or_relay_failed" });
     expect(await readCaseByTicket(input.ticketId)).toBeNull();
+    expect(fixture.threadless).not.toHaveBeenCalled();
     expect(fixture.continueCase).not.toHaveBeenCalled();
   });
 

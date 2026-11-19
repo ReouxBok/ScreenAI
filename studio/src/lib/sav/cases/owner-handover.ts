@@ -15,8 +15,9 @@ import { recordCaseAfterConfirmedIntake, relayPaused, v2HubspotOwnerId } from ".
 import { SAV_V2_OWNER_HANDOVER_PERMISSION, savV2OwnerHandoverEnabled } from "./owner-handover-config";
 import {
   claimOwnerHandover, finishOwnerHandover, isHumanOwnerChange, listDueOwnerHandovers, ownerHandoverClaimIsCurrent,
-  ownerHandoverFromMarker, type OwnerHandoverTransition,
+  ownerHandoverFromMarker, reopenPreOutcomeOwnerHandovers, type OwnerHandoverTransition,
 } from "./owner-handover-markers";
+import { ownerHandoverPollFloor } from "./owner-handover-poll";
 import { readSavV2QualificationScope } from "./qualification-scope";
 import { startV2FromThreadlessTicket } from "./threadless-entry";
 import { continueCaseAfterCommit, v2EntryRelayDeps } from "./v2-entry";
@@ -74,7 +75,9 @@ async function openHandoverTicket(input: OwnerHandoverTransition, ownerId: strin
 > {
   const ticket = await readSavOwnerHandoverTicket(input.ticketId);
   if (ticket.archived) return { skipped: "ticket_closed" } as const;
-  const { hubspot_owner_id, hs_pipeline, hs_pipeline_stage, hs_ticket_category } = ticket.properties;
+  // SAV-99 (Ugo 19/11): the HubSpot category is often wrong, so it never decides the entry. The ticket's content does (V2 entry / Access skill,
+  // sensitive topics to the team); a ticket the agent does not take goes back to the team (`threadless-entry.ts`).
+  const { hubspot_owner_id, hs_pipeline, hs_pipeline_stage } = ticket.properties;
   if (hubspot_owner_id !== ownerId) return { skipped: "owner_changed" } as const;
   const config = readCaseTicketStageConfig(env), stages = SAV_HUBSPOT_SUPPORT.stages;
   if (hs_pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId) return { skipped: "outside_support" } as const;
@@ -82,7 +85,6 @@ async function openHandoverTicket(input: OwnerHandoverTransition, ownerId: strin
   const openStages: string[] = [stages.new, stages.awaitingContact, stages.awaitingTeam];
   if (config.mode === "on") openStages.push(config.waitingCustomer);
   if (!openStages.includes(hs_pipeline_stage)) return { skipped: "stage_unverified" } as const;
-  if (hs_ticket_category !== SAV_HUBSPOT_SUPPORT.categories.access) return { skipped: "outside_access" } as const;
 
   // A later change away and back may already exist in HubSpot while its webhook is still in flight.
   // The history must confirm the same transition, not just the same current value.
@@ -169,17 +171,21 @@ export async function runSavOwnerHandover(input: OwnerHandoverTransition, option
     console.warn("sav_v2_owner_handover", { status: "read_or_relay_failed" });
     return { status: "read_or_relay_failed" };
   }
-  await finishOwnerHandover(claim, false, now());
+  await finishOwnerHandover(claim, false, now(), status);
   console.info("sav_v2_owner_handover", { status });
   return { status };
 }
 
-export async function sweepDueOwnerHandovers(deadlineMs: number) {
+export async function sweepDueOwnerHandovers(deadlineMs: number, env: Env = process.env) {
   const counts: Record<string, number> = {};
-  if (!savV2OwnerHandoverEnabled()) return counts;
-  for (const row of await listDueOwnerHandovers(new Date())) {
+  if (!savV2OwnerHandoverEnabled(env)) return counts;
+  // SAV-99: the handovers dropped before this fix (category) are evaluated once more, bounded by the poll's floor (`reopenPreOutcomeOwnerHandovers`).
+  const now = new Date();
+  const reopened = await reopenPreOutcomeOwnerHandovers(now, await ownerHandoverPollFloor(env, now));
+  if (reopened) counts.reopened = reopened;
+  for (const row of await listDueOwnerHandovers(now)) {
     if (Date.now() + 100_000 > deadlineMs) break;
-    const { status } = await runSavOwnerHandover(ownerHandoverFromMarker(row), { deadlineMs, catchUp: true });
+    const { status } = await runSavOwnerHandover(ownerHandoverFromMarker(row), { env, deadlineMs, catchUp: true });
     counts[status] = (counts[status] ?? 0) + 1;
   }
   return counts;

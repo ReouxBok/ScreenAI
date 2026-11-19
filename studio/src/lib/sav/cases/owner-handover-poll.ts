@@ -69,6 +69,13 @@ export function ownerHandoverPollLookbackMs(env: Env) {
   return hours * 3_600_000;
 }
 
+/** SAV-99: the oldest owner change the poll may ever hand to the markers (its first run minus the lookback); without a poll state, now minus the lookback. */
+export async function ownerHandoverPollFloor(env: Env, now: Date) {
+  const [row] = await requireDb().select({ cursor: savSyncState.cursor }).from(savSyncState).where(eq(savSyncState.key, OWNER_HANDOVER_POLL_KEY));
+  const state = parseState(row?.cursor);
+  return new Date(state ? state.floor : now.getTime() - ownerHandoverPollLookbackMs(env));
+}
+
 function parseState(cursor: string | null | undefined): PollState | null {
   if (!cursor) return null;
   try { return stateSchema.parse(JSON.parse(cursor)); } catch { return null; }

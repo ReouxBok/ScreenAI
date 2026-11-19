@@ -1,5 +1,5 @@
 import "server-only";
-import { and, asc, eq, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, gte, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savSyncState } from "@/db/schema";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
@@ -127,10 +127,39 @@ export async function ownerHandoverClaimIsCurrent(row: Marker, tx?: CaseTx) {
   return !!current;
 }
 
-export async function finishOwnerHandover(row: Marker, retry: boolean, now: Date) {
+/** SAV-99 (19/11): a finished handover now keeps WHY it ended (`outcome:<status>`), so a later reading never has to guess it. */
+export const ownerHandoverOutcome = (status: string) => `outcome:${status.replace(/[^a-z0-9_]/gi, "_").slice(0, 60)}`;
+
+export async function finishOwnerHandover(row: Marker, retry: boolean, now: Date, outcome?: string) {
   const status = retry ? row.processedCount < MAX_ATTEMPTS ? "pending" : "failed" : "complete";
   await requireDb().update(savSyncState).set({
-    status, lastError: retry ? "owner_handover_read_or_relay_failed" : null, updatedAt: now,
+    status, lastError: retry ? "owner_handover_read_or_relay_failed" : outcome ? ownerHandoverOutcome(outcome) : null, updatedAt: now,
     completedAt: status === "pending" ? null : now,
   }).where(sameClaim(row));
+}
+
+/**
+ * SAV-99 (Ugo 19/11): until this fix, a ticket a person gave the agent was dropped when its HubSpot category was not « Acces » (`outside_access`), and
+ * the marker ended `complete` without its outcome. Such a handover is evaluated ONCE more with the current rules: only a marker that ended `complete`
+ * BEFORE outcomes were recorded (`lastError` null), whose transition is not older than the poll's floor, whose ticket has no case, with attempts left.
+ * Nothing is reset: same transition, same claim, same attempt counter, same guards in `runSavOwnerHandover` (owner still the agent, the same human
+ * transition, ticket open, pause, case, permission). The reopened row carries `sav99_category_recheck` until it ends with its outcome, so it is never
+ * reopened twice. At most `limit` per pass. Never a global replay: a marker finished after this fix always carries its outcome.
+ */
+export const OWNER_HANDOVER_CATEGORY_RECHECK = "sav99_category_recheck";
+export async function reopenPreOutcomeOwnerHandovers(now: Date, floor: Date, limit = 5) {
+  const db = requireDb();
+  const rows = await db.select({ key: savSyncState.key }).from(savSyncState).where(and(sql`${savSyncState.key} like ${PREFIX + "%"}`,
+    eq(savSyncState.status, "complete"), isNull(savSyncState.lastError), gte(savSyncState.startedAt, floor), lt(savSyncState.processedCount, MAX_ATTEMPTS),
+    sql`not exists (select 1 from sav.cases c where c.ticket_id = substring(${savSyncState.key} from ${PREFIX.length + 1}))`))
+    .orderBy(asc(savSyncState.startedAt), asc(savSyncState.key)).limit(limit);
+  let reopened = 0;
+  for (const { key } of rows) {
+    // Due at once for the sweep that follows (a pending retry is due RETRY_MS after its last update), and only if nobody touched the row since.
+    const [row] = await db.update(savSyncState).set({ status: "pending", lastError: OWNER_HANDOVER_CATEGORY_RECHECK, completedAt: null,
+      updatedAt: new Date(now.getTime() - RETRY_MS) })
+      .where(and(eq(savSyncState.key, key), eq(savSyncState.status, "complete"), isNull(savSyncState.lastError))).returning({ key: savSyncState.key });
+    if (row) reopened++;
+  }
+  return reopened;
 }
