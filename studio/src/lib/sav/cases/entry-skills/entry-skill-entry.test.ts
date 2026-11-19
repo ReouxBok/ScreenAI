@@ -70,7 +70,7 @@ const evidence = (e: Record<string, string>, m: Mail, network: ReturnType<typeof
     accessSkillDeps: { network: network ?? (async () => { throw Error("NETWORK_FORBIDDEN"); }), ...source.accessSkillDeps } });
 const rowsLike = async (prefix: string) => f.db.select().from(savSyncState).where(like(savSyncState.key, `${prefix}%`));
 const admittedBy = (rows: CaseAdmissionQualification["requests"]) => rows.map(row => row.provenance.kind === "qualified_rule"
-  ? `${row.provenance.ruleId}@${row.provenance.revision}${row.provenance.blockId ? `#${row.provenance.blockId}` : ""}` : `${row.provenance.kind}:${row.provenance.reason}`);
+  ? `${row.provenance.ruleId}@${row.provenance.revision}${row.provenance.blockId ? `#${row.provenance.blockId}` : ""}` : `${row.provenance.kind}:${"reason" in row.provenance ? row.provenance.reason : ""}`);
 const logged = (spy: ReturnType<typeof vi.spyOn>, event: string) => spy.mock.calls.filter((call: unknown[]) => call[0] === event).map((call: unknown[]) => call[1] as Record<string, unknown>);
 const withoutIds = (rows: Array<Record<string, unknown>>) => rows.map(({ messageId: _m, ...rest }) => rest);
 let infos: ReturnType<typeof vi.spyOn>, errors: ReturnType<typeof vi.spyOn>;

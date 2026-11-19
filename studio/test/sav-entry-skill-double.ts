@@ -38,5 +38,5 @@ export function confirmSays(rows: Array<{ requestId: string; verdict: string; qu
     requests: rows.map(row => ({ requestId: row.requestId, verdict: row.verdict, family: row.family ?? (row.verdict === "sensitive" ? "finance" : null), confidence: row.confidence ?? "high", quote: row.quote, reason: "synthetic" })),
     sensitiveMentions: [] };
 }
-export const counterSaysNo = () => ({ asksOrContestsSensitive: "no", families: [], quote: null, reason: "synthetic" });
+export const counterSaysNo = () => ({ asksOrContestsSensitive: "no", families: [] as string[], quote: null, reason: "synthetic" });
 export const counterSaysYes = () => ({ asksOrContestsSensitive: "yes", families: ["finance"], quote: null, reason: "synthetic" });
