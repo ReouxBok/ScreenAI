@@ -5,7 +5,8 @@
 import "server-only";
 import { closeAfterConfirmedJ2 } from "./j2-confirmed-closure";
 import { isTerminalReply, closingHandoffReplyEnabled } from "./case-terminal-reply";
-import { j2AutoGate } from "./j2-auto-reminder";
+import { j2AutoGate, readCaseOpenBlocks } from "./j2-auto-reminder";
+import { caseBlockReplyKernelProblem } from "./block-auto-reply";
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -213,7 +214,7 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     const { proposal } = payload;
     if (phase === "reply" && isTerminalReply(proposal.purpose) && !closingHandoffReplyEnabled(deps.env())) return fault("HOLD_EFFECTS_OFF");
     if (phase === "reply" && proposal.purpose === "reminder") {
-      const blocked = await j2AutoGate(deps.env(), tx);
+      const blocked = await j2AutoGate(deps.env(), tx, () => readCaseOpenBlocks(tx, proposal.caseId));
       if (blocked) return fault(`HOLD_${blocked.toUpperCase()}`);
     }
     const facts = await readCaseReplyFacts(tx, proposal, policyRevision, { lockCase: true });
@@ -229,6 +230,9 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     if (phase === "reply") {
       const skill = accessSkillSendProblem({ env: deps.env(), admission: facts.admissionRecord ?? null, text: proposal.text, purpose: proposal.purpose });
       if (skill) return fault(skill);
+      // 19/11: the same kernel on our text for a case a block other than Access admitted, whatever approved it (`block-auto-reply.ts`; none before such a block).
+      const kernel = caseBlockReplyKernelProblem({ admission: facts.admissionRecord ?? null, text: proposal.text, purpose: proposal.purpose });
+      if (kernel) return fault(kernel);
     }
     // A note describes an interaction that already happened: it is held by the mode, the pauses and the lease, not by what came after (but never by a LOCAL human).
     const live: CaseEffectLive = {

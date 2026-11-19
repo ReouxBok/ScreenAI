@@ -16,8 +16,10 @@ import type { CaseReplyAuthorizer } from "./case-reply-validation";
 import { proposeCaseReplyFromDraft, queueValidatedCaseReply, resolveCaseReplyLanguage, type CaseReplyDraftInput, type CaseReplyLanguageInput } from "./case-runtime-effects";
 import { judgeCurrentTicketOwner } from "./case-ticket-owner";
 import { listCaseEvents, readCase } from "./case-store";
-import { accessAutoReplyAuthorizer } from "./customer-return-store";
-import { readAccessAutoApprovalConfig, type AccessAutoApprovalFacts } from "./customer-return";
+import { autoReplyAuthorizer } from "./customer-return-store";
+import type { AccessAutoApprovalFacts } from "./customer-return";
+import { autoBlockProblem, caseBlockReplyKernelProblem, readAutoReplyConfig } from "./block-auto-reply";
+import { caseRequestBlockId } from "./case-blocks";
 import { caseAccessScopeStamp, caseStampBlockId, readCaseDecisionScopes } from "./investigation-access-scope";
 import { caseDecisionDraft, type CaseDecisionDraft } from "./investigation-intent";
 import { readCaseInvestigationProgress } from "./investigation-record";
@@ -27,7 +29,7 @@ import { readPilotReplyProvenance, type PilotProvenanceDeps } from "./pilot-pass
 
 /*
  * B (4/11, LOCAL and OFF): from the investigation of an admitted case to the NORMAL send plan, and nothing else. B proposes the recorded
- * decision's reply through C, approves it only through A's access rule (`auto_access.v1`) on facts read again from the database, and queues
+ * decision's reply through C, approves it only through A's rule (`auto_access.v1`, on the allow-list of blocks) on facts read again from the database, and queues
  * it through C's `queueValidatedCaseReply`: one execution on the single ledger, run by C's executor. Anything short of every proof leaves a
  * proposal for a person. The text is formatted `automated` only after those proofs; C stores it and reads the mode from its persisted
  * authority (CONTRAT-B-C-UX). Idempotent: a replay or a concurrent pass finds the same proposal, approval and execution, and calls no model.
@@ -98,9 +100,12 @@ async function autoFacts(caseId: string, deps: CaseReplyPassageDeps, decision: {
   if (!current) reasons.push("admission_not_current_input");
   const owner = await judgeCurrentTicketOwner(deps.store.readTicketOwner, snapshot.ticketId);
   const ownerNow: AccessAutoApprovalFacts["ownerNow"] = owner.ok ? "v2" : owner.code === "owner_human" ? "human" : owner.code === "owner_none" ? "none" : "unknown";
+  const rows = snapshot.body.openRequests.filter(row => row.status === "open" || (decision?.draft.reply && isTerminalReply(decision.draft.reply.purpose)));
   const facts: AccessAutoApprovalFacts = {
     case: { owner: pending ? "agent" : snapshot.owner, sensitivity: snapshot.sensitivity, admitted: admitted && current },
-    openFamilies: [...new Set(snapshot.body.openRequests.filter(row => row.status === "open" || (decision?.draft.reply && isTerminalReply(decision.draft.reply.purpose))).map(row => row.family))],
+    openFamilies: [...new Set(rows.map(row => row.family))],
+    // Allow-list (19/11): the block of each of those requests, from the admission that recorded it (never guessed from a family two blocks may share).
+    openBlocks: rows.map(row => ({ family: row.family, blockId: caseRequestBlockId(snapshot, row) })),
     decision: decision ? { accepted: true, scopeCurrent: decision.draft.replyLimit !== "access_scope_unknown" && decision.draft.replyLimit !== "access_scope_changed",
       shownSourcesVerified: proven, nextAction: decision.nextAction } : null,
     ownerNow,
@@ -114,6 +119,11 @@ async function autoFacts(caseId: string, deps: CaseReplyPassageDeps, decision: {
  * Anything missing or unreadable refuses; it never approves a payload other than the stored one (C's store passes its own row).
  */
 export function caseAccessAutoReplyAuthorizer(deps: Pick<CaseReplyPassageDeps, "store" | "provenance">): CaseReplyAuthorizer {
+  return caseAutoReplyAuthorizer(deps);
+}
+
+/** The same authorizer under its block-neutral name: the allow-list (`block-auto-reply.ts`) decides which blocks it may approve for. */
+export function caseAutoReplyAuthorizer(deps: Pick<CaseReplyPassageDeps, "store" | "provenance">): CaseReplyAuthorizer {
   const passageDeps = { ...deps, policy: null } satisfies CaseReplyPassageDeps;
   return async request => {
     // The block's switch first: off, paused or draft, the rule never approves (a person still may, through C's own path).
@@ -128,7 +138,10 @@ export function caseAccessAutoReplyAuthorizer(deps: Pick<CaseReplyPassageDeps, "
     let proven = false;
     try { proven = (await readPilotReplyProvenance(proposal, deps.provenance)).status === "proven"; } catch { proven = false; }
     if (!proven) return { allowed: false, reason: "provenance_unproven" };
-    return accessAutoReplyAuthorizer({ env: deps.store.env(), readFacts: async () => {
+    // « Le noyau dans notre réponse » (19/11): a case a block other than Access admitted is never approved by the rule on a text carrying a kernel phrase.
+    const admitted = await readCase(request.caseId);
+    if (caseBlockReplyKernelProblem({ admission: admitted?.admission, text: proposal.text, purpose: proposal.purpose })) return { allowed: false, reason: "reply_sensitive_wording" };
+    return autoReplyAuthorizer({ env: deps.store.env(), readFacts: async () => {
       const latest = await latestDraft(request.caseId, deps.provenance, deps.store.env());
       if (!latest.draft || latest.draft.triggerEventId !== proposal.triggerEventId) return null;
       const { facts, reasons } = await autoFacts(request.caseId, passageDeps, { draft: latest.draft, nextAction: latest.nextAction }, proven);
@@ -161,7 +174,7 @@ export async function passCaseInvestigationToReplyPlan(caseId: string, deps: Cas
   // language and in the `automated` mode B is about to ask for: what is checked is what would be stored, never the raw draft.
   const languageInput: CaseReplyLanguageInput = deps.language ? await deps.language(caseId) : { code: "unknown", proven: false };
   const language = resolveCaseReplyLanguage(languageInput);
-  const config = readAccessAutoApprovalConfig(deps.store.env());
+  const config = readAutoReplyConfig(deps.store.env());
   const reasons: string[] = [];
   // The stricter of the global switch and the block's: either one short of `auto` leaves the proposal to a person.
   if (config.mode !== "on") reasons.push(`auto_${config.why}`);
@@ -174,13 +187,17 @@ export async function passCaseInvestigationToReplyPlan(caseId: string, deps: Cas
       proven = (await readPilotReplyProvenance({ caseId, triggerEventId: draft.triggerEventId!, purpose: draft.reply.purpose, text }, deps.provenance)).status === "proven";
     } catch { proven = false; }
     if (!proven) reasons.push("provenance_unproven");
+    const admitted = await readCase(caseId);
+    if (caseBlockReplyKernelProblem({ admission: admitted?.admission, text, purpose: draft.reply.purpose })) reasons.push("reply_sensitive_wording");
     const { facts, reasons: factReasons } = await autoFacts(caseId, deps, { draft, nextAction: latest.nextAction }, proven);
     reasons.push(...factReasons);
     if (!facts) reasons.push("facts_unread");
     else {
       if (facts.case.owner !== "agent" || !facts.case.admitted) reasons.push("case_not_admitted");
       if (facts.case.sensitivity !== "none") reasons.push("sensitive");
-      if (!facts.openFamilies.length || facts.openFamilies.some(family => family !== "access")) reasons.push("not_access_only");
+      // The block rule: the same function as A's approval (`autoBlockProblem`), never a copy of it.
+      const blocked = autoBlockProblem(facts, config);
+      if (blocked) reasons.push(blocked);
       if (!["answer", "ask"].includes(latest.nextAction) && !(closingHandoffReplyEnabled(deps.store.env()) && isTerminalReply(draft.reply.purpose))) reasons.push("decision_not_reply");
       if (!facts.decision?.scopeCurrent) reasons.push("scope_not_current");
       if (facts.ownerNow !== "v2") reasons.push(facts.ownerNow === "unknown" ? "owner_unread" : "owner_not_v2");
