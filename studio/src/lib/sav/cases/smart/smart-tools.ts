@@ -137,9 +137,12 @@ export function createSmartToolRunner(ports: Readonly<{
     try { result = await tool.execute(call.args); } catch { return out("failed", "unavailable"); }
     if (result.status !== "ok") return out(result.status === "empty" ? "empty" : result.status === "disabled" ? "off"
       : result.status === "sensitive_input" || result.status === "invalid_input" ? "refused" : "failed", result.status);
-    const text = smartAcademyText(result.summary).slice(0, SAV_SMART_TOOL_LIMITS.maxResultBytes - 600);
+    // Bounded in BYTES of the JSON the model reads (multi-byte text and JSON escaping included), never cut inside a character.
+    let text = smartAcademyText(result.summary);
+    const resultOf = (value: string) => out("ok", null, { needId: call.needId, source: "Limova Academy", text: value });
+    while (text && resultOf(text).bytes > SAV_SMART_TOOL_LIMITS.maxResultBytes) text = [...text].slice(0, Math.floor([...text].length * 0.9)).join("");
     evidence.push({ callId: call.id, needId: call.needId, text });
-    return out("ok", null, { needId: call.needId, source: "Limova Academy", text });
+    return resultOf(text);
   };
 
   return {

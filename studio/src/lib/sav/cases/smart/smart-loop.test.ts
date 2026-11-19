@@ -127,6 +127,15 @@ describe("Academy (interrupteur allumé, outil injecté)", () => {
       expect(result.teamNoteText ?? "", label).not.toContain("https://");
     }
   });
+  it("le résultat Academy est borné en octets (texte multioctet et échappements JSON compris)", async () => {
+    const long = `${"é€😀\"".repeat(2_000)}fin`;
+    const { decides } = await run({ understand: { output: smartReading() }, decide: [tools({ id: "t1", tool: "rechercher_integrations", args: { query: "Gmail" } }), final()],
+      verify: { output: SMART_CONFORME } }, { academy: academy([], long) }, GMAIL);
+    const result = decides[1]!.toolResults![0]!;
+    expect(result.status).toBe("ok");
+    expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThanOrEqual(3_000);
+    expect(String(result.text)).not.toMatch(/\uFFFD/);
+  });
   it("une intégration absente des mots du client n'est pas cherchée (pas d'alternative)", async () => {
     const seen: unknown[] = [];
     const { result } = await run({ understand: { output: smartReading() }, decide: [tools({ id: "t1", tool: "rechercher_integrations", args: { query: "Yonos" } }), final()], verify: { output: SMART_CONFORME } },
