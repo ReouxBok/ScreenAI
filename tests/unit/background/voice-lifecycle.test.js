@@ -47,6 +47,39 @@ async function stopOrReset(reset) {
 }
 
 describe('already dispatched voice commands', () => {
+  it('does not report an old task as successful merely because its click opened a followed tab', async () => {
+    const task = await message({ type: 'VOICE_TASK_BEGIN' });
+    await message({ type: 'VOICE_TRANSCRIPT', role: 'user', text: 'Ouvre Documents' });
+    chromeMock.tabs.sendMessage.mockImplementation(async (_tabId, request) => {
+      if (request.type === 'EXECUTE_ELEMENT_ACTION') {
+        await message({ type: 'VOICE_TASK_UPDATE', revision: task.revision + 1 });
+        chromeMock._listeners.tabs.onCreated.forEach(listener => listener({ id: 18, openerTabId: 17, windowId: 1 }));
+        background.lockTab(18);
+      }
+      return { ok: true, clickDispatched: true };
+    });
+    const result = await message({ type: 'VOICE_ACTION_REQUEST', elementId: 2, contextVersion: 1,
+      targetLabel: 'Documents', explicitRequest: true, taskRevision: task.revision });
+    expect(result).toMatchObject({ ok: false, cancelled: true });
+  });
+
+  it('cancels pending dictation when the current voice request is replaced', async () => {
+    const task = await message({ type: 'VOICE_TASK_BEGIN' });
+    const gate = suspendConsent();
+    const pending = message({ type: 'VOICE_TEXT_INPUT_REQUEST', elementId: 1, text: 'OLD DICTATION', contextVersion: 1, taskRevision: task.revision });
+    await gate.wait();
+    await message({ type: 'VOICE_TASK_UPDATE', revision: task.revision + 1 });
+    gate.release(); await pending;
+    expect(mutationCalls()).toEqual([]);
+  });
+
+  it('rejects a late tool from an already replaced voice request', async () => {
+    const task = await message({ type: 'VOICE_TASK_BEGIN' });
+    await message({ type: 'VOICE_TASK_UPDATE', revision: task.revision + 1 });
+    const result = await message({ type: 'VOICE_SCROLL_REQUEST', direction: 'down', taskRevision: task.revision });
+    expect(result.cancelled).toBe(true);
+    expect(mutationCalls()).toEqual([]);
+  });
   it.each([
     ['scroll after stop', false, { type: 'VOICE_SCROLL_REQUEST', direction: 'down', contextVersion: 1 }],
     ['scroll after reset on another tab', true, { type: 'VOICE_SCROLL_REQUEST', direction: 'down', contextVersion: 1 }],

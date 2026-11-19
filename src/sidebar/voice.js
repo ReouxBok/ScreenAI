@@ -5,7 +5,7 @@
 // The Live model tends to stop after each tool and wait for the user. Each
 // successful page action reminds it to finish the user's goal on its own.
 const VOICE_PAGE_ACTION_TOOLS = new Set([
-  'click_element', 'navigate_internal', 'request_page_action', 'fill_field', 'type_text_into_page', 'scroll_page', 'open_page'
+  'click_element', 'set_control_state', 'navigate_internal', 'request_page_action', 'fill_field', 'type_text_into_page', 'scroll_page', 'open_page'
 ]);
 // create_in_limova opens a tab and sends a message: it only runs when the
 // sentence the user is saying right now asks for it or says yes to it, never
@@ -746,8 +746,11 @@ class LimovaVoiceSession {
     return output;
   }
 
-  async handleToolCalls(functionCalls) {
+  async handleToolCalls(functionCalls, execution = {}) {
     const lifecycleId = this.lifecycleId;
+    const isCurrent = () => lifecycleId === this.lifecycleId && (!execution.isCurrent || execution.isCurrent());
+    const sendToolMessage = request => chrome.runtime.sendMessage({ ...request,
+      ...(execution.taskRevision === undefined ? {} : { taskRevision: execution.taskRevision }) });
     this.toolCallsInFlight += 1;
     this.lastToolActivityAt = Date.now();
     clearTimeout(this.replyRecoveryTimer);
@@ -755,12 +758,14 @@ class LimovaVoiceSession {
     const functionResponses = [];
     try {
       for (const call of functionCalls) {
-      if (lifecycleId !== this.lifecycleId) return;
+      if (!isCurrent()) return;
+      this.diagnostic('VOICE_TOOL_RECEIVED', { tool: call.name, contextVersion: Number(call.args?.contextVersion || 0) });
       let result = { ok: false, error: 'Fonction non autorisée.' };
       if (call.name === 'inspect_current_page' || call.name === 'verify_expected_result' || call.name === 'capture_current_view') {
-        result = await chrome.runtime.sendMessage({
+        result = await sendToolMessage({
           type: 'VOICE_CONTEXT_REQUEST',
           toolName: call.name,
+          ...(call.name === 'verify_expected_result' ? { conditions: call.args?.conditions, expectation: call.args?.expectation } : {}),
           ...(call.name === 'capture_current_view' ? { capture: true } : {})
         })
           .catch(() => ({ ok: false, error: 'La page est indisponible.' }));
@@ -769,8 +774,19 @@ class LimovaVoiceSession {
           characterCount: String(result?.pageContext || '').length,
           elementCount: Number(result?.elementCount || 0)
         });
+      } else if (call.name === 'select_control' && typeof call.args?.targetLabel === 'string' && typeof call.args?.checked === 'boolean') {
+        result = await sendToolMessage({ type: 'VOICE_SELECT_CONTROL_REQUEST', targetLabel: call.args.targetLabel, checked: call.args.checked })
+          .catch(() => ({ ok: false, error: 'La sélection est indisponible.' }));
+      } else if (call.name === 'set_control_state' && Number.isInteger(call.args?.elementId) && typeof call.args?.checked === 'boolean') {
+        result = await sendToolMessage({ type: 'VOICE_CONTROL_STATE_REQUEST', elementId: call.args.elementId,
+          contextVersion: call.args.contextVersion, targetLabel: call.args.targetLabel, checked: call.args.checked })
+          .catch(() => ({ ok: false, error: 'La page est indisponible.' }));
+        if (result?.ok) {
+          const refreshed = await sendToolMessage({ type: 'VOICE_CONTEXT_REQUEST', capture: true }).catch(() => null);
+          if (refreshed?.ok) result = { ...result, ...refreshed };
+        }
       } else if (call.name === 'search_knowledge_base' && typeof call.args?.query === 'string') {
-        result = await chrome.runtime.sendMessage({
+        result = await sendToolMessage({
           type: 'VOICE_KB_SEARCH',
           query: call.args.query
         }).catch(() => ({ ok: false, error: 'La documentation Limova est indisponible.' }));
@@ -782,7 +798,7 @@ class LimovaVoiceSession {
       } else if ((call.name === 'fill_field' || call.name === 'type_text_into_page')
         && Number.isInteger(call.args?.elementId)
         && typeof call.args?.text === 'string') {
-        result = await chrome.runtime.sendMessage({
+        result = await sendToolMessage({
           type: 'VOICE_TEXT_INPUT_REQUEST',
           elementId: call.args.elementId,
           contextVersion: call.args.contextVersion,
@@ -801,13 +817,13 @@ class LimovaVoiceSession {
           // Limova filters large integration grids with a short React debounce.
           // Wait for the filtered cards to replace the previous 3,237-item map.
           await new Promise(resolve => setTimeout(resolve, 550));
-          if (lifecycleId !== this.lifecycleId) return;
-          const refreshed = await chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST', capture: true })
+          if (!isCurrent()) return;
+          const refreshed = await sendToolMessage({ type: 'VOICE_CONTEXT_REQUEST', capture: true })
             .catch(() => null);
           if (refreshed?.ok) result = { ...result, ...refreshed };
         }
       } else if (call.name === 'scroll_page' && ['up', 'down', 'top', 'bottom'].includes(call.args?.direction)) {
-        result = await chrome.runtime.sendMessage({
+        result = await sendToolMessage({
           type: 'VOICE_SCROLL_REQUEST',
           direction: call.args.direction,
           amount: ['small', 'medium', 'large'].includes(call.args?.amount) ? call.args.amount : 'medium',
@@ -816,13 +832,13 @@ class LimovaVoiceSession {
         }).catch(() => ({ ok: false, error: 'La page est indisponible.' }));
         if (result?.ok) {
           await new Promise(resolve => setTimeout(resolve, 180));
-          if (lifecycleId !== this.lifecycleId) return;
-          const refreshed = await chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST' }).catch(() => null);
+          if (!isCurrent()) return;
+          const refreshed = await sendToolMessage({ type: 'VOICE_CONTEXT_REQUEST' }).catch(() => null);
           if (refreshed?.ok) result = { ...result, ...refreshed };
         }
       } else if (call.name === 'open_page' && typeof call.args?.url === 'string') {
         // The background waits for the page to load and returns its fresh map.
-        result = await chrome.runtime.sendMessage({
+        result = await sendToolMessage({
           type: 'VOICE_OPEN_PAGE',
           url: call.args.url,
           newTab: call.args?.newTab === true
@@ -838,7 +854,7 @@ class LimovaVoiceSession {
       } else if (call.name === 'create_in_limova' && typeof call.args?.request === 'string') {
         // The background reads the page, opens Limova and sends the request in
         // its chat, then returns the map of the new conversation.
-        result = await chrome.runtime.sendMessage({
+        result = await sendToolMessage({
           type: 'VOICE_CREATE_IN_LIMOVA',
           request: call.args.request
         }).catch(() => ({ ok: false, error: 'Extension indisponible.' }));
@@ -847,7 +863,7 @@ class LimovaVoiceSession {
           requestLength: call.args.request.length
         });
       } else if (['click_element', 'navigate_internal', 'request_page_action'].includes(call.name) && Number.isInteger(call.args?.elementId)) {
-        result = await chrome.runtime.sendMessage({
+        result = await sendToolMessage({
           type: 'VOICE_ACTION_REQUEST',
           toolName: call.name,
           elementId: call.args.elementId,
@@ -861,13 +877,13 @@ class LimovaVoiceSession {
         // element IDs on its next step.
         if (result?.ok) {
           await new Promise(resolve => setTimeout(resolve, 300));
-          if (lifecycleId !== this.lifecycleId) return;
-          const refreshed = await chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST', capture: true })
+          if (!isCurrent()) return;
+          const refreshed = await sendToolMessage({ type: 'VOICE_CONTEXT_REQUEST', capture: true })
             .catch(() => null);
           if (refreshed?.ok) result = { ...result, ...refreshed };
         }
       }
-      if (lifecycleId !== this.lifecycleId) return;
+      if (!isCurrent()) return;
       const pageContext = String(result?.pageContext || '');
       if (pageContext) this.acknowledgePageContext(result?.contextVersion);
       if (result?.visualCapture) {
@@ -908,19 +924,27 @@ class LimovaVoiceSession {
       } else if (result?.knowledge) {
         response.knowledgeBase = String(result.knowledge).slice(0, 6_000);
       }
-      if (response.status === 'ok' && call.name === 'create_in_limova') {
+      for (const key of ['moved', 'atStart', 'atEnd', 'unchanged', 'cancelled', 'verification', 'verificationRequired', 'retryWithFreshContext', 'matches', 'targetLabel', 'checked', 'durationMs']) {
+        if (result?.[key] !== undefined) response[key] = result[key];
+      }
+      if (call.name === 'verify_expected_result' && response.verification?.status !== 'confirmed') response.status = 'unexpected';
+      if (call.name === 'scroll_page' && result?.moved === false) {
+        response.nextStep = 'Aucun déplacement : change de zone de défilement ou recherche une autre cible. Ne répète pas ce même défilement.';
+      } else if (response.status === 'ok' && call.name === 'create_in_limova') {
         response.nextStep = VOICE_HANDOFF_DONE_HINT;
       } else if (response.status === 'ok' && VOICE_PAGE_ACTION_TOOLS.has(call.name)) {
         response.nextStep = VOICE_CONTINUATION_HINT;
       }
+      this.diagnostic('VOICE_TOOL_COMPLETED', { tool: call.name, status: response.status, verified: response.verification?.status === 'confirmed' });
+      this.onToolResult?.(call, response);
         functionResponses.push({
         id: call.id,
         name: call.name,
         response
       });
       }
-      if (lifecycleId === this.lifecycleId && this.socket?.readyState === WebSocket.OPEN) {
-        this.socket.send(JSON.stringify({ toolResponse: { functionResponses } }));
+      if (isCurrent() && this.socket?.readyState === WebSocket.OPEN) {
+        await this.socket.send(JSON.stringify({ toolResponse: { functionResponses } }));
       }
     } finally {
       if (lifecycleId === this.lifecycleId) {

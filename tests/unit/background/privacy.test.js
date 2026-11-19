@@ -34,6 +34,105 @@ describe('background privacy boundaries', () => {
     delete globalThis.fetch;
   });
 
+  it('maps native and ARIA selection controls once with their state', async () => {
+    document.body.innerHTML = '<main><label for="native">Agenda démo</label><input id="native" type="checkbox"><div role="checkbox" tabindex="0" aria-label="Agenda ARIA" aria-checked="true"></div><div role="switch" aria-label="Agenda switch" aria-checked="mixed"></div></main>';
+    const context = await background.getPageContext(17);
+    expect((context.match(/Agenda ARIA/g) || [])).toHaveLength(1);
+    expect(context).toContain('checkbox(div) "Agenda ARIA" ☑ON');
+    expect(context).toContain('checkbox(input) "Agenda démo" ☐OFF');
+    expect(context).toContain('toggle(div) "Agenda switch"');
+  });
+
+  it('keeps a styled transparent native checkbox but rejects a hidden ancestor', async () => {
+    document.body.innerHTML = '<main><label for="styled">Agenda stylé</label><input id="styled" type="checkbox" style="opacity:0"><div style="opacity:0"><label for="hidden">Agenda invisible</label><input id="hidden" type="checkbox" style="opacity:0"></div></main>';
+    const context = await background.getPageContext(17);
+    expect(context).toContain('checkbox(input) "Agenda stylé"');
+    expect(context).not.toContain('Agenda invisible');
+    expect(document.querySelector('#styled').hasAttribute('data-lid')).toBe(true);
+    expect(document.querySelector('#hidden').hasAttribute('data-lid')).toBe(false);
+  });
+
+  it('returns ambiguity and missing-target results without a selection side effect', async () => {
+    document.body.innerHTML = '<main><label for="one">Anthony Alpha</label><input id="one" type="checkbox"><label for="two">Anthony Beta</label><input id="two" type="checkbox"></main>';
+    background.lockTab(17);
+    const sender = { id: chromeMock.runtime.id, url: chromeMock.runtime.getURL('src/sidebar/sidebar.html') };
+    const ambiguous = await background.handleMessage({ type: 'VOICE_SELECT_CONTROL_REQUEST', targetLabel: 'Anthony', checked: true }, sender);
+    expect(ambiguous.ok).toBe(false);
+    expect(ambiguous.matches).toHaveLength(2);
+    const missing = await background.handleMessage({ type: 'VOICE_SELECT_CONTROL_REQUEST', targetLabel: 'Unknown calendar', checked: true }, sender);
+    expect(missing.status).toBe('not_found');
+    expect(document.querySelector('#one').checked).toBe(false);
+    expect(document.querySelector('#two').checked).toBe(false);
+  });
+
+  it('selects and verifies a named transparent control in one request', async () => {
+    document.body.innerHTML = '<main><label for="styled">Anthony Brignoli</label><input id="styled" type="checkbox" style="opacity:0"></main>';
+    background.lockTab(17);
+    const sender = { id: chromeMock.runtime.id, url: chromeMock.runtime.getURL('src/sidebar/sidebar.html') };
+    await background.handleMessage({ type: 'VOICE_TRANSCRIPT', role: 'user', text: 'Affiche l’agenda de Anthony Brignoli' }, sender);
+    const originalSend = chromeMock.tabs.sendMessage.getMockImplementation();
+    chromeMock.tabs.sendMessage.mockImplementation(async (_tabId, request) => {
+      if (request.type === 'EXECUTE_ELEMENT_ACTION') {
+        document.querySelector('#styled').checked = request.desiredChecked;
+        return { ok: true };
+      }
+      return { ok: true };
+    });
+    const result = await background.handleMessage({ type: 'VOICE_SELECT_CONTROL_REQUEST', targetLabel: 'agenda de Anthony Brignoli', checked: true }, sender);
+    expect(result.ok).toBe(true);
+    expect(result.verification.status).toBe('confirmed');
+    expect(result.pageContext.length).toBeLessThan(2000);
+    const repeated = await background.handleMessage({ type: 'VOICE_SELECT_CONTROL_REQUEST', targetLabel: 'Anthony Brignoli', checked: true }, sender);
+    expect(repeated.unchanged).toBe(true);
+    expect(chromeMock.tabs.sendMessage.mock.calls.filter(([, request]) => request.type === 'EXECUTE_ELEMENT_ACTION')).toHaveLength(1);
+    chromeMock.tabs.sendMessage.mockImplementation(originalSend);
+  });
+
+  it('does not turn a request to analyse into a selection', async () => {
+    document.body.innerHTML = '<main><label for="styled">Anthony Brignoli</label><input id="styled" type="checkbox" style="opacity:0"></main>';
+    background.lockTab(17);
+    const sender = { id: chromeMock.runtime.id, url: chromeMock.runtime.getURL('src/sidebar/sidebar.html') };
+    await background.handleMessage({ type: 'VOICE_TRANSCRIPT', role: 'user', text: 'Analyse les informations sur Anthony Brignoli' }, sender);
+    const result = await background.handleMessage({ type: 'VOICE_SELECT_CONTROL_REQUEST', targetLabel: 'Anthony Brignoli', checked: true }, sender);
+    expect(result.ok).toBe(false);
+    expect(result.clarificationRequired).toBe(true);
+    expect(document.querySelector('#styled').checked).toBe(false);
+  });
+
+  it('allows explicit reversible selection but keeps sensitive choices gated', () => {
+    const control = { type: 'checkbox', text: 'Agenda démo', checked: false };
+    expect(background.classifyActionRisk(control, { explicitRequest: true }).level).toBe('low');
+    expect(background.classifyActionRisk(control).level).toBe('sensitive');
+    for (const change of [{ inForm: true }, { disabled: true }, { text: 'Accepter les conditions' }, { text: 'Autoriser le partage' }]) {
+      expect(background.classifyActionRisk({ ...control, ...change }, { explicitRequest: true }).level).toBe('sensitive');
+    }
+  });
+
+  it('requires observed postconditions instead of treating a page read as proof', async () => {
+    const sender = { id: chromeMock.runtime.id, url: chromeMock.runtime.getURL('src/sidebar/sidebar.html') };
+    background.lockTab(17);
+    const missing = await background.handleMessage({ type: 'VOICE_CONTEXT_REQUEST', toolName: 'verify_expected_result', conditions: [{ kind: 'text_present', text: 'IMPOSSIBLE_STATE' }] }, sender);
+    expect(missing.ok).toBe(false);
+    expect(missing.verification.status).toBe('not_confirmed');
+    const empty = await background.handleMessage({ type: 'VOICE_CONTEXT_REQUEST', toolName: 'verify_expected_result' }, sender);
+    expect(empty.verification.status).toBe('unverified');
+    const found = await background.handleMessage({ type: 'VOICE_CONTEXT_REQUEST', toolName: 'verify_expected_result', conditions: [{ kind: 'text_present', text: 'Documents' }] }, sender);
+    expect(found.verification.status).toBe('confirmed');
+  });
+
+  it('does not choose between two identically named selection controls', async () => {
+    document.body.innerHTML = '<main><div role="checkbox" aria-label="Agenda démo" aria-checked="true"></div><div role="checkbox" aria-label="Agenda démo" aria-checked="false"></div></main>';
+    background.lockTab(17);
+    await background.getPageContext(17);
+    const elementId = Number(document.querySelector('[data-lid]').getAttribute('data-lid'));
+    const sender = { id: chromeMock.runtime.id, url: chromeMock.runtime.getURL('src/sidebar/sidebar.html') };
+    const result = await background.handleMessage({ type: 'VOICE_CONTROL_STATE_REQUEST', elementId, checked: true, targetLabel: 'Agenda démo' }, sender);
+    expect(result.ok).toBe(false);
+    expect(result.clarificationRequired).toBe(true);
+    const proof = await background.handleMessage({ type: 'VOICE_CONTEXT_REQUEST', toolName: 'verify_expected_result', conditions: [{ kind: 'control_checked', targetLabel: 'Agenda démo', checked: true }] }, sender);
+    expect(proof.verification.status).toBe('not_confirmed');
+  });
+
   beforeEach(async () => {
     background.handleResetSession();
     await chromeMock.storage.local.set({

@@ -282,6 +282,19 @@ describe('content.js — DOM helpers', () => {
       expect(modalClick).toHaveBeenCalledOnce();
     });
 
+    it('activates a transparent native checkbox through its visible label surface', async () => {
+      vi.useFakeTimers();
+      window.requestAnimationFrame = callback => setTimeout(callback, 0);
+      document.documentElement.dataset.limovaContextVersion = '11';
+      document.body.innerHTML = '<label for="styled">Agenda stylé</label><input id="styled" type="checkbox" data-lid="5" style="opacity:0">';
+      for (const element of document.querySelectorAll('label,input')) element.getBoundingClientRect = () => ({ left:100, top:80, right:220, bottom:120, width:120, height:40 });
+      const action = content.executeElementActionWithCursor(5, 11, { desiredChecked: true });
+      await vi.advanceTimersByTimeAsync(1200);
+      await expect(action).resolves.toMatchObject({ ok:true });
+      expect(document.querySelector('input').checked).toBe(true);
+      vi.useRealTimers();
+    });
+
     it('shows a computer-use pointer before clicking', async () => {
       vi.useFakeTimers();
       window.requestAnimationFrame = callback => setTimeout(callback, 0);
@@ -299,6 +312,23 @@ describe('content.js — DOM helpers', () => {
 
       await expect(action).resolves.toMatchObject({ ok: true, visualized: true });
       expect(click).toHaveBeenCalledOnce();
+      vi.useRealTimers();
+    });
+
+    it.each([false, true])('sets a native checkbox to checked without reversing an existing selection (%s)', async checked => {
+      vi.useFakeTimers();
+      window.requestAnimationFrame = callback => setTimeout(callback, 0);
+      document.documentElement.dataset.limovaContextVersion = '11';
+      document.body.innerHTML = '<input type="checkbox" data-lid="5">';
+      const checkbox = document.querySelector('input');
+      checkbox.checked = checked;
+      checkbox.getBoundingClientRect = () => ({ left: 100, top: 80, right: 120, bottom: 100, width: 20, height: 20 });
+      const click = vi.spyOn(checkbox, 'click');
+      const action = content.executeElementActionWithCursor(5, 11, { desiredChecked: true });
+      await vi.advanceTimersByTimeAsync(1200);
+      await expect(action).resolves.toMatchObject({ ok: true });
+      expect(checkbox.checked).toBe(true);
+      expect(click).toHaveBeenCalledTimes(checked ? 0 : 1);
       vi.useRealTimers();
     });
 
