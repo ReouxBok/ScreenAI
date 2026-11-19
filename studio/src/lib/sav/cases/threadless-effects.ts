@@ -37,7 +37,7 @@ export type ThreadlessEffectPorts = {
   readTicket?: typeof readThreadlessTicket;
   gmailPermissions: (mailbox: string, signal: AbortSignal) => Promise<void>;
 };
-type PassDeps = Pick<CaseRuntimeDeps, "env" | "deadlineMs" | "executionId"> & ThreadlessEffectPorts;
+type PassDeps = Pick<CaseRuntimeDeps, "env" | "deadlineMs" | "executionId" | "pilotProvenance"> & ThreadlessEffectPorts;
 
 async function updateParent(tx: ExecutionTx, id: string, state: Parent["state"], reason: string | null) {
   await tx.update(parents).set({ state, reason, updatedAt: new Date() }).where(eq(parents.id, id));
@@ -206,6 +206,21 @@ async function passOne(parent: Parent, deps: PassDeps) {
   const accessRevision = !gmail && (await qualifyThreadlessTicket(read.source, env)).status === "admitted"
     ? await threadlessAccessRevision(env, db) : null;
   if (!gmail && !accessRevision) return;
+  if (!gmail) {
+    // SAV-96 B: the last look before the marker, exactly as a thread reply (`case-effect-driver.ts`): the decision, its scope and every cited card
+    // re-proven now, under the PERSISTED basis. A card retired or changed since the approval: no POST, a person takes the ticket. An automated
+    // first mail is never sent without this port.
+    const [stored] = await db.select({ basis: savCaseReplyValidations.authorizationBasis }).from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, validationId));
+    const automated = caseReplyModeForBasis(stored?.basis) === "automated";
+    let unproven: string | null = null;
+    if (deps.pilotProvenance) {
+      try { unproven = await deps.pilotProvenance(proposal, { basis: stored?.basis ?? null }); } catch { unproven = "provenance_unreadable"; }
+    } else if (automated) unproven = "provenance_port_absent";
+    if (unproven) {
+      await waitBeforeSend(parent, "threadless_provenance_unproven", true);
+      return;
+    }
+  }
 
   const intent: SendIntent | CrmIntent = gmail
     ? { kind: CRM_KIND, key: `crm-email:${parent.replyKey}`, permission: THREADLESS_CRM_PERMISSION,

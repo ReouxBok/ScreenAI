@@ -29,8 +29,8 @@ export async function loadThreadlessFirstMailDeps(env: Env): Promise<ThreadlessF
     return {
       env: source, investigation: built.deps, provenance: built.provenance, readTicketOwner,
       executionPolicy: { id: config.policyId, hash: config.policyHash },
-      // The reading the entry stored when it admitted the ticket (computed here only if it is missing: once, under V2's model budget).
-      accessSkill: ticket => readThreadlessAccessSkill(ticket, env, true),
+      // The reading the entry stored when it admitted the ticket under SAV-97; never computed (nor paid) here.
+      accessSkill: ticket => readThreadlessAccessSkill(ticket, env, false),
     };
   } catch {
     return null;

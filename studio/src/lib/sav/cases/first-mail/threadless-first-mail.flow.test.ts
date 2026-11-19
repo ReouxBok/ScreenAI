@@ -24,7 +24,7 @@ import type { CaseEmbeddingSpendPort, CaseEmbeddingTransport, CaseKnowledgeVecto
 import type { CaseInvestigationModelRequest } from "../investigation-runner";
 import { caseCallLedgerOnStore, type CaseInvestigationRuntimeDeps } from "../investigation-runtime";
 import { caseInvestigationPrompt } from "../investigation-v2-providers";
-import type { PilotProvenanceDeps } from "../pilot-passage-provenance";
+import { pilotProvenanceGate, type PilotProvenanceDeps } from "../pilot-passage-provenance";
 import { THREADLESS_ACCESS_DRAFT, THREADLESS_ADMIT_PERMISSION, THREADLESS_CRM_PERMISSION, THREADLESS_SEND_PERMISSION, threadlessReplySubject } from "../threadless-config";
 import { startV2FromThreadlessTicket, type ThreadlessFirstMailPort } from "../threadless-entry";
 import { readThreadlessAccessSkill } from "../threadless-source";
@@ -74,7 +74,7 @@ beforeAll(async () => {
 }, 60_000);
 afterAll(async () => { state.db = null; await f?.client.close(); });
 
-type Mode = Readonly<{ auto?: "on" | "off"; autoReply?: boolean; skill?: boolean }>;
+type Mode = Readonly<{ auto?: "on" | "off"; autoReply?: boolean; skill?: boolean; rules?: "legacy" | "skill" | "both" }>;
 async function configure(mode: Mode = {}) {
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "synthetic-first-mail-fixture-key-32-characters");
   vi.spyOn(console, "info").mockImplementation(() => {});
@@ -85,16 +85,17 @@ async function configure(mode: Mode = {}) {
     mutations: [THREADLESS_ADMIT_PERMISSION, THREADLESS_SEND_PERMISSION, THREADLESS_CRM_PERMISSION], admission: { kind: "automatic" },
   };
   grant = await approveIntakeExecutionPolicy(executionPolicy);
-  const rule = { ...(mode.skill === false ? LEGACY_RULE : SKILL_RULE), at: before };
+  const rules = (mode.rules ?? (mode.skill === false ? "legacy" : "skill")) === "both" ? [LEGACY_RULE, SKILL_RULE] : [(mode.rules ?? (mode.skill === false ? "legacy" : "skill")) === "legacy" ? LEGACY_RULE : SKILL_RULE];
+  const configured = rules.map(rule => ({ ...rule, at: before }));
   const admission = { revision: REVISION, admittedFamilies: ["access"], approvedBy: APPROVER, approvedAt: before,
-    qualifiedRules: [{ ruleId: rule.ruleId, revision: rule.revision, families: ["access"] }] };
+    qualifiedRules: configured.map(rule => ({ ruleId: rule.ruleId, revision: rule.revision, families: ["access"] })) };
   for (const [key, value] of Object.entries({
     ...ACCESS_SKILL_TEST_PROVIDER_ENV,
     SAV_V2_NEW_THREAD: "on", SAV_V2_NEW_THREAD_AUTO: mode.auto ?? "on", SAV_CASE_RECORDING: "on", SAV_V2_ENTRY: "on", SAV_CASE_EFFECTS: "supervised",
     SAV_V2_ACCESS_SKILL: mode.skill === false ? "off" : "on",
     SAV_V2_AUTO_REPLY: mode.autoReply === false ? undefined : "access", SAV_V2_AUTO_APPROVER_ID: mode.autoReply === false ? undefined : APPROVER,
     SAV_V2_HUBSPOT_OWNER_ID: OWNER, HUBSPOT_ACCESS_TOKEN: "synthetic",
-    SAV_V2_ADMISSION_RULES_JSON: JSON.stringify([rule]),
+    SAV_V2_ADMISSION_RULES_JSON: JSON.stringify(configured),
     SAV_V2_ADMISSION_POLICY_JSON: JSON.stringify({ policy: admission, validFrom: before, validUntil: after }),
     SAV_V2_ACCESS_SCOPE_JSON: JSON.stringify({ schema: SAV_CASE_ACCESS_SCOPE_REVISION, policyRevision: REVISION, revision: "fixture-access-scope",
       family: "access", sources: [{ knowledgeId: card.id, contentVersionId: card.contentVersionId, use: "answer" }] }),
@@ -103,7 +104,14 @@ async function configure(mode: Mode = {}) {
     SAV_TEST_MODE: "false", SAV_WRITES_DISABLED: "false", SAV_INTAKE_EXECUTION_KILL_SWITCH: "0",
   })) vi.stubEnv(key, value);
 }
-beforeEach(() => configure());
+/** The cited card as the knowledge base holds it now (`readActiveSource`): retired, or its version gone, between approval and send. */
+const knowledgeNow = { card: "active" as "active" | "retired" | "changed" };
+const provenanceDeps: PilotProvenanceDeps = {
+  accessScope: async () => JSON.parse(process.env.SAV_V2_ACCESS_SCOPE_JSON!) as unknown, currentPolicyRevision: async () => REVISION, now: () => new Date(), env: () => process.env,
+  readActiveSource: async () => knowledgeNow.card === "changed" ? null
+    : ({ active: knowledgeNow.card === "active", title: card.title, content: card.content, verifiedAt: card.verifiedAt! }),
+};
+beforeEach(async () => { knowledgeNow.card = "active"; await configure(); });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 /** SAV-97's honest synthetic judge: a ticket naming a subscription only as the login screen is Access; a bill is sensitive. */
@@ -179,6 +187,8 @@ function fixture(ticketInput: Ticket = {}) {
     executionId, deadlineMs: Date.now() + 30_000, context: { runtime: {} as never, policy: executionPolicy },
     adapters: createIntakeExecutorAdapters({ env: () => process.env, gmailRequest, network: hubspot, gmailPermissions }),
     threadless: { transport, gmailPermissions },
+    // The production effects binding's gate (`v2-effects-binding.ts`): the same last look as a thread reply.
+    pilotProvenance: pilotProvenanceGate(provenanceDeps),
   });
   return { input, ack, crmId, controls, counts, run, skillModel, sentMail: () => sentMail };
 }
@@ -214,10 +224,9 @@ function firstMailDeps(model = decisionModel()): ThreadlessFirstMailDeps {
     knowledge: { vectors, embed, spend },
     model: { money: async () => ({ status: "allowed" }), provider: model.provider },
   };
-  const provenance: PilotProvenanceDeps = { accessScope, currentPolicyRevision: async () => REVISION, now: () => new Date(), env: () => process.env,
-    readActiveSource: async () => ({ active: true, title: card.title, content: card.content, verifiedAt: card.verifiedAt! }) };
+  const provenance = provenanceDeps;
   return { env: () => process.env, investigation, provenance, readTicketOwner: async () => "v2",
-    executionPolicy: { id: grant.id, hash: grant.policyHash }, accessSkill: source => readThreadlessAccessSkill(source, process.env, true) };
+    executionPolicy: { id: grant.id, hash: grant.policyHash }, accessSkill: source => readThreadlessAccessSkill(source, process.env, false) };
 }
 const port = (deps: ThreadlessFirstMailDeps): ThreadlessFirstMailPort => caseId => composeThreadlessFirstMail(caseId, deps);
 const validations = (caseId: string) => f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, caseId));
@@ -409,5 +418,78 @@ describe("SAV-96 B : le premier mail d'un ticket sans fil, écrit par le modèle
     const [parent] = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.id, started.executionId));
     expect(parent?.state).not.toBe("confirmed");
     expect((await listCaseEvents(started.caseId)).filter(event => event.kind === "outbound_observed").length).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("SAV-96 B (revue Astra 6.2, bloquant 1) : SAV_V2_NEW_THREAD_AUTO ne change jamais l'admission ni ne paie un jugement", () => {
+  it("AUTO off + SKILL off : l'admission historique, brouillon fixe pour une personne, aucun jugement, aucun modèle", async () => {
+    await configure({ auto: "off", skill: false });
+    const s = fixture({ content: PLAIN_LOGIN }), firstMail = vi.fn<ThreadlessFirstMailPort>();
+    expect(await startV2FromThreadlessTicket(s.input, { firstMail })).toMatchObject({ status: "started" });
+    expect(firstMail).not.toHaveBeenCalled();
+    expect(s.counts.judge).toBe(0);
+    const sensitive = fixture({ content: SUBSCRIPTION_LOGIN });
+    expect(await startV2FromThreadlessTicket(sensitive.input, { firstMail })).toMatchObject({ status: "human_wait", reason: "sensitive_request" });
+    expect(sensitive.counts.judge).toBe(0);
+  });
+  it("AUTO on + SKILL off : la même admission historique ; le modèle écrit, mais AUCUN jugement SAV-97 n'est payé", async () => {
+    await configure({ auto: "on", skill: false });
+    const s = fixture({ content: PLAIN_LOGIN }), model = decisionModel();
+    expect(await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps(model)) })).toMatchObject({ status: "queued" });
+    expect(model.requests).toHaveLength(1);
+    expect(s.counts.judge).toBe(0);
+    // The historical lexical veto still decides: the same refusal as with AUTO off, no model, no judgment.
+    const sensitive = fixture({ content: SUBSCRIPTION_LOGIN }), other = decisionModel();
+    expect(await startV2FromThreadlessTicket(sensitive.input, { firstMail: port(firstMailDeps(other)) })).toMatchObject({ status: "human_wait", reason: "sensitive_request" });
+    expect(sensitive.counts.judge).toBe(0);
+    expect(other.requests).toHaveLength(0);
+  });
+  it("AUTO off + SKILL on : SAV-97 décide l'admission, comme pour un mail (jugement payé par l'admission) ; brouillon fixe pour une personne, aucun modèle", async () => {
+    await configure({ auto: "off", skill: true });
+    const s = fixture({ content: SUBSCRIPTION_LOGIN }), firstMail = vi.fn<ThreadlessFirstMailPort>();
+    const started = await startV2FromThreadlessTicket(s.input, { firstMail });
+    expect(started).toMatchObject({ status: "started" });
+    expect(firstMail).not.toHaveBeenCalled();
+    expect(s.skillModel.calls.map(call => call.kind)).toEqual(["judge", "counter"]);
+    const [row] = await validations((started as { caseId: string }).caseId);
+    expect(readCaseReplyDisclosure(textOf(row!).text)?.mode).toBe("manual_reviewed");
+  });
+  it("AUTO on + SKILL on : la même admission SAV-97, un seul jugement (celui de l'admission, réutilisé), puis le premier mail automatique", async () => {
+    const s = fixture({ content: SUBSCRIPTION_LOGIN });
+    expect(await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps()) })).toMatchObject({ status: "queued" });
+    expect(s.skillModel.calls.map(call => call.kind)).toEqual(["judge", "counter"]);
+  });
+  it("même ticket, même SKILL : AUTO off ou on donnent la même décision d'admission et le même nombre de jugements", async () => {
+    for (const skill of [false, true]) for (const content of [PLAIN_LOGIN, SUBSCRIPTION_LOGIN]) {
+      const seen: Array<{ admitted: boolean; judge: number }> = [];
+      for (const auto of ["off", "on"] as const) {
+        await configure({ auto, skill });
+        const s = fixture({ content });
+        const started = await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps()) });
+        seen.push({ admitted: started.status === "started" || started.status === "queued", judge: s.counts.judge });
+      }
+      expect(seen[1], `${skill}/${content}`).toEqual(seen[0]);
+    }
+  });
+  it("SKILL off avec la règle du skill aussi configurée : l'admission historique à l'octet près (les deux règles candidates, donc ambiguë, comme avant)", async () => {
+    await configure({ auto: "on", skill: false, rules: "both" });
+    const s = fixture({ content: PLAIN_LOGIN }), model = decisionModel();
+    expect(await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps(model)) })).toMatchObject({ status: "out_of_scope" });
+    expect(model.requests).toHaveLength(0);
+    expect(s.counts.judge).toBe(0);
+  });
+});
+
+describe("SAV-96 B (revue Astra 6.2, bloquant 2) : la fiche citée est revérifiée au moment de l'envoi", () => {
+  it.each(["retired", "changed"] as const)("fiche %s après la mise en file : 0 POST Gmail, le ticket passe à une personne", async state => {
+    const s = fixture();
+    const started = await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps()) });
+    if (started.status !== "queued") throw Error(`NOT_QUEUED_${started.status}`);
+    knowledgeNow.card = state;
+    await s.run(started.executionId);
+    await s.run(started.executionId);
+    expect(s.counts).toMatchObject({ gmailPosts: 0, crmPosts: 0 });
+    expect(await threadFor(s)).toBeUndefined();
+    expect(await readCase(started.caseId)).toMatchObject({ owner: "human" });
   });
 });

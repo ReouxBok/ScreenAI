@@ -2,6 +2,7 @@ import "server-only";
 import { requireDb } from "@/db";
 import { containsPromptInjection } from "../../policy";
 import { accessSkillKernelHits } from "../access-skill/access-skill-kernel";
+import { readAccessSkillMode } from "../access-skill/access-skill-mode";
 import type { AccessSkillReading } from "../access-skill/access-skill-judge";
 import { caseAdmissionStatus } from "../admission-policy";
 import { caseEffectHash, caseReplyPayloadHash, type CaseReplyProposal } from "../case-effects";
@@ -29,8 +30,9 @@ import { firstMailSkillPinned, SAV_FIRST_MAIL_PROMPT_SUFFIX } from "./first-mail
  * SAV-96 B (Ugo 18/11): the FIRST mail of a HubSpot ticket that has no email thread, written by the V2 decision model on the normal V2 path,
  * framed by the first-mail skill, and sent without a click when the existing Access auto-reply authority covers it.
  *
- *   1. Sensitive first: SAV-97's kernel, then its judge and counter-read on the TICKET text (stored reading reused, else computed once).
- *      Anything but « admit » leaves the whole ticket to the team; nothing is written for the customer.
+ *   1. Sensitive first: SAV-97's kernel (no call). The admission already decided who owns the ticket, exactly like a mail: under `SAV_V2_ACCESS_SKILL=on`
+ *      SAV-97's judge and counter-read (paid once, by the entry); otherwise the historical detectors and lexical veto. Here the stored reading is only READ
+ *      again when the skill is `on` (never paid here: `SAV_V2_NEW_THREAD_AUTO` alone never causes a paid judgment); anything but « admit » → the team.
  *   2. The normal V2 investigation (`runCaseInvestigationRuntime`): knowledge cards, decision validator, call ledger and V2 budget. The ticket's
  *      own stored event is the input; its subject and description are the only customer text, as untrusted data; the CRM notes are never shown.
  *   3. The recorded decision becomes ONE proposal (`caseDecisionDraft`, SAV-94 layout, `finalizeCaseReplyProposal`, help line, signature, mention).
@@ -50,7 +52,7 @@ export type ThreadlessFirstMailDeps = Readonly<{
   readTicketOwner: CaseTicketOwnerPort;
   /** The approved execution policy an automated first mail is queued under; null: a person validates it. */
   executionPolicy: Readonly<{ id: string; hash: string }> | null;
-  /** SAV-97's reading of the ticket (`readOrComputeAccessSkill`, purpose `first_mail`): the stored one, or computed once. */
+  /** SAV-97's STORED reading of the ticket (written by the entry's admission under `SAV_V2_ACCESS_SKILL=on`); never computed here. */
   accessSkill: (source: ThreadlessTicketSource) => Promise<AccessSkillReading>;
 }>;
 
@@ -98,12 +100,14 @@ export async function composeThreadlessFirstMail(caseId: string, deps: Threadles
     return { status: "team", reason: "kernel_phrase" };
   }
   if (request.id !== threadlessRequestId(source)) return { status: "fallback", reason: "request_unproven" };
-  const reading = await deps.accessSkill(source)
-    .catch((): AccessSkillReading => ({ status: "unavailable", reason: "store_failed" }));
-  if (reading.status !== "ready" || reading.verdict.outcome !== "admit" || reading.verdict.requests[request.id] !== "access") {
-    const reason = reading.status !== "ready" ? `access_skill_${reading.reason}` : reading.verdict.outcome === "team" ? `access_skill_${reading.verdict.reasons[0]}` : "access_skill_not_access";
-    await handToTeam(caseId, reason);
-    return { status: "team", reason };
+  if (readAccessSkillMode(env) === "on") {
+    const reading = await deps.accessSkill(source)
+      .catch((): AccessSkillReading => ({ status: "unavailable", reason: "store_failed" }));
+    if (reading.status !== "ready" || reading.verdict.outcome !== "admit" || reading.verdict.requests[request.id] !== "access") {
+      const reason = reading.status !== "ready" ? `access_skill_${reading.reason}` : reading.verdict.outcome === "team" ? `access_skill_${reading.verdict.reasons[0]}` : "access_skill_not_access";
+      await handToTeam(caseId, reason);
+      return { status: "team", reason };
+    }
   }
 
   // 2. The normal V2 investigation, the ticket as its input.

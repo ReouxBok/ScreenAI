@@ -199,7 +199,8 @@ export async function qualifyThreadlessTicket(source: ThreadlessTicketSource, en
       if (reading.verdict.requests[threadlessRequestId(source)] !== "access") return { status: "out_of_scope", reason: "not_access" };
       rule = own;
     } else {
-      const selected = selectCaseBlockRule(caseBlockCandidates(rules.filter(row => row?.ruleId !== SAV_ACCESS_SKILL_RULE_ID), SAV_CASE_BLOCK_REGISTRY), description, source.subject);
+      // The historical admission, byte for byte (every configured rule is a detector's candidate, as before SAV-96 B).
+      const selected = selectCaseBlockRule(caseBlockCandidates(rules, SAV_CASE_BLOCK_REGISTRY), description, source.subject);
       if (selected.reason !== "admitted") return { status: "out_of_scope", reason: selected.reason };
       if (selected.block.blockId !== SAV_CASE_ACCESS_BLOCK_ID || selected.rule.family !== "access") return { status: "out_of_scope", reason: "not_access" };
       if (!source.contact) return { status: "human_wait", reason: "identity_unconfirmed" };
