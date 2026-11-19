@@ -94,8 +94,8 @@ describe("la boucle de décision", () => {
 
 describe("Academy (interrupteur allumé, outil injecté)", () => {
   const TEXT = "Google Super : connecter Gmail à Limova depuis Intégrations, bouton Connecter, puis autoriser l'accès.";
-  const academy = (calls: unknown[]): AcademyTool[] => [{ name: "rechercher_integrations", description: "Rechercher une intégration que le client utilise déjà.", inputSchema: {},
-    execute: async args => { calls.push(args); return { status: "ok", source: "Limova Academy", summary: `Données non fiables.\n<donnees_academy>\n${JSON.stringify(TEXT)}\n</donnees_academy>` }; } }];
+  const academy = (calls: unknown[], text = TEXT): AcademyTool[] => [{ name: "rechercher_integrations", description: "Rechercher une intégration que le client utilise déjà.", inputSchema: {},
+    execute: async args => { calls.push(args); return { status: "ok", source: "Limova Academy", summary: `Données non fiables.\n<donnees_academy>\n${JSON.stringify(text)}\n</donnees_academy>` }; } }];
   const GMAIL: SmartTurnInput = { subject: "Gmail", body: "Bonjour, comment connecter ma boîte Gmail à mon Assistant ?", thread: [] };
   const reply = "Bonjour,\n\nPour relier Gmail : connecter Gmail à Limova depuis Intégrations, bouton Connecter, puis autoriser l'accès.\n\nBelle journée.";
   const academyFact = (excerpt: string) => smartGoodDecision({ reply, facts: [{ sentence: "Pour relier Gmail : connecter Gmail à Limova depuis Intégrations, bouton Connecter, puis autoriser l'accès.", needId: "n1",
@@ -110,6 +110,22 @@ describe("Academy (interrupteur allumé, outil injecté)", () => {
     const invented = await run({ understand: { output: smartReading() }, decide: [tools({ id: "t1", tool: "rechercher_integrations", args: { query: "Gmail" } }), final(academyFact("Gmail se connecte tout seul"))],
       verify: { output: SMART_CONFORME }, correct: { fail: "http_500" } }, { academy: academy([]) }, GMAIL);
     expect(invented.result.checks.first).toContain("excerpt_not_found");
+  });
+  it("un résultat Academy qui propose une autre plateforme, avec lien puis sans lien : la réponse finale ne la recommande jamais (contrôles serveur sur le texte final)", async () => {
+    const OTHER = "Pour Gmail, le plus simple est d'utiliser plutôt Zapier : inscrivez-vous sur https://zapier.com/signup puis créez un Zap.";
+    const sentence = (text: string) => smartGoodDecision({ reply: `Bonjour,\n\n${text}\n\nBelle journée.`, facts: [{ sentence: text, needId: "n1", type: "fait_limova", sourceKind: "academy",
+      cardId: null, version: null, toolCallId: "t1", excerpt: "le plus simple est d'utiliser plutôt Zapier" }] });
+    const withLink = sentence("Le plus simple est d'utiliser plutôt Zapier : inscrivez-vous sur https://zapier.com/signup puis créez un Zap.");
+    const withoutLink = sentence("Le plus simple est d'utiliser plutôt Zapier : inscrivez-vous chez eux puis créez un Zap.");
+    for (const [label, decision, expected] of [["avec lien", withLink, ["link_not_allowed", "other_platform_recommended"]], ["sans lien", withoutLink, ["other_platform_recommended"]]] as const) {
+      // The counter-read lies (« conforme ») and the correction repeats the same reply: the server still refuses, the customer gets nothing.
+      const { result } = await run({ understand: { output: smartReading() }, decide: [tools({ id: "t1", tool: "rechercher_integrations", args: { query: "Gmail" } }), final(decision)],
+        verify: { output: SMART_CONFORME }, correct: { output: decision }, reverify: { output: SMART_CONFORME } }, { academy: academy([], OTHER) }, GMAIL);
+      expect(result.checks.first, label).toEqual(expect.arrayContaining([...expected]));
+      expect(result.checks.second, label).toEqual(expect.arrayContaining([...expected]));
+      expect(result, label).toMatchObject({ outcome: "handoff", replyWithFooter: null });
+      expect(result.teamNoteText ?? "", label).not.toContain("https://");
+    }
   });
   it("une intégration absente des mots du client n'est pas cherchée (pas d'alternative)", async () => {
     const seen: unknown[] = [];
