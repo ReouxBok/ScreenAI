@@ -11,7 +11,7 @@ import type { ExecutionPolicy } from "../intake/execution-policy";
 import { intakeRuntimeHash } from "../intake/runtime-contract";
 import { sweepDueOwnerHandovers } from "./owner-handover";
 import { OWNER_HANDOVER_DELAY_MS, ownerHandoverMarkerKey, type OwnerHandoverTransition } from "./owner-handover-markers";
-import { OWNER_HANDOVER_POLL_KEY, OWNER_HANDOVER_POLL_OVERLAP_MS, pollSavOwnerHandovers } from "./owner-handover-poll";
+import { OWNER_HANDOVER_POLL_KEY, OWNER_HANDOVER_POLL_MAX_TICKET_FAILURES, OWNER_HANDOVER_POLL_OVERLAP_MS, ownerHandoverPollSeenKey, pollSavOwnerHandovers } from "./owner-handover-poll";
 
 const fixture = vi.hoisted(() => ({
   db: null as unknown,
@@ -35,7 +35,7 @@ let policyId: string, policyHash: string;
 let nextTicket = Date.now() * 100;
 const testTickets = new Set<string>();
 
-type Ticket = { id: string; owner?: string; modifiedAt?: number; changedAt?: number; source?: string; archived?: boolean; stage?: string; category?: string };
+type Ticket = { id: string; owner?: string; modifiedAt?: number; changedAt?: number; source?: string; archived?: boolean; stage?: string; category?: string; unreadable?: boolean | number };
 
 /** A fictional HubSpot: one bounded search and the owner-history read. Any other call fails the test. */
 function hubspot(tickets: Ticket[], options: { searchFails?: boolean } = {}) {
@@ -59,6 +59,7 @@ function hubspot(tickets: Ticket[], options: { searchFails?: boolean } = {}) {
     expect(init?.method ?? "GET").toBe("GET");
     expect(request.searchParams.get("propertiesWithHistory")).toBe("hubspot_owner_id");
     reads.push(ticket!.id);
+    if (ticket!.unreadable) return Response.json({ message: "synthetic" }, { status: ticket!.unreadable === true ? 404 : ticket!.unreadable });
     const owner = ticket!.owner ?? OWNER;
     return Response.json({
       id: ticket!.id, archived: ticket!.archived ?? false,
@@ -112,7 +113,7 @@ beforeEach(() => {
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
 afterEach(async () => {
-  await database.db.delete(savSyncState).where(inArray(savSyncState.key, [OWNER_HANDOVER_POLL_KEY, ...[...testTickets].map(ownerHandoverMarkerKey)]));
+  await database.db.delete(savSyncState).where(inArray(savSyncState.key, [OWNER_HANDOVER_POLL_KEY, ...[...testTickets].flatMap(id => [ownerHandoverMarkerKey(id), ownerHandoverPollSeenKey(id)])]));
   testTickets.clear();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -229,6 +230,68 @@ describe("SAV-96 repair: the reconcile pass reads HubSpot instead of waiting for
     assigned.owner = HUMAN;
     await expect(sweepDueOwnerHandovers(Date.now() + 240_000)).resolves.toEqual({ owner_changed: 1 });
     expect(fixture.threadless).not.toHaveBeenCalled();
+  });
+
+  it("takes a reassignment made during the previous wake, without a webhook (Astra 19/11, point 1)", async () => {
+    const first = Date.now() - 3 * OWNER_HANDOVER_DELAY_MS, second = Date.now() - OWNER_HANDOVER_DELAY_MS - 1_000;
+    const assigned = ticket({ changedAt: first, modifiedAt: first });
+    const tickets = [assigned];
+    hubspot(tickets);
+    await poll();
+    expect(fixture.start).toHaveBeenCalledTimes(1);
+    // A person takes the ticket and gives it back to the agent while the first wake runs: the wake sees a different transition and stops,
+    // and its end rewrites the marker's updatedAt after the reassignment.
+    assigned.changedAt = second;
+    assigned.modifiedAt = second;
+    await expect(sweepDueOwnerHandovers(Date.now() + 240_000)).resolves.toEqual({ owner_transition_changed: 1 });
+    const [marker] = await database.db.select().from(savSyncState).where(eq(savSyncState.key, ownerHandoverMarkerKey(assigned.id)));
+    expect(marker!.updatedAt.getTime()).toBeGreaterThan(second);
+    const { reads } = hubspot(tickets);
+    await expect(poll()).resolves.toMatchObject({ read: 1, observed: 1 });
+    expect(reads).toEqual([assigned.id]);
+    const transition = { ticketId: assigned.id, ownerTransitionKey: `hubspot-owner:${assigned.id}:${second}:${OWNER}`, observedAt: new Date(second).toISOString() };
+    expect(fixture.start).toHaveBeenCalledTimes(2);
+    expect(fixture.start.mock.lastCall![1][0]).toEqual(transition);
+    await expect(sweepDueOwnerHandovers(Date.now() + 240_000)).resolves.toEqual({ off: 1 });
+    expect(fixture.threadless).toHaveBeenCalledExactlyOnceWith(transition);
+    expect(await database.db.select().from(savWebhookReceipts)).toEqual([]);
+  });
+
+  it("isolates a ticket whose history stays unreadable: the next one is taken, the bad one is skipped visibly after a bounded number of tries (point 2)", async () => {
+    const base = Date.now() - 600_000;
+    const bad = ticket({ modifiedAt: base, unreadable: true }), good = ticket({ modifiedAt: base + 1_000 });
+    hubspot([bad, good]);
+    await expect(poll()).resolves.toMatchObject({ status: "partial", read: 1, failed: 1, observed: 1 });
+    expect(fixture.start).toHaveBeenCalledExactlyOnceWith(expect.any(Function), [expect.objectContaining({ ticketId: good.id }), expect.any(String)]);
+    // The cursor waits on the failing ticket only; the good one is not read again.
+    expect((await cursor())!.state).toMatchObject({ after: base, complete: false });
+    for (let pass = 2; pass < OWNER_HANDOVER_POLL_MAX_TICKET_FAILURES; pass++) {
+      const { reads } = hubspot([bad, good]);
+      await expect(poll()).resolves.toMatchObject({ read: 0, seen: 1, failed: 1 });
+      expect(reads).toEqual([bad.id]);
+    }
+    const [row] = await database.db.select().from(savSyncState).where(eq(savSyncState.key, ownerHandoverPollSeenKey(bad.id)));
+    expect(row).toMatchObject({ status: "failing", processedCount: OWNER_HANDOVER_POLL_MAX_TICKET_FAILURES - 1, lastError: "owner_history_read_failed" });
+    await expect(poll()).resolves.toMatchObject({ status: "ok", read: 0, skipped: 1, failed: 0 });
+    const [skipped] = await database.db.select().from(savSyncState).where(eq(savSyncState.key, ownerHandoverPollSeenKey(bad.id)));
+    expect(skipped).toMatchObject({ status: "skipped", processedCount: OWNER_HANDOVER_POLL_MAX_TICKET_FAILURES, lastError: "owner_history_read_failed" });
+    expect(console.warn).toHaveBeenCalledWith("sav_v2_owner_handover_poll", { status: "ticket_skipped", ticketId: bad.id, failures: OWNER_HANDOVER_POLL_MAX_TICKET_FAILURES });
+    expect((await cursor())!.state).toMatchObject({ after: base + 1_000, complete: true });
+    const { reads } = hubspot([bad, good]);
+    await poll();
+    expect(reads).toEqual([]);
+    expect(fixture.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts no failure during a HubSpot outage (every read failing with 503), and keeps the cursor", async () => {
+    const base = Date.now() - 600_000;
+    const tickets = [ticket({ modifiedAt: base, unreadable: 503 }), ticket({ modifiedAt: base + 1_000, unreadable: 503 })];
+    for (let pass = 0; pass < OWNER_HANDOVER_POLL_MAX_TICKET_FAILURES + 1; pass++) {
+      hubspot(tickets);
+      await expect(poll()).resolves.toMatchObject({ read: 0, failed: 2, skipped: 0 });
+    }
+    expect(await database.db.select().from(savSyncState).where(inArray(savSyncState.key, tickets.map(row => ownerHandoverPollSeenKey(row.id))))).toEqual([]);
+    expect((await cursor())!.state).toMatchObject({ after: base, complete: false });
   });
 
   it("keeps the cursor on a failed search, and records why", async () => {

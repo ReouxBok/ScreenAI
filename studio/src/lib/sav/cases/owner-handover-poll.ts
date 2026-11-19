@@ -4,10 +4,10 @@ import { z } from "zod";
 import { requireDb } from "@/db";
 import { savSyncState } from "@/db/schema";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
-import { requestSavHubspot } from "../hubspot-transport";
+import { requestSavHubspot, SavCrmReadError } from "../hubspot-transport";
 import { v2HubspotOwnerId } from "./intake-boundary";
 import { savV2OwnerHandoverPollEnabled } from "./owner-handover-config";
-import { observeSavOwnerHandoverEvents, ownerHandoverMarkerKey, type OwnerEvent } from "./owner-handover-markers";
+import { observeSavOwnerHandoverEvents, type OwnerEvent } from "./owner-handover-markers";
 
 /*
  * SAV-96 repair (19/11). Production never received a HubSpot webhook, so `observeSavOwnerHandoverEvents` was never called and a ticket a person
@@ -20,7 +20,7 @@ import { observeSavOwnerHandoverEvents, ownerHandoverMarkerKey, type OwnerEvent 
  * The ticket's creation date never matters. Only an owner change made after the poll's floor (its first run minus the lookback, default 24 h)
  * can start a handover, so turning the poll on never replays months of old assignments.
  *
- * Cost: 1 search per pass (2 at most when a page is full), plus 1 history read per ticket modified since its last observation (25 at most per pass).
+ * Cost: 1 search per pass (2 at most when a page is full), plus 1 history read per ticket modified since the poll last read it (25 at most per pass).
  * No model, no write to HubSpot. Off: not one call.
  */
 
@@ -61,7 +61,7 @@ export type OwnerHandoverPollDeps = {
 };
 export type OwnerHandoverPollResult =
   | { skipped: "off" | "owner_unconfigured" | "token_missing" | "leased" | "deadline" }
-  | { status: "ok" | "partial" | "search_failed" | "observe_failed"; found: number; read: number; seen: number; observed: number; beforeFloor: number; unreadable: number; pages: number };
+  | { status: "ok" | "partial" | "search_failed" | "observe_failed"; found: number; read: number; seen: number; observed: number; beforeFloor: number; unreadable: number; failed: number; skipped: number; pages: number };
 
 export function ownerHandoverPollLookbackMs(env: Env) {
   const raw = Number(env.SAV_V2_OWNER_HANDOVER_POLL_LOOKBACK_HOURS);
@@ -132,9 +132,31 @@ export function ownerEventFromHistory(ticket: OwnerTicketHistory): OwnerEvent | 
   };
 }
 
-async function lastObservedAt(ticketId: string) {
-  const [row] = await requireDb().select({ updatedAt: savSyncState.updatedAt }).from(savSyncState).where(eq(savSyncState.key, ownerHandoverMarkerKey(ticketId)));
-  return row?.updatedAt.getTime() ?? null;
+/*
+ * What the poll itself last read for each ticket: the `hs_lastmodifieddate` whose owner history was read and handed to the markers. Never the
+ * marker's own `updatedAt`, which the end of a wake rewrites (Astra, 19/11: a reassignment made during a wake would otherwise be missed).
+ * `processedCount` counts the consecutive failed reads of this ticket; after MAX_TICKET_FAILURES the ticket is skipped, visibly.
+ */
+export const OWNER_HANDOVER_POLL_SEEN_PREFIX = "sav-v2-owner-handover-poll.seen:";
+export const ownerHandoverPollSeenKey = (ticketId: string) => OWNER_HANDOVER_POLL_SEEN_PREFIX + ticketId;
+export const OWNER_HANDOVER_POLL_MAX_TICKET_FAILURES = 3;
+const SEEN_RETENTION_MS = 14 * 86_400_000;
+
+function transientReadFailure(error: unknown) {
+  const code = error instanceof SavCrmReadError ? error.diagnostic.code : "";
+  return /^(?:HUBSPOT_HTTP_(?:408|429|5\d\d)|SAV_HUBSPOT_READ_)/.test(code);
+}
+
+async function readSeen(ticketId: string) {
+  const [row] = await requireDb().select().from(savSyncState).where(eq(savSyncState.key, ownerHandoverPollSeenKey(ticketId)));
+  if (!row) return null;
+  const modifiedAt = row.cursor && /^\d{1,16}$/.test(row.cursor) ? Number(row.cursor) : null;
+  return { modifiedAt, failures: row.processedCount };
+}
+
+async function writeSeen(ticketId: string, values: { cursor: string | null; status: string; failures: number; lastError: string | null }, now: Date) {
+  const set = { cursor: values.cursor, status: values.status, processedCount: values.failures, lastError: values.lastError, updatedAt: now };
+  await requireDb().insert(savSyncState).values({ key: ownerHandoverPollSeenKey(ticketId), ...set }).onConflictDoUpdate({ target: savSyncState.key, set });
 }
 
 export async function pollSavOwnerHandovers(deps: OwnerHandoverPollDeps = {}): Promise<OwnerHandoverPollResult> {
@@ -150,7 +172,7 @@ export async function pollSavOwnerHandovers(deps: OwnerHandoverPollDeps = {}): P
   const { state, leaseAt } = claimed;
   const search = deps.search ?? defaultSearch(env), readTicket = deps.readTicket ?? defaultReadTicket;
   const observe = deps.observe ?? ((events, options) => observeSavOwnerHandoverEvents(events, options));
-  const counts = { found: 0, read: 0, seen: 0, observed: 0, beforeFloor: 0, unreadable: 0, pages: 0 };
+  const counts = { found: 0, read: 0, seen: 0, observed: 0, beforeFloor: 0, unreadable: 0, failed: 0, skipped: 0, pages: 0 };
   const from = state.complete ? Math.max(state.floor, state.after - OWNER_HANDOVER_POLL_OVERLAP_MS) : state.after;
 
   const tickets: { id: string; modifiedAt: number }[] = [];
@@ -178,15 +200,22 @@ export async function pollSavOwnerHandovers(deps: OwnerHandoverPollDeps = {}): P
   counts.found = tickets.length;
 
   const events: OwnerEvent[] = [];
+  const read: { id: string; modifiedAt: number }[] = [], failed: { id: string; modifiedAt: number; failures: number; seenAt: number | null; transient: boolean }[] = [];
   let processedThrough: number | null = null, stopped = false;
   for (const ticket of tickets) {
-    if (counts.read >= MAX_READS || Date.now() + 30_000 > deadlineMs) { stopped = true; break; }
-    // Nothing changed on this ticket since its last owner change was observed: no read.
-    const observedAt = await lastObservedAt(ticket.id);
-    if (observedAt !== null && observedAt >= ticket.modifiedAt) { counts.seen++; processedThrough = ticket.modifiedAt; continue; }
-    let history: OwnerTicketHistory;
-    try { history = await readTicket(ticket.id); counts.read++; } catch { stopped = true; break; }
+    if (counts.read + failed.length >= MAX_READS || Date.now() + 30_000 > deadlineMs) { stopped = true; break; }
     processedThrough = ticket.modifiedAt;
+    // Nothing changed on this ticket since the poll last read its owner history: no read.
+    const seen = await readSeen(ticket.id);
+    if (seen?.modifiedAt != null && seen.modifiedAt >= ticket.modifiedAt) { counts.seen++; continue; }
+    let history: OwnerTicketHistory;
+    // One unreadable ticket never stops the others: its failure is counted below, the loop goes on.
+    try { history = await readTicket(ticket.id); } catch (error) {
+      failed.push({ id: ticket.id, modifiedAt: ticket.modifiedAt, failures: seen?.failures ?? 0, seenAt: seen?.modifiedAt ?? null, transient: transientReadFailure(error) });
+      continue;
+    }
+    counts.read++;
+    read.push(ticket);
     const event = history.id === ticket.id && !history.archived ? ownerEventFromHistory(history) : null;
     if (!event) { counts.unreadable++; continue; }
     if ((event.occurredAt ?? 0) < state.floor) { counts.beforeFloor++; continue; }
@@ -200,11 +229,30 @@ export async function pollSavOwnerHandovers(deps: OwnerHandoverPollDeps = {}): P
       return { status: "observe_failed", ...counts };
     }
   }
-  const complete = exhausted && !stopped;
+  // Recorded only once the markers hold the events: a crash before leaves the tickets to be read again.
+  for (const ticket of read) await writeSeen(ticket.id, { cursor: String(ticket.modifiedAt), status: "seen", failures: 0, lastError: null }, clock());
+  // A transient failure (429, 5xx, timeout) in a pass where no read succeeded is a HubSpot outage, not a bad ticket: nothing is counted, the
+  // cursor waits. Any other failure (404, 403, an unexpected answer), or a transient one while other reads succeed, counts one failure; after
+  // MAX_TICKET_FAILURES the ticket is skipped (logged, kept in sync_state with its error) and the cursor moves on.
+  let holdAt: number | null = null;
+  for (const ticket of failed) {
+    const outage = ticket.transient && counts.read === 0;
+    const failures = outage ? ticket.failures : ticket.failures + 1;
+    const skip = !outage && failures >= OWNER_HANDOVER_POLL_MAX_TICKET_FAILURES;
+    if (!outage) await writeSeen(ticket.id, { cursor: skip ? String(ticket.modifiedAt) : ticket.seenAt === null ? null : String(ticket.seenAt),
+      status: skip ? "skipped" : "failing", failures, lastError: "owner_history_read_failed" }, clock());
+    console.warn("sav_v2_owner_handover_poll", { status: skip ? "ticket_skipped" : "ticket_read_failed", ticketId: ticket.id, failures });
+    if (skip) counts.skipped++;
+    else { counts.failed++; holdAt = Math.min(holdAt ?? ticket.modifiedAt, ticket.modifiedAt); }
+  }
+  await requireDb().delete(savSyncState).where(and(sql`${savSyncState.key} like ${OWNER_HANDOVER_POLL_SEEN_PREFIX + "%"}`,
+    sql`${savSyncState.updatedAt} < ${new Date(clock().getTime() - SEEN_RETENTION_MS)}`)).catch(() => undefined);
+  const complete = exhausted && !stopped && holdAt === null;
   const next: PollState = complete
     ? { ...state, after: Math.max(state.after, tickets.at(-1)?.modifiedAt ?? state.after), complete: true }
-    // A bounded pass resumes exactly where it stopped, without the overlap, so a busy window always moves forward.
-    : { ...state, after: processedThrough ?? from, complete: false };
+    // A bounded pass resumes exactly where it stopped, without the overlap, so a busy window always moves forward; a ticket still being retried
+    // holds the cursor at its own date (the others after it are not read again: their seen rows answer).
+    : { ...state, after: Math.min(holdAt ?? Infinity, processedThrough ?? from), complete: false };
   await finishPoll(leaseAt, next, null, counts.observed, clock());
   const status = complete ? "ok" : "partial";
   console.info("sav_v2_owner_handover_poll", { status, ...counts });
