@@ -150,7 +150,7 @@ export async function composeThreadlessFirstMail(caseId: string, deps: Threadles
   if (!snapshot || snapshot.owner !== "agent" || snapshot.threadIds.length) return { status: "fallback", reason: "case_moved" };
   const shape: Omit<CaseReplyProposal, "text"> = {
     caseId, caseVersion: snapshot.version, triggerEventId: draft.triggerEventId, inboundMessageId: null,
-    ticketSource: { kind: "hubspot_ticket", version: caseEffectHash(source) }, purpose: reply.purpose,
+    ticketSource: { kind: "hubspot_ticket", version: caseEffectHash(source), origin: "model" }, purpose: reply.purpose,
     ...(reply.purpose === "question" && reply.question ? { question: reply.question } : {}),
     recipient: source.contact!.email, subject: threadlessReplySubject(source.ticketId),
   };

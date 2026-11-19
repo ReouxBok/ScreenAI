@@ -212,7 +212,7 @@ function decisionModel(reply: (request: CaseInvestigationModelRequest) => string
 }
 
 const DIM = 8;
-function firstMailDeps(model = decisionModel()): ThreadlessFirstMailDeps {
+function firstMailDeps(model = decisionModel(), knobs: Readonly<{ money?: "refused" }> = {}): ThreadlessFirstMailDeps {
   const vectors: CaseKnowledgeVectorSearch = { dimension: DIM, readRevision: async () => "kb-syn-r1", available: async () => true, search: async queries => queries.map(() => [card]) };
   const embed: CaseEmbeddingTransport = async ({ texts }) => ({ vectors: texts.map((_, i) => Array.from({ length: DIM }, (__, j) => (i + 1) / (j + 3))), usage: null });
   const spend: CaseEmbeddingSpendPort = { reserve: async () => ({ status: "allowed", reservationId: `res-${Date.now()}` }), settle: async () => undefined, release: async () => undefined };
@@ -226,7 +226,7 @@ function firstMailDeps(model = decisionModel()): ThreadlessFirstMailDeps {
     revisions: async () => ({ rules: "rules-r1", playbookId: "playbook-1", model: "model-fixture", prompt: "prompt-r1" }),
     ledger: caseCallLedgerOnStore,
     knowledge: { vectors, embed, spend },
-    model: { money: async () => ({ status: "allowed" }), provider: model.provider },
+    model: { money: async () => knobs.money === "refused" ? { status: "refused", reason: "fixture" } : { status: "allowed" }, provider: model.provider },
   };
   const provenance = provenanceDeps;
   return { env: () => process.env, investigation, provenance, readTicketOwner: async () => "v2",
@@ -529,5 +529,45 @@ describe("SAV-96 B (contre-revue Astra) : une correction humaine ne dispense jam
       expect(await threadFor(s)).toBeUndefined();
       expect(await readCase(started.caseId)).toMatchObject({ owner: "human" });
     }
+  });
+});
+
+describe("SAV-96 B (re-revue Astra) : l'origine enregistrée du brouillon décide, jamais son texte", () => {
+  it("enquête sans décision → brouillon fixe → corrigé dans le Studio → accepté comme au lot B, envoyé exactement une fois", async () => {
+    await configure({ autoReply: false });
+    const s = fixture(), model = decisionModel();
+    // The model budget is refused: the investigation records no decision, the entry keeps the fixed draft for a person.
+    const started = await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps(model, { money: "refused" })) });
+    if (started.status !== "started") throw Error(`NOT_STARTED_${started.status}`);
+    expect(model.requests).toHaveLength(0);
+    const [row] = await validations(started.caseId);
+    const original = textOf(row!);
+    expect(original.ticketSource?.origin).toBeUndefined();
+    expect(original.text).toBe(finalizeCaseReplyProposal({ ...original, text: THREADLESS_ACCESS_DRAFT }, { language: "fr", validation: "human" }).text);
+    const corrected = finalizeCaseReplyProposal({ ...original, text: "Bonjour,\n\nSuite à votre demande concernant la connexion : pouvez-vous nous dire ce qui s’affiche quand vous vous connectez ?" },
+      { language: readCaseReplyDisclosure(original.text)?.language ?? "fr", validation: "human" });
+    // The Studio judges the provenance BEFORE storing the correction (`case-reply-review.ts`), under the correction basis: accepted.
+    expect(await pilotProvenanceGate(provenanceDeps)(corrected, { basis: CASE_REPLY_STUDIO_CORRECTION_BASIS })).toBeNull();
+    const store = { env: () => process.env, currentPolicyRevision: async () => REVISION, readTicketOwner: async () => "v2" as const, pilotProvenance: pilotProvenanceGate(provenanceDeps) };
+    const submitted = await submitCaseReplyProposal(corrected, store, { supersedes: { validationId: row!.id, payloadHash: row!.payloadHash } });
+    if (!submitted.ok) throw Error(`SUBMIT_${submitted.code}`);
+    const [fresh] = (await validations(started.caseId)).filter(one => one.id === submitted.id);
+    expect(await decideCaseReply({ action: "approve", validationId: submitted.id, approverId: staffId, deps: store,
+      seen: { payloadHash: fresh!.payloadHash, caseVersion: fresh!.caseVersion, recipient: fresh!.recipient },
+      authorizer: () => ({ allowed: true, basis: CASE_REPLY_STUDIO_CORRECTION_BASIS }) })).toMatchObject({ ok: true, state: "approved" });
+    const queued = await queueValidatedCaseReply({ validationId: submitted.id, policy: { id: grant.id, hash: grant.policyHash }, deps: store });
+    if (!queued.ok) throw Error(`QUEUE_${queued.code}`);
+    await s.run(queued.executionId);
+    await s.run(queued.executionId);
+    expect(s.counts.gmailPosts).toBe(1);
+    expect(s.sentMail()!.body).toBe(corrected.text);
+  });
+  it("un brouillon du modèle porte son origine enregistrée, gardée par la correction", async () => {
+    await configure({ autoReply: false });
+    const s = fixture();
+    const started = await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps()) });
+    if (started.status !== "started") throw Error(`NOT_STARTED_${started.status}`);
+    const [row] = await validations(started.caseId);
+    expect(textOf(row!).ticketSource?.origin).toBe("model");
   });
 });

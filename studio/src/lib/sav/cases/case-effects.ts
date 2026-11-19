@@ -53,7 +53,9 @@ export type CaseReplyProposal = Readonly<{
   caseVersion: number;
   triggerEventId: string;
   inboundMessageId: string | null;
-  ticketSource?: Readonly<{ kind: "hubspot_ticket"; version: string }>;
+  /** SAV-96 B: `origin: "model"` is set by the first-mail composer BEFORE any edit and kept by a Studio correction (`{ ...original, text }`): the
+   * stored origin of the draft. Absent: the fixed draft of lot B (its payload and hash unchanged). */
+  ticketSource?: Readonly<{ kind: "hubspot_ticket"; version: string; origin?: "model" }>;
   purpose: CaseReplyPurpose;
   recipient: string;
   subject: string;

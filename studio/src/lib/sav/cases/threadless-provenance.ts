@@ -23,8 +23,13 @@ export async function readThreadlessReplyProvenance(proposal: CaseReplyProposal,
   if (!row?.source.contact || row.source.contact.email !== proposal.recipient || proposal.subject !== threadlessReplySubject(row.source.ticketId)
       || caseEffectHash(row.source) !== proposal.ticketSource?.version) return "threadless_source_changed";
   if ((await qualifyThreadlessTicket(row.source, env)).status !== "admitted" || !await threadlessAccessRevision(env)) return "threadless_access_unproven";
-  const template = finalizeCaseReplyProposal({ ...proposal, text: THREADLESS_ACCESS_DRAFT }, { language: "fr", validation: "human" });
-  if (template.text === proposal.text) return null;
+  // SAV-96 B: decided by the STORED origin of the draft, never by its text. The fixed draft (lot B, no decision, no card): its exact text, or a Studio
+  // correction of it, as before. A model draft: proven like a thread reply, a correction skipping the text comparison only.
+  if (proposal.ticketSource?.origin !== "model") {
+    const template = finalizeCaseReplyProposal({ ...proposal, text: THREADLESS_ACCESS_DRAFT }, { language: "fr", validation: "human" });
+    if (template.text === proposal.text) return null;
+    return humanCorrection ? null : "threadless_draft_changed";
+  }
   if (savV2NewThreadAutoEnabled(env) && deps) {
     // `reminderInputKey` names the input whose recorded decision is read: here the ticket's event, never a customer mail.
     // As a thread reply (`readPilotReplyProvenance`): a Studio correction skips the text comparison ONLY. The decision, its scope and every cited card
@@ -32,5 +37,6 @@ export async function readThreadlessReplyProvenance(proposal: CaseReplyProposal,
     const read = await readPilotReplyProvenance(proposal, deps, { humanCorrection, reminderInputKey: threadlessInputKey(row.eventId) });
     return read.status === "proven" ? null : `threadless_reply_unproven:${[...read.reasons].sort().join(",")}`;
   }
-  return humanCorrection ? null : "threadless_draft_changed";
+  // A model draft is only ever proven with SAV_V2_NEW_THREAD_AUTO=on and the provenance readers: anything else keeps it from leaving.
+  return "threadless_model_draft_unproven";
 }
