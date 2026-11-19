@@ -135,7 +135,8 @@ export function createSmartToolRunner(ports: Readonly<{
     if (!words.length || words.some(word => !fold(word).split(/[\s_-]+/).filter(part => part.length > 1).some(part => haystack.includes(part)))) return out("refused", "not_in_customer_words");
     let result: AcademyToolResult;
     try { result = await tool.execute(call.args); } catch { return out("failed", "unavailable"); }
-    if (result.status !== "ok") return out(result.status === "empty" ? "empty" : result.status === "disabled" ? "off" : "failed", result.status);
+    if (result.status !== "ok") return out(result.status === "empty" ? "empty" : result.status === "disabled" ? "off"
+      : result.status === "sensitive_input" || result.status === "invalid_input" ? "refused" : "failed", result.status);
     const text = smartAcademyText(result.summary).slice(0, SAV_SMART_TOOL_LIMITS.maxResultBytes - 600);
     evidence.push({ callId: call.id, needId: call.needId, text });
     return out("ok", null, { needId: call.needId, source: "Limova Academy", text });

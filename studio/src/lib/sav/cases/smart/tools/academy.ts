@@ -9,8 +9,23 @@ const ATTEMPT_TIMEOUT_MS = 4000;
 const MAX_ATTEMPTS = 2;
 const MAX_SUMMARY_CHARS = 3000;
 
-const keyword = z.string().trim().min(1).max(200);
-const slug = z.string().trim().min(1).max(100);
+/*
+ * Privacy (Astra, 20/11): the arguments go to a PUBLIC server. They are limited to an integration name, an action or a slug (a few plain
+ * words), and anything that looks like a personal identifier or a secret (email, phone, URL, IBAN, card, long token, a password named as such)
+ * is refused BEFORE the network: the tool returns `sensitive_input`, a soft error the model adapts to.
+ */
+const SENSITIVE_ARG = [
+  /@/, // an email address, or a handle
+  /https?:\/\/|www\.|\b[a-z0-9-]+\.(?:com|fr|io|ai|net|org|eu|be|ch)\/\S/i, // a URL (it may carry a token)
+  /(?:\+?\d[\s.-]?){8,}/, // a phone, card or account number
+  /\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){2,}/i, // an IBAN
+  /\b(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{20,}\b/, // a long token or key
+  /\b(?:mot de passe|mdp|password|passwd|token|jeton|api[ _-]?key|cl[eé] (?:api|secr[eè]te)|secret|code (?:de v[eé]rification|sms)|otp)\b/i,
+];
+export const isAcademyArgumentSensitive = (value: string) => SENSITIVE_ARG.some(pattern => pattern.test(value));
+/** An integration name or an action: a few plain words (letters, digits, spaces, « . - ' & + »), at most 60 characters and 6 words. */
+const keyword = z.string().trim().min(1).max(60).regex(/^[\p{L}\p{N}][\p{L}\p{N} .'’&+-]*$/u).refine(value => value.split(/\s+/).length <= 6);
+const slug = z.string().trim().min(1).max(100).regex(/^[a-z0-9][a-z0-9-]*$/);
 
 const definitions = {
   rechercher_integrations: {
@@ -28,7 +43,7 @@ const definitions = {
 };
 
 type AcademyToolName = keyof typeof definitions;
-type AcademyFailure = "disabled" | "denied" | "invalid_input" | "timeout" | "unavailable"
+type AcademyFailure = "disabled" | "denied" | "invalid_input" | "sensitive_input" | "timeout" | "unavailable"
   | "invalid_response" | "response_too_large" | "unsafe_result" | "empty";
 
 export type AcademyToolResult =
@@ -107,6 +122,9 @@ export async function executeAcademyTool(name: string, input: unknown): Promise<
   if (!isAcademyToolName(name)) return { status: "denied" };
   if (!isAcademyEnabled()) return { status: "disabled" };
 
+  // Before any parsing that could echo it, and before the network: a personal identifier or a secret never leaves.
+  if (input && typeof input === "object" && Object.values(input as Record<string, unknown>).some(value => typeof value === "string" && isAcademyArgumentSensitive(value)))
+    return { status: "sensitive_input" };
   const args = definitions[name].args.safeParse(input);
   if (!args.success) return { status: "invalid_input" };
 

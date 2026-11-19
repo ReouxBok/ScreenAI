@@ -90,6 +90,43 @@ describe("outils Limova Academy", () => {
   });
 
   it.each([
+    ["rechercher_integrations", { query: "Gmail client.fictif@exemple.invalid" }],
+    ["rechercher_integrations", { query: "Gmail 06 12 34 56 78" }],
+    ["rechercher_integrations", { query: "https://exemple.invalid/connect?token=abc" }],
+    ["rechercher_integrations", { query: "FR76 3000 6000 0112 3456 7890 189" }],
+    ["rechercher_integrations", { query: "Gmail mot de passe Soleil" }],
+    ["lister_actions_integration", { slug: "gmail", query: ["sk", "live", "4eC39HqLyjWDarjtT1zdp7dc"].join("_") }],
+    ["obtenir_guide_connexion", { slug: "client.fictif@exemple.invalid" }],
+  ])("confidentialité : %s refuse une donnée personnelle ou un secret AVANT le réseau (0 appel)", async (name, args) => {
+    expect(await executeAcademyTool(name, args)).toEqual({ status: "sensitive_input" });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(requestCount).toBe(0);
+  });
+
+  it.each([
+    ["rechercher_integrations", { query: "Je voudrais connecter ma boîte Gmail à mon Assistant s'il vous plaît" }],
+    ["rechercher_integrations", { query: "Gmail; DROP" }],
+    ["obtenir_guide_connexion", { slug: "Google Super" }],
+  ])("l'argument se limite au nom d'une intégration, à une action ou au slug (%s)", async (name, args) => {
+    expect(await executeAcademyTool(name, args)).toEqual({ status: "invalid_input" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("confidentialité : « Gmail » part bien, en un seul appel, sans autre donnée", async () => {
+    let request: { params?: { arguments?: unknown } } = {};
+    respond = async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      request = JSON.parse(Buffer.concat(chunks).toString());
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(reply(1, "Google Super")));
+    };
+    expect(await executeAcademyTool("rechercher_integrations", { query: "Gmail" })).toMatchObject({ status: "ok" });
+    expect(requestCount).toBe(1);
+    expect(request.params?.arguments).toEqual({ query: "Gmail", limit: 8 });
+  });
+
+  it.each([
     ["rechercher_integrations", { query: "Gmail" }, { query: "Gmail", limit: 8 }],
     ["lister_actions_integration", { slug: "gmail", limit: 4 }, { slug: "gmail", limit: 4 }],
     ["obtenir_guide_connexion", { slug: "gmail" }, { slug: "gmail" }],
