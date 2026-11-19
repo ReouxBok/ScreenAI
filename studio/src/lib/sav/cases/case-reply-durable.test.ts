@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, like } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/pglite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../../test/sav-db";
@@ -794,6 +794,14 @@ describe("revue Astra P1 : la liste des réponses automatiques est relue juste a
     return { s, id: result.executionId };
   }
   const ONE = [{ id: "r1", summary: "Synthetic widget setting." }], TWO = [{ id: "r1", summary: "Synthetic connection." }, { id: "r2", summary: "Synthetic widget setting." }];
+  /** The Studio switch of a block (`block-switch.ts`), as the administrator's action stores it. */
+  const setSwitch = async (blockId: string, mode: "off" | "draft" | "auto", paused = false) => {
+    const values = { key: `sav-block-switch.v1:${blockId}`, status: "active", cursor: encryptSavPayload({ revision: "sav-block-switch.v1", blockId, mode, paused,
+      setBy: "admin@example.invalid", setAt: new Date().toISOString(), reason: "Réglage synthétique" }) };
+    await f.db.insert(savSyncState).values(values).onConflictDoUpdate({ target: savSyncState.key, set: values });
+  };
+  beforeEach(() => setSwitch(BLOCK, "auto"));
+  afterEach(() => f.db.delete(savSyncState).where(like(savSyncState.key, "sav-block-switch.v1:%")));
 
   it("contre-recette : bloc retiré de la liste après l'approbation automatique, 0 appel Gmail, motif explicite, dossier remis à l'équipe", async () => {
     for (const after of ["access", "access,syn-other", "", null]) {
@@ -834,6 +842,8 @@ describe("revue Astra P1 : la liste des réponses automatiques est relue juste a
 
   it("Accès avec SAV_V2_AUTO_REPLY=access : inchangé, la réponse automatique part ; Accès retiré de la liste : annulée, rien n'est envoyé", async () => {
     setList("access");
+    // Today's production reading: no saved Access setting, the frozen legacy fallback (auto) applies.
+    expect(await f.db.select().from(savSyncState).where(eq(savSyncState.key, "sav-block-switch.v1:access"))).toEqual([]);
     const kept = await queued(ADMITTED, [{ id: "r1", summary: "Synthetic connection." }]);
     expect(await run(kept.id)).toMatchObject({ state: "confirmed" });
     expect(sends).toBe(1);
@@ -846,6 +856,71 @@ describe("revue Astra P1 : la liste des réponses automatiques est relue juste a
   it("une réponse approuvée par une personne n'est pas concernée : elle part, liste vide ou non", async () => {
     setList(null);
     const { id } = await queued(WIDGET, ONE, "person");
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+  });
+
+  /*
+   * Contre-revue Astra (nouveau P1) : le mode Studio du bloc (`block-switch.ts`) est relu, lui aussi, juste avant l'envoi : le plus strict entre la liste
+   * et l'interrupteur du bloc ; seul `auto` laisse partir une réponse approuvée par la règle.
+   */
+  const SWITCHED = [["off", false], ["auto", true], ["draft", false]] as const;
+  const NOT_AUTO = "SAV_CASE_EFFECT_CANCELLED_AUTO_REPLY_BLOCK_NOT_AUTO";
+  it("bloc passé sur Arrêt, Pause ou Brouillon dans le Studio (toujours listé) : annulée, 0 appel Gmail, dossier remis à l'équipe", async () => {
+    for (const [mode, paused] of SWITCHED) {
+      setList(`access,${BLOCK}`);
+      await setSwitch(BLOCK, "auto");
+      const { s, id } = await queued(WIDGET, ONE);
+      await setSwitch(BLOCK, mode, paused);
+      expect(await run(id), `${mode}${paused ? "+paused" : ""}`).toMatchObject({ reason: NOT_AUTO });
+      expect(sends).toBe(0);
+      expect(await effectsOf(id)).toEqual([]);
+      const snapshot = (await readCase(s.caseId))!;
+      expect(snapshot.owner).toBe("human");
+      expect(snapshot.body.handoff).toMatchObject({ reason: "auto_reply_block_not_auto" });
+    }
+  });
+  it("réglage du bloc illisible : annulée (jamais envoyée) ; un bloc d'une paire repassé en brouillon suffit à annuler", async () => {
+    setList(`access,${BLOCK}`);
+    const broken = await queued(WIDGET, ONE);
+    await f.db.update(savSyncState).set({ cursor: "corrupt" }).where(eq(savSyncState.key, `sav-block-switch.v1:${BLOCK}`));
+    expect(await run(broken.id)).toMatchObject({ reason: NOT_AUTO });
+    expect(sends).toBe(0);
+    await setSwitch(BLOCK, "auto");
+    setList(`access,${BLOCK},access+${BLOCK}`);
+    const pair = await queued(MIXED, TWO);
+    await setSwitch("access", "draft");
+    expect(await run(pair.id)).toMatchObject({ reason: NOT_AUTO });
+    expect(sends).toBe(0);
+  });
+  it("mode auto inchangé : la réponse part une fois", async () => {
+    setList(`access,${BLOCK}`);
+    const { id } = await queued(WIDGET, ONE);
+    await setSwitch(BLOCK, "auto");
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+  });
+  it("Accès : sans réglage enregistré (prod d'aujourd'hui) ou réglé sur auto, part comme avant ; réglé sur Arrêt, Pause ou Brouillon après l'approbation, annulé", async () => {
+    setList("access");
+    const legacy = await queued(ADMITTED, [{ id: "r1", summary: "Synthetic connection." }]);
+    expect(await run(legacy.id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+    await setSwitch("access", "auto");
+    const explicit = await queued(ADMITTED, [{ id: "r1", summary: "Synthetic connection." }]);
+    expect(await run(explicit.id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+    for (const [mode, paused] of SWITCHED) {
+      await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-block-switch.v1:access"));
+      const { id } = await queued(ADMITTED, [{ id: "r1", summary: "Synthetic connection." }]);
+      await setSwitch("access", mode, paused);
+      expect(await run(id), `${mode}${paused ? "+paused" : ""}`).toMatchObject({ reason: NOT_AUTO });
+      expect(sends).toBe(0);
+    }
+  });
+  it("une réponse approuvée par une personne n'est pas concernée par le mode Studio relu à l'envoi", async () => {
+    setList(null);
+    const { id } = await queued(WIDGET, ONE, "person");
+    await setSwitch(BLOCK, "draft");
     expect(await run(id)).toMatchObject({ state: "confirmed" });
     expect(sends).toBe(1);
   });

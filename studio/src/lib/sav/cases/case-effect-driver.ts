@@ -27,6 +27,8 @@ import { enqueueCaseHandoffStage } from "./case-handoff-stage";
 import { caseHandoffStageEnabled, caseTicketStageKey } from "./customer-return";
 import { TICKET_STAGE_KEY_PREFIX } from "./case-ticket-stage";
 import { lockCaseForWrite, transitionCaseOwner } from "./case-store";
+import { readSavBlockSwitch, savBlockEffectiveMode } from "./block-switch";
+import { SAV_CASE_ACCESS_BLOCK_ID } from "./case-types";
 import { caseReplyNoteEnabled, caseReplySummaryWithStage, isCaseReplySummary, type CaseReplySummaryStage } from "./case-reply-summary-note";
 import {
   caseNoteAssociationKey, caseNoteKey, caseRecipientCheck, caseReplyKey, checkCaseReplyApproval, decideCaseEffect, readCaseEffectsMode, SAV_CASE_EFFECT_PERMISSIONS,
@@ -44,6 +46,12 @@ export type { CaseEffectPayload };
 const fault = (code: string): never => { throw Error(`SAV_CASE_EFFECT_${code}`); };
 /** Revue Astra P1: a rule-approved reply whose block the allow-list no longer lets answer alone. Final, like every cancellation; the case goes to the team. */
 const AUTO_REPLY_WITHDRAWN = "CANCELLED_AUTO_REPLY_WITHDRAWN";
+/** Contre-revue Astra: the same reply whose block the Studio switch no longer sets to `auto` (off, paused, draft, unreadable). Same handling. */
+const AUTO_REPLY_BLOCK_NOT_AUTO = "CANCELLED_AUTO_REPLY_BLOCK_NOT_AUTO";
+/** The cancellations that hand the case to the team, and the reason the case records. */
+const AUTO_REPLY_HANDOFF: Readonly<Record<string, string>> = {
+  [`SAV_CASE_EFFECT_${AUTO_REPLY_WITHDRAWN}`]: "auto_reply_withdrawn", [`SAV_CASE_EFFECT_${AUTO_REPLY_BLOCK_NOT_AUTO}`]: "auto_reply_block_not_auto",
+};
 const LEASE_MS = 80_000;
 /** A configuration that cannot be read now holds; a scope that excludes the case, or expired, cancels. */
 const QUALIFICATION_HOLD = new Set(["qualification_scope_mode_missing", "qualification_scope_mode_invalid", "qualification_scope_missing", "qualification_scope_invalid", "qualification_scope_not_open", "qualification_binding_unreadable"]);
@@ -258,6 +266,17 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
       if (withdrawn) {
         console.info(JSON.stringify({ event: "sav_v2_auto_reply_withdrawn", caseId: proposal.caseId, executionId: lease.row.id, reason: withdrawn }));
         return fault(AUTO_REPLY_WITHDRAWN);
+      }
+      // Contre-revue Astra (19/11): the Studio switch of EACH block of the case is read again too, under the same lock (`block-switch.ts`, the reading the passage
+      // uses: no saved row = off, except the frozen Access fallback `auto`, so Access without a setting behaves as today). The effective mode is the stricter of the
+      // list and the switch; only `auto` lets the rule's reply go. Off, paused, draft or an unreadable row: cancelled, the case goes to the team.
+      const blockIds = savAutoReplyLegacyAccessOnly(config) ? [SAV_CASE_ACCESS_BLOCK_ID] : [...new Set((open ?? []).map(row => row.blockId as string))].sort();
+      for (const blockId of blockIds) {
+        const mode = savBlockEffectiveMode(await readSavBlockSwitch(tx, blockId), deps.env());
+        if (mode !== "auto") {
+          console.info(JSON.stringify({ event: "sav_v2_auto_reply_block_not_auto", caseId: proposal.caseId, executionId: lease.row.id, blockId, mode }));
+          return fault(AUTO_REPLY_BLOCK_NOT_AUTO);
+        }
       }
     }
     return facts;
@@ -518,15 +537,16 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
           state: cancelled ? "refused" : state, reason: reason.slice(0, 200), leaseToken: null, leaseUntil: null, updatedAt: new Date(),
         }).where(and(eq(savCaseEffectExecutions.id, lease.row.id), eq(savCaseEffectExecutions.leaseToken, lease.token))).returning({ id: savCaseEffectExecutions.id });
         await executionJournal(tx, lease.row.id, row ? (cancelled ? "case_effect_cancelled" : "pass_waiting") : "obsolete_pass", { state, reason });
-        // Revue Astra P1: never a silent case. The reply the rule approved will not leave: the case goes to the team, in the same transaction (execution, then
+        // Revue Astra P1 (and its counter-review): never a silent case. The reply the rule approved will not leave: the case goes to the team, in the same transaction (execution, then
         // case: the lock order of every path). Best effort inside a savepoint: a case already a person's, or moved, keeps the cancellation as it is.
         const caseId = payloads.get(lease)?.proposal.caseId;
-        if (row && caseId && reason === `SAV_CASE_EFFECT_${AUTO_REPLY_WITHDRAWN}`) {
+        const handoffReason = Object.hasOwn(AUTO_REPLY_HANDOFF, reason) ? AUTO_REPLY_HANDOFF[reason] : undefined;
+        if (row && caseId && handoffReason) {
           await tx.transaction(async savepoint => {
             const snapshot = await lockCaseForWrite(savepoint, caseId);
             if (snapshot.owner !== "agent") return;
             await transitionCaseOwner({ caseId, expectedVersion: snapshot.version, transition: "handoff", actor: { type: "agent" },
-              commandKey: `auto-reply-withdrawn.${lease.row.id}`, reason: "auto_reply_withdrawn" }, savepoint);
+              commandKey: `auto-reply-withdrawn.${lease.row.id}`, reason: handoffReason }, savepoint);
           }).catch(error => console.warn(JSON.stringify({ event: "sav_v2_auto_reply_withdrawn_handoff_failed", caseId, code: error instanceof Error ? error.message.slice(0, 120) : "unknown" })));
         }
       });
