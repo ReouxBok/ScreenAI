@@ -245,12 +245,12 @@ describe("pannes contenues : le cron de prod ne passe jamais en erreur à cause 
     state.db = storeWith({ failWith: "55P03" });
     expect(await pass(ENV(), network())).toEqual({ skipped: "error_contained", code: "sql_55P03" });
   });
-  it("chaque transaction du registre borne ses attentes : lock_timeout et statement_timeout courts", async () => {
+  it("chaque transaction du registre borne ses attentes : lock_timeout et statement_timeout courts (réserver, régler, relire le registre)", async () => {
     await v1Mail();
     const statements: string[] = [];
     state.db = storeWith({ statements });
     expect(await pass(ENV(), network())).toMatchObject({ ran: 1 });
-    expect(statements.filter(text => text.includes("set local lock_timeout = '3000ms'"))).toHaveLength(2);
-    expect(statements.filter(text => text.includes("set local statement_timeout = '5000ms'"))).toHaveLength(2);
+    expect(statements.filter(text => text.includes("set local lock_timeout = '3000ms'"))).toHaveLength(3);
+    expect(statements.filter(text => text.includes("set local statement_timeout = '5000ms'"))).toHaveLength(3);
   });
 });
