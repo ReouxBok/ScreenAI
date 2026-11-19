@@ -20,7 +20,7 @@ export const renderIntakeNote = (text: string, marker: string) => `<p>${plain(te
 export const renderIntakeNoteHidden = (text: string, marker: string) => `<p>${plain(text).replace(/\n/g, "<br>")}</p><!-- sav-intake:${marker} -->`;
 /** Only the V2 reply's summary note (`note:<case>:reply-summary.<trigger>`) and the V2 closure note (`note:<case>:closed-summary.cycle-<n>`, SAV-92 16/11) are
  * rendered without a visible marker; every other note keeps the visible one. */
-export const hiddenMarkerNoteKey = (key: string | undefined) => typeof key === "string" && /^note:[^:]+:(?:reply|closed)-summary\./.test(key);
+export const hiddenMarkerNoteKey = (key: string | undefined) => typeof key === "string" && /^note:[^:]+:(?:reply|closed|handoff)-summary\./.test(key);
 /** 18/11 (SAV-93): HubSpot's default note → ticket association type (HUBSPOT_DEFINED 228), sent with the note's creation so it is born on the ticket. */
 export const HUBSPOT_NOTE_TO_TICKET = 228;
 const ENTITIES: Readonly<Record<string, string>> = {
@@ -45,7 +45,7 @@ export function noteBodyText(html: string) {
 }
 /** 18/11 (SAV-93): a V2 case note whose proof may compare the normalized text (new rows carry `ticketAssociation`; older V2 summary rows are recognized by key). */
 const normalizedCaseNote = (intent: EffectIntent) => intent.ticketAssociation === "at_create"
-    || hiddenMarkerNoteKey(intent.key) || /^note-association:[^:]+:(?:reply|closed)-summary\./.test(intent.key);
+    || hiddenMarkerNoteKey(intent.key) || /^note-association:[^:]+:(?:reply|closed|handoff)-summary\./.test(intent.key);
 const ownerHistorySchema = z.object({ propertiesWithHistory: z.object({ hubspot_owner_id: z.array(z.object({ value: z.string().nullable().optional(), timestamp: z.string() }).passthrough()).min(1) }).passthrough() }).passthrough();
 const sameProperties = (actual: Record<string, string | null>, expected: Record<string, string>) => Object.entries(expected).every(([k, v]) => k === "hs_timestamp" ? Date.parse(actual[k] ?? "") === Date.parse(v) : actual[k] === v);
 // HubSpot removes this exact historical comment and may append one LF. Do

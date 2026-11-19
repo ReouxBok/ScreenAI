@@ -432,6 +432,9 @@ export const caseRelayProofSchema = z.discriminatedUnion("kind", [
   // V1 classified it as an acknowledgement needing no CRM effect; its thread already
   // belongs to exactly one case, which is the one fed.
   z.object({ kind: z.literal("acknowledgement_on_case_thread"), messageId: uuid, intakeRunId: uuid, intakeRunVersion: z.number().int().min(1), sourceHash: ref }).strict(),
+  // SAV-99 (Ugo 19/11): V1 never executed this mail (the team made the ticket outside the Studio) and a person gave the ticket to the V2 agent: the
+  // assignment, read again now, is the proof; the mail's reading is the handover's own (stored in the case's admission), never V1's.
+  z.object({ kind: z.literal("owner_handover_mail"), messageId: uuid, ticketId: z.string().regex(/^[0-9]{1,30}$/) }).strict(),
 ]);
 export type CaseRelayProof = z.infer<typeof caseRelayProofSchema>;
 /** Pilot access (3/11), route 3A: V1's confirmed `ticket_create` of the relayed execution, whose stored
@@ -452,7 +455,9 @@ export const caseAttributionProofSchema = z.discriminatedUnion("kind", [
   caseOwnerAtCreationProofSchema,
   /* Ugo (4/11): attribution and processing are two things. A ticket whose CURRENT HubSpot owner reads as the V2 owner, on a mail V1 confirmed on that ticket, needs no owner effect
    * of V1: the reading is the proof, nothing is written, and no compare-and-set is asked because nothing is taken from anyone. */
-  z.object({ kind: z.literal("hubspot_owner_read"), messageId: uuid, ticketId: z.string().regex(/^[0-9]{1,30}$/), ownerId: z.string().regex(/^[0-9]{1,20}$/) }).strict(),
+  z.object({ kind: z.literal("hubspot_owner_read"), messageId: uuid, ticketId: z.string().regex(/^[0-9]{1,30}$/), ownerId: z.string().regex(/^[0-9]{1,20}$/),
+    /** SAV-99 (Ugo 19/11): a person gave the ticket to the agent and V1 never executed this mail; the store checks that instead (`attributionProven`). */
+    handover: z.literal("manual").optional() }).strict(),
 ]);
 export type CaseAttributionProof = z.infer<typeof caseAttributionProofSchema>;
 

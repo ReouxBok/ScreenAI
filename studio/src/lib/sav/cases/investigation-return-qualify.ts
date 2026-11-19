@@ -93,7 +93,7 @@ export function caseInvestigationReturnAwareQualify(v1Qualify: CaseInvestigation
     }
     // Identity and CRM context belong to the sender V1 relayed or the verified recipient of the first send on a HubSpot ticket.
     const prior = snapshot.admission?.qualification;
-    const relayed = [...events].reverse().find(row => row.direction === "customer_inbound" && (row.detail?.relay as { kind?: unknown } | undefined)?.kind === "intake_effects_confirmed");
+    const relayed = [...events].reverse().find(row => row.direction === "customer_inbound" && ["intake_effects_confirmed", "owner_handover_mail"].includes((row.detail?.relay as { kind?: string } | undefined)?.kind ?? ""));
     const relayedId = relayed?.detail?.messageId;
     let origin: { fromEmail: string; subject: string } | null | undefined;
     if (typeof relayedId === "string") {

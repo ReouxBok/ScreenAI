@@ -68,7 +68,10 @@ export const HANDOFF_REASONS = ["explicit_human_request", "sensitive_request", "
   "outside_active_blocks",
   // SAV-92 review (counter-review of 66e648a): not a model reason. The team part of a mail could not be noticed until the wait's bound, so the agent sent
   // nothing and the WHOLE mail went to the team (`case-team-part-wait.ts`); its notice says so in fixed words, never the partial "team part" text.
-  "team_part_handoff_unavailable"] as const;
+  "team_part_handoff_unavailable",
+  // SAV-99 (Ugo 19/11): not a model reason. A person gave the ticket to the agent, which did not take it (outside its blocks, sensitive, unreadable,
+  // contact not found, ambiguous thread...): the case was born with the team, the ticket goes back to « Nouveau » with no owner, and no mail was sent.
+  "agent_not_taken"] as const;
 export type HandoffReason = typeof HANDOFF_REASONS[number];
 export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
   explicit_human_request: "le client demande à parler à une personne",
@@ -77,6 +80,7 @@ export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
   knowledge_conflict: "des fiches de connaissance se contredisent",
   evidence_inaccessible: "un élément nécessaire au diagnostic n'est pas accessible à l'agent",
   diagnosis_out_of_tools: "le diagnostic dépasse les outils de l'agent",
+  agent_not_taken: "ticket attribué à l'agent, qui ne l'a pas pris en charge",
   repeated_failure: "les essais de l'agent ont échoué à répétition",
   decision_refused: "le validateur a refusé deux fois la décision de l'agent pour ce message",
   outside_active_blocks: "cette partie du message est laissée à l'équipe : aucun bloc actif de l'agent ne la couvre, ou elle dépasse la limite de demandes d'une réponse",
@@ -224,6 +228,29 @@ export function handoffNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ti
   return { ok: true, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion, reason: action.reason,
     report: { need: report.need, expected: report.expected, observed: report.observed, trialIds: report.trialIds, hypotheses: report.hypotheses,
       missingInformation: report.missingInformation, expectedIntervention: report.expectedIntervention } };
+}
+
+/** SAV-99: the fixed next human action of a ticket the agent did not take. */
+export const HANDOFF_NOT_TAKEN_INTERVENTION = "Reprendre le ticket : il est remis en « Nouveau », sans propriétaire. Aucun mail n'a été envoyé au client par l'agent.";
+
+/**
+ * SAV-99 (Ugo 19/11): the notice of a ticket a person gave the agent and the agent did not take. Such a case is BORN with the team (`openCaseFromHubspotTicket`
+ * with a wait reason): no investigation record, so `handoffNoticeTrigger` never fires for it. Its one input is the CRM observation that opened it (`ticket:<event>`);
+ * a person who took it since, or any later input (mail, investigation, command, owner change), means there is nothing to notice any more.
+ * `why`: the plain reason, from the stored reason code (`caseNotTakenWhy`), never the ticket's text.
+ */
+export function agentNotTakenNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ticketId" | "body" | "owner" | "phase" | "threadIds">, events: readonly (CaseInvestigationJournalEvent & { id?: string })[],
+  why: (reason: string | undefined) => string): HandoffNoticeTrigger {
+  const handoff = snapshot.body.handoff;
+  if (snapshot.owner !== "human" || snapshot.phase !== "handoff_pending" || !handoff || snapshot.threadIds.length) return { ok: false, why: "not_handoff" };
+  if (handoff.humanSince) return { ok: false, why: "taken_by_person" };
+  const born = [...events].sort((a, b) => a.caseVersion - b.caseVersion).find(event => event.kind === "crm_observed");
+  if (!born || typeof born.id !== "string" || events.some(event => event.kind !== "crm_observed")) return { ok: false, why: born ? "stale_input" : "no_record" };
+  const inputKey = `ticket:${born.id}`;
+  if (!INPUT_KEY.test(inputKey)) return { ok: false, why: "no_record" };
+  return { ok: true, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion: born.caseVersion, reason: "agent_not_taken",
+    report: { need: `Ticket attribué à l'Agent SAV, non pris en charge : ${why(handoff.reason)}`, expected: null, observed: null, trialIds: [], hypotheses: [], missingInformation: [],
+      expectedIntervention: HANDOFF_NOT_TAKEN_INTERVENTION } };
 }
 
 /**
@@ -432,6 +459,7 @@ const NOTE_REASON_SENTENCES: Record<HandoffReason, string> = {
   decision_refused: "Je préfère laisser l'équipe reprendre ce message.",
   outside_active_blocks: "Cette partie de la demande relève de l'équipe ; je continue de traiter le reste du message.",
   team_part_handoff_unavailable: "Aucune réponse ne lui a été envoyée : tout le message est à reprendre.",
+  agent_not_taken: "Je n'ai pas pris ce ticket en charge et aucun mail n'a été envoyé au client.",
 };
 const NOTE_TRIAL_OUTCOMES: Record<CaseTrial["outcome"], string> = {
   failed: "le problème persiste", pending: "nous attendons son retour", succeeded: "le client indique que cela a fonctionné", unknown: "nous ne savons pas encore si cela a suffi",

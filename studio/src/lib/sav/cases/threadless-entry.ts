@@ -50,13 +50,15 @@ async function start(input: Input, env: NodeJS.ProcessEnv, options: EntryOptions
   if (read.status !== "ready" && read.status !== "human_wait") return { status: read.status };
   // SAV-96 B: under SAV-97 `on`, the entry is the one place that may pay for the skill's reading of the ticket; every later check reads it.
   const qualification = await qualifyThreadlessTicket(read.source, env, new Date(), { accessSkillCompute: true });
-  if (qualification.status === "out_of_scope") return { status: "out_of_scope" };
   const revision = qualification.status === "admitted" ? await threadlessAccessRevision(env, db) : null;
-  if (qualification.status === "admitted" && !revision) return { status: "out_of_scope" };
 
+  // SAV-99 (Ugo 19/11): a person gave this ticket to the agent. When the agent does not take it (not an Access request by its content, no rule,
+  // Access closed, sensitive, contact not found...), it never stays in the agent's name with nobody on it: the case is born with the team
+  // (`handoff_pending`, the reason kept), and the existing hand-over stage gives the ticket back (« Nouveau », no owner, one short note). No mail.
   const waitReason = qualification.status === "human_wait"
     ? qualification.reason === "identity_unconfirmed" && read.status === "human_wait" ? read.reason : qualification.reason
-    : undefined;
+    : qualification.status === "out_of_scope" ? threadlessWaitReason(qualification.reason)
+      : !revision ? "access_block_closed" : undefined;
   const opened = await openCaseFromHubspotTicket({
     source: read.source, ownerTransitionKey: input.ownerTransitionKey, observedAt: input.observedAt, env,
     assertFresh: tx => threadlessAuthorityStillGranted(tx, authority, THREADLESS_ADMIT_PERMISSION),
@@ -89,6 +91,35 @@ async function start(input: Input, env: NodeJS.ProcessEnv, options: EntryOptions
   }
   return fixedDraft(input, env, snapshot, stored, read.source, revision);
 }
+
+/**
+ * SAV-99 (Ugo 19/11): a ticket a person gave the agent, WITH mail, that the agent does not take (outside its blocks, sensitive, sender not the ticket's
+ * contact, several threads or tickets for one thread, thread unreadable...). It must not stay in the agent's name with nobody on it: the same team case as a
+ * ticket without mail (`handoff_pending`, the reason kept, no thread), hence the same hand-over stage (« Nouveau », no owner, one short note) and Slack notice.
+ * Nothing is sent to the customer. Under the same switches, pause and authority as the entry; once per ticket (an existing case is left as it is).
+ */
+export async function handBackOwnerHandoverTicket(input: Input, reason: string): Promise<ThreadlessEntryResult> {
+  const env = process.env;
+  if (!savV2NewThreadEnabled(env)) return { status: "off" };
+  if (!inputSchema.safeParse(input).success || Date.parse(input.observedAt) > Date.now()) return { status: "invalid" };
+  const db = requireDb();
+  if (!await threadlessActionAllowed(env, db)) return { status: "paused" };
+  if (!await threadlessSchemaInstalled(db)) return { status: "unavailable" };
+  const authority = await readThreadlessAuthority(env, THREADLESS_ADMIT_PERMISSION, input.observedAt);
+  if (!authority) return { status: "unavailable" };
+  const read = await readThreadlessTicket(input.ticketId, env, { handback: true });
+  if (read.status !== "ready" && read.status !== "human_wait") return { status: read.status };
+  const waitReason = threadlessWaitReason(reason);
+  const opened = await openCaseFromHubspotTicket({
+    source: read.source, ownerTransitionKey: input.ownerTransitionKey, observedAt: input.observedAt, env, waitReason, handback: true,
+    assertFresh: tx => threadlessAuthorityStillGranted(tx, authority, THREADLESS_ADMIT_PERMISSION),
+  });
+  if (!("case" in opened)) return { status: opened.status };
+  return opened.status === "created" ? { status: "human_wait", caseId: opened.case.caseId, reason: waitReason } : { status: "existing_case" };
+}
+
+/** The case's stored wait reason (`threadlessTicketEventSchema`): a reason code as it is, anything else the generic « out of scope ». */
+export const threadlessWaitReason = (reason: string) => /^[a-z_]{1,80}$/.test(reason) ? reason : "out_of_scope";
 
 type StoredSource = NonNullable<Awaited<ReturnType<typeof readCaseThreadlessSource>>>;
 async function fixedDraft(input: Input, env: NodeJS.ProcessEnv, snapshot: CaseSnapshot, stored: StoredSource, source: ThreadlessTicketSource, revision: string): Promise<ThreadlessEntryResult> {

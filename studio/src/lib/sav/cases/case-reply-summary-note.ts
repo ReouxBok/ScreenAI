@@ -69,3 +69,36 @@ export function caseClosureNoteText(families: readonly string[]) {
   const what = !labels.length ? RESOLVED_GENERIC : labels.length === 1 ? labels[0]! : "ses demandes sont résolues";
   return `Le client a confirmé que ${what}. Ticket fermé.`;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// SAV-99 (decision of Ugo, 19/11): a ticket a person gave the agent WITHOUT any mail, that the agent did not take, goes back to the team (stage « Nouveau », no owner).
+// Before that write, the same stage execution leaves ONE short note on the ticket saying why, through the existing case note effect (`append_case_note`, under
+// `SAV_V2_REPLY_NOTE=on`). Deterministic, from the stored reason code only: never the ticket's text, a model output or an id.
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+/** The note's `interactionId` (`note:<case>:handoff-summary.v<n>`, n = the hand-over's case version): one note per hand-over, whatever replays or passes. */
+export const CASE_HANDOFF_NOTE_PREFIX = "handoff-summary.";
+export const caseHandoffNoteInteractionId = (handoffVersion: number) => `${CASE_HANDOFF_NOTE_PREFIX}v${handoffVersion}`;
+
+const IDENTITY = new Set(["no_contact", "multiple_contacts", "missing_email", "invalid_email", "recipient_not_allowed", "identity_unconfirmed"]);
+const NOT_ACCESS = "d'après son contenu, la demande ne relève d'aucun sujet que l'agent traite aujourd'hui";
+const NOT_TAKEN: Readonly<Record<string, string>> = {
+  sensitive_request: "demande sensible (facturation, résiliation ou autre sujet réservé à l'équipe)",
+  not_access: NOT_ACCESS, no_block_match: NOT_ACCESS, ambiguous_block: "d'après son contenu, la demande mêle plusieurs sujets ; l'agent ne la prend pas seul",
+  untrusted_source: "le contenu du ticket contient des instructions suspectes",
+  access_block_closed: "le traitement automatique des demandes d'accès est fermé",
+  thread_ambiguous: "le ticket est lié à plusieurs fils de mails, ou son fil à un autre ticket ; l'agent ne choisit pas seul",
+  identity_mismatch: "l'expéditeur du mail ne correspond pas au contact du ticket dans HubSpot",
+};
+/** Unknown, absent or technical reasons: the generic label, never the code itself. */
+const NOT_TAKEN_GENERIC = "la demande sort du périmètre actuel de l'agent";
+
+/** Why the agent did not take the ticket, in plain words, from the stored reason code only (also the Slack notice's « Problème », `agentNotTakenNoticeTrigger`). */
+export function caseNotTakenWhy(reason: string | null | undefined) {
+  return !reason ? NOT_TAKEN_GENERIC : IDENTITY.has(reason) ? "contact client introuvable, ambigu ou sans adresse mail utilisable dans HubSpot"
+    : reason.startsWith("access_skill_") ? "l'agent n'a pas pu lire la demande de façon fiable" : NOT_TAKEN[reason] ?? NOT_TAKEN_GENERIC;
+}
+
+export function caseThreadlessHandoffNoteText(reason: string | null | undefined) {
+  return `Ticket attribué à l'Agent SAV mais non pris en charge : ${caseNotTakenWhy(reason)}. Aucun mail envoyé au client. Ticket remis en « Nouveau », sans propriétaire, pour l'équipe.`;
+}

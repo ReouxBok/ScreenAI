@@ -478,7 +478,8 @@ describe("SAV-96 B (revue Astra 6.2, bloquant 1) : SAV_V2_NEW_THREAD_AUTO ne cha
   it("SKILL off avec la règle du skill aussi configurée : l'admission historique à l'octet près (les deux règles candidates, donc ambiguë, comme avant)", async () => {
     await configure({ auto: "on", skill: false, rules: "both" });
     const s = fixture({ content: PLAIN_LOGIN }), model = decisionModel();
-    expect(await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps(model)) })).toMatchObject({ status: "out_of_scope" });
+    // SAV-99 (Ugo 19/11): not taken (ambiguous, as before) now means a team case with its reason, never a mail; the admission itself is unchanged.
+    expect(await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps(model)) })).toMatchObject({ status: "human_wait", reason: "ambiguous_block" });
     expect(model.requests).toHaveLength(0);
     expect(s.counts.judge).toBe(0);
   });
