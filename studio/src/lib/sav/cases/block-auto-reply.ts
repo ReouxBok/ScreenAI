@@ -92,6 +92,24 @@ export function autoBlockProblem(facts: Readonly<{ openFamilies: readonly string
 }
 
 /**
+ * Revue Astra P1 (19/11): the allow-list is read AGAIN at the send fence, for a reply the RULE approved (its basis), not only at the approval. Between the
+ * approval and the send an operator may withdraw a block from `SAV_V2_AUTO_REPLY`: the queued reply then no longer goes out alone. Why, or null:
+ *   - `auto_off`: the list no longer grants anything (absent, empty, no valid approver);
+ *   - with the list `access` alone: the case's admission names a block other than Access (`caseBlockAdmittedOtherThanAccess`), so its approval came from a
+ *     longer list (`not_access_only`); an Access case is judged exactly as before (no new reading, nothing else checked);
+ *   - any other list: the same rule as the approval (`autoBlockProblem`) on the open requests' blocks, read in the admission (`caseRequestBlockId`): each
+ *     block listed, and one block or a qualified pair. Absent rows: unknown, never a default block.
+ * The same config and the same facts as at the approval give the same answer: nothing changes while the operator changes nothing.
+ */
+export type SavAutoReplyWithdrawn = "auto_off" | SavAutoBlockProblem;
+export function autoReplyWithdrawnProblem(config: AutoReplyConfig, facts: Readonly<{ admission: unknown; openBlocks: readonly SavAutoOpenBlock[] | null }>): SavAutoReplyWithdrawn | null {
+  if (config.mode !== "on") return "auto_off";
+  if (savAutoReplyLegacyAccessOnly(config)) return caseBlockAdmittedOtherThanAccess(facts.admission) ? "not_access_only" : null;
+  const rows = facts.openBlocks ?? [];
+  return autoBlockProblem({ openFamilies: rows.map(row => row.family), openBlocks: facts.openBlocks ?? undefined }, config);
+}
+
+/**
  * « Le noyau dans notre réponse » for every block other than Access: OUR outgoing answer, question or reminder of a case a block's rule admitted
  * never carries a kernel phrase (cancel, refund, delete the account...). A hit: not approved by the rule, and cancelled at the send fence, whoever
  * approved it. A hand-over or closing notice is the team's path already and is not judged here. Access keeps its own fence, unchanged

@@ -6,7 +6,8 @@ import "server-only";
 import { closeAfterConfirmedJ2 } from "./j2-confirmed-closure";
 import { isTerminalReply, closingHandoffReplyEnabled } from "./case-terminal-reply";
 import { j2AutoGate, readCaseOpenBlocks } from "./j2-auto-reminder";
-import { caseBlockReplyKernelProblem } from "./block-auto-reply";
+import { autoReplyWithdrawnProblem, caseBlockReplyKernelProblem, readAutoReplyConfig, savAutoReplyLegacyAccessOnly } from "./block-auto-reply";
+import { ACCESS_AUTO_APPROVAL_BASIS } from "./customer-return";
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -25,7 +26,7 @@ import { enqueueCaseTicketStage } from "./case-ticket-stage-queue";
 import { enqueueCaseHandoffStage } from "./case-handoff-stage";
 import { caseHandoffStageEnabled, caseTicketStageKey } from "./customer-return";
 import { TICKET_STAGE_KEY_PREFIX } from "./case-ticket-stage";
-import { lockCaseForWrite } from "./case-store";
+import { lockCaseForWrite, transitionCaseOwner } from "./case-store";
 import { caseReplyNoteEnabled, caseReplySummaryWithStage, isCaseReplySummary, type CaseReplySummaryStage } from "./case-reply-summary-note";
 import {
   caseNoteAssociationKey, caseNoteKey, caseRecipientCheck, caseReplyKey, checkCaseReplyApproval, decideCaseEffect, readCaseEffectsMode, SAV_CASE_EFFECT_PERMISSIONS,
@@ -41,6 +42,8 @@ import type { CaseEffectPayload } from "./case-reply-store";
 
 export type { CaseEffectPayload };
 const fault = (code: string): never => { throw Error(`SAV_CASE_EFFECT_${code}`); };
+/** Revue Astra P1: a rule-approved reply whose block the allow-list no longer lets answer alone. Final, like every cancellation; the case goes to the team. */
+const AUTO_REPLY_WITHDRAWN = "CANCELLED_AUTO_REPLY_WITHDRAWN";
 const LEASE_MS = 80_000;
 /** A configuration that cannot be read now holds; a scope that excludes the case, or expired, cancels. */
 const QUALIFICATION_HOLD = new Set(["qualification_scope_mode_missing", "qualification_scope_mode_invalid", "qualification_scope_missing", "qualification_scope_invalid", "qualification_scope_not_open", "qualification_binding_unreadable"]);
@@ -245,6 +248,18 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     if (decision.action === "hold") return fault(`HOLD_${decision.code.toUpperCase()}`);
     if (decision.action === "cancel") return fault(`CANCELLED_${decision.code.toUpperCase()}`);
     if (phase !== "reply" && facts.owner !== "agent") return fault(facts.owner === null ? "CASE_MISSING" : "CANCELLED_OWNER_CHANGED");
+    // Revue Astra P1 (19/11), last, once every other check lets the reply go: a reply the RULE approved leaves only while `SAV_V2_AUTO_REPLY` still lets the
+    // case's block(s), read in its admission, answer alone. A person's approval is not concerned; a J2 reminder re-reads the list at its own gate (`j2AutoGate`).
+    if (phase === "reply" && proposal.purpose !== "reminder" && approval?.basis === ACCESS_AUTO_APPROVAL_BASIS) {
+      const config = readAutoReplyConfig(deps.env());
+      let open: Awaited<ReturnType<typeof readCaseOpenBlocks>> = null;
+      if (config.mode === "on" && !savAutoReplyLegacyAccessOnly(config)) open = await readCaseOpenBlocks(tx, proposal.caseId).catch(() => null);
+      const withdrawn = autoReplyWithdrawnProblem(config, { admission: facts.admissionRecord ?? null, openBlocks: open });
+      if (withdrawn) {
+        console.info(JSON.stringify({ event: "sav_v2_auto_reply_withdrawn", caseId: proposal.caseId, executionId: lease.row.id, reason: withdrawn }));
+        return fault(AUTO_REPLY_WITHDRAWN);
+      }
+    }
     return facts;
   }
 
@@ -503,6 +518,17 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
           state: cancelled ? "refused" : state, reason: reason.slice(0, 200), leaseToken: null, leaseUntil: null, updatedAt: new Date(),
         }).where(and(eq(savCaseEffectExecutions.id, lease.row.id), eq(savCaseEffectExecutions.leaseToken, lease.token))).returning({ id: savCaseEffectExecutions.id });
         await executionJournal(tx, lease.row.id, row ? (cancelled ? "case_effect_cancelled" : "pass_waiting") : "obsolete_pass", { state, reason });
+        // Revue Astra P1: never a silent case. The reply the rule approved will not leave: the case goes to the team, in the same transaction (execution, then
+        // case: the lock order of every path). Best effort inside a savepoint: a case already a person's, or moved, keeps the cancellation as it is.
+        const caseId = payloads.get(lease)?.proposal.caseId;
+        if (row && caseId && reason === `SAV_CASE_EFFECT_${AUTO_REPLY_WITHDRAWN}`) {
+          await tx.transaction(async savepoint => {
+            const snapshot = await lockCaseForWrite(savepoint, caseId);
+            if (snapshot.owner !== "agent") return;
+            await transitionCaseOwner({ caseId, expectedVersion: snapshot.version, transition: "handoff", actor: { type: "agent" },
+              commandKey: `auto-reply-withdrawn.${lease.row.id}`, reason: "auto_reply_withdrawn" }, savepoint);
+          }).catch(error => console.warn(JSON.stringify({ event: "sav_v2_auto_reply_withdrawn_handoff_failed", caseId, code: error instanceof Error ? error.message.slice(0, 120) : "unknown" })));
+        }
       });
     },
   };

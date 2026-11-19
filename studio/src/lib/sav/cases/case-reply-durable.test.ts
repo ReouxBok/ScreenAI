@@ -22,7 +22,9 @@ import { createIntakeExecutorAdapters, type GmailRequest } from "../intake/execu
 import { executeIntakePass } from "../intake/executor";
 import { getExecutionEffects } from "../intake/execution-store";
 import type { ExecutionOptions } from "../intake/execution-types";
-import { listCaseEvents, listCaseTimers, openCaseEvent, readCase, transitionCaseOwner } from "./case-store";
+import { listCaseEvents, listCaseTimers, openCaseEvent, readCase, transitionCaseOwner, type CaseOpenedRequest } from "./case-store";
+import { prepareCaseReplyText } from "./case-reply-outbound";
+import { ACCESS_AUTO_APPROVAL_BASIS } from "./customer-return";
 import { caseDedupeKey } from "./case-types";
 import { createCaseEffectDriver } from "./case-effect-driver";
 import { nextJ2Slot } from "./j2-calendar";
@@ -52,14 +54,14 @@ const setV2Pause = async (level: "actions_paused" | "fully_paused" | null) => {
     cursor: encryptSavPayload({ revision: "sav-agent-pause.v1", agent: "v2", level, setBy: "fixture@example.invalid", setAt: AT, reason: "release fictive" }) });
 };
 
-async function scenario(purpose: CaseReplyProposal["purpose"] = "question", extra: { note?: boolean; text?: string; admission?: typeof ADMITTED } = {}) {
+async function scenario(purpose: CaseReplyProposal["purpose"] = "question", extra: { note?: boolean; text?: string; admission?: typeof ADMITTED; opens?: CaseOpenedRequest[]; automated?: boolean } = {}) {
   const gmailThreadId = `gmail-thread-${randomUUID()}`, gmailMessageId = `gm-${randomUUID()}`, ticketId = String(++ticketSeq);
   const thread = (await f.db.insert(savThreads).values({ mailboxId, gmailThreadId, customerEmail: "customer@example.invalid" }).returning())[0]!;
   const message = (await f.db.insert(savMessages).values({
     threadId: thread.id, mailboxId, direction: "inbound", gmailMessageId, fromEmail: "customer@example.invalid", toEmails: ["support@example.invalid"], subject: "Synthetic connection failure",
     bodyCiphertext: encryptSavPayload({ text: "The synthetic connection fails.", headers: { "message-id": "<incoming@example.invalid>" }, attachments: [] }), receivedAt: new Date("2026-10-28T07:00:00.000Z"),
   }).returning())[0]!;
-  const { case: opened } = await openCaseEvent({ ticketId, threadId: thread.id, admission: extra.admission ?? ADMITTED, kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(gmailMessageId), sourceRef: { type: "email", id: gmailMessageId }, occurredAt: "2026-10-28T07:00:00.000Z" });
+  const { case: opened } = await openCaseEvent({ ticketId, threadId: thread.id, admission: extra.admission ?? ADMITTED, ...(extra.opens ? { opens: extra.opens } : {}), kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(gmailMessageId), sourceRef: { type: "email", id: gmailMessageId }, occurredAt: "2026-10-28T07:00:00.000Z" });
   p = executionProvider(); p.setGmail(gmailMessageId, gmailThreadId); p.seedTicket({ id: ticketId });
   sends = 0; loseAck = false;
   const gmail: GmailRequest = async <T>(mailbox: string, path: string, init?: RequestInit) => {
@@ -72,7 +74,7 @@ async function scenario(purpose: CaseReplyProposal["purpose"] = "question", extr
   const snapshot = (await readCase(opened.caseId))!;
   const proposal: CaseReplyProposal = {
     caseId: opened.caseId, caseVersion: snapshot.version, triggerEventId: `inbound:${gmailMessageId}`, inboundMessageId: message.id, purpose, recipient: "customer@example.invalid",
-    subject: "Synthetic connection failure", text: finalReplyText(extra.text ?? "SYNTHETIC reply.\nSignature kept exactly."),
+    subject: "Synthetic connection failure", text: extra.automated ? prepareCaseReplyText(extra.text ?? "SYNTHETIC reply.\nSignature kept exactly.", "fr", "automated") : finalReplyText(extra.text ?? "SYNTHETIC reply.\nSignature kept exactly."),
     ...(purpose === "question" ? { question: { id: "q1", text: "SYNTHETIC question?", factKeys: [] } } : {}),
   };
   const note: CaseEffectNote | undefined = extra.note ? { interactionId: inboundInteractionId(gmailMessageId), text: "Synthetic interaction note.", at: "2026-10-30T10:00:00.000Z" } : undefined;
@@ -757,6 +759,93 @@ describe("SAV-97 : dernier contrôle avant envoi d'un dossier admis par le skill
   it("off (production d'aujourd'hui) : un dossier admis autrement n'est pas touché par ce contrôle", async () => {
     const s = await scenario("answer", { text: "Pour résilier votre abonnement, rendez-vous dans les paramètres." });
     const { id } = await admit(s);
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+  });
+});
+
+/*
+ * Revue Astra P1 (19/11): an AUTOMATICALLY approved reply (the rule's basis) already in the queue is sent only while `SAV_V2_AUTO_REPLY` still lets the
+ * case's block(s), read in its admission, answer alone (the block alone, or the qualified pair). Withdrawn: cancelled with an explicit reason, nothing reaches
+ * Gmail, and the case goes to the team (never a silent case). A reply a person approved is not concerned; Access under `access` is unchanged.
+ */
+describe("revue Astra P1 : la liste des réponses automatiques est relue juste avant l'envoi", () => {
+  const BLOCK = "syn-widget", AUTO_APPROVER = "30000000-0000-4000-8000-000000000044";
+  const WIDGET_RULE = { ruleId: "rule-widget", revision: "r1", families: ["usage"], blockId: BLOCK };
+  const widgetRow = (requestId: string) => ({ requestId, family: "usage" as const, provenance: { kind: "qualified_rule" as const, ruleId: "rule-widget", revision: "r1", at: AT, blockId: BLOCK } });
+  const accessRow = (requestId: string) => ({ requestId, family: "access" as const, provenance: { kind: "human" as const, staffUserId: staff.staffUserId, at: AT } });
+  const admissionOf = (requests: unknown[]) => ({ ...ADMITTED, policy: { ...ADMITTED.policy, qualifiedRules: [...ADMITTED.policy.qualifiedRules, WIDGET_RULE] },
+    qualification: { ...ADMITTED.qualification, requests } }) as unknown as typeof ADMITTED;
+  const WIDGET = admissionOf([widgetRow("r1")]), MIXED = admissionOf([accessRow("r1"), widgetRow("r2")]);
+  const ruleApproval: CaseReplyAuthorizer = () => ({ allowed: true, basis: ACCESS_AUTO_APPROVAL_BASIS });
+  const setList = (value: string | null) => {
+    const rest = { ...environment };
+    delete rest.SAV_V2_AUTO_REPLY;
+    environment = { ...rest, SAV_V2_AUTO_APPROVER_ID: AUTO_APPROVER, ...(value === null ? {} : { SAV_V2_AUTO_REPLY: value }) };
+  };
+  /** A reply approved by the rule (or by a person) and queued, on a case whose open requests are `opens`. */
+  async function queued(admission: typeof ADMITTED, opens: CaseOpenedRequest[], by: "rule" | "person" = "rule") {
+    const s = await scenario("answer", { admission, opens, automated: by === "rule" });
+    expect((await readCase(s.caseId))!.owner).toBe("agent");
+    const validationId = await propose(s.proposal);
+    expect(await approve(validationId, s.proposal, by === "rule" ? ruleApproval : allow, by === "rule" ? AUTO_APPROVER : APPROVER)).toMatchObject({ ok: true });
+    const result = await queue(validationId);
+    if (!result.ok) throw Error(`ENQUEUE_REFUSED:${result.code}`);
+    return { s, id: result.executionId };
+  }
+  const ONE = [{ id: "r1", summary: "Synthetic widget setting." }], TWO = [{ id: "r1", summary: "Synthetic connection." }, { id: "r2", summary: "Synthetic widget setting." }];
+
+  it("contre-recette : bloc retiré de la liste après l'approbation automatique, 0 appel Gmail, motif explicite, dossier remis à l'équipe", async () => {
+    for (const after of ["access", "access,syn-other", "", null]) {
+      setList(`access,${BLOCK}`);
+      const { s, id } = await queued(WIDGET, ONE);
+      setList(after);
+      expect(await run(id), String(after)).toMatchObject({ reason: "SAV_CASE_EFFECT_CANCELLED_AUTO_REPLY_WITHDRAWN" });
+      expect(sends).toBe(0);
+      expect(await effectsOf(id)).toEqual([]);
+      expect(await execution(id)).toMatchObject({ state: "refused", reason: "SAV_CASE_EFFECT_CANCELLED_AUTO_REPLY_WITHDRAWN" });
+      const snapshot = (await readCase(s.caseId))!;
+      expect(snapshot.owner).toBe("human");
+      expect(snapshot.body.handoff).toMatchObject({ reason: "auto_reply_withdrawn" });
+      // The registry says why, never a bare "cancelled".
+      expect(await getCaseReplyEffect({ validationId: (await validationsOf(s.caseId))[0]!.id as string }, { env: () => environment }))
+        .toMatchObject({ status: { code: "cancelled", sent: "no", terminal: true, endedBy: "SAV_CASE_EFFECT_CANCELLED_AUTO_REPLY_WITHDRAWN" } });
+    }
+  });
+
+  it("paire retirée (les deux blocs restent listés) : la réponse d'un dossier multi-blocs ne part plus seule", async () => {
+    setList(`access,${BLOCK},access+${BLOCK}`);
+    const { id } = await queued(MIXED, TWO);
+    setList(`access,${BLOCK}`);
+    expect(await run(id)).toMatchObject({ reason: "SAV_CASE_EFFECT_CANCELLED_AUTO_REPLY_WITHDRAWN" });
+    expect(sends).toBe(0);
+  });
+
+  it("toujours listé (bloc seul ou paire) : la réponse part une fois", async () => {
+    setList(`access,${BLOCK}`);
+    const single = await queued(WIDGET, ONE);
+    expect(await run(single.id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+    setList(`access,${BLOCK},access+${BLOCK}`);
+    const pair = await queued(MIXED, TWO);
+    expect(await run(pair.id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+  });
+
+  it("Accès avec SAV_V2_AUTO_REPLY=access : inchangé, la réponse automatique part ; Accès retiré de la liste : annulée, rien n'est envoyé", async () => {
+    setList("access");
+    const kept = await queued(ADMITTED, [{ id: "r1", summary: "Synthetic connection." }]);
+    expect(await run(kept.id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+    const withdrawn = await queued(ADMITTED, [{ id: "r1", summary: "Synthetic connection." }]);
+    setList(BLOCK);
+    expect(await run(withdrawn.id)).toMatchObject({ reason: "SAV_CASE_EFFECT_CANCELLED_AUTO_REPLY_WITHDRAWN" });
+    expect(sends).toBe(0);
+  });
+
+  it("une réponse approuvée par une personne n'est pas concernée : elle part, liste vide ou non", async () => {
+    setList(null);
+    const { id } = await queued(WIDGET, ONE, "person");
     expect(await run(id)).toMatchObject({ state: "confirmed" });
     expect(sends).toBe(1);
   });

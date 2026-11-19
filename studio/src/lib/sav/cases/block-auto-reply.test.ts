@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/db", () => ({ requireDb: () => { throw Error("NO_DATABASE_ALLOWED"); } }));
 import { closingHandoffReplyEnabled, isTerminalReply } from "./case-terminal-reply";
 import {
-  autoBlockProblem, caseBlockAdmittedOtherThanAccess, caseBlockReplyKernelProblem, readAutoReplyConfig, savAutoReplyLegacyAccessOnly, type SavAutoOpenBlock,
+  autoBlockProblem, autoReplyWithdrawnProblem, caseBlockAdmittedOtherThanAccess, caseBlockReplyKernelProblem, readAutoReplyConfig, savAutoReplyLegacyAccessOnly, type SavAutoOpenBlock,
 } from "./block-auto-reply";
 import { decideAccessAutoApproval, decideAutoApproval, readAccessAutoApprovalConfig, type AccessAutoApprovalFacts } from "./customer-return";
 import { savBlockEffectiveMode } from "./block-switch";
@@ -207,6 +207,29 @@ describe("« le noyau dans notre réponse » for every block other than Access",
       expect(caseBlockAdmittedOtherThanAccess(value)).toBe(false);
       expect(caseBlockReplyKernelProblem({ admission: value, text: "Pour résilier votre abonnement, écrivez-nous.", purpose: "answer" })).toBeNull();
     }
+  });
+});
+
+describe("revue Astra P1 : la liste relue à l'envoi d'une réponse approuvée par la règle (`autoReplyWithdrawnProblem`)", () => {
+  const cfg = (value: string | undefined) => readAutoReplyConfig({ SAV_V2_AUTO_REPLY: value, SAV_V2_AUTO_APPROVER_ID: APPROVER });
+  const admitted = (blockId: string) => ({ qualification: { requests: [{ requestId: "r1", family: "usage", provenance: { kind: "qualified_rule", ruleId: "rule-syn", revision: "r1", blockId } }] } });
+  const accessOnly = { qualification: { requests: [{ requestId: "r1", family: "access", provenance: { kind: "human" } }] } };
+  const widget: SavAutoOpenBlock[] = [{ family: "usage", blockId: "syn-widget" }], access: SavAutoOpenBlock[] = [{ family: "access", blockId: "access" }];
+  it("`access` alone: an Access case passes exactly as before, without reading the open requests; a case another block admitted is withdrawn", () => {
+    expect(autoReplyWithdrawnProblem(cfg("access"), { admission: accessOnly, openBlocks: null })).toBeNull();
+    expect(autoReplyWithdrawnProblem(cfg("access"), { admission: admitted("syn-widget"), openBlocks: null })).toBe("not_access_only");
+  });
+  it("nothing granted any more (absent, empty, only ignored entries, no valid approver): withdrawn for every block, Access included", () => {
+    for (const config of [cfg(undefined), cfg(""), cfg("*"), readAutoReplyConfig({ SAV_V2_AUTO_REPLY: "access" })])
+      expect(autoReplyWithdrawnProblem(config, { admission: accessOnly, openBlocks: access })).toBe("auto_off");
+  });
+  it("any other list: the approval's own rule on the open blocks (listed; one block or a qualified pair; unknown rows never pass)", () => {
+    expect(autoReplyWithdrawnProblem(cfg("access,syn-widget"), { admission: admitted("syn-widget"), openBlocks: widget })).toBeNull();
+    expect(autoReplyWithdrawnProblem(cfg("access,syn-other"), { admission: admitted("syn-widget"), openBlocks: widget })).toBe("block_not_allowed");
+    expect(autoReplyWithdrawnProblem(cfg("access,syn-widget"), { admission: accessOnly, openBlocks: [...access, ...widget] })).toBe("multi_block_draft");
+    expect(autoReplyWithdrawnProblem(cfg("access,syn-widget,access+syn-widget"), { admission: accessOnly, openBlocks: [...access, ...widget] })).toBeNull();
+    expect(autoReplyWithdrawnProblem(cfg("access,syn-widget"), { admission: admitted("syn-widget"), openBlocks: null })).toBe("block_unknown");
+    expect(autoReplyWithdrawnProblem(cfg("syn-widget"), { admission: accessOnly, openBlocks: access })).toBe("block_not_allowed");
   });
 });
 
