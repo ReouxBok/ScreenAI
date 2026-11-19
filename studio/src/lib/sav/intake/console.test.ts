@@ -1396,6 +1396,50 @@ describe("SAV V1 unread: every inbound message, fair recovery and counter", () =
     expect(await syncHandledIntakeGmailRead(messageId,deps)).toEqual({skipped:"already_confirmed"});expect(writes).toHaveLength(3);
     expect(mutationsSent()).toHaveLength(0);
   });
+  it("a message deleted from Gmail (404) is skipped: the following ones are read and the case records no failure", async () => {
+    await administrative();
+    await db.db.update(savThreads).set({gmailThreadId:"1a000"}).where(eq(savThreads.id,threadId));
+    await db.db.update(savMessages).set({gmailMessageId:"1a123"}).where(eq(savMessages.id,messageId));
+    const first=await message(threadId,new Date(Date.now()-120000)),second=await message(threadId,new Date(Date.now()-60000));
+    await db.db.update(savMessages).set({gmailMessageId:"1a121"}).where(eq(savMessages.id,first.id));
+    await db.db.update(savMessages).set({gmailMessageId:"1a122"}).where(eq(savMessages.id,second.id));
+    await externalMarker();
+    const unread=new Set(["1a122","1a123"]),writes:string[]=[];
+    const gmail:GmailRequest=async<T>(_mailbox:string,path:string,init?:RequestInit)=>{
+      if(path==="profile")return {emailAddress:"contact@limova.ai"} as T;
+      const id=path.split("/")[1].split("?")[0];
+      if(id==="1a121")throw Error("GMAIL_HTTP_404"); // oldest mail deleted from Gmail
+      if(init?.method==="POST"){writes.push(id);unread.delete(id);return {} as T;}
+      return {id,threadId:"1a000",labelIds:["INBOX",...unread.has(id)?["UNREAD"]:[]]} as T;
+    };
+    const deps={env:()=>({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}),gmail};
+    expect(await syncHandledIntakeGmailRead(messageId,deps)).toEqual({confirmed:true,earlierMessages:1,goneMessages:1});
+    expect(writes).toEqual(["1a123","1a122"]);expect(unread.size).toBe(0);
+    expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,FAILED))).toHaveLength(0);
+    const gone=(await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_INTAKE_GMAIL_READ))).find(r=>r.entityId===first.id);
+    expect(gone?.technicalMetadata).toMatchObject({gone:true,providerStatus:404,coveredByMessageId:messageId});
+    expect(await syncHandledIntakeGmailRead(messageId,deps)).toEqual({skipped:"already_confirmed"});
+  });
+  it("a failure on one earlier message never stops the next ones, and counts once on the case", async () => {
+    await administrative();
+    await db.db.update(savThreads).set({gmailThreadId:"1a000"}).where(eq(savThreads.id,threadId));
+    await db.db.update(savMessages).set({gmailMessageId:"1a123"}).where(eq(savMessages.id,messageId));
+    const first=await message(threadId,new Date(Date.now()-120000)),second=await message(threadId,new Date(Date.now()-60000));
+    await db.db.update(savMessages).set({gmailMessageId:"1a122"}).where(eq(savMessages.id,second.id)); // first keeps a non-hex id: refused
+    await externalMarker();
+    const unread=new Set(["1a122","1a123"]);
+    const gmail:GmailRequest=async<T>(_mailbox:string,path:string,init?:RequestInit)=>{
+      if(path==="profile")return {emailAddress:"contact@limova.ai"} as T;
+      const id=path.split("/")[1].split("?")[0];
+      if(init?.method==="POST"){unread.delete(id);return {} as T;}
+      return {id,threadId:"1a000",labelIds:["INBOX",...unread.has(id)?["UNREAD"]:[]]} as T;
+    };
+    expect(await syncHandledIntakeGmailRead(messageId,{env:()=>({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}),gmail})).toMatchObject({confirmed:false,earlierMessages:1});
+    expect(unread.size).toBe(0);
+    const rows=await db.db.select().from(auditLogs).where(eq(auditLogs.action,FAILED));
+    expect(rows.map(r=>[r.entityId,r.technicalMetadata])).toEqual([[messageId,{errorCode:"SAV_INTAKE_GMAIL_READ_SOURCE_INVALID",scope:"earlier",failedMessages:1}]]);
+    expect(first.id).not.toBe(second.id);
+  });
   it("an earlier message is never marked read while the case is not finished", async () => {
     await administrative();
     await message(threadId,new Date(Date.now()-60000));
@@ -1411,7 +1455,7 @@ describe("SAV V1 unread: every inbound message, fair recovery and counter", () =
     switchOn();
     expect(await reconcileHandledIntakeGmailRead(5)).toMatchObject({checked:1,failed:1,pending:1});
     const rows=await db.db.select().from(auditLogs).where(eq(auditLogs.action,FAILED));
-    expect(rows.map(r=>[r.entityId,r.technicalMetadata])).toEqual([[messageId,{errorCode:"SAV_INTAKE_GMAIL_READ_SOURCE_INVALID",scope:"earlier"}]]);
+    expect(rows.map(r=>[r.entityId,r.technicalMetadata])).toEqual([[messageId,{errorCode:"SAV_INTAKE_GMAIL_READ_SOURCE_INVALID",scope:"earlier",failedMessages:1}]]);
     expect(earlier.gmailMessageId).not.toMatch(/^[a-f0-9]+$/);
   });
   it("old rows that keep failing never starve a newer finished row", async () => {
@@ -1436,9 +1480,11 @@ describe("SAV V1 unread: every inbound message, fair recovery and counter", () =
     const parked=await poison(0);await failures(parked.id,SAV_INTAKE_GMAIL_READ_FAILURE_CAP,120);
     await db.db.delete(savMessages).where(eq(savMessages.id,messageId));
     switchOn();vi.mocked(console.info).mockClear();
-    const counter={pending:1,parked:1,checked:0,confirmed:0,earlierMessages:0,notReady:0,failed:0};
-    expect(await reconcileHandledIntakeGmailRead(5)).toEqual(counter);
-    expect(vi.mocked(console.info)).toHaveBeenCalledWith("sav_intake_gmail_read_pass",counter);
+    const counter={pending:1,parked:1,checked:0,confirmed:0,earlierMessages:0,goneMessages:0,notReady:0,failed:0};
+    const result=await reconcileHandledIntakeGmailRead(5);
+    expect(result).toMatchObject(counter);expect(Object.keys(result).sort()).toEqual([...Object.keys(counter),"selectMs","durationMs"].sort());
+    expect((result as {durationMs:number}).durationMs).toBeGreaterThanOrEqual(0);
+    expect(vi.mocked(console.info)).toHaveBeenCalledWith("sav_intake_gmail_read_pass",result);
     expect(await readIntakeGmailReadBacklog()).toEqual({state:"available",pending:1,parked:1});
     await db.db.update(auditLogs).set({createdAt:new Date(Date.now()-25*3600000)}).where(eq(auditLogs.entityId,parked.id));
     expect(await reconcileHandledIntakeGmailRead(5)).toMatchObject({checked:1,parked:1});
