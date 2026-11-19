@@ -15,7 +15,7 @@ import { z } from "zod";
  * Parsing strips unknown keys (a model may add some) but never fills a missing required field: a missing field is an invalid output.
  */
 
-export const SAV_SMART_CONTRACT_REVISION = "sav-smart-contract-2026-11-20.v2";
+export const SAV_SMART_CONTRACT_REVISION = "sav-smart-contract-2026-11-20.v3";
 
 export const SAV_SMART_OUTCOMES = ["reply", "ask", "handoff"] as const;
 export type SmartOutcome = typeof SAV_SMART_OUTCOMES[number];
@@ -39,8 +39,15 @@ export const smartNeedSchema = z.object({
 });
 export type SmartNeed = z.infer<typeof smartNeedSchema>;
 
+/** Barrier 2 (Astra, 20/11): the model names the sensitive family it sees, with the exact quote of the mail that proves it. Absent: stop. */
+export const SAV_SMART_SENSIBLE_FAMILIES = ["aucune", "resiliation", "remboursement", "facturation", "abonnement", "finance", "autre_sensible"] as const;
+export const smartSensibleSchema = z.object({ famille: z.enum(SAV_SMART_SENSIBLE_FAMILIES), preuve: text(400).default("") });
+export type SmartSensible = z.infer<typeof smartSensibleSchema>;
+
 export const smartReadingSchema = z.object({
   needs: z.array(smartNeedSchema).max(4),
+  /** Optional in the schema so a reading without it still parses: the SERVER then stops (absent = doubt = the team). */
+  sensible: smartSensibleSchema.nullable().catch(null).default(null),
   sensitive: z.enum(["yes", "no", "doubt"]),
   sensitiveFamilies: z.array(z.enum(SAV_SMART_SENSITIVE_FAMILIES)).max(6).default([]),
   wantsHuman: z.boolean(),

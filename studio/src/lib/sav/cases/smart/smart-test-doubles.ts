@@ -41,7 +41,7 @@ export function smartStaticKnowledge(sources: readonly SmartSource[] = [SMART_TE
 
 export const smartReading = (extra: Record<string, unknown> = {}) => ({
   needs: [{ id: "n1", ask: "se connecter à son espace", alreadyDone: ["a demandé un nouveau code"], theme: "connexion", search: "connexion code non reçu" }],
-  sensitive: "no", sensitiveFamilies: [], wantsHuman: false, upset: false, instructionInMail: false, ...extra,
+  sensitive: "no", sensitiveFamilies: [], wantsHuman: false, upset: false, instructionInMail: false, sensible: { famille: "aucune", preuve: "" }, ...extra,
 });
 export const SMART_GOOD_REPLY = "Bonjour,\n\nVous n'arrivez pas à vous connecter. Utilisez l'adresse e-mail de votre invitation. Si le code n'arrive pas, regardez dans le dossier des indésirables.\n\nSi cela bloque encore, dites-nous quel message s'affiche.\n\nBelle journée.";
 export const smartGoodDecision = (extra: Record<string, unknown> = {}) => ({

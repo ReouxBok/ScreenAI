@@ -114,3 +114,60 @@ describe("revue d'Astra (20/11) : la demande sensible ne disparaît pas derrièr
     expect(smartSafetyNet({ subject: "Partage", body: "Bonjour, comment partager un Assistant ?\nSi vous n'êtes pas le destinataire de ce message, merci de nous en informer." })).toMatchObject({ stop: false });
   });
 });
+
+describe("contre-revue d'Astra (20/11) : double barrière", () => {
+  const ASTRA_SIX = [
+    "Pouvez-vous annuler le renouvellement automatique de mon compte Limova ?",
+    "Je ne souhaite plus être client chez vous. Merci de mettre fin à mon contrat.",
+    "J'ai payé deux fois la même mensualité Limova, comment récupérer la différence ?",
+    "Bonjour, pouvez-vous me restituer les 49 € débités hier par Limova ?",
+    "Bonjour, pouvez-vous m'envoyer un duplicata de notre facture ?",
+    "Je souhaite passer du paiement mensuel au paiement annuel chez Limova.",
+  ];
+  const turn = async (body: string, reading: Record<string, unknown> = {}, subject = "Demande") => {
+    const { runSmartTurn } = await import("./smart-agent");
+    const { smartScriptedModel, smartStaticKnowledge, smartReading, smartGoodDecision, SMART_CONFORME } = await import("./smart-test-doubles");
+    const scripted = smartScriptedModel({ understand: { output: smartReading(reading) }, decide: { output: smartGoodDecision() }, verify: { output: SMART_CONFORME } });
+    const result = await runSmartTurn({ subject, body, thread: [] }, { model: scripted.model, knowledge: smartStaticKnowledge(), maxInputBytes: 100_000, today: "2026-11-20" });
+    return { result, kinds: scripted.calls.map(call => call.kind) };
+  };
+
+  it("couche 1, sans modèle : les 6 intentions d'Astra → team_sensitive, 0 appel modèle, aucun texte client", async () => {
+    for (const body of ASTRA_SIX) {
+      const { result, kinds } = await turn(body);
+      expect(result, body).toMatchObject({ outcome: "team_sensitive", sensitiveStop: "net", replyWithFooter: null });
+      expect(kinds, body).toEqual([]);
+    }
+  });
+  it("couche 2 : une formulation inédite que les motifs ne voient pas, mais que le modèle dit sensible → équipe, aucun texte client", async () => {
+    const body = "Bonjour, merci de ne plus reconduire notre engagement l'année prochaine.";
+    expect(smartSafetyNet({ subject: "Demande", body }).stop).toBe(false);
+    const { result, kinds } = await turn(body, { sensible: { famille: "resiliation", preuve: "merci de ne plus reconduire notre engagement l'année prochaine" } });
+    expect(result).toMatchObject({ outcome: "team_sensitive", sensitiveStop: "understand", replyWithFooter: null, decision: null });
+    expect(result.reasons).toContain("understand:sensible_resiliation");
+    expect(kinds).toEqual(["understand"]);
+  });
+  it("couche 2 : champ absent ou illisible → équipe (le doute arrête)", async () => {
+    for (const sensible of [null, { famille: "peut-etre", preuve: "" }]) {
+      const { result } = await turn("Bonjour, comment synchroniser mon calendrier Google avec mon Assistant ?", { sensible });
+      expect(result).toMatchObject({ outcome: "team_sensitive", replyWithFooter: null });
+      expect(result.reasons).toContain("understand:sensible_missing");
+    }
+  });
+  it("couche 2 : indice levé, modèle « aucune » sans preuve, avec une preuve inventée, ou une preuve sans le mot → équipe", async () => {
+    const body = "Bonjour, mon Assistant doit relancer les factures impayées de mes clients mais il ne trouve pas le fichier.";
+    for (const preuve of ["", "je veux relancer mes clients", "il ne trouve pas le fichier"]) {
+      const { result, kinds } = await turn(body, { sensible: { famille: "aucune", preuve } });
+      expect(result, preuve).toMatchObject({ outcome: "team_sensitive", replyWithFooter: null });
+      expect(result.reasons, preuve).toEqual(expect.arrayContaining(["hint:finance", "understand:hint_unexplained"]));
+      expect(kinds).toEqual(["understand"]);
+    }
+  });
+  it("témoins ordinaires : relancer les factures de ses clients (preuve exacte) et synchroniser son calendrier passent", async () => {
+    const clients = await turn("Bonjour, mon Assistant doit relancer les factures impayées de mes clients mais il ne trouve pas le fichier.",
+      { sensible: { famille: "aucune", preuve: "mon Assistant doit relancer les factures impayées de mes clients" } });
+    expect(clients.result.outcome).toBe("reply");
+    const calendar = await turn("Bonjour, comment synchroniser mon calendrier Google avec mon Assistant ?", {}, "Calendrier");
+    expect(calendar.result.outcome).toBe("reply");
+  });
+});

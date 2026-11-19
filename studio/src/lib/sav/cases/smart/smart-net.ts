@@ -59,6 +59,11 @@ const OWN_BILLING_REQUESTS: ReadonlyArray<readonly [string, RegExp]> = [
   ["finance", /\bcombien (?:ca |cela )?cout\w*|\bquel(?:le)? (?:est (?:le|votre) )?(?:prix|tarif)\b|\b(?:vos|votre) (?:tarifs?|prix)\b|\b(?:payer|paye|paie) (?:limova|l'abonnement|mon abonnement|ma facture)\b/],
   ["subscription", /\b(?:(?:mon|notre|votre|cet|son) |l')abonnement\b|\bessai gratuit\b|\bforfait\b|\b(?:changer|changement|modifier|passer|upgrade|downgrade|augmenter|reduire|baisser)\w* (?:\w+ ){0,3}(?:d'offre|d'abonnement|de forfait|de formule|(?:mon|l'|d'|notre|la|le|une) ?(?:offre|abonnement|forfait|formule|plan))\b/],
   ["cancellation", /\b(?:resili\w*|desabonn\w*|annuler (?:mon|l'|notre) (?:abonnement|compte|offre)|supprimer (?:mon|notre) compte|fermer (?:mon|notre) compte)\b/],
+  // Astra counter-review (20/11): the same intents in other words. Renewal, leaving, ending the contract.
+  ["cancellation", /\b(?:annul|arret|stop|desactiv|suspend|bloqu|empech)\w* (?:\w+ ){0,2}(?:renouvellement|reconduction)\b|\b(?:renouvellement|reconduction) (?:automatique|tacite)\b|\bplus (?:etre|rester) (?:client|abonne)\w*\b|\b(?:mettre|met|mis) fin (?:a|au) (?:\w+ )?(?:contrat|engagement|compte|abonnement|collaboration)\b|\b(?:rompre|terminer|arreter|cloturer|stopper) (?:mon|notre|le|ce) (?:contrat|engagement)\b|\bquitter limova\b/],
+  // Paid twice, getting the difference back, giving back a debit, a duplicate invoice, monthly/annual payment.
+  ["finance", /\bpaye\w* (?:\w+ ){0,3}(?:deux|2|plusieurs) fois\b|\brecuper\w* (?:la difference|mon argent|notre argent|le trop|la somme|le montant)|\b(?:restitu|rend|recredit|reverse|rembours)\w* (?:\w+ ){0,3}(?:\d+(?:[.,]\d+)? ?(?:€|euros?|eur)\b|debit\w*|prelev\w*|montant|somme|argent)|\b\d+(?:[.,]\d+)? ?(?:€|euros?|eur) (?:\w+ ){0,2}(?:debite|preleve|facture|paye|encaisse)\w*|\bduplicata\b/],
+  ["subscription", /\b(?:paiement|abonnement|formule|facturation|offre|plan) (?:mensuel|annuel)\w*|\b(?:du|le) (?:mensuel|annuel) (?:a|au|vers|en) (?:l')?(?:paiement )?(?:annuel|mensuel)\b|\bpasser (?:\w+ ){0,3}(?:au |a l'|en )?(?:paiement )?(?:mensuel|annuel)\b/],
   ["rights", /\b(?:rgpd|donnees personnelles|droit d'acces|suppression de (?:mes|nos) donnees)\b/],
   ["identity", /\b(?:changer (?:le|de) (?:proprietaire|titulaire)|transferer (?:le|mon) compte|usurp\w*|pirat\w*|compte (?:vole|hacke))\b/],
 ];
@@ -70,6 +75,21 @@ const TOPIC_WORDS: ReadonlyArray<readonly [string, RegExp]> = [
   ["rights", /\b(?:rgpd|donnees personnelles)\b/],
   ["identity", /\b(?:proprietaire|titulaire|pirat\w*|usurp\w*)\b/],
 ];
+
+/**
+ * Barrier 2 (server, after the model's reading): a hint raised by the net is explained away only when the model says « aucune » AND quotes, word
+ * for word from the mail, a proof that carries the hinted word in another subject (the customer's own clients' invoices, a tutorial...). The proof
+ * must itself pass this net (a proof that is a sensitive request explains nothing).
+ */
+export function smartHintsExplained(hints: readonly string[], proof: string): boolean {
+  if (!hints.length) return true;
+  const value = norm(proof);
+  if (!value.trim() || smartSafetyNet({ subject: "", body: proof }).stop) return false;
+  return hints.every(hint => {
+    const family = hint.replace(/^hint:/, ""), topic = TOPIC_WORDS.find(([name]) => name === family);
+    return Boolean(topic && topic[1].test(value));
+  });
+}
 
 /** The customer's own new words: quoted history removed, boilerplate lines removed, signature labels removed (a PS or a speaking line kept). */
 export function smartFreshText(body: string): string {

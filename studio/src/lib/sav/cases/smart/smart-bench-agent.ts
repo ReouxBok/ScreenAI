@@ -45,7 +45,7 @@ function dryRunModel(network: Network, env: Env): SmartModelPort {
     const needs = [{ id: "n1", ask: "demande du client", alreadyDone: [], theme: null, search: "aide" }];
     const decision = { outcome: "handoff", reply: null, teamNote: { raison: "no_source", besoin: "Banc à blanc : pas de modèle." }, handoffReason: "no_source",
       coverage: [{ needId: "n1", status: "handed" }], facts: [] };
-    const output = kind === "understand" ? { needs, sensitive: "no", sensitiveFamilies: [], wantsHuman: false }
+    const output = kind === "understand" ? { needs, sensitive: "no", sensitiveFamilies: [], wantsHuman: false, sensible: { famille: "aucune", preuve: "" } }
       : kind === "verify" || kind === "reverify" ? { verdict: "conforme", problems: [] }
       : { thinking: "", action: "final", calls: [], decision };
     return { status: "ok", output, usage: { inputTokens: 0, outputTokens: 0 }, inputBytes };
