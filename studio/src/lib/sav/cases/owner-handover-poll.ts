@@ -231,17 +231,17 @@ export async function pollSavOwnerHandovers(deps: OwnerHandoverPollDeps = {}): P
   }
   // Recorded only once the markers hold the events: a crash before leaves the tickets to be read again.
   for (const ticket of read) await writeSeen(ticket.id, { cursor: String(ticket.modifiedAt), status: "seen", failures: 0, lastError: null }, clock());
-  // A transient failure (429, 5xx, timeout) in a pass where no read succeeded is a HubSpot outage, not a bad ticket: nothing is counted, the
-  // cursor waits. Any other failure (404, 403, an unexpected answer), or a transient one while other reads succeed, counts one failure; after
-  // MAX_TICKET_FAILURES the ticket is skipped (logged, kept in sync_state with its error) and the cursor moves on.
+  // Astra 19/11: a transient failure (408, 429, 5xx, timeout, network) is NEVER a durable failure and never leads to a skip: the ticket waits
+  // (read again next pass, the cursor held at its date) while the others move on. Only a durable failure (another 4xx, an unreadable answer)
+  // counts; after MAX_TICKET_FAILURES durable failures the ticket is skipped (logged, kept in sync_state with its error) and the cursor moves on.
   let holdAt: number | null = null;
   for (const ticket of failed) {
-    const outage = ticket.transient && counts.read === 0;
-    const failures = outage ? ticket.failures : ticket.failures + 1;
-    const skip = !outage && failures >= OWNER_HANDOVER_POLL_MAX_TICKET_FAILURES;
-    if (!outage) await writeSeen(ticket.id, { cursor: skip ? String(ticket.modifiedAt) : ticket.seenAt === null ? null : String(ticket.seenAt),
-      status: skip ? "skipped" : "failing", failures, lastError: "owner_history_read_failed" }, clock());
-    console.warn("sav_v2_owner_handover_poll", { status: skip ? "ticket_skipped" : "ticket_read_failed", ticketId: ticket.id, failures });
+    const failures = ticket.transient ? ticket.failures : ticket.failures + 1;
+    const skip = !ticket.transient && failures >= OWNER_HANDOVER_POLL_MAX_TICKET_FAILURES;
+    await writeSeen(ticket.id, { cursor: skip ? String(ticket.modifiedAt) : ticket.seenAt === null ? null : String(ticket.seenAt),
+      status: skip ? "skipped" : ticket.transient ? "waiting" : "failing", failures,
+      lastError: ticket.transient ? "owner_history_read_transient" : "owner_history_read_failed" }, clock());
+    console.warn("sav_v2_owner_handover_poll", { status: skip ? "ticket_skipped" : ticket.transient ? "ticket_read_transient" : "ticket_read_failed", ticketId: ticket.id, failures });
     if (skip) counts.skipped++;
     else { counts.failed++; holdAt = Math.min(holdAt ?? ticket.modifiedAt, ticket.modifiedAt); }
   }

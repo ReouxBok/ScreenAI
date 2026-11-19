@@ -283,14 +283,39 @@ describe("SAV-96 repair: the reconcile pass reads HubSpot instead of waiting for
     expect(fixture.start).toHaveBeenCalledTimes(1);
   });
 
-  it("counts no failure during a HubSpot outage (every read failing with 503), and keeps the cursor", async () => {
+  it("never counts a transient failure: a ticket in 503 during passes where others succeed waits, then is taken once HubSpot recovers (Astra contre-revue)", async () => {
+    const base = Date.now() - 600_000;
+    const waiting = ticket({ modifiedAt: base, unreadable: 503 });
+    const others: Ticket[] = [];
+    for (let pass = 0; pass < OWNER_HANDOVER_POLL_MAX_TICKET_FAILURES + 1; pass++) {
+      others.push(ticket({ modifiedAt: base + 1_000 * (pass + 1), source: "INTEGRATION" }));
+      hubspot([waiting, ...others]);
+      await expect(poll()).resolves.toMatchObject({ read: 1, failed: 1, skipped: 0 });
+    }
+    const [row] = await database.db.select().from(savSyncState).where(eq(savSyncState.key, ownerHandoverPollSeenKey(waiting.id)));
+    expect(row).toMatchObject({ status: "waiting", processedCount: 0, cursor: null, lastError: "owner_history_read_transient" });
+    expect((await cursor())!.state).toMatchObject({ after: base, complete: false });
+    expect(fixture.start).not.toHaveBeenCalled();
+    // HubSpot recovers; the ticket itself has not changed since.
+    waiting.unreadable = undefined;
+    const { reads } = hubspot([waiting, ...others]);
+    await expect(poll()).resolves.toMatchObject({ status: "ok", read: 1, observed: 1, failed: 0 });
+    expect(reads).toEqual([waiting.id]);
+    await poll();
+    expect(fixture.start).toHaveBeenCalledTimes(1);
+    await expect(sweepDueOwnerHandovers(Date.now() + 240_000)).resolves.toEqual({ off: 1 });
+    expect(fixture.threadless).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ ticketId: waiting.id }));
+  });
+
+  it("keeps waiting through a full HubSpot outage (every read failing with 503), never skipping, and keeps the cursor", async () => {
     const base = Date.now() - 600_000;
     const tickets = [ticket({ modifiedAt: base, unreadable: 503 }), ticket({ modifiedAt: base + 1_000, unreadable: 503 })];
     for (let pass = 0; pass < OWNER_HANDOVER_POLL_MAX_TICKET_FAILURES + 1; pass++) {
       hubspot(tickets);
       await expect(poll()).resolves.toMatchObject({ read: 0, failed: 2, skipped: 0 });
     }
-    expect(await database.db.select().from(savSyncState).where(inArray(savSyncState.key, tickets.map(row => ownerHandoverPollSeenKey(row.id))))).toEqual([]);
+    const rows = await database.db.select().from(savSyncState).where(inArray(savSyncState.key, tickets.map(row => ownerHandoverPollSeenKey(row.id))));
+    expect(rows.map(row => [row.status, row.processedCount, row.cursor])).toEqual([["waiting", 0, null], ["waiting", 0, null]]);
     expect((await cursor())!.state).toMatchObject({ after: base, complete: false });
   });
 
