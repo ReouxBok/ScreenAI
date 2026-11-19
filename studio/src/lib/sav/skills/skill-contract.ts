@@ -33,7 +33,8 @@ export type BlockSource = Readonly<{
 
 export type BlockManifest = Readonly<{
   blockId: string;
-  family: "usage" | "access";
+  /** `access` is the Access block's alone; `integration` (19/11) is the Integrations block's own family; other blocks share `usage`. */
+  family: "usage" | "access" | "integration";
   skills: readonly SkillRevision[];
   excludedNeighbours: readonly string[];
   sources: readonly BlockSource[];

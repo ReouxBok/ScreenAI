@@ -16,7 +16,8 @@ import { SAV_INTEGRATIONS_BLOCK_ID, SAV_INTEGRATIONS_NEIGHBOURS, type Integratio
 
 export const SAV_INTEGRATIONS_MANIFEST: BlockManifest = {
   blockId: SAV_INTEGRATIONS_BLOCK_ID,
-  family: "usage",
+  // Root decision (19/11, assembly): the Integrations block has its own family `integration` (entry, rule, policy and scope alike).
+  family: "integration",
   skills: [
     { id: SAV_INTEGRATIONS_ENTRY_SKILL_ID, revision: SAV_INTEGRATIONS_ENTRY_SKILL_REVISION },
     { id: SAV_INTEGRATIONS_DECISION_SKILL_ID, revision: SAV_INTEGRATIONS_DECISION_SKILL_REVISION },

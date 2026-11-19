@@ -5,7 +5,7 @@ import { CHARLY_MAX_BLOCK_ID, CHARLY_MAX_ENTRY_SKILL, CHARLY_MAX_LABEL } from ".
 
 /*
  * Charly Max block: its REGISTRATION at the entry (interface of the lot infra-entry, `/private/tmp/sav-blocks-20261119/INTERFACE.md` v1.2).
- * Data only. Not listed in `cases/blocks/registry.ts` (the assembly adds the import line). Arrives `off`; admits nobody until the switch names it
+ * Data only. Listed in `cases/blocks/registry.ts` since the assembly (19/11). Arrives `off`; admits nobody until the switch names it
  * and Ugo approves the rule `charly_max-entry-skill` at this revision.
  */
 export const CHARLY_MAX_ENTRY_BLOCK = defineEntrySkillBlock({

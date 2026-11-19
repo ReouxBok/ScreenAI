@@ -24,7 +24,7 @@ describe("manifeste du bloc", () => {
   });
   it("les révisions et empreintes correspondent aux skills réels ; bloc et famille non réservés à Accès", () => {
     expect(SAV_INTEGRATIONS_MANIFEST.blockId).toBe("integrations");
-    expect(SAV_INTEGRATIONS_MANIFEST.family).toBe("usage");
+    expect(SAV_INTEGRATIONS_MANIFEST.family).toBe("integration");
     expect(SAV_INTEGRATIONS_MANIFEST.skills).toEqual([SAV_INTEGRATIONS_ENTRY_SKILL, SAV_INTEGRATIONS_DECISION_SKILL].map(({ id, revision }) => ({ id, revision })));
     expect(SAV_INTEGRATIONS_MANIFEST_DETAILS.promptSha256).toEqual({ entry: skillFingerprint(SAV_INTEGRATIONS_ENTRY_SKILL), decision: skillFingerprint(SAV_INTEGRATIONS_DECISION_SKILL) });
     expect(SAV_INTEGRATIONS_MANIFEST.excludedNeighbours).toEqual(expect.arrayContaining(["access", "charly_max", "platform_bug", "commercial"]));

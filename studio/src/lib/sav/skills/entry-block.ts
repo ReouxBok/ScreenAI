@@ -63,8 +63,9 @@ export type EntryRouterLine = Readonly<{
  */
 export type EntrySkillBlock = Readonly<{
   blockId: string;
-  /** An admissible family other than `access` (reserved to the Access block). Two blocks may share `usage`. */
-  family: "usage";
+  /** An admissible family other than `access` (reserved to the Access block): `usage` (two blocks may share it, e.g. Collaborators and Charly
+   * Max) or `integration` (the Integrations block, 19/11 root decision). It must be the family of the block's rule and of its scope. */
+  family: EntrySkillBlockFamily;
   /** Human label (French) used in logs and the router's catalog. */
   label: string;
   manifest: BlockManifest;
@@ -84,6 +85,10 @@ export type EntrySkillBlock = Readonly<{
   /** Every block arrives `off`. The mode is set only by the entry switch (`SAV_V2_ENTRY_BLOCKS_JSON`), never by the code. */
   initialMode: "off";
 }>;
+
+/** The families a block with a skill may declare at the entry (`SAV_CASE_ADMISSIBLE_FAMILIES` minus `access`). */
+export const SAV_ENTRY_BLOCK_FAMILIES = ["usage", "integration"] as const;
+export type EntrySkillBlockFamily = typeof SAV_ENTRY_BLOCK_FAMILIES[number];
 
 export const entrySkillRuleId = (blockId: string) => `${blockId}-entry-skill`;
 export const entrySkillRevision = (block: Pick<EntrySkillBlock, "skill">) => block.skill.revision;
@@ -133,7 +138,7 @@ export type EntrySkillBlockProblem =
 export function entrySkillBlockProblems(block: EntrySkillBlock): EntrySkillBlockProblem[] {
   const problems = new Set<EntrySkillBlockProblem>();
   if (!SAV_ENTRY_BLOCK_ID.test(block.blockId) || (SAV_ENTRY_RESERVED_ROUTES as readonly string[]).includes(block.blockId)) problems.add("block_id_invalid");
-  if (block.family !== "usage") problems.add("family_invalid");
+  if (!(SAV_ENTRY_BLOCK_FAMILIES as readonly string[]).includes(block.family)) problems.add("family_invalid");
   if (!block.label?.trim() || block.label.length > 80) problems.add("label_invalid");
   if (!block.router?.covers?.trim() || !block.router.notThis?.trim() || block.router.covers.length > 240 || block.router.notThis.length > 240) problems.add("router_line_invalid");
   if (block.manifest.blockId !== block.blockId) problems.add("manifest_block_mismatch");

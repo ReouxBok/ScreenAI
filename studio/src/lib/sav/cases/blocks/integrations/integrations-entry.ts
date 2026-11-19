@@ -5,12 +5,12 @@ import { SAV_INTEGRATIONS_MANIFEST } from "./integrations-manifest";
 import { SAV_INTEGRATIONS_BLOCK_ID } from "./integrations-scope";
 
 /*
- * Block « Intégrations »: its REGISTRATION at the entry of the SAV agent (INTERFACE.md v1.2 of the infra-entry lot). Data only. Not imported by
- * `cases/blocks/registry.ts` here (the assembly adds that line). Arrives `off`; the mode is set only by `SAV_V2_ENTRY_BLOCKS_JSON`.
+ * Block « Intégrations »: its REGISTRATION at the entry of the SAV agent (INTERFACE.md v1.2 of the infra-entry lot). Data only. Listed in
+ * `cases/blocks/registry.ts` since the assembly (19/11), family `integration` (root decision). Arrives `off`; the mode is set only by `SAV_V2_ENTRY_BLOCKS_JSON`.
  */
 export const INTEGRATIONS_ENTRY_BLOCK = defineEntrySkillBlock({
   blockId: SAV_INTEGRATIONS_BLOCK_ID,
-  family: "usage",
+  family: "integration",
   label: SAV_INTEGRATIONS_ENTRY_LABEL,
   manifest: SAV_INTEGRATIONS_MANIFEST,
   router: SAV_INTEGRATIONS_ROUTER_LINE,
