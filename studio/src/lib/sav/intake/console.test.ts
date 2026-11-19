@@ -36,7 +36,7 @@ import { releaseLegacyAiPauses } from "./legacy-pause";
 import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED, getSavExternalCompletion, revertSavExternalCompletionBatch, markSavDossiersHandledExternally, completeSavDossierManually } from "../external-completion";
 import { listIntakeConsole, projectIntakeThread, refreshIntakeConsole } from "./console-store";
 import { classifyInvalidSourceAsOther } from "./invalid-source-classification";
-import { syncHandledIntakeGmailRead, reconcileHandledIntakeGmailRead, SAV_INTAKE_GMAIL_READ } from "./gmail-read";
+import { syncHandledIntakeGmailRead, reconcileHandledIntakeGmailRead, readIntakeGmailReadBacklog, SAV_INTAKE_GMAIL_READ, SAV_INTAKE_GMAIL_READ_FAILURE_CAP } from "./gmail-read";
 import type { GmailRequest } from "./execution-adapters";
 import { readIntakeConsoleDetail } from "./console-detail";
 import { ensureIntakeObservations, readIntakeObservationBinding, readIntakeLearningQualification, attributeIntakeObservationEvents } from "./observation-binding";
@@ -1354,6 +1354,111 @@ it("revoked administrative markers cannot starve the next valid Gmail receipt",a
   expect(await reconcileHandledIntakeGmailRead(1)).toMatchObject({checked:1});
   const failures=await db.db.select().from(auditLogs).where(eq(auditLogs.action,"sav_intake_gmail_read_failed"));
   expect(failures).toHaveLength(1);expect(failures[0].entityId).toBe(messageId);
+});
+describe("SAV V1 unread: every inbound message, fair recovery and counter", () => {
+  const FAILED = "sav_intake_gmail_read_failed";
+  const administrative = async () => {
+    vi.stubEnv("SAV_RELEASE_STAGE","v0");vi.stubEnv("SAV_PILOT_MODE","false");
+    await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+    await db.db.update(savMailboxes).set({email:"contact@limova.ai"}).where(eq(savMailboxes.id,mailboxId));
+  };
+  const marker = async (thread: string, id: string) => db.db.insert(auditLogs).values({actorEmail:"ugo@limova.ai",action:SAV_EXTERNAL_COMPLETION,entityType:"sav_message",entityId:id,
+    technicalMetadata:{version:1,threadId:thread,batchId:randomUUID(),receivedBefore:new Date().toISOString(),reason:"processed_outside_studio"}});
+  const failures = async (id: string, count: number, minutesAgo: number) => { for (let n=0;n<count;n++) await db.db.insert(auditLogs).values({actorEmail:"studio-intake",action:FAILED,entityType:"sav_message",entityId:id,
+    technicalMetadata:{errorCode:"SAV_INTAKE_GMAIL_READ_SOURCE_NOT_READY"},createdAt:new Date(Date.now()-(minutesAgo+n)*60000)}); };
+  const poison = async (n: number) => {
+    const t=(await db.db.insert(savThreads).values({mailboxId,gmailThreadId:`old-${n}`,customerEmail:"customer@example.invalid"}).returning())[0];
+    const m=await message(t.id,new Date(Date.now()-600000+n)); await marker(t.id,m.id); return m;
+  };
+  const switchOn = () => { for (const [key,value] of Object.entries({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"})) vi.stubEnv(key,value); };
+  const newFailures = async (since: Date) => (await db.db.select().from(auditLogs).where(eq(auditLogs.action,FAILED))).filter(row => row.createdAt >= since);
+  it("marks every inbound message of a finished thread read, the handled one first, each with its own receipt", async () => {
+    await administrative();
+    await db.db.update(savThreads).set({gmailThreadId:"1a000"}).where(eq(savThreads.id,threadId));
+    await db.db.update(savMessages).set({gmailMessageId:"1a123"}).where(eq(savMessages.id,messageId));
+    const first=await message(threadId,new Date(Date.now()-120000)),second=await message(threadId,new Date(Date.now()-60000));
+    await db.db.update(savMessages).set({gmailMessageId:"1a121"}).where(eq(savMessages.id,first.id));
+    await db.db.update(savMessages).set({gmailMessageId:"1a122"}).where(eq(savMessages.id,second.id));
+    await externalMarker();
+    const unread=new Set(["1a121","1a122","1a123"]),writes:string[]=[];
+    const gmail:GmailRequest=async<T>(_mailbox:string,path:string,init?:RequestInit)=>{
+      if(path==="profile")return {emailAddress:"contact@limova.ai"} as T;
+      const id=path.split("/")[1].split("?")[0];
+      if(init?.method==="POST"){writes.push(id);unread.delete(id);return {} as T;}
+      return {id,threadId:"1a000",labelIds:["INBOX",...unread.has(id)?["UNREAD"]:[]]} as T;
+    };
+    const deps={env:()=>({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}),gmail};
+    expect(await syncHandledIntakeGmailRead(messageId,deps)).toEqual({confirmed:true,earlierMessages:2});
+    expect(writes).toEqual(["1a123","1a121","1a122"]);expect(unread.size).toBe(0);
+    const receipts=await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_INTAKE_GMAIL_READ));
+    expect(receipts.map(r=>r.entityId).sort()).toEqual([messageId,first.id,second.id].sort());
+    expect(receipts.filter(r=>r.entityId!==messageId).every(r=>r.technicalMetadata.coveredByMessageId===messageId)).toBe(true);
+    expect(await syncHandledIntakeGmailRead(messageId,deps)).toEqual({skipped:"already_confirmed"});expect(writes).toHaveLength(3);
+    expect(mutationsSent()).toHaveLength(0);
+  });
+  it("an earlier message is never marked read while the case is not finished", async () => {
+    await administrative();
+    await message(threadId,new Date(Date.now()-60000));
+    switchOn();
+    expect(await reconcileHandledIntakeGmailRead(5)).toMatchObject({checked:0,pending:0});
+    expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,FAILED))).toHaveLength(0);
+  });
+  it("recovery also reaches the earlier messages of a thread whose last message was already read", async () => {
+    await administrative();
+    const earlier=await message(threadId,new Date(Date.now()-60000)); // synthetic non-hex Gmail id: refused before any provider call
+    await externalMarker();
+    await db.db.insert(auditLogs).values({actorEmail:"studio-intake",action:SAV_INTAKE_GMAIL_READ,entityType:"sav_message",entityId:messageId,technicalMetadata:{version:1,threadId,alreadyRead:false}});
+    switchOn();
+    expect(await reconcileHandledIntakeGmailRead(5)).toMatchObject({checked:1,failed:1,pending:1});
+    const rows=await db.db.select().from(auditLogs).where(eq(auditLogs.action,FAILED));
+    expect(rows.map(r=>[r.entityId,r.technicalMetadata])).toEqual([[messageId,{errorCode:"SAV_INTAKE_GMAIL_READ_SOURCE_INVALID",scope:"earlier"}]]);
+    expect(earlier.gmailMessageId).not.toMatch(/^[a-f0-9]+$/);
+  });
+  it("old rows that keep failing never starve a newer finished row", async () => {
+    await administrative();
+    for (let n=0;n<3;n++) await failures((await poison(n)).id,2,6); // eligible again under the former 5-minute rule
+    await externalMarker();
+    switchOn();const since=new Date();
+    const result=await reconcileHandledIntakeGmailRead(1);
+    expect((await newFailures(since)).map(r=>r.entityId)).toEqual([messageId]);expect(result).toMatchObject({checked:1,pending:4});
+  });
+  it("rotates failing rows: the oldest failure goes first, a row in backoff waits", async () => {
+    await administrative();
+    const a=await poison(0),b=await poison(1);await failures(a.id,1,7);await failures(b.id,1,30);
+    await failures(messageId,3,5); // backoff 20 min: not eligible yet
+    await externalMarker();
+    switchOn();const since=new Date();
+    const result=await reconcileHandledIntakeGmailRead(5);
+    expect((await newFailures(since)).map(r=>r.entityId)).toEqual([b.id,a.id]);expect(result).toMatchObject({checked:2,pending:3});
+  });
+  it("caps a row after repeated failures: parked, retried once a day after the others, counted", async () => {
+    await administrative();
+    const parked=await poison(0);await failures(parked.id,SAV_INTAKE_GMAIL_READ_FAILURE_CAP,120);
+    await db.db.delete(savMessages).where(eq(savMessages.id,messageId));
+    switchOn();vi.mocked(console.info).mockClear();
+    const counter={pending:1,parked:1,checked:0,confirmed:0,earlierMessages:0,notReady:0,failed:0};
+    expect(await reconcileHandledIntakeGmailRead(5)).toEqual(counter);
+    expect(vi.mocked(console.info)).toHaveBeenCalledWith("sav_intake_gmail_read_pass",counter);
+    expect(await readIntakeGmailReadBacklog()).toEqual({state:"available",pending:1,parked:1});
+    await db.db.update(auditLogs).set({createdAt:new Date(Date.now()-25*3600000)}).where(eq(auditLogs.entityId,parked.id));
+    expect(await reconcileHandledIntakeGmailRead(5)).toMatchObject({checked:1,parked:1});
+  });
+  it("an agent pause records no failure in the recovery, so it never pushes rows towards the cap", async () => {
+    await administrative();await externalMarker();switchOn();
+    const values={key:"sav-agent-pause.v1:intake",status:"active",updatedAt:new Date(),cursor:encryptSavPayload({revision:"sav-agent-pause.v1",agent:"intake",level:"actions_paused",setBy:"ugo@limova.ai",setAt:new Date().toISOString(),reason:"synthetic"})};
+    await db.db.insert(savSyncState).values(values).onConflictDoUpdate({target:savSyncState.key,set:values});
+    try {
+      expect(await reconcileHandledIntakeGmailRead(5)).toEqual({skipped:"SAV_INTAKE_AGENT_ACTIONS_PAUSED"});
+      expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,FAILED))).toHaveLength(0);
+    } finally { await db.db.delete(savSyncState).where(eq(savSyncState.key,"sav-agent-pause.v1:intake")); }
+  });
+  it("the console counter is off with the switch and shows counts only", async () => {
+    expect(await readIntakeGmailReadBacklog()).toEqual({state:"off"});
+    await administrative();await externalMarker();switchOn();
+    const counter=await readIntakeGmailReadBacklog();
+    expect(counter).toEqual({state:"available",pending:1,parked:0});
+    expect(JSON.stringify(counter)).not.toMatch(/@|example|Synthetic/);
+  });
 });
 it("a launched human hold is effective locally and never occupies another dossier through legacy work", async () => {
   await recordIntakeLaunch({ mailboxId, receivedAfter: options.runtime.receivedAfter, createdAfter: options.runtime.createdAfter });

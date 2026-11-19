@@ -1,5 +1,5 @@
 import "server-only";
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, ne, sql, type SQL } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { auditLogs, savActions, savMailboxes, savMessages, savThreads, savIntakeConsole } from "@/db/schema";
 import { requestSavGmail } from "../gmail";
@@ -57,8 +57,17 @@ export async function syncHandledIntakeGmailRead(messageId: string, deps: { env?
   if (!await intakeConsoleInstalled(db)) return { skipped: "schema_absent" };
   const [message] = await db.select().from(savMessages).where(and(eq(savMessages.id, messageId), eq(savMessages.direction, "inbound")));
   if (!message) return { skipped: "message_missing" };
-  const [receipt] = await db.select({ id: auditLogs.id }).from(auditLogs).where(and(eq(auditLogs.action, SAV_INTAKE_GMAIL_READ), eq(auditLogs.entityType, "sav_message"), eq(auditLogs.entityId, message.id), eq(auditLogs.actorEmail, "studio-intake"))).limit(1);
-  if (receipt) return { skipped: "already_confirmed" };
+  // The other inbound messages of the same thread and mailbox are covered by the
+  // handled message's proof (evidence() requires it to be the latest inbound).
+  const earlier = await db.select({ id: savMessages.id, gmailMessageId: savMessages.gmailMessageId }).from(savMessages)
+    .where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.mailboxId, message.mailboxId), eq(savMessages.direction, "inbound"),
+      ne(savMessages.id, message.id), sql`${savMessages.gmailMessageId} is not null`))
+    .orderBy(asc(savEffectiveReceivedAt), asc(savMessages.id));
+  const confirmedIds = new Set((await db.select({ id: auditLogs.entityId }).from(auditLogs).where(and(eq(auditLogs.action, SAV_INTAKE_GMAIL_READ),
+    eq(auditLogs.entityType, "sav_message"), eq(auditLogs.actorEmail, "studio-intake"), inArray(auditLogs.entityId, [message.id, ...earlier.map(row => row.id)])))).map(row => row.id));
+  const handledConfirmed = confirmedIds.has(message.id);
+  const pendingEarlier = earlier.filter(row => !confirmedIds.has(row.id)).slice(0, EARLIER_MESSAGES_PER_CALL);
+  if (handledConfirmed && !pendingEarlier.length) return { skipped: "already_confirmed" };
   const evidence = async (): Promise<Record<string, string> | null> => {
     const handled = await getSavExternalCompletion(message);
     if (handled) return { administrativeId: handled.id };
@@ -91,51 +100,134 @@ export async function syncHandledIntakeGmailRead(messageId: string, deps: { env?
   if (!mailbox?.active || mailbox.email !== "contact@limova.ai" || !message.gmailMessageId) return { skipped: "source_invalid" };
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, message.threadId));
   if (!thread) return { skipped: "thread_missing" };
+  const guard = async () => { await authority(); if (!await evidence()) throw Error("SAV_INTAKE_GMAIL_READ_PROOF_CHANGED"); };
+  const markRead = (gmailMessageId: string) => markHandledGmailMessageRead({ mailboxEmail: mailbox.email, gmailMessageId, gmailThreadId: thread.gmailThreadId }, deps.gmail ?? requestSavGmail, guard);
+  let scope: "handled" | "earlier" = "handled", earlierMessages = 0;
   try {
-    const result = await markHandledGmailMessageRead({ mailboxEmail: mailbox.email, gmailMessageId: message.gmailMessageId, gmailThreadId: thread.gmailThreadId }, deps.gmail ?? requestSavGmail, async () => {
-      await authority(); if (!await evidence()) throw Error("SAV_INTAKE_GMAIL_READ_PROOF_CHANGED");
-    });
-    await db.insert(auditLogs).values({ actorEmail: "studio-intake", action: SAV_INTAKE_GMAIL_READ, entityType: "sav_message", entityId: message.id,
-      technicalMetadata: { version: 1, threadId: thread.id, ...proof, alreadyRead: result.alreadyRead } });
-    return { confirmed: true };
+    // The handled message first: an earlier message that cannot be read never delays it.
+    if (!handledConfirmed) {
+      const result = await markRead(message.gmailMessageId);
+      await db.insert(auditLogs).values({ actorEmail: "studio-intake", action: SAV_INTAKE_GMAIL_READ, entityType: "sav_message", entityId: message.id,
+        technicalMetadata: { version: 1, threadId: thread.id, ...proof, alreadyRead: result.alreadyRead } });
+    }
+    scope = "earlier";
+    for (const row of pendingEarlier) {
+      // Same checks as the handled message: exact mailbox, Gmail thread, never SENT/DRAFT, proof re-read before each write.
+      const result = await markRead(row.gmailMessageId!);
+      await db.insert(auditLogs).values({ actorEmail: "studio-intake", action: SAV_INTAKE_GMAIL_READ, entityType: "sav_message", entityId: row.id,
+        technicalMetadata: { version: 1, threadId: thread.id, ...proof, alreadyRead: result.alreadyRead, coveredByMessageId: message.id } });
+      earlierMessages++;
+    }
+    return earlierMessages ? { confirmed: true, earlierMessages } : { confirmed: true };
   } catch (error) {
     const errorCode = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_INTAKE_GMAIL_READ_RETRY_REQUIRED";
-    await db.insert(auditLogs).values({ actorEmail: "studio-intake", action: FAILED, entityType: "sav_message", entityId: message.id, technicalMetadata: { errorCode } });
-    return { confirmed: false, errorCode };
+    // Failures stay keyed on the handled message: it is the row the recovery selects, backs off and caps.
+    await db.insert(auditLogs).values({ actorEmail: "studio-intake", action: FAILED, entityType: "sav_message", entityId: message.id,
+      technicalMetadata: scope === "earlier" ? { errorCode, scope } : { errorCode } });
+    return { confirmed: false, errorCode, ...earlierMessages ? { earlierMessages } : {} };
   }
 }
 
-/** Recovery of read receipts only; the fast path is the targeted wake. */
+/** Failures counted since the row's last read receipt. Below the cap, the next
+ * attempt waits 5 min × 2^(failures-1); at the cap, once a day and after every
+ * other candidate. A row that is never ready can no longer starve the others. */
+export const SAV_INTAKE_GMAIL_READ_FAILURE_CAP = 8;
+const EARLIER_MESSAGES_PER_CALL = 10;
+
+/** Candidates of the recovery: the latest inbound message of a contact@ thread
+ * whose console state may be finished (the exact proof stays evidence()), and
+ * that lacks its own receipt or a receipt for an earlier inbound message. */
+function scoredReadCandidates(administrativeIds: string[]) {
+  const administrative = administrativeIds.length ? sql`m.id in (${sql.join(administrativeIds.map(id => sql`${id}::uuid`), sql`, `)})` : sql`false`;
+  return sql`with receipt as (
+      select a.entity_id, max(a.created_at) as at from public.audit_logs a
+      where a.entity_type='sav_message' and a.actor_email='studio-intake' and a.action=${SAV_INTAKE_GMAIL_READ} group by a.entity_id
+    ), candidate as (
+      select m.id, least(m.received_at,m.created_at) as received_at, r.at as confirmed_at
+      from sav.messages m left join receipt r on r.entity_id=m.id::text
+      where m.direction='inbound' and m.gmail_message_id is not null
+        and exists(select 1 from sav.mailboxes b where b.id=m.mailbox_id and b.email='contact@limova.ai' and b.active)
+        and m.id=(select l.id from sav.messages l where l.thread_id=m.thread_id and l.direction='inbound' order by least(l.received_at,l.created_at) desc,l.created_at desc,l.id desc limit 1)
+        and (${administrative} or exists(select 1 from sav.intake_console c where c.message_id=m.id and c.epoch=c.projected_epoch and (c.status='qualified_other' and c.view='other' or c.status='acknowledgement_only' and c.view='completed' or c.status in ('followup_pending','followup_partial','followup_started','not_applicable_sensitive','summary_finished'))))
+        and (r.at is null or exists(select 1 from sav.messages e where e.thread_id=m.thread_id and e.mailbox_id=m.mailbox_id and e.direction='inbound' and e.id<>m.id
+          and e.gmail_message_id is not null and not exists(select 1 from receipt x where x.entity_id=e.id::text)))
+    ), failure as (
+      select a.entity_id, count(*)::int as n, max(a.created_at) as last_at from public.audit_logs a join candidate c on c.id::text=a.entity_id
+      where a.entity_type='sav_message' and a.action=${FAILED} and (c.confirmed_at is null or a.created_at>c.confirmed_at) group by a.entity_id
+    ), scored as (
+      select c.id, c.received_at, c.confirmed_at is not null as backfill, coalesce(f.n,0)::int as failures, f.last_at
+      from candidate c left join failure f on f.entity_id=c.id::text
+    )`;
+}
+type Executor = { execute: (query: SQL) => Promise<unknown> };
+async function rowsOf<T>(db: Executor, query: SQL) {
+  const result = await db.execute(query);
+  return (Array.isArray(result) ? result : (result as { rows: T[] }).rows) as T[];
+}
+async function readBacklog(db: Executor, administrativeIds: string[]) {
+  const [row] = await rowsOf<{ pending: number | string; parked: number | string }>(db, sql`${scoredReadCandidates(administrativeIds)}
+    select count(*)::int as pending, count(*) filter (where failures>=${SAV_INTAKE_GMAIL_READ_FAILURE_CAP})::int as parked from scored`);
+  return { pending: Number(row?.pending ?? 0), parked: Number(row?.parked ?? 0) };
+}
+
+/** Console counter: counts only, no address, subject or identifier. */
+export async function readIntakeGmailReadBacklog(): Promise<{ state: "off" } | { state: "unavailable" } | { state: "available"; pending: number; parked: number }> {
+  if (process.env.SAV_INTAKE_GMAIL_MARK_READ !== "on") return { state: "off" };
+  try {
+    const db = requireDb();
+    if (!await intakeConsoleInstalled(db)) return { state: "unavailable" };
+    const administrativeIds = await listSavExternalCompletionMessageIds(db, true);
+    return { state: "available", ...await db.transaction(async tx => {
+      await tx.execute(sql`select set_config('statement_timeout','3s',true)`);
+      return readBacklog(tx, administrativeIds);
+    }, { accessMode: "read only" }) };
+  } catch { return { state: "unavailable" }; }
+}
+
+/** Recovery of read receipts only; the fast path is the targeted wake.
+ * Fair order: never-tried rows first, then the oldest failure (rotation); rows
+ * whose handled message is already read (earlier messages only) after new ones;
+ * capped rows last, once a day. One counter log line per pass, counts only. */
 export async function reconcileHandledIntakeGmailRead(limit = 3, deadlineMs = Date.now() + 30_000) {
   if (process.env.SAV_INTAKE_GMAIL_MARK_READ !== "on") return { skipped: "off" };
   if (!await intakeConsoleInstalled()) return { skipped: "schema_absent" };
-  const administrativeIds = await listSavExternalCompletionMessageIds(requireDb(), true);
-  const administrative = administrativeIds.length ? sql`${savMessages.id} in (${sql.join(administrativeIds.map(id => sql`${id}::uuid`), sql`, `)})` : sql`false`;
-  const rows = await requireDb().select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.direction, "inbound"),
-    sql`${savMessages.gmailMessageId} is not null`,
-    sql`exists(select 1 from sav.mailboxes b where b.id=${savMessages.mailboxId} and b.email='contact@limova.ai' and b.active)`,
-    sql`${savMessages.id}=(select m.id from sav.messages m where m.thread_id=${savMessages.threadId} and m.direction='inbound' order by least(m.received_at,m.created_at) desc,m.created_at desc,m.id desc limit 1)`,
-    sql`(${administrative} or exists(select 1 from sav.intake_console c where c.message_id=${savMessages.id} and c.epoch=c.projected_epoch and (c.status='qualified_other' and c.view='other' or c.status='acknowledgement_only' and c.view='completed' or c.status in ('followup_pending','followup_partial','followup_started','not_applicable_sensitive','summary_finished'))))`,
-    sql`not exists(select 1 from public.audit_logs a where a.entity_type='sav_message' and a.entity_id=${savMessages.id}::text and a.actor_email='studio-intake' and a.action=${SAV_INTAKE_GMAIL_READ})`,
-    sql`not exists(select 1 from public.audit_logs a where a.entity_type='sav_message' and a.entity_id=${savMessages.id}::text and a.action=${FAILED} and a.created_at>now()-interval '5 minutes')`
-  )).orderBy(asc(savEffectiveReceivedAt), asc(savMessages.id)).limit(Math.max(1, Math.min(20, limit)));
-  const results = [];
+  const db = requireDb();
+  // Paused: no attempt and no failure marker, so a pause never pushes rows towards the cap.
+  const paused = savAgentPauseCode(await readSavAgentPause(db));
+  if (paused) return { skipped: paused };
+  const administrativeIds = await listSavExternalCompletionMessageIds(db, true);
+  const cap = SAV_INTAKE_GMAIL_READ_FAILURE_CAP;
+  const backlog = await readBacklog(db, administrativeIds);
+  const rows = await rowsOf<{ id: string }>(db, sql`${scoredReadCandidates(administrativeIds)}
+    select id from scored
+    where failures=0 or last_at < now() - case when failures>=${cap} then interval '24 hours'
+      else least(interval '24 hours', interval '5 minutes' * power(2, least(failures-1, 12))) end
+    order by failures>=${cap}, backfill, last_at asc nulls first, received_at asc, id asc
+    limit ${Math.max(1, Math.min(20, limit))}`);
+  const counter = { pending: backlog.pending, parked: backlog.parked, checked: 0, confirmed: 0, earlierMessages: 0, notReady: 0, failed: 0 };
   for (const row of rows) {
     if (Date.now() + 1000 >= deadlineMs) break;
     const gmail: GmailRequest = (mailbox, path, init) => requestSavGmail(mailbox, path, { ...init, signal: AbortSignal.timeout(Math.max(1, Math.min(10_000, deadlineMs - Date.now()))) });
     try {
       const result = await syncHandledIntakeGmailRead(row.id, { gmail });
+      if ("skipped" in result && String(result.skipped).startsWith("SAV_INTAKE_AGENT")) break; // pause set during the pass: no marker
+      counter.checked++;
       if ("skipped" in result && !["off", "already_confirmed"].includes(result.skipped!)) {
-        await requireDb().insert(auditLogs).values({ actorEmail: "studio-intake", action: FAILED, entityType: "sav_message", entityId: row.id,
+        counter.notReady++;
+        await db.insert(auditLogs).values({ actorEmail: "studio-intake", action: FAILED, entityType: "sav_message", entityId: row.id,
           technicalMetadata: { errorCode: "SAV_INTAKE_GMAIL_READ_SOURCE_NOT_READY", reason: result.skipped! } });
       }
-      results.push(result);
+      if ("confirmed" in result) {
+        if (result.confirmed) counter.confirmed++; else counter.failed++;
+        counter.earlierMessages += result.earlierMessages ?? 0;
+      }
     }
     catch {
-      await requireDb().insert(auditLogs).values({ actorEmail: "studio-intake", action: FAILED, entityType: "sav_message", entityId: row.id,
+      counter.checked++; counter.failed++;
+      await db.insert(auditLogs).values({ actorEmail: "studio-intake", action: FAILED, entityType: "sav_message", entityId: row.id,
         technicalMetadata: { errorCode: "SAV_INTAKE_GMAIL_READ_SOURCE_UNAVAILABLE" } });
-      results.push({ confirmed: false });
     }
   }
-  return { checked: results.length, confirmed: results.filter(x => "confirmed" in x && x.confirmed).length };
+  console.info("sav_intake_gmail_read_pass", counter);
+  return counter;
 }
