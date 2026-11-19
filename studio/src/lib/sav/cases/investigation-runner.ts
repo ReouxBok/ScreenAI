@@ -71,6 +71,8 @@ export type CaseInvestigationModelRequest = {
   feedback: Array<Pick<CaseDecisionRejection, "code" | "label" | "path" | "detail"> & { kind: CaseDecisionRefusalKind }>;
   /** `resolution_check` only: the requests the decision closes, with the quoted customer words. */
   closure: CaseClosureItem[];
+  /** SAV-96 B: set only by the first-mail path (a HubSpot ticket with no thread yet): the decision prompt adds the first-mail skill. Absent: unchanged. */
+  firstMail?: true;
 };
 
 export type CaseInvestigationModelResult =
@@ -268,6 +270,12 @@ export type CaseInvestigationPorts = {
   readScopeCards?(refs: KnowledgeRef[]): Promise<SavRetrievalCandidate[]>;
   /** The model transport's own preflight (no network, no cost): used only to drop out-of-scope cards before a request too large to send. */
   preflight?(request: CaseInvestigationModelRequest): CaseModelTransportDiagnostic | null;
+  /**
+   * SAV-96 B: the input of a case opened from a HubSpot ticket with no thread (`threadless-first-mail.ts`), or null when it has none any more.
+   * Given, it REPLACES the customer-mail input (`latestInvestigationInput`) and the "admission names the latest mail" check: the ticket's own
+   * stored event is the input, its text the only customer text. Absent: unchanged.
+   */
+  threadlessInput?(snapshot: CaseSnapshot, events: readonly CaseEvent[]): Readonly<{ inputKey: string; sourceRef: SourceRef }> | null;
 };
 
 /**
@@ -347,7 +355,9 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
   // contract stops admission writes too, so the case stays visibly stale until the pause ends.
   // Pilot (review d70a, contract A-B): an open gate on an admission decided for an older mail (a customer return that copied the
   // former qualification) is stale too; the latest mail is qualified again, its own words deciding, before anything answers it.
-  const pilotStale = Boolean(ports.accessScope) && gate.open && !caseAdmissionNamesLatestInput(read.snapshot, read.events);
+  const namesLatest = (snapshot: CaseSnapshot, events: readonly CaseEvent[]) =>
+    ports.threadlessInput ? ports.threadlessInput(snapshot, events) !== null : caseAdmissionNamesLatestInput(snapshot, events);
+  const pilotStale = Boolean(ports.accessScope) && gate.open && !namesLatest(read.snapshot, read.events);
   const reevaluate = ((!gate.open && gate.reason === "admission_stale" && gate.detail === "input_newer") || pilotStale) && !actionsPaused;
   // Ugo (31/10): the ticket's owner is read before anything is done on an agent case, the re-evaluation write included.
   // Nothing is written on a stop: taking the case from the agent is the CRM observation's.
@@ -375,14 +385,15 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
   }
   const { snapshot, events } = read, caseVersion = snapshot.version;
   if (!gate.open) return { status: "skipped", caseId, caseVersion, reason: gate.reason, ...(gate.detail === undefined ? {} : { detail: gate.detail }), modelCalls: 0 };
-  const inputKey = latestInvestigationInput(events);
+  const threadless = ports.threadlessInput ? ports.threadlessInput(snapshot, events) : null;
+  const inputKey = ports.threadlessInput ? threadless?.inputKey ?? null : latestInvestigationInput(events);
   if (!inputKey) return { status: "skipped", caseId, caseVersion, reason: "no_customer_input", modelCalls: 0 };
   // Pilot ACCÈS (ROOT 3/11): `access` is the only admissible family, whatever the policy admits, and its sources are never
   // widened; then no approved scope for the policy in force, no search (the scope is the proof its answers stay low risk).
   let accessScope: CaseBlockScope | undefined;
   let blockScopes: CaseDecisionBlockScopes | undefined;
   if (ports.accessScope) {
-    if (!caseAdmissionNamesLatestInput(snapshot, events)) return { status: "skipped", caseId, caseVersion, reason: "admission_not_current_input", modelCalls: 0 };
+    if (!namesLatest(snapshot, events)) return { status: "skipped", caseId, caseVersion, reason: "admission_not_current_input", modelCalls: 0 };
     // Treatment blocks (11/11): a case whose open requests all belong to ONE other block is checked against that block's own scope, of its
     // own family. Anything else (Access, no request, a request without a block) keeps the Access pilot's checks, unchanged.
     // SAV-92 (15/11): open requests of SEVERAL blocks (each one named by its admission) are decided together, each block on its own scope, all read now.
@@ -533,7 +544,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
     // the run's own calls and proposal; a closed code, never the revision ids.
     const knowledgeChanged = (moved: CaseInvestigationReport) =>
       wait("knowledge_changed", { problem: moved.status === "knowledge_requeue" && moved.currentRevision === null ? "revision_unreadable" : "revision_moved" });
-    const customerTexts = await ports.customerTexts(caseId, events.filter(event => event.direction === "customer_inbound").map(event => event.sourceRef));
+    const customerTexts = await ports.customerTexts(caseId, threadless ? [threadless.sourceRef] : events.filter(event => event.direction === "customer_inbound").map(event => event.sourceRef));
     let built = buildCaseDecisionContext({ snapshot, events, knowledge, coverage, locale: ports.scope.locale, audience: ports.scope.audience, admission, customerTexts });
     if (!built.ok) {
       // Never a silent return: the case waits for a person with the closed reason code, and no generation call is made.

@@ -127,7 +127,7 @@ export function pilotProvenanceGate(deps: PilotProvenanceDeps) {
   return async (proposal: CaseReplyProposal, context?: Readonly<{ basis?: string | null }>): Promise<string | null> => {
     try {
       const humanCorrection = context?.basis === CASE_REPLY_STUDIO_CORRECTION_BASIS;
-      if (proposal.ticketSource) return await readThreadlessReplyProvenance(proposal, deps.env?.() ?? process.env, humanCorrection);
+      if (proposal.ticketSource) return await readThreadlessReplyProvenance(proposal, deps.env?.() ?? process.env, humanCorrection, deps);
       const read = await readPilotReplyProvenance(proposal, deps, { humanCorrection });
       return read.status === "proven" ? null : [...read.reasons].sort().join(",");
     } catch { return "decision_unreadable"; }
