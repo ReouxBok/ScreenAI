@@ -52,7 +52,8 @@ const progressSchema = z.object({
   recordedOn: count.nullable(),
 }).strict();
 const storedSchema = z.object({
-  kind: z.literal(SAV_CASE_INVESTIGATION_RECORD_KIND), inputKey: z.string().regex(/^(in|back):[A-Za-z0-9._@<>=+-]{1,200}$/),
+  kind: z.literal(SAV_CASE_INVESTIGATION_RECORD_KIND), // SAV-96 B: `ticket:<event id>`, the stored event of a HubSpot ticket with no thread (its first mail).
+  inputKey: z.string().regex(/^(in|back|ticket):[A-Za-z0-9._@<>=+-]{1,200}$/),
   progress: progressSchema, decision: z.record(z.string(), z.unknown()).nullable(),
 }).strict();
 

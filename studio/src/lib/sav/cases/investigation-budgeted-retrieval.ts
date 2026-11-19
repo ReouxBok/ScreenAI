@@ -34,7 +34,8 @@ export const SAV_CASE_KNOWLEDGE_EMBEDDING_PURPOSE = "knowledge_embedding";
 /** The index's vector size (SAV_RETRIEVAL_EMBEDDING_DIMENSION, request-retrieval-db.ts): no port may ask for more. */
 export const SAV_CASE_KNOWLEDGE_MAX_DIMENSION = 768;
 /** The input keys the runner makes: `in:` or `back:` and the case event's UUID. The only ones a paid search accepts. */
-export const SAV_CASE_INPUT_KEY = /^(in|back):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** SAV-96 B: `ticket:<event UUID>` too, a first mail's input. */
+export const SAV_CASE_INPUT_KEY = /^(in|back|ticket):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** The first bound a search breaks, or null. Pure: no read, no cost. */
 export function caseKnowledgeRequestProblem(input: { inputKey: string; queries: readonly unknown[]; limit: number; dimension: number }): CaseKnowledgeRequestProblem | null {

@@ -1,4 +1,5 @@
 import { caseAskBeforeHandoffEnabled, SAV_CASE_ASK_BEFORE_HANDOFF_INSTRUCTION } from "./ask-before-handoff";
+import { firstMailSkillInstruction } from "./first-mail/first-mail-skill";
 import { casePromptCompactOn, compactCaseKnowledgeContent, selectCaseKnowledgePassages } from "./investigation-prompt-compact";
 import { caseDecisionBodyBreakdown, caseGeminiDecisionWire, type CaseDecisionBodyBreakdown } from "./investigation-context-budget";
 import { caseDecisionGenerationConfig, caseDecisionPromptRevision, caseProviderJsonSchema, readCaseDecisionGeneration, type CaseDecisionGenerationConfig, type CaseDecisionGenerationProblem } from "./investigation-decision-generation";
@@ -205,6 +206,8 @@ export function caseInvestigationPrompt(request: CaseInvestigationModelRequest, 
     ...(request.customerContext?.evidence ? [SAV_CASE_ATTACHMENTS_INSTRUCTION] : []),
     ...(caseAskBeforeHandoffEnabled() && request.purpose !== "resolution_check" ? [SAV_CASE_ASK_BEFORE_HANDOFF_INSTRUCTION] : []),
     ...(options.accessSkill && request.purpose !== "resolution_check" ? [SAV_CASE_ACCESS_SKILL_DECISION_INSTRUCTION] : []),
+    // SAV-96 B: the first mail of a ticket without a thread (set only by that path); every other request keeps its exact prompt.
+    ...(request.firstMail && request.purpose !== "resolution_check" ? [firstMailSkillInstruction()] : []),
     ...(request.purpose !== "resolution_check" ? [SAV_CASE_REPLY_LAYOUT_INSTRUCTION] : []),
     request.purpose === "resolution_check" ? "Objet : vérifier si les demandes listées dans « closure » sont résolues, d'après les mots du client cités." : "Objet : la prochaine action sur les demandes ouvertes.",
     `Le champ caseVersion vaut ${request.snapshot.version}.`,

@@ -6,8 +6,9 @@ import { accessSkillWireAnswer } from "../src/lib/sav/cases/access-skill/access-
  */
 
 export const ACCESS_SKILL_TEST_POLICY = { revision: "synthetic-skill", approvedBy: "20000000-0000-4000-8000-000000000097", approvedAt: "2026-11-18T00:00:00Z",
-  transport: { model: "synthetic-model", embeddingModel: "synthetic-embedding", priceExpiresAt: "2027-06-01T00:00:00Z", maxInputTokens: 131072, maxOutputTokens: 1024, maxInputBytes: 100_000,
+  transport: { model: "synthetic-model", embeddingModel: "synthetic-embedding", priceExpiresAt: new Date(Date.now() + 365 * 86_400_000).toISOString(), maxInputTokens: 131072, maxOutputTokens: 1024, maxInputBytes: 100_000,
     embeddingMaxInputTokens: 2048, embeddingMaxTexts: 3, embeddingMaxTextBytes: 1024 },
+  // The price pin stays valid one year after the run (a fixed date would turn every test red the day it passes).
   // One micro-dollar per million tokens: a reservation of 1 covers a full window, so the whole corpus fits the shared caps.
   model: { dailyCapMicroUsd: 1_000_000, reserveMicroUsdPerCall: 1, microUsdPerMillionInputTokens: 1, microUsdPerMillionOutputTokens: 1 },
   embedding: { dailyCapMicroUsd: 1_000_000, reserveMicroUsdPerCall: 1, microUsdPerMillionInputTokens: 1 } };
