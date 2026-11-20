@@ -161,8 +161,8 @@ describe("allumé : 0 effet, un seul paiement par mail", () => {
     await v1Mail({ receivedAt: new Date(AT.getTime() - 25 * 3_600_000) });
     expect(await pass(ENV(), network())).toMatchObject({ ran: 0, stoppedBy: "no_mail" });
   });
-  it("PS sensible : arrêté par le filet, 0 appel payé, ligne rangée « team_sensitive »", async () => {
-    await v1Mail({ body: "Bonjour, souci de connexion.\nCordialement\nJean\nPS : je souhaite un remboursement" });
+  it("mail trop long pour être lu en entier : arrêté par le filet (arrêt technique, N2), 0 appel payé, ligne rangée « team_sensitive »", async () => {
+    await v1Mail({ body: `Bonjour, souci de connexion.\n${"détail ".repeat(1_200)}` });
     const net = network(), result = await pass(ENV(), net);
     expect(result).toMatchObject({ ran: 1, outcomes: { team_sensitive: 1 } });
     expect(net.calls).toEqual([]);
@@ -274,7 +274,7 @@ describe("plafonds et temps", () => {
 
 describe("rapport", () => {
   it("agrégats : décisions, refus par motif, sensibles arrêtés, coût, durée, octets, fiches manquantes", async () => {
-    await v1Mail(); await v1Mail({ body: "Bonjour, je veux résilier." });
+    await v1Mail(); await v1Mail({ body: `Bonjour, je veux résilier.\n${"détail ".repeat(1_200)}` });
     await pass(ENV(), network({ decide: smartGoodDecision({ reply: "Bonjour,\n\nInscrivez-vous chez Yonos.\n\nBelle journée.", facts: [] }) }));
     const report = aggregateSmartShadow(await readSmartShadowRows()).support;
     expect(report).toMatchObject({ mails: 2, outcomes: { handoff: 1, team_sensitive: 1 }, sensitiveStopped: { net: 1, understand: 0 }, corrected: 1, refusedAfterCorrection: 1 });

@@ -1,25 +1,21 @@
 import { containsPromptInjection } from "../../policy";
-import { accessSkillKernelHits } from "../access-skill/access-skill-kernel";
 import { maskCaseCustomerText } from "../investigation-customer-context";
 import { normalizeSensitiveText } from "../sensitive-words";
 
 /*
- * Agent SAV intelligent, lot D1, step 0 (20/11, calibrated the same evening): the safety net WITHOUT any model. Pure: no model, network, database or clock.
+ * Agent SAV intelligent, lot D1, step 0 (20/11; N2 the same night, Ugo: « le mini-filet doit être smart mais pas restrictif »): the net WITHOUT
+ * any model before the first call. Pure: no model, network, database or clock.
  *
- * Ugo's base stays absolute: a REAL request about cancellation, refund, billing, payment, subscription, personal data or account identity goes
- * WHOLE to the team, 0 paid call, zero tolerance. What changed (prod, 19/11: 15 mails out of 15 stopped as sensitive or handed over, none
- * answered): a WORD alone no longer stops the mail. Limova's customers run their own business with their Assistants (their invoices, their
- * prices, their quotes), and mails carry footers (« pour vous désabonner », RGPD notices), signatures (« Service facturation ») and quoted
- * history. So the net reads the INTEGRAL raw text (subject, body, signature, PS, quoted history: nothing is cut before it reads) and:
- *   - stops on a kernel phrase of the Access skill (résilier, rembourser, désabonner, supprimer mon compte, RGPD, opposition bancaire...)
- *     anywhere, quoted history and PS included, EXCEPT on a boilerplate line (legal notice, newsletter unsubscribe footer, company registration);
- *   - stops on a request form about the customer's OWN Limova bill or subscription (« ma facture », « cette facture », « j'ai été prélevé »,
- *     « double prélèvement », « changer d'offre », « mon abonnement », « combien coûte »...) in the customer's own new words (quoted history
- *     removed, boilerplate removed, signature labels removed; a PS or a sentence written after the signature still counts);
- *   - stops on a sensitive topic word in the SUBJECT when the body is too thin to say what is asked (« Question tarif » / « Bonjour »);
- *   - stops on an instruction aimed at the model, an empty mail, or a mail too long to be read whole;
- *   - otherwise lets the mail go to the model's reading (the second barrier), with closed `hint:*` codes for the words it saw but did not stop on
- *     (measured in the shadow). The server's checks on the reply (`kernel_in_reply`, promises) and the counter-read stay the third barrier.
+ * It no longer stops a mail on its WORDS (calibrated word lists stopped 8 ordinary mails out of 10 in the shadow: invoices, prices,
+ * subscriptions are part of the customers' own business). What is left before the model is TECHNICAL only:
+ *   - an empty mail, or a mail too long to be read whole (never given to the model in part);
+ *   - an instruction aimed at the model (`smartInstructionToModel`): a security stop, not a judgment of the subject. Since the N2 review it
+ *     is the shared detector, except that its bare words (« system prompt ») need an order addressed to the assistant: a customer who
+ *     reports the LABEL « system prompt » shown by their Assistant is not stopped;
+ *   - the cleaning of quoted history (`smartFreshText`) and the masking of personal data (`smartMask`).
+ * Sensitivity and anger are the MODEL's judgment (the reading: `sensible`, `sensitiveFamilies`, `upset`), with zero tolerance: any doubt
+ * goes to the team. After the model, the server reads only OUR reply (`smart-checks.ts`, `sensitive_commitment`), then the counter-read.
+ * `hints`: closed `hint:*` codes for topic words seen in the mail, informational only (shadow report), never a stop.
  */
 
 /** A mail longer than this (masked, characters) is never given to the model in part: the whole mail goes to the team. */
@@ -46,26 +42,7 @@ const isBoilerplate = (line: string) => BOILERPLATE.test(line) && !FIRST_PERSON.
 /** A line that speaks (first person, a request, a question): never a mere signature label. A PS always speaks. */
 const SPEAKS = /(?:^p\.? ?s\.?\b|\?|\b(?:je|j'|nous|on|vous|mon|ma|mes|notre|nos|pouvez|pourriez|voudrais|veux|souhaite|merci de|svp|stp)\b)/;
 
-/** Requests about the customer's OWN Limova bill, payment or subscription (normalized text: no accent, lower case). */
-const OWN_BILLING_REQUESTS: ReadonlyArray<readonly [string, RegExp]> = [
-  ["finance", /\b(?:ma|cette|votre|derniere) (?:derniere |premiere )?factur\w*\b(?! (?:de|a|aux|pour) (?:mes|nos) clients)|\bfactur\w* (?:limova|de limova|du mois|de l'abonnement|de mon abonnement)\b/],
-  // Getting a copy of one's invoices (« où télécharger mes factures ? », « la facture de novembre »), the invoices of the customer's OWN clients aside.
-  ["finance", /\b(?:mes|nos) factur\w*\b(?! (?:a|aux|de|des|pour) (?:mes |nos )?(?:clients|fournisseurs))|\b(?:telecharg|recuper|retrouv|obten|recevoir|consult|acced|trouv|voir|avoir)\w* (?:\w+ ){0,2}(?:la|les|une) factur\w*\b(?! (?:a|aux|de|des|pour) (?:mes |nos )?(?:clients|fournisseurs))|\bfactur\w* (?:de |d'|du mois (?:de |d'))?(?:janvier|fevrier|mars|avril|mai|juin|juillet|aout|septembre|octobre|novembre|decembre)\b/],
-  ["finance", /\b(?:me |m'|nous )(?:envoyer|renvoyer|transmettre|faire parvenir|redonner)\w* (?:\w+ ){0,3}factur\w*/],
-  ["finance", /\b(?:contest\w*|errone\w*|erreur (?:de|sur (?:la|ma)) factur\w*|double (?:prelevement|paiement|debit|facturation)|(?:preleve|debite|facture)\w* (?:deux|2|plusieurs) fois|trop (?:paye|preleve|facture))\b/],
-  ["finance", /\b(?:j'ai ete|on m'a|vous m'avez|nous avons ete|j'ai encore ete) (?:preleve|debite|facture)\w*|\bprelevement\w*\b|\bcarte bancaire\b|\blitige\b/],
-  ["finance", /\bcombien (?:ca |cela )?cout\w*|\bquel(?:le)? (?:est (?:le|votre) )?(?:prix|tarif)\b|\b(?:vos|votre) (?:tarifs?|prix)\b|\b(?:payer|paye|paie) (?:limova|l'abonnement|mon abonnement|ma facture)\b/],
-  ["subscription", /\b(?:(?:mon|notre|votre|cet|son) |l')abonnement\b|\bessai gratuit\b|\bforfait\b|\b(?:changer|changement|modifier|passer|upgrade|downgrade|augmenter|reduire|baisser)\w* (?:\w+ ){0,3}(?:d'offre|d'abonnement|de forfait|de formule|(?:mon|l'|d'|notre|la|le|une) ?(?:offre|abonnement|forfait|formule|plan))\b/],
-  ["cancellation", /\b(?:resili\w*|desabonn\w*|annuler (?:mon|l'|notre) (?:abonnement|compte|offre)|supprimer (?:mon|notre) compte|fermer (?:mon|notre) compte)\b/],
-  // Astra counter-review (20/11): the same intents in other words. Renewal, leaving, ending the contract.
-  ["cancellation", /\b(?:annul|arret|stop|desactiv|suspend|bloqu|empech)\w* (?:\w+ ){0,2}(?:renouvellement|reconduction)\b|\b(?:renouvellement|reconduction) (?:automatique|tacite)\b|\bplus (?:etre|rester) (?:client|abonne)\w*\b|\b(?:mettre|met|mis) fin (?:a|au) (?:\w+ )?(?:contrat|engagement|compte|abonnement|collaboration)\b|\b(?:rompre|terminer|arreter|cloturer|stopper) (?:mon|notre|le|ce) (?:contrat|engagement)\b|\bquitter limova\b/],
-  // Paid twice, getting the difference back, giving back a debit, a duplicate invoice, monthly/annual payment.
-  ["finance", /\bpaye\w* (?:\w+ ){0,3}(?:deux|2|plusieurs) fois\b|\brecuper\w* (?:la difference|mon argent|notre argent|le trop|la somme|le montant)|\b(?:restitu|rend|recredit|reverse|rembours)\w* (?:\w+ ){0,3}(?:\d+(?:[.,]\d+)? ?(?:€|euros?|eur)\b|debit\w*|prelev\w*|montant|somme|argent)|\b\d+(?:[.,]\d+)? ?(?:€|euros?|eur) (?:\w+ ){0,2}(?:debite|preleve|facture|paye|encaisse)\w*|\bduplicata\b/],
-  ["subscription", /\b(?:paiement|abonnement|formule|facturation|offre|plan) (?:mensuel|annuel)\w*|\b(?:du|le) (?:mensuel|annuel) (?:a|au|vers|en) (?:l')?(?:paiement )?(?:annuel|mensuel)\b|\bpasser (?:\w+ ){0,3}(?:au |a l'|en )?(?:paiement )?(?:mensuel|annuel)\b/],
-  ["rights", /\b(?:rgpd|donnees personnelles|droit d'acces|suppression de (?:mes|nos) donnees)\b/],
-  ["identity", /\b(?:changer (?:le|de) (?:proprietaire|titulaire)|transferer (?:le|mon) compte|usurp\w*|pirat\w*|compte (?:vole|hacke))\b/],
-];
-/** Topic words: in the customer's new request (subject and fresh text, ordinary uses removed) they send the mail to the team, point. */
+/** Topic words: informational hints only (never a stop since N2). */
 const TOPIC_WORDS: ReadonlyArray<readonly [string, RegExp]> = [
   ["finance", /\b(?:rembours\w*|factur\w*|paiement\w*|prelev\w*|debit\w*|impaye\w*|tarif\w*|prix|avoirs? (?:sur (?:ma|la|votre|notre|cette) facture|commercial)|un avoir\b|litige)\b/],
   ["subscription", /\b(?:abonnement\w*|offre|forfait|essai gratuit|upgrade|downgrade)\b/],
@@ -73,23 +50,6 @@ const TOPIC_WORDS: ReadonlyArray<readonly [string, RegExp]> = [
   ["rights", /\b(?:rgpd|donnees personnelles)\b/],
   ["identity", /\b(?:proprietaire|titulaire|pirat\w*|usurp\w*)\b/],
 ];
-
-/**
- * The customer's ORDINARY business, decided by the net itself, never by the model (Astra, third review): their own clients' invoices, automating
- * or chasing invoices or quotes, the billing or the prices of their clients, products or services. These spans are removed before the topic
- * words are read; anything left is a sensitive hint and goes to the team.
- */
-const CLIENTS = String.raw`(?:mes |nos |ses |leurs |les |des )?(?:clients?|fournisseurs?|patients?|eleves?|adherents?|prospects?|locataires?)`;
-const ORDINARY_USES: readonly RegExp[] = [
-  new RegExp(String.raw`\b(?:les |des |ses |leurs |mes |nos |la |une )?(?:factur|devis|paiement|reglement|impaye|tarif|prix|relance)\w*(?: \w+){0,2} (?:de|d'|a|aux|des|pour|par|chez) ${CLIENTS}`, "g"),
-  new RegExp(String.raw`\b(?:automatis|relanc|gener|cre|edit|prepar|rempli|suivr|suiv|classe|archiv|numerot|envoie|envoient|envoyer a)\w* (?:\w+ ){0,3}(?:factur|devis|relance)\w*`, "g"),
-  /\b(?:mon|son|l'|cet|un) assistant (?:\w+ ){0,6}(?:factur|devis|tarif|prix)\w*/g,
-  /\b(?:prix|tarifs?) (?:de |des |d')(?:mes |nos )?(?:prestations?|produits?|services?|articles?|chambres?|menus?|seances?|cours)\b/g,
-  /\bgrille tarifaire\b/g,
-];
-/** Sentences of a normalized text (end punctuation or a new line); decimals such as « 49.90 » are not cut. */
-const smartSentences = (text: string) => text.split(/(?<!\d)[.!?;]+|[.!?;]+(?!\d)|\n+/).map(part => part.trim()).filter(Boolean);
-const withoutOrdinaryUses = (text: string) => ORDINARY_USES.reduce((value, pattern) => value.replace(pattern, " "), text);
 
 /** The customer's own new words: quoted history removed, boilerplate lines removed, signature labels removed (a PS or a speaking line kept). */
 export function smartFreshText(body: string): string {
@@ -107,29 +67,35 @@ export function smartFreshText(body: string): string {
   return kept.join("\n");
 }
 
-/** Every line of the integral text except boilerplate (kernel phrases are read there, quoted history included). */
-const withoutBoilerplate = (text: string) => String(text ?? "").split(/\r?\n/).filter(line => !isBoilerplate(norm(line))).join("\n");
+/**
+ * Astra, N2 review (P2): the shared detector (`containsPromptInjection`) also stops on the BARE words « system prompt », « developer message »
+ * or « jailbreak », so a customer who reports that label shown by their Assistant went to the team. Here those bare words count only with an
+ * order addressed to the assistant (normalized text). The other patterns of the shared detector are kept as they are: never broader than it.
+ */
+const BARE_LABELS = /system prompt|developer message|jailbreak/gi;
+const ORDER_TO_MODEL: readonly RegExp[] = [
+  /\b(?:revele[sz]?|devoile[sz]?|montre[sz]?-moi|affiche[sz]?-moi|donne[sz]?-moi|repete[sz]?|recopie[sz]?|ecris-moi)\b(?: \w+){0,2} (?:ton|tes|votre|vos) (?:prompt|system prompt|consignes|instructions|regles)\b/,
+  /\b(?:reveal|show me|print|repeat|output|dump|leak|disclose|tell me|ignore|forget|disregard)\b(?: \w+){0,2} (?:your|the) (?:system prompt|hidden prompt|developer message|instructions|initial prompt|rules)\b/,
+  /\bjailbreak(?:ed|ing)? (?:mode|prompt|yourself|toi)\b|\b(?:tu es|you are) (?:maintenant|now) (?:en mode|in) (?:dan|developpeur|developer|jailbreak)\b/,
+];
+/** True when a customer text gives the assistant an order about its own rules (exported for the tests). */
+export function smartInstructionToModel(value: string): boolean {
+  if (!containsPromptInjection(value)) return false;
+  if (containsPromptInjection(value.replace(BARE_LABELS, " "))) return true;
+  const text = norm(value);
+  return ORDER_TO_MODEL.some(pattern => pattern.test(text));
+}
 
-/** Step 0 on the integral raw texts (never truncated before reading). `reasons` and `hints`: closed codes only. */
+/** Step 0 on the integral raw texts (never truncated before reading). Technical stops only; `reasons` and `hints`: closed codes only. */
 export function smartSafetyNet(input: Readonly<{ subject: string; body: string }>): SmartNetResult {
   const subject = String(input.subject ?? ""), body = String(input.body ?? "");
-  const subjectNorm = norm(subject), fresh = smartFreshText(body);
-  const reasons = [
-    ...accessSkillKernelHits(subject, withoutBoilerplate(body)).map(id => `kernel:${id}`),
-    ...OWN_BILLING_REQUESTS.filter(([, pattern]) => pattern.test(fresh) || pattern.test(subjectNorm)).map(([family]) => `sensitive:${family}`),
-    // A sensitive topic word left in the new request (subject or fresh words, the customer's ordinary business removed): the team, point.
-    // Each occurrence on its own (Astra, fourth review): an ordinary use excuses only the occurrence in the SAME sentence; the subject is its
-    // own sentence. One sensitive occurrence left anywhere: the team.
-    ...TOPIC_WORDS.filter(([, pattern]) => smartSentences(`${subjectNorm}\n${fresh}`).some(sentence => pattern.test(withoutOrdinaryUses(sentence))))
-      .map(([family]) => `sensitive:${family}`),
-  ];
-  if (containsPromptInjection(`${subject}\n${body}`)) reasons.push("instruction_in_mail");
+  const reasons: string[] = [];
+  if (smartInstructionToModel(`${subject}\n${body}`)) reasons.push("instruction_in_mail");
   if (!body.trim() && !subject.trim()) reasons.push("empty");
   if (smartMask(body).length > SAV_SMART_MAIL_MAX_CHARS || smartMask(subject).length > SAV_SMART_SUBJECT_MAX_CHARS) reasons.push("too_long");
-  if (reasons.length) return { stop: true, reasons: [...new Set(reasons)] };
-  // Hints: topic words seen only outside the new request (quoted history, signature, footer) or in an ordinary use. Informational (shadow report).
-  const whole = norm(body);
-  return { stop: false, hints: [...new Set(TOPIC_WORDS.filter(([, pattern]) => pattern.test(whole) || pattern.test(subjectNorm)).map(([family]) => `hint:${family}`))] };
+  if (reasons.length) return { stop: true, reasons };
+  const whole = `${norm(subject)}\n${norm(body)}`;
+  return { stop: false, hints: TOPIC_WORDS.filter(([, pattern]) => pattern.test(whole)).map(([family]) => `hint:${family}`) };
 }
 
 /**

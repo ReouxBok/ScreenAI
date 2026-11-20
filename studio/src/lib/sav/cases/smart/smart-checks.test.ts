@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { smartServerChecks } from "./smart-checks";
+import { smartSensitiveCommitment, smartServerChecks } from "./smart-checks";
 import { smartDecisionSchema, smartReadingSchema } from "./smart-contract";
 import { smartJudgeInput, smartJudgeRead, smartTeamReplyFor } from "./smart-judge";
 import { SMART_GOOD_REPLY, SMART_TEST_CARD, smartGoodDecision, smartReading } from "./smart-test-doubles";
@@ -28,12 +28,72 @@ describe("contrôles serveur sans modèle (lot D3)", () => {
     expect(check(`${SMART_GOOD_REPLY} Inscrivez-vous au prochain webinaire Limova.`)).toEqual([]);
     expect(check(`${SMART_GOOD_REPLY} Zapier peut vous aider.`)).toContain("third_party_named");
   });
-  it("promesses, actions sur le compte, noyau sensible dans notre réponse", () => {
+  it("promesses et actions sur le compte", () => {
     expect(check(`${SMART_GOOD_REPLY} Ce sera corrigé d'ici demain.`)).toContain("promise_unsourced");
     expect(check(`${SMART_GOOD_REPLY} Cette option est gratuite.`)).toContain("promise_unsourced");
     expect(check(`${SMART_GOOD_REPLY} Cette fonction sera bientôt disponible.`)).toContain("promise_unsourced");
     expect(check(`${SMART_GOOD_REPLY} J'ai réinitialisé votre accès.`)).toContain("account_action_claimed");
-    expect(check(`${SMART_GOOD_REPLY} Vous pouvez résilier depuis vos paramètres.`)).toContain("kernel_in_reply");
+  });
+  it("N2 : 6 réponses qui ENGAGENT une action sensible sur le compte sont refusées (sensitive_commitment)", () => {
+    for (const sentence of [
+      "Nous allons annuler votre abonnement dès aujourd'hui.",
+      "Je vous rembourse le mois de novembre.",
+      "Votre abonnement sera résilié à la fin du mois.",
+      "Nous allons supprimer toutes vos données.",
+      "Je vais changer le titulaire du compte pour votre associé.",
+      "Je vous envoie un nouveau mot de passe par mail.",
+    ]) {
+      expect(smartSensitiveCommitment(sentence), sentence).toBe(true);
+      expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toContain("sensitive_commitment");
+    }
+    expect(smartSensitiveCommitment("Vous serez remboursé intégralement.")).toBe(true);
+    expect(smartSensitiveCommitment("On a supprimé votre compte.")).toBe(true);
+  });
+  it("N2 : 6 réponses qui MENTIONNENT seulement un sujet sensible passent (un mot ne refuse plus, « kernel_in_reply » n'est plus émis)", () => {
+    for (const sentence of [
+      "Votre facture est disponible dans votre espace, rubrique Facturation.",
+      "Le prix d'une intégration n'est pas indiqué dans nos fiches, je transmets cette question à l'équipe.",
+      "Vous pouvez annuler la routine depuis la conversation où elle a été créée.",
+      "Pour supprimer un fichier, ouvrez la bibliothèque puis cliquez sur « … ».",
+      "Votre question sur le remboursement est transmise à l'équipe.",
+      "Votre abonnement n'est pas en cause : le souci vient de la connexion Gmail.",
+    ]) {
+      expect(smartSensitiveCommitment(sentence), sentence).toBe(false);
+      expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toEqual([]);
+    }
+    // Orchestrator decision (second review): abonnement + annuler in OUR reply refuses even in the negative; the turn goes to the team.
+    expect(smartSensitiveCommitment("Nous ne pouvons pas annuler votre abonnement nous-mêmes.")).toBe(true);
+    expect(smartSensitiveCommitment("Je vous suggère de supprimer le fichier puis de le réimporter.")).toBe(false);
+    // Orchestrator decision (second review): any word of cancellation in OUR reply refuses, even a mention; the turn then goes to the team.
+    expect(check(`${SMART_GOOD_REPLY} Pour toute question de résiliation, je transmets votre message à l'équipe.`)).toContain("sensitive_commitment");
+  });
+  it("revue N2 (P1 Astra) : la procédure donnée au client pour résilier ou annuler son abonnement ou son contrat est refusée ; annuler une routine passe", () => {
+    for (const sentence of [
+      "Vous pouvez résilier votre abonnement depuis vos paramètres.",
+      "Vous pouvez résilier depuis vos paramètres.",
+      "Résiliez votre abonnement depuis l'onglet Facturation.",
+      "Pour annuler votre abonnement, ouvrez vos paramètres.",
+      "Il vous suffit de mettre fin à votre contrat depuis votre espace.",
+      "Annulez le renouvellement depuis votre compte.",
+      // Second review (PORTE_1C): the button label, whatever the wording.
+      "Dans vos paramètres Limova, cliquez sur “Résilier mon abonnement”, puis confirmez.",
+      "La résiliation se fait en un clic depuis votre espace.",
+      "Vous pouvez arrêter votre abonnement à tout moment.",
+      "Pour mettre fin au contrat, écrivez-nous.",
+    ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toContain("sensitive_commitment");
+    for (const sentence of [
+      "Vous pouvez annuler la routine depuis vos paramètres.",
+      "Pour arrêter la routine, supprimez-la depuis sa conversation.",
+      "Vous pouvez annuler l'envoi programmé avant 8 h.",
+      "Vous pouvez annuler une tâche en cours depuis la conversation.",
+      "Votre facture est disponible dans votre espace, rubrique Facturation.",
+      "Votre abonnement n'est pas en cause : le souci vient de la connexion Gmail.",
+    ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toEqual([]);
+  });
+  it("N2, enquête : demander l'URL de la conversation, des captures ou le numéro de téléphone du client n'est pas une demande de secret", () => {
+    expect(check(`${SMART_GOOD_REPLY} Pouvez-vous nous envoyer l'URL de la conversation, visible dans la barre d'adresse, et une capture d'écran ?`)).toEqual([]);
+    expect(check(`${SMART_GOOD_REPLY} Pouvez-vous nous indiquer le numéro de téléphone avec lequel vous écrivez à Charly Max ?`)).toEqual([]);
+    expect(check(`${SMART_GOOD_REPLY} Pouvez-vous nous envoyer votre token API ?`)).toContain("credential_request");
   });
   it("faits : phrase absente, fait d'un autre éditeur, extrait du client introuvable", () => {
     const fact = smartGoodDecision().facts[0];

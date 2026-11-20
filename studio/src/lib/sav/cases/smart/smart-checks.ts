@@ -1,5 +1,4 @@
 import { normalizeSavEvidenceText, savEvidenceContains } from "../../evidence-text";
-import { accessSkillKernelHits } from "../access-skill/access-skill-kernel";
 import { requestsCredential } from "../decision-validator";
 import type { SmartCheckCode, SmartDecision, SmartReading } from "./smart-contract";
 import { smartRepeatCodes, type SmartCaseMemory } from "./smart-memory";
@@ -19,7 +18,10 @@ import type { SmartAcademyEvidence } from "./smart-tools";
  *   secret     the existing V2 tripwire (`requestsCredential`) on the reply;
  *   promise    a delay, a price, a gift or a future feature that no cited card carries;
  *   account    a claim that an action was done on the account;
- *   kernel     a kernel phrase (cancel, refund...) in OUR reply;
+ *   commitment the reply COMMITS to a sensitive action on the account, or gives the customer the procedure to cancel their subscription or
+ *              contract (N2, 20/11, and its review): « nous allons annuler / rembourser / supprimer », « je vous
+ *              rembourse », « votre abonnement sera résilié », « je vous envoie votre mot de passe »... A word alone (« votre facture est
+ *              disponible dans… », « vous pouvez annuler la routine ») never refuses: since N2 the old `kernel_in_reply` is no longer emitted;
  *   coverage   every need of the reading is answered, asked or handed; a reply or a question has a text; a handoff has a team note.
  * The checks are deliberately narrow (closed patterns): what they miss is the counter-read's job, and the shadow measures both.
  */
@@ -64,13 +66,42 @@ const PROMISES: readonly RegExp[] = [
   /\b(?:sous|dans|d'ici|en moins de|au plus tard (?:dans|sous)) (?:\d+|un|une|deux|trois|quelques) ?(?:h|heures?|jours?(?: ouvres)?|semaines?|mois|minutes?)\b/,
   /\b(?:des demain|d'ici demain|d'ici la fin (?:de|du) \w+|tres prochainement|prochainement|bientot|dans les plus brefs delais|tres vite|au plus vite)\b/,
   /\d+(?:[.,]\d+)? ?(?:€|euros?\b|eur\b|\$|dollars?\b)/,
-  /\b(?:gratuit(?:e|s|es|ement)?|offert(?:e|s|es)?|geste commercial|remboursement|rembourse\w*|un avoir|reduction|remise)\b/,
+  // N2: « remboursement » alone is a mention; a refund COMMITMENT is `sensitive_commitment`.
+  /\b(?:gratuit(?:e|s|es|ement)?|offert(?:e|s|es)?|geste commercial|un avoir|reduction|remise)\b/,
   /\b(?:sera|seront) (?:bientot |prochainement )?(?:disponibles?|corrige(?:e|s|es)?|ajoute(?:e|s|es)?|integre(?:e|s|es)?|resolue?s?|deploye(?:e|s|es)?|livre(?:e|s|es)?)\b/,
   /\b(?:nous allons|on va|l'equipe va|nos equipes vont|les developpeurs vont) (?:corriger|ajouter|developper|integrer|resoudre|regler|deployer|sortir)\b/,
   /\bprochaine (?:version|mise a jour|fonctionnalite)\b/,
 ];
 const ACCOUNT_ACTION = /\b(?:j'ai|je viens d'|nous avons|nous venons d'|on a) ?(?:bien )?(?:active|desactive|modifie|supprime|reinitialise|change|corrige|debloque|ajoute|cree|regle|resolu|reactive|verifie votre compte|mis a jour)\b|\bc'est (?:fait|regle|corrige|active)\b/;
 const HANDOFF_CLAIM = /\b(?:j'ai|nous avons) (?:bien )?(?:transmis|transfere|signale|remonte)\b/;
+/*
+ * Sensitive commitments (N2): narrow on purpose, an ACTOR on our side (je, nous, on, l'équipe) + at most an auxiliary and pronouns + an action
+ * verb in a conjugated form (never the noun: « remboursement » alone is a mention), or the passive « votre abonnement sera résilié ». What
+ * they miss is the counter-read's `sensitive_commitment` code. Written on the folded text (no accent, lower case).
+ */
+const OUR_SIDE = String.raw`\b(?:je|j'|nous|on|l'equipe|notre equipe|nos equipes|le support|le service client)\s*`;
+const AUX = String.raw`(?:(?:vais|allons|va|vont|pouvons|peux|peut|devons|dois|doit|viens d'|venons d'|vient d'|ai|avons|a|ont|me charge d[e']|nous chargeons d[e']|m'occupe d[e']|nous occupons d[e']|procede a|procedons a)\s*)?`;
+const PRONOUNS = String.raw`(?:(?:vous|le|la|les|l'|en|lui|y|bien|immediatement|aujourd'hui|directement|tout de suite)\s*)*`;
+const VERB_END = String.raw`(?:e|es|er|erai|erons|era|eront|ons|ee|ees)\b`;
+const ACTION = String.raw`(?:(?:annul|resili|rembours|supprim|effac|recredit)${VERB_END}|(?:ferm|clotur|desactiv|suspend)\w* (?:votre|le|ce|l'|son) ?(?:compte|abonnement|contrat|acces|offre)|transfer\w* (?:la propriete|la titularite|le compte|votre compte|l'abonnement|votre abonnement)|chang\w* (?:le|de) (?:titulaire|proprietaire)|reinitialis\w* (?:votre|le|vos) (?:mot de passe|identifiant|acces|code)|(?:envoi\w*|envoy\w*|communiqu\w*|donn\w*|transmet\w*|fourni\w*) (?:votre|un|le|vos|un nouveau|votre nouveau) (?:mot de passe|identifiant|code d'acces|code de connexion|acces)|(?:accord|offr|propos)\w* (?:un |une )?(?:remboursement|avoir|geste commercial|dedommagement|mois offert|reduction|remise))`;
+const COMMITMENTS: readonly RegExp[] = [
+  new RegExp(`${OUR_SIDE}${AUX}${PRONOUNS}${ACTION}`),
+  /\b(?:votre|vos|le|l'|ce|cet|son) ?(?:abonnement|compte|contrat|commande|offre|donnees|paiement|prelevement|acces)s? (?:sera|seront|va etre|vont etre|a ete|ont ete) (?:bien |immediatement |automatiquement |definitivement |integralement )?(?:annule|resilie|rembourse|supprime|efface|ferme|clos|cloture|desactive|transfere|suspendu|recredite)e?s?\b/,
+  /\bvous (?:serez|allez etre|avez ete) (?:bien |integralement |entierement |rapidement )?(?:rembourse|recredite|dedommage)e?s?\b/,
+  /\b(?:un|le|votre) (?:remboursement|avoir|geste commercial|dedommagement) (?:vous )?(?:sera|va etre|a ete) (?:effectue|fait|emis|verse|vire|lance|accorde|applique)/,
+  // Astra, N2 review (P1): the PROCEDURE given to the customer to cancel their Limova subscription or contract (« vous pouvez résilier votre
+  // abonnement depuis vos paramètres », « résiliez depuis… », « pour mettre fin à votre contrat, … »). Cancelling a routine stays allowed.
+  new RegExp(String.raw`\b(?:vous pouvez|vous pourrez|vous pourriez|il (?:vous )?suffit d[e']|pour|afin d[e']|vous devez|il faut|merci d[e']|n'hesitez pas a)\s*(?:\w+ ){0,2}(?:resilier\b|(?:annuler|arreter|stopper|suspendre|interrompre|mettre fin a|ne pas renouveler|desactiver|clore|cloturer|fermer) (?:le renouvellement (?:de |d')?)?(?:votre|l'|le|ce|cet|son) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement|compte limova)\b)`),
+  // Orchestrator decision after the second review (Ugo: cancellation is never handled by the agent on its own): on OUR reply only, any word of
+  // cancellation (« résilier », « résiliation », « Résilier mon abonnement »…) or « mettre fin à / arrêter / annuler / stopper / suspendre » +
+  // abonnement, contrat or compte Limova refuses, whatever the wording. Cancelling a routine, a task or a scheduled send still passes.
+  /\bresili\w*/,
+  /\b(?:mettre fin|mis fin|mettez fin|met fin|arret\w*|annul\w*|stopp?\w*|suspend\w*|interromp\w*)\b(?: \w+){0,3} (?:a |au |a l')?(?:votre |mon |notre |son |l'|le |ce |cet )?(?:abonnement|contrat|compte limova)\b/,
+  /\b(?:resiliez|(?:annulez|arretez|stoppez|suspendez|mettez fin a|cloturez|fermez) (?:votre|l'|le) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement|compte limova))\b/,
+];
+/** True when the reply commits to a sensitive action on the account (exported for the tests and the shadow report). */
+export const smartSensitiveCommitment = (reply: string) => { const folded = fold(reply); return COMMITMENTS.some(pattern => pattern.test(folded)); };
+
 const URL_RE = /\bhttps?:\/\/[^\s<>"')\]]+/giu;
 const DOMAIN = /(?<![\p{L}\p{N}@./-])(?:www\.)?[a-z0-9][a-z0-9-]{1,62}(?:\.[a-z0-9-]{1,62})*\.(?:com|fr|io|ai|net|org|co|app|eu|be|ch|ca|me|so|dev)(?![\p{L}\p{N}-])/giu;
 
@@ -153,7 +184,7 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
     if (match.some(hit => !citedText.includes(hit))) { codes.add("promise_unsourced"); break; }
   }
   if (ACCOUNT_ACTION.test(foldedReply) || (decision.outcome !== "handoff" && HANDOFF_CLAIM.test(foldedReply))) codes.add("account_action_claimed");
-  if (reply && accessSkillKernelHits(reply).length) codes.add("kernel_in_reply");
+  if (reply && smartSensitiveCommitment(reply)) codes.add("sensitive_commitment");
   if (input.memory) for (const code of smartRepeatCodes(input.memory, decision)) codes.add(code);
   return { ok: codes.size === 0, codes: [...codes] };
 }
