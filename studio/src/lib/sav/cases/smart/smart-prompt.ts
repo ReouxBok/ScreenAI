@@ -18,9 +18,9 @@ import { SAV_SMART_RESOURCES as SMART_RESOURCE_LIST } from "./tools/resources";
  * Fictional examples only (public repository).
  */
 
-export const SAV_SMART_PROMPT_REVISION = "sav-smart-prompt-2026-11-20.v3";
+export const SAV_SMART_PROMPT_REVISION = "sav-smart-prompt-2026-11-20.v4";
 /** sha256 of `smartPromptFingerprintSource()`. Pinned by `smart-prompt.test.ts`; change it only with the revision. */
-export const SAV_SMART_PROMPT_SHA256 = "bdb798a2d0773b8c1611376d33c1dd35d1a1dcc41c10c0e12e6c0265381c07aa";
+export const SAV_SMART_PROMPT_SHA256 = "155f835f07973ece7a276819bf9978ef68c0c28358971a6590a01d4a6c23dbc1";
 /** The fixed decide prompt's ceiling (ARCHITECTURE 3: « 9 000 octets au plus »). */
 export const SAV_SMART_PROMPT_MAX_BYTES = 9_000;
 
