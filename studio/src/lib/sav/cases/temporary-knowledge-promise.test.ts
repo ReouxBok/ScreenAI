@@ -12,6 +12,8 @@ describe("temporaryKnowledgePromise (SAV-105)", () => {
     "We don't know yet when it will be fixed.",
     "Nous n’allons pas ajouter cette fonctionnalité.",
     "La fonctionnalité ne sera pas disponible demain.",
+    "Nous ignorons quand elle apparaîtra sur votre compte, mais nous ne pouvons pas garantir de délai.",
+    "Nous ignorons quand, et si, la fonctionnalité sera disponible.",
   ])("caution or uncertainty about the date is not a promise: %s", wording => {
     expect(temporaryKnowledgePromise(wording)).toBe(false);
   });
@@ -25,6 +27,9 @@ describe("temporaryKnowledgePromise (SAV-105)", () => {
     "La fonctionnalité sera disponible demain.",
     "Nous ignorons la cause, mais nous allons corriger le problème lundi.",
     "Nous ne savons pas quand exactement ; la fonctionnalité sera disponible vendredi.",
+    "La fonctionnalité sera disponible vendredi, même si nous ignorons quand elle apparaîtra sur votre compte.",
+    "La fonctionnalité sera disponible vendredi même si nous ignorons quand elle apparaîtra sur votre compte.",
+    "We will fix it on Friday, even if we don't know when it will show on your account.",
   ])("a commitment of the support, simple or near future, is a promise: %s", wording => {
     expect(temporaryKnowledgePromise(wording)).toBe(true);
   });
