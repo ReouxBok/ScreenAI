@@ -1,5 +1,21 @@
 # Déploiement et publication
 
+## Extension 2.2.62 — autonomie, accord vocal et formulaires rapides
+
+Les accords vocaux naturels reprennent une action en attente une seule fois. Une réponse ambiguë conserve la carte d’approbation ; un refus ou une modification explicite l’annule. Le mode « Accès complet » accepte les étapes ordinaires d’une tâche vocale dont la cible a été vérifiée, sans exiger que le membre prononce le libellé exact du bouton final. Les restrictions explicites du membre et les contrôles des cibles sont conservés.
+
+La capacité `batch_fields` active `fill_fields` et le raisonnement `low` du backend GPT-6 Luna. Chaque champ passe par les validations existantes ; un échec arrête le lot. Les anciens clients ne reçoivent pas ce nouvel outil. Les animations sont raccourcies et les clics ayant déjà un effet visible n’attendent plus systématiquement 700 ms.
+
+Les champs natifs `date`, `time` et `datetime-local` acceptent leur format canonique. Le navigateur valide la valeur et ses contraintes avant toute modification ; une valeur invalide ne vide pas le champ existant.
+
+Déployer le proxy avant de soumettre `dist/limova-ai-extension-2.2.62.zip`. Le dossier du bureau utilise un proxy local distinct. Une validation locale ne constitue pas une publication au Store.
+
+## Extension 2.2.61 — continuité des consignes vocales
+
+Ce correctif conserve la tâche et la consigne complète après une pause vocale, évite les doubles résultats d’outils lors d’une interruption et distingue une commande rejetée d’une coupure de session. GPT Live et la voix Marin sont conservés.
+
+Le paquet `dist/limova-ai-extension-2.2.61.zip` doit remplacer la 2.2.60 soumise au Chrome Web Store et faire l’objet d’un nouvel examen pour être distribué. Ce correctif concerne uniquement l’extension ; le proxy v80 reste compatible. Le dossier local du bureau doit être rechargé dans `chrome://extensions/` pour afficher la nouvelle version.
+
 ## Extension 2.2.60 — GPT Live et autonomie
 
 Le paquet standard utilise GPT Live (`gpt-live-1`), la voix Marin et un backend délégué `gpt-6-luna`. Le proxy conserve `/api/live-token` pour les anciens clients Gemini.

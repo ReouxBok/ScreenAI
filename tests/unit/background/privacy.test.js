@@ -107,6 +107,36 @@ describe('background privacy boundaries', () => {
     chromeMock.tabs.sendMessage.mockImplementation(originalSend);
   });
 
+  it('uses the whole paused voice request for intent without merging caption bubbles or reusing it after correction', async () => {
+    document.body.innerHTML = '<main><label for="calendar">Anthony Brignoli</label><input id="calendar" type="checkbox"></main>';
+    background.lockTab(17);
+    const sender = { id: chromeMock.runtime.id, url: chromeMock.runtime.getURL('src/sidebar/sidebar.html') };
+    const send = request => background.handleMessage(request, sender);
+    const { revision } = await send({ type: 'VOICE_TASK_BEGIN' });
+    await send({ type: 'VOICE_TRANSCRIPT', role: 'user', text: 'Affiche mon agenda', utteranceId: 'paused:user:1', final: false,
+      taskRevision: revision, taskInstruction: 'Affiche mon agenda puis affiche celui de Anthony Brignoli' });
+    await send({ type: 'VOICE_TRANSCRIPT', role: 'user', text: 'puis affiche celui de Anthony Brignoli', utteranceId: 'paused:user:2', final: false });
+    // Delayed persistence of the earlier bubble must not restore its old intent.
+    await send({ type: 'VOICE_TRANSCRIPT', role: 'user', text: 'Affiche mon agenda', utteranceId: 'paused:user:1', final: false });
+    const originalSend = chromeMock.tabs.sendMessage.getMockImplementation();
+    chromeMock.tabs.sendMessage.mockImplementation(async (_tabId, request) => {
+      if (request.type === 'EXECUTE_ELEMENT_ACTION') document.querySelector('#calendar').checked = request.desiredChecked;
+      return { ok: true };
+    });
+    try {
+      expect(await send({ type: 'VOICE_SELECT_CONTROL_REQUEST', targetLabel: 'Anthony Brignoli', checked: true, taskRevision: revision })).toMatchObject({ ok: true });
+      const { conversationHistory } = await send({ type: 'GET_STATE' });
+      expect(conversationHistory.filter(item => item.voiceUtteranceId?.startsWith('paused:')).map(item => item.content)).toEqual([
+        'Affiche mon agenda', 'puis affiche celui de Anthony Brignoli'
+      ]);
+      await send({ type: 'VOICE_TASK_UPDATE', revision: revision + 1 });
+      await send({ type: 'VOICE_TRANSCRIPT', role: 'user', text: 'Analyse la page', utteranceId: 'paused:user:3', final: false });
+      document.querySelector('#calendar').checked = false;
+      expect(await send({ type: 'VOICE_SELECT_CONTROL_REQUEST', targetLabel: 'Anthony Brignoli', checked: true, taskRevision: revision + 1 })).toMatchObject({ ok: false, clarificationRequired: true });
+      expect(document.querySelector('#calendar').checked).toBe(false);
+    } finally { chromeMock.tabs.sendMessage.mockImplementation(originalSend); }
+  });
+
   it('does not turn a request to analyse into a selection', async () => {
     document.body.innerHTML = '<main><label for="styled">Anthony Brignoli</label><input id="styled" type="checkbox" style="opacity:0"></main>';
     background.lockTab(17);

@@ -5,7 +5,7 @@
 // The Live model tends to stop after each tool and wait for the user. Each
 // successful page action reminds it to finish the user's goal on its own.
 const VOICE_PAGE_ACTION_TOOLS = new Set([
-  'click_element', 'set_control_state', 'navigate_internal', 'request_page_action', 'fill_field', 'type_text_into_page', 'scroll_page', 'open_page'
+  'click_element', 'set_control_state', 'navigate_internal', 'request_page_action', 'fill_field', 'fill_fields', 'type_text_into_page', 'scroll_page', 'open_page'
 ]);
 // create_in_limova opens a tab and sends a message: it only runs when the
 // sentence the user is saying right now asks for it or says yes to it, never
@@ -14,7 +14,7 @@ const VOICE_HANDOFF_GO_AHEAD = /\b(oui|ouais|ok|okay|d['’]accord|vas[- ]y|go|l
 const VOICE_HANDOFF_REQUEST = /\b(cr[ée]+e?r?|r[ée]dige[rz]?|[ée]cri[st]|[ée]crire|g[ée]n[èe]re[rz]?|pr[ée]pare[rz]?|fais[- ]moi|post|publication|mail|e-mail|article|newsletter|script|visuel|create|write|draft|crea|escribe|redacta)\b/i;
 const VOICE_HANDOFF_CONFIRM_HINT = 'Aucune demande de création ni aucun accord dans ce que l’utilisateur vient de dire : rien n’a été envoyé. Dis-lui en une phrase ce que tu proposes de créer dans Limova, à partir de quelle page, puis demande « Je lance ? » et attends sa réponse. N’appelle create_in_limova qu’après son oui.';
 const VOICE_HANDOFF_DONE_HINT = 'La demande est envoyée dans le chat Limova, avec le contenu de la page. Ne la renvoie pas et ne retape rien : dis brièvement que Limova prépare le contenu dans l’onglet ouvert, puis commente la réponse quand elle apparaît si l’utilisateur le souhaite.';
-const VOICE_CONTINUATION_HINT = 'Action réussie. Si l’objectif de la dernière demande de l’utilisateur demande encore des étapes, enchaîne tout de suite l’action suivante avec la carte DOM ci-jointe, sans attendre de nouvelle consigne ni lui demander de relancer. Ne t’arrête que lorsque l’objectif est atteint, qu’une information indispensable manque ou que l’étape suivante est sensible (paiement, suppression, données personnelles). Si l’utilisateur a demandé d’écrire puis d’envoyer, l’envoi fait partie de sa demande.';
+const VOICE_CONTINUATION_HINT = 'Action réussie. Si la demande complète comporte encore des étapes, enchaîne tout de suite l’action suivante avec la carte DOM ci-jointe, sans attendre une répétition ni une autorisation orale supplémentaire. L’application applique le niveau d’autonomie et attend un accord dans l’outil si nécessaire. Une création demandée comprend son enregistrement normal ; si l’utilisateur a demandé d’écrire puis d’envoyer, l’envoi fait partie de sa demande. Arrête-toi lorsque le résultat final est vérifié ou qu’une information indispensable manque.';
 
 class LimovaVoiceSession {
   constructor(options = {}) {
@@ -798,6 +798,30 @@ class LimovaVoiceSession {
           resultCharacters: String(result?.knowledge || '').length,
           ...(!result?.ok && result?.failureCode ? { failureCode: result.failureCode } : {})
         });
+      } else if (call.name === 'fill_fields') {
+        const fields = call.args?.fields;
+        const valid = Number.isInteger(call.args?.contextVersion) && Array.isArray(fields) && fields.length > 0 && fields.length <= 12
+          && new Set(fields.map(field => field?.elementId)).size === fields.length
+          && fields.every(field => Number.isInteger(field?.elementId) && typeof field.text === 'string' && typeof field.targetLabel === 'string');
+        result = { ok: false, error: 'Liste de champs invalide.' };
+        const fieldResults = [];
+        if (valid) for (let index = 0; index < fields.length; index++) {
+          if (!isCurrent()) return;
+          const field = fields[index];
+          const typed = await sendToolMessage({ type: 'VOICE_TEXT_INPUT_REQUEST', elementId: field.elementId,
+            text: field.text, targetLabel: field.targetLabel, contextVersion: call.args.contextVersion })
+            .catch(() => ({ ok: false, error: 'La page est indisponible.' }));
+          fieldResults.push({ elementId: field.elementId, ok: typed?.ok === true, ...(typed?.failureCode ? { failureCode: typed.failureCode } : {}) });
+          result = typed || { ok: false, error: 'La saisie n’est pas confirmée.' };
+          if (!result.ok || !isCurrent()) break;
+          // Refresh after each field for safe remapping; one masked capture
+          // and one backend round trip cover the whole form.
+          const fresh = await sendToolMessage({ type: 'VOICE_CONTEXT_REQUEST', capture: index === fields.length - 1 }).catch(() => null);
+          if (!fresh?.ok) { result = fresh || { ok: false, error: 'Le formulaire a changé.' }; break; }
+          result = { ...result, ...fresh };
+        }
+        result = { ...result, fieldResults, completedFields: fieldResults.filter(field => field.ok).length };
+        this.diagnostic('VOICE_FORM_INPUT_COMPLETED', { fieldCount: valid ? fields.length : 0, completedFields: result.completedFields, ok: result.ok });
       } else if ((call.name === 'fill_field' || call.name === 'type_text_into_page')
         && Number.isInteger(call.args?.elementId)
         && typeof call.args?.text === 'string') {
@@ -930,6 +954,7 @@ class LimovaVoiceSession {
       for (const key of ['moved', 'atStart', 'atEnd', 'unchanged', 'cancelled', 'verification', 'verificationRequired', 'retryWithFreshContext', 'matches', 'targetLabel', 'checked', 'durationMs']) {
         if (result?.[key] !== undefined) response[key] = result[key];
       }
+      if (call.name === 'fill_fields') { response.fieldResults = result.fieldResults; response.completedFields = result.completedFields; }
       if (call.name === 'verify_expected_result' && response.verification?.status !== 'confirmed') response.status = 'unexpected';
       if (call.name === 'scroll_page' && result?.moved === false) {
         response.nextStep = 'Aucun déplacement : change de zone de défilement ou recherche une autre cible. Ne répète pas ce même défilement.';

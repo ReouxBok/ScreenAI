@@ -188,6 +188,7 @@ let voiceContextWindowId = null;
 let voiceContextTabId = null;
 let voicePermissionTabId = null;
 let voiceTaskRevision = 0;
+let voiceTaskInstruction = '';
 let voiceTaskProgress = { phase: 'not_started', stepCount: 0 };
 const userPageInteractionSequences = new Map();
 let trainingState = { active: false, stopping: false, token: null, session: null };
@@ -1018,6 +1019,7 @@ async function handleMessage(request, sender) {
       if (request.type === 'VOICE_TASK_UPDATE' && (!Number.isSafeInteger(request.revision) || request.revision <= voiceTaskRevision)) return { ok: false };
       clearPendingActions();
       voiceTaskRevision = request.type === 'VOICE_TASK_BEGIN' ? voiceTaskRevision + 1 : request.revision;
+      voiceTaskInstruction = '';
       voiceTaskProgress = { phase: request.type === 'VOICE_TASK_BEGIN' ? 'not_started' : 'listening', stepCount: 0 };
       for (const tabId of [...presenceTabs]) hideAgentPresence(tabId, { stop: true });
       if (sessionState.lockedTabId) await chrome.tabs.sendMessage(sessionState.lockedTabId, { type: 'VOICE_TASK_REVISION', revision: voiceTaskRevision }).catch(() => {});
@@ -1092,6 +1094,7 @@ async function handleMessage(request, sender) {
         voiceSessionGeneration += 1;
         if (request.active !== true) {
           clearPendingActions();
+          voiceTaskInstruction = '';
           voiceContextWindowId = null;
           voiceContextTabId = null;
           voicePermissionTabId = null;
@@ -3587,6 +3590,7 @@ function handleResetSession() {
   userPageInteractionSequences.clear();
   voiceSessionActive = false;
   voiceSessionGeneration += 1;
+  voiceTaskInstruction = '';
   voiceContextWindowId = null;
   voiceContextTabId = null;
   voicePermissionTabId = null;
@@ -4023,7 +4027,7 @@ async function getLiveToken(context) {
         trainingMode,
         // Tells the proxy this extension follows every site and handles
         // open_page and create_in_limova.
-        capabilities: ['any_site', 'limova_handoff', 'browser_tasks', 'structured_verification'],
+        capabilities: ['any_site', 'limova_handoff', 'browser_tasks', 'structured_verification', 'batch_fields'],
         ...(sessionState.resetContext ? { resetContext: true } : {}),
         ...(trainingMode || evaluationMode ? {} : await userFirstNameField()),
         ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
@@ -4052,6 +4056,7 @@ async function getLiveToken(context) {
     return {
       ok: true,
       ...data,
+      autonomyMode,
       contextVersion: freshContext.contextVersion,
       visualCapture: trainingMode ? null : freshContext.visualCapture || null
     };
@@ -4184,16 +4189,24 @@ async function handleUserPageInteraction(rawInteraction, sender) {
   }
 }
 
-async function storeVoiceUtterance({ role, text, utteranceId, final = true }) {
+async function storeVoiceUtterance({ role, text, utteranceId, final = true, taskInstruction, taskRevision }) {
   const generation = sessionGeneration;
   if (!['user', 'assistant'].includes(role) || !/^[a-zA-Z0-9:_-]{1,160}$/.test(utteranceId || '')) return { ok: false };
   if (!(await hasAIProcessingConsent()) || generation !== sessionGeneration) return { ok: false };
+  if (taskRevision !== undefined && taskRevision !== voiceTaskRevision) return cancelledOperation();
   const content = String(text || '').trim().slice(0, 4000);
   if (!content) return { ok: false };
   if (trainingState.active || evaluationState.active) return final ? storeVoiceTranscript(role, content) : { ok: true };
   const previous = sessionState.conversationHistory.find(item => item.voiceUtteranceId === utteranceId);
   if (previous && previous.role !== role) return { ok: false };
-  if (role === 'user' && previous?.content !== content) rememberUserTurn(content, 'voice');
+  // Caption bubbles stay separate, but the intent guard must see the complete
+  // current request (including a continuation after a pause). An idle caption
+  // flush must not overwrite that request with one fragment or an old prefix.
+  if (role === 'user') {
+    if (typeof taskInstruction === 'string' && taskRevision === voiceTaskRevision) voiceTaskInstruction = taskInstruction.trim();
+    const instruction = voiceTaskInstruction || content;
+    if (previous?.content !== content || lastUserTurn?.message !== instruction) rememberUserTurn(instruction, 'voice');
+  }
   if (previous) previous.content = content;
   else {
     const sequence = Number(utteranceId.split(':').at(-1));
@@ -4598,7 +4611,7 @@ async function scrollVoicePage(rawDirection, rawAmount, rawElementId, requestedC
   };
 }
 
-const WRITABLE_TEXT_INPUT_TYPES = new Set(['text', 'textarea', 'email', 'search', 'tel', 'url', 'number']);
+const WRITABLE_TEXT_INPUT_TYPES = new Set(['text', 'textarea', 'email', 'search', 'tel', 'url', 'number', 'date', 'time', 'datetime-local']);
 
 function isWritableTextElement(element) {
   return element?.type === 'input'
@@ -5205,6 +5218,27 @@ const SAVE_INFORMATION_QUERY = /^(?:comment|pourquoi|explique|how|why|explain|co
 const SAVE_NEGATED_TASK = /\b(?:ne|n)\b.{0,20}\b(?:cree|creer|ajoute|ajouter|modifie|modifier|deplace|deplacer|planifie|programme)\b.{0,15}\b(?:pas|jamais)\b|\b(?:ne pas|ne jamais|do not|don t|never)\s+(?:cree\w*|ajout\w*|modifi\w*|create|add|edit|update|schedule)\b/;
 const SAVE_DANGERS = /\b(?:paiement|payer|payment|pay|achat|purchase|carte bancaire|credit card|facturation|billing|abonnement|subscription|publier|publish|autoriser|authorize|permission|mot de passe|password|invite|inviter|invitation|envoyer|send|supprimer|delete)\b/;
 
+function isInformationRequest(message) {
+  const request = normalizeActionLanguage(message).replace(/^(?:charly|charlie)\s+/, '');
+  if (/^(?:(?:est ce que )?(?:tu peux|vous pouvez|peux tu|pouvez vous|can you|could you|puedes) )?(?:(?:me|m|nous) )?(?:explique|expliquer|explain|explicar|dire comment|dire pourquoi|tell me how|show me how)\b/.test(request)) return true;
+  if (!SAVE_INFORMATION_QUERY.test(request)) return false;
+  // A politely phrased command is still a command; an explanation request is
+  // not permission to act merely because it contains a creation verb.
+  return !/^(?:est ce que (?:tu peux|vous pouvez)|can you|could you|puedes)\b/.test(request)
+    || /\b(?:explique|expliquer|explain|explicar|comment|how|como)\b/.test(request);
+}
+
+function isDelegatedFullAction(element, userMessage, toolExplicitRequest, source) {
+  if (autonomyMode !== 'full' || !toolExplicitRequest || source !== 'voice' || isInformationRequest(userMessage)) return false;
+  const request = normalizeActionLanguage(userMessage);
+  if (SAVE_HOLD.test(request) || SAVE_NEGATED_TASK.test(request)) return false;
+  const task = /\b(?:cree|creer|crees|ajoute|ajouter|modifie|modifier|deplace|deplacer|mets|mettre|planifie|programme|organise|bloque|reserver|reserve|remplis|remplir|ecris|redige|fais|faire|enregistre|sauvegarde|create|add|edit|update|schedule|fill|save|crea|anade|modifica|guardar)\b/.test(request);
+  const target = normalizeActionLanguage(`${element.text || ''} ${(element.aliases || []).join(' ')} ${element.section || ''}`);
+  const protectedTarget = SAVE_DANGERS.test(target)
+    || (isPlainSaveControl(element) && SAVE_DANGERS.test(normalizeActionLanguage(lastPageContext.split('\n').slice(0, 3).join(' '))));
+  return task && !protectedTarget;
+}
+
 function isPlainSaveControl(element) {
   return element?.type === 'clickable' && !element.disabled && !element.external && !element.hrefPath
     && SAVE_CONTROL.test(normalizeActionLanguage(element.text));
@@ -5214,16 +5248,16 @@ function requestedSave(element, userMessage, pageContext) {
   if (!isPlainSaveControl(element)) return false;
   const request = normalizeActionLanguage(userMessage);
   if (!request || SAVE_HOLD.test(request) || SAVE_NEGATED_TASK.test(request)
-    || SAVE_INFORMATION_QUERY.test(request)) return false;
+    || isInformationRequest(request)) return false;
   const target = normalizeActionLanguage(`${element.text} ${(element.aliases || []).join(' ')} ${element.section || ''}`);
   if (SAVE_DANGERS.test(target)) return false;
   if (SAVE_VERB.test(request)) return !SAVE_DANGERS.test(request);
-  if (!/\b(?:cree|creer|ajoute|ajouter|planifie|planifier|programme|programmer|organise|organiser|modifie|modifier|deplace|deplacer|mets|mettre|create|add|schedule|edit|update|move|crea|crear|anade|modifica)\b/.test(request)) return false;
+  if (!/\b(?:cree|creer|crees|ajoute|ajouter|planifie|planifier|programme|programmer|organise|organiser|bloque|bloquer|reserve|reserver|modifie|modifier|deplace|deplacer|mets|mettre|create|add|schedule|edit|update|move|crea|crear|anade|modifica)\b/.test(request)) return false;
   const context = normalizeActionLanguage(`${pageContext} ${element.section || ''}`);
   // Match the requested resource family to the actual page/form, so "create
   // an event" cannot authorize a Save in an unrelated billing or access form.
   return [
-    /\b(?:agenda|calendrier|calendar|calendario|rendez vous|rdv|evenement|event|reunion|meeting|appointment|evento|cita)\b/,
+    /\b(?:agenda|calendrier|calendar|calendario|rendez vous|rdv|evenement|event|reunion|meeting|appointment|evento|cita|creneau|slot)\b/,
     /\b(?:note|notes|nota|brouillon|draft|borrador)\b/,
     /\b(?:tache|task|tarea)\b/,
     /\b(?:contact|contacts|contacto)\b/
@@ -5250,7 +5284,7 @@ function classifyActionRisk(element, {
   if (isPlainSaveControl(element) && (SAVE_HOLD.test(normalizeActionLanguage(userMessage)) || SAVE_NEGATED_TASK.test(normalizeActionLanguage(userMessage)))) {
     return { level: 'sensitive', label, reason: 'save_explicitly_withheld' };
   }
-  if (isPlainSaveControl(element) && SAVE_INFORMATION_QUERY.test(normalizeActionLanguage(userMessage))) return { level: 'sensitive', label, reason: 'save_requires_confirmation' };
+  if (isPlainSaveControl(element) && isInformationRequest(userMessage)) return { level: 'sensitive', label, reason: 'save_requires_confirmation' };
   if (requestedSave(element, userMessage, pageContext)) {
     return { level: 'low', label, reason: 'requested_save' };
   }
@@ -5433,7 +5467,10 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
     return payload;
   }
   const risk = classifyActionRisk(element, { explicitRequest, strictExplicitRequest, userMessage, messageSendRequest, pageContext: lastPageContext });
+  const delegatedFullAction = isDelegatedFullAction(element, userMessage, toolExplicitRequest, intent.source);
   Logger.event('action', 'ACTION_CLASSIFIED', {
+    autonomyMode,
+    delegatedFullAction,
     elementId,
     risk: risk.level,
     reason: risk.reason,
@@ -5469,7 +5506,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
     || /supprim|delete|remove|payer|payment|achat|buy|purchase|send|envoyer|publish|publier|autoriser|authorize|allow|grant|confirmer|confirm|valider|submit|invite|déconnect|disconnect|revoke|révoqu/i.test(String(element.text || ''));
   const approve = risk.reason === 'save_requires_confirmation' || autonomyMode === 'ask'
     || (autonomyMode === 'balanced' && (risk.level === 'sensitive' || (consequential && risk.reason !== 'requested_save')))
-    || (autonomyMode === 'full' && risk.level === 'sensitive' && !strictExplicitRequest);
+    || (autonomyMode === 'full' && risk.level === 'sensitive' && !strictExplicitRequest && !delegatedFullAction);
   if (approve) return requestActionApproval(action, () => executeElementAction(action));
   return executeElementAction(action);
 }
@@ -5488,7 +5525,7 @@ async function requestActionApproval(action, execute) {
   pending.abortListener = () => cancelPendingAction(actionId);
   action.operation.signal?.addEventListener('abort', pending.abortListener, { once: true });
   pendingActions.set(actionId, pending);
-  Logger.event('action', 'ACTION_CONFIRMATION_REQUESTED', { actionId, elementId: action.elementId, risk: action.risk, kind: action.kind || 'click' }, action.operationId);
+  Logger.event('action', 'ACTION_CONFIRMATION_REQUESTED', { actionId, elementId: action.elementId, risk: action.risk, kind: action.kind || 'click', autonomyMode }, action.operationId);
   analytics.track('action_confirmation', { decision: 'requested', risk: action.risk });
   broadcastToSidebar({ type: 'ACTION_PROPOSAL', actionId, label: action.label, risk: action.risk,
     kind: action.kind || 'click', detail: action.detail || '', expiresAt: pending.expiresAt });
@@ -5611,15 +5648,18 @@ async function executeElementAction(action) {
     error: result?.error || (result?.ok === true ? undefined : 'Action refusée par la page.')
   };
   if (result?.ok === true && sessionState.lockedTabId) {
-    // Give SPA state, route transitions and request-driven UI enough time to
-    // settle. The former 350 ms window incorrectly marked valid Limova clicks
-    // as failed on components that update after a debounce.
-    await new Promise(resolve => setTimeout(resolve, 700));
+    // Fast synchronous React updates need no fixed delay. Retain the wider
+    // settling window when the first read cannot yet prove a visible change.
+    const comparable = value => String(value || '').replace(/\b\d+ms\b/g, 'Nms').replace(/\s+/g, ' ').trim();
+    let refreshedContext = await getPageContext(operation.tabId, operation).catch(() => '');
     if (!isCurrentOperation(operation)) return reportClickOpenedFollowedTab();
-    const [refreshedContext, technical] = await Promise.all([
-      getPageContext(operation.tabId, operation).catch(() => ''),
-      getPageTechnicalDiagnostics(operation.tabId, actionStartedAt)
-    ]);
+    if (!refreshedContext || comparable(contextBeforeClick) === comparable(refreshedContext)) {
+      await new Promise(resolve => setTimeout(resolve, 700));
+      if (!isCurrentOperation(operation)) return reportClickOpenedFollowedTab();
+      refreshedContext = await getPageContext(operation.tabId, operation).catch(() => '');
+    }
+    if (!isCurrentOperation(operation)) return reportClickOpenedFollowedTab();
+    const technical = await getPageTechnicalDiagnostics(operation.tabId, actionStartedAt);
     if (!isCurrentOperation(operation)) return cancelledOperation();
     if (refreshedContext) {
       payload.pageContext = refreshedContext;
@@ -5630,7 +5670,6 @@ async function executeElementAction(action) {
     if (result.clickDispatched === true) {
       const tabAfterClick = await chrome.tabs.get(operation.tabId).catch(() => null);
       if (!isCurrentOperation(operation)) return cancelledOperation();
-      const comparable = value => String(value || '').replace(/\b\d+ms\b/g, 'Nms').replace(/\s+/g, ' ').trim();
       const routeChanged = privacySafeUrl(tabBeforeClick?.url || '') !== privacySafeUrl(tabAfterClick?.url || '');
       const domChanged = Boolean(refreshedContext) && comparable(contextBeforeClick) !== comparable(refreshedContext);
       const popupObserved = Boolean(externalPopupFlow || externalPopupTabs.size);
@@ -5871,6 +5910,7 @@ function pauseWhileSidebarClosed() {
   for (const controller of voiceTokenControllers) controller.abort();
   voiceSessionActive = false;
   voiceSessionGeneration += 1;
+  voiceTaskInstruction = '';
   voiceContextWindowId = null;
   voiceContextTabId = null;
   voicePermissionTabId = null;
