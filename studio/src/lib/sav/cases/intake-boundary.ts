@@ -12,6 +12,7 @@ import type { IntakeRuntimePayload } from "../intake/runtime-contract";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { decideCaseAdmission } from "./admission-policy";
 import { savV2OwnerHandoverEnabled } from "./owner-handover-config";
+import { isSmartSupportProvenance, savV2EntrySmartOn } from "./smart-entry-switch";
 import { listCaseEvents, openCaseEvent, readCaseByTicket, savCaseRecordingEnabled, transitionCaseOwner, v1IntentHash, type CaseTx } from "./case-store";
 import {
   SAV_CASE_SENSITIVE_FAMILIES, SAV_CASE_SUBJECT_LENGTH, caseDedupeKey, caseRequestId, caseRequestSubjectSchema,
@@ -304,7 +305,7 @@ export async function readIntakeAcknowledgement(messageId: string): Promise<Inta
 
 export type CaseRelayResult =
   | { skipped: "recording_off" | "intake_not_confirmed" | "source_missing" | "no_case_for_thread" | "thread_case_ambiguous" | "before_case" | "customer_return_wait" | "customer_return_not_consumed"
-      | "owner_handover_off" | "owner_handover_out_of_scope" | "owner_handover_not_attributed" | "owner_handover_ticket_mismatch" | "owner_handover_no_v1_execution" }
+      | "owner_handover_off" | "owner_handover_out_of_scope" | "owner_handover_smart_pending" | "owner_handover_not_attributed" | "owner_handover_ticket_mismatch" | "owner_handover_no_v1_execution" }
   | { caseId: string; version: number; created: boolean; appended: boolean; owner: string; relay: CaseRelayProof["kind"] | "v2_customer_return";
       admission: { target: string; reasons: string[] } | null; existingTicket?: SavV2ExistingTicketOwnerRule };
 
@@ -374,7 +375,8 @@ export async function relayOwnerHandoverMail(messageId: string, qualification: C
   if (!message || message.direction !== "inbound" || !message.gmailMessageId) return { skipped: "source_missing" };
   const request = ownerHandoverMailRequest(message.gmailMessageId);
   if (qualification.requests.some(row => row.requestId !== request.requestId)) throw Error("SAV_CASE_QUALIFICATION_REQUEST_UNKNOWN");
-  const policy = deps.readAdmissionPolicy ? await deps.readAdmissionPolicy() : null;
+  // SAV-117 review P1B: a smart-entry reading is decided without the historical admission policy, which is not read for it (an unreadable one blocks nothing).
+  const policy = savV2EntrySmartOn(deps.env ?? process.env) || smartQualification(qualification) ? null : deps.readAdmissionPolicy ? await deps.readAdmissionPolicy() : null;
   const relay: CaseRelayProof = { kind: "owner_handover_mail", messageId, ticketId: deps.ownerHandover.ticketId };
   return relayToCase({ ticketId: deps.ownerHandover.ticketId, threadId: message.threadId, gmailMessageId: message.gmailMessageId, receivedAt: message.receivedAt,
     decision: { classification: "support", requests: [] }, relay, deps, confirmedTicket: true, attribution: "pending",
@@ -433,6 +435,13 @@ async function relayToCase(input: {
     confirmedTicket: input.confirmedTicket, deps: input.deps, target: relayProof.kind === "owner_handover_mail" ? undefined
       : { ticketId: input.ticketId, executionId: relayProof.kind === "intake_effects_confirmed" ? relayProof.executionId : null, runId: relayProof.intakeRunId, runVersion: relayProof.intakeRunVersion } });
   const handover = input.deps.ownerHandover;
+  // SAV-117 review P1B/1D: under `SAV_V2_ENTRY_SMART=on`, until the smart brain is wired (N8), EVERY handover waits, whatever its reading (the smart entry's, or
+  // a mail it leaves to the team such as support + cancellation). It is neither recorded nor « out of scope »: nothing is handed back to the team, no note, stage or
+  // owner is written in HubSpot; the marker keeps this outcome and the person's assignment stays as it is. Off: the Access check below, exactly as before.
+  if (handover && savV2EntrySmartOn(input.deps.env ?? process.env)) {
+    console.info("sav_v2_owner_handover_smart_pending", { messageId: relayProof.messageId, reading: smartQualification(admission.qualification) ? "smart_support" : "team" });
+    return { skipped: "owner_handover_smart_pending" };
+  }
   if (handover && (!admission.qualification.requests.every(request => request.family === "access"
     && (request.provenance.kind === "human" || (request.provenance.kind === "qualified_rule" && (request.provenance.blockId ?? SAV_CASE_ACCESS_BLOCK_ID) === SAV_CASE_ACCESS_BLOCK_ID)))
     || decideCaseAdmission({ ...admission, caseSensitivity: caseSensitivityOf(input.decision) }).target !== "agent")) return { skipped: "owner_handover_out_of_scope" };
@@ -512,12 +521,16 @@ async function relayToCase(input: {
  * requests, with the qualification port's proof where it covers them. The V2 owner port computes
  * the same thing before the case exists, so both decide alike. */
 export async function relayAdmissionInput(input: { messageId: string; gmailMessageId: string; decision: Pick<SavIntakeDecision, "classification" | "requests">; confirmedTicket: boolean; deps: CaseBoundaryDeps; target?: CaseQualificationTarget }) {
-  const policy = input.deps.readAdmissionPolicy ? await input.deps.readAdmissionPolicy() : null;
+  // SAV-117 review P1B, `SAV_V2_ENTRY_SMART=on` only: the historical admission policy is not read at all (the smart entry is decided without it, and every other
+  // reading under the switch is the team's: sensitivity, identity and CRM need no policy). An unreadable policy then blocks no mail. Off: read first, as before.
+  const policy = savV2EntrySmartOn(input.deps.env ?? process.env) ? null : input.deps.readAdmissionPolicy ? await input.deps.readAdmissionPolicy() : null;
   const requests = caseRequestsOpenedByIntake(input.decision, input.gmailMessageId, input.confirmedTicket);
   const proven = requests.length && input.deps.readQualification
     ? await input.deps.readQualification({ messageId: input.messageId, gmailMessageId: input.gmailMessageId, requests, ...(input.target ? { target: input.target } : {}) }) : null;
   return { admission: { policy, qualification: relayQualification(admissionQualificationFromIntake(input.decision, input.gmailMessageId), proven, requests) }, requests };
 }
+/** A qualification the smart entry read (`smart-entry-switch.ts`): decided without the historical policy. */
+const smartQualification = (qualification: CaseAdmissionQualification) => qualification.requests.some(request => isSmartSupportProvenance(request.provenance));
 
 /** Durable catch-up after a crash between V1 confirmation and the wake: the V1 records are
  * the source of truth, the wake is only a hint. Finds confirmed executions, and accepted

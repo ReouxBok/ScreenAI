@@ -32,6 +32,7 @@ import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, type CaseNoteCreateI
 import { caseNoteAssociationKey, caseNoteKey, SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { caseClosureNoteInteractionId, caseClosureNoteText, caseHandoffNoteInteractionId, caseReplyNoteEnabled, caseThreadlessHandoffNoteText } from "./case-reply-summary-note";
 import { createIntakeExecutorAdapters } from "../intake/execution-adapters";
+import { smartEntryEffectsHold } from "./smart-entry-switch";
 
 const NOTE_KINDS = new Set(["note_create", "note_associate"]);
 const ENGAGED_STATES: readonly string[] = ["dispatched", "acked", "uncertain"];
@@ -382,6 +383,9 @@ export type TicketStagePassResult =
 /** One bounded pass: the due stages, each on the existing executor with the stage driver. The HubSpot stage adapter is the only port of the executor that is ever called. */
 export async function runCaseTicketStagePass(deps: TicketStageRuntimeDeps): Promise<TicketStagePassResult> {
   const env = deps.env();
+  // SAV-117 review 1F: the central hold before N8 (`smartEntryEffectsHold`, to remove in N8): no HubSpot stage written, nothing claimed; everything stays due.
+  const hold = smartEntryEffectsHold(env);
+  if (hold) return { skipped: hold };
   if (readCaseTicketStageConfig(env).mode !== "on") return { skipped: "stages_off" };
   let config: ReturnType<typeof intakeExecutionConfig>;
   try { config = intakeExecutionConfig(env); } catch (error) { return { skipped: code(error) }; }

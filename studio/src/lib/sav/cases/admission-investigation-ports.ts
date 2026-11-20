@@ -3,7 +3,7 @@ import {
   admissionPolicyPort, admissionPolicyRevisionPort, qualificationFromConfirmedV1, v1QualificationPort,
   type AdmissionPolicyRecord, type ConfirmedV1Context, type V1AdmissionAdapterPolicy,
 } from "./admission-runtime";
-import type { CaseAdmissionQualification, CaseEvent, CaseQualificationBlock, CaseSnapshot } from "./case-types";
+import { isSmartSupportProvenance, type CaseAdmissionQualification, type CaseEvent, type CaseQualificationBlock, type CaseSnapshot } from "./case-types";
 import {
   admissionQualificationFromIntake, caseRequestsOpenedByIntake, relayQualification,
   type CaseBoundaryDeps, type CaseQualificationTarget, type CaseRelayRequest,
@@ -37,6 +37,8 @@ export type AdmissionInvestigationDeps = {
 };
 
 const fault = (code: string): never => { throw Error(code); };
+/** SAV-117 review P1B: a reading of the smart entry is decided without the historical admission policy, which is then not read (`decideCaseAdmission`). */
+const smartQualification = (qualification: CaseAdmissionQualification) => qualification.requests.some(request => isSmartSupportProvenance(request.provenance));
 
 /** Which source a read failed on; the relay rethrows as is, B's `qualify` turns it into a typed refusal (A6). */
 type QualifySource = "v1_context" | "adapter" | "rules" | "policy";
@@ -113,7 +115,7 @@ export function caseInvestigationQualify(deps: AdmissionInvestigationDeps): Case
       if (relay.kind === "owner_handover_mail") {
         const qualification = snapshot.admission?.qualification;
         if (!qualification || relay.ticketId !== snapshot.ticketId) return null;
-        return { admission: { policy: await guarded(failed, "policy", policy), qualification }, sourceRef: event.sourceRef };
+        return { admission: { policy: smartQualification(qualification) ? null : await guarded(failed, "policy", policy), qualification }, sourceRef: event.sourceRef };
       }
       const target: CaseQualificationTarget = { ticketId: snapshot.ticketId, executionId: relay.executionId, runId: relay.intakeRunId, runVersion: relay.intakeRunVersion };
       // The case's requests opened by this mail, as the relay recorded them (whatever their status since); the V1
@@ -124,7 +126,7 @@ export function caseInvestigationQualify(deps: AdmissionInvestigationDeps): Case
       if (!qualified) return null;
       // Same composition as the relay: a proven request replaces its hint, a sensitive hint always stays.
       const qualification = relayQualification(admissionQualificationFromIntake(qualified.context.decision, gmailMessageId), qualified.qualification, qualified.requests);
-      return { admission: { policy: await guarded(failed, "policy", policy), qualification }, sourceRef: event.sourceRef };
+      return { admission: { policy: smartQualification(qualification) ? null : await guarded(failed, "policy", policy), qualification }, sourceRef: event.sourceRef };
     } catch (error) {
       if (isCaseQualificationUnavailable(error)) throw error;
       const block = checkBlock(error);

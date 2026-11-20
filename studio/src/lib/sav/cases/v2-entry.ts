@@ -41,6 +41,7 @@ import { requestCaseSettleWake, type CaseSettleWakeStart } from "./case-v2-laten
 import { SAV_ACCESS_SKILL_REVISION, SAV_ACCESS_SKILL_RULE_ID } from "./access-skill/access-skill-guidelines";
 import { accessSkillLogFields, readOrComputeAccessSkill, type AccessSkillDeps, type AccessSkillReading } from "./access-skill/access-skill-judge";
 import { readAccessSkillMode } from "./access-skill/access-skill-rule";
+import { SAV_SMART_ENTRY_FAMILY, savV2EntrySmartOn, smartSupportProvenance } from "./smart-entry-switch";
 
 type Env = Record<string, string | undefined>;
 export const savV2EntryEnabled = (env: Env) => env.SAV_V2_ENTRY === "on" && savCaseRecordingEnabled(env);
@@ -96,11 +97,28 @@ const SENSITIVE_V1_KINDS = new Set(["finance", "cancellation"]);
  */
 export async function firstBlockEvidence(env: Env, messageId: string, gmailMessageId: string, requests: CaseRelayRequest[], registry: readonly CaseBlockDetector[] = SAV_CASE_BLOCK_REGISTRY,
   source: CaseEntrySource = {}): Promise<CaseAdmissionQualification["requests"]> {
+  if (savV2EntrySmartOn(env)) return smartSupportEvidence(messageId, gmailMessageId, requests);
   const mode = readAccessSkillMode(env);
   if (mode === "on") return accessSkillBlockEvidence(env, messageId, gmailMessageId, requests, registry, source);
   const legacy = await legacyBlockEvidence(env, messageId, gmailMessageId, requests, registry, source);
   if (mode === "shadow" && source.accessSkillCompute === "always") await shadowAccessSkill(env, messageId, gmailMessageId, requests, source, legacy);
   return legacy;
+}
+
+/**
+ * SAV-117 (N4), `SAV_V2_ENTRY_SMART=on` only (contract V1→V2: `smart-entry-switch.ts`): every request V1 classified `support` is the agent's, whatever its topic.
+ * The WHOLE mail stays with the team (nothing returned, so `no_request`) when one request is not support (finance, cancellation, commercial...) or the stored mail
+ * cannot be read. Every request is kept, however many V1 relayed (review P1B: what one reply covers is the treatment's concern, never a second filter here).
+ * No block detector, word list, model or policy is read here; identity, CRM and the case's sensitivity are still decided by `decideCaseAdmission`. Dated by the mail it reads, so a re-evaluation of the same mail gives the same evidence.
+ */
+async function smartSupportEvidence(messageId: string, gmailMessageId: string, requests: CaseRelayRequest[]): Promise<CaseAdmissionQualification["requests"]> {
+  const outcome = (code: string) => console.info("sav_v2_entry_smart", { messageId, requests: requests.length, outcome: code });
+  if (!requests.length || requests.some(request => request.kind !== "support")) { outcome("not_all_support"); return []; }
+  const mail = await storedEntryMail(messageId, gmailMessageId);
+  if (!mail) { outcome("mail_unavailable"); return []; }
+  outcome("support");
+  const provenance = smartSupportProvenance(mail.receivedAt.toISOString());
+  return requests.map(request => ({ requestId: request.requestId, family: SAV_SMART_ENTRY_FAMILY, provenance }));
 }
 
 /** SAV-97: the rules the detectors read (`off`, `shadow`): the skill's own rule is never a detector's candidate, so configuring it changes nothing there. */
@@ -313,6 +331,9 @@ export const creationOwnerForIntake = async (env: Env, input: Parameters<NonNull
     || disposition.kind !== "ticket" || disposition.target.operation !== "create"
     || disposition.target.contactId !== disposition.contactScope.primaryContactId)
     return { assign: false as const, reason: "not_admitted" };
+  // SAV-117: a smart admission records the revision `smart-entry.v1`, which no V2 actor accepts until the smart brain is wired (N8). Until then the ticket is
+  // never created with the V2 owner on it: it would be held by an owner whose case cannot act.
+  if (savV2EntrySmartOn(env)) return { assign: false as const, reason: "not_admitted" };
   const sources = v2EntryPolicySources(env);
   const decided = await v2OwnerAtCreationPort({ env,
     readAdmissionPolicy: admissionPolicyPort({ read: sources.readPolicyRecord, now: () => new Date() }),

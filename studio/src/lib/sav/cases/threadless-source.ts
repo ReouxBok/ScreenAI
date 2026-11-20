@@ -18,6 +18,7 @@ import { readOrComputeAccessSkill, type AccessSkillDeps, type AccessSkillReading
 import { SAV_ACCESS_SKILL_REVISION, SAV_ACCESS_SKILL_RULE_ID } from "./access-skill/access-skill-guidelines";
 import { readAccessSkillMode } from "./access-skill/access-skill-rule";
 import type { AccessSkillInput } from "./access-skill/access-skill-wire";
+import { SAV_SMART_ENTRY_FAMILY, SAV_SMART_ENTRY_MISSING_PRIMARY, savV2EntrySmartOn, smartSupportProvenance } from "./smart-entry-switch";
 
 type Env = Readonly<Record<string, string | undefined>>;
 export const SAV_THREADLESS_SOURCE_REVISION = "sav-hubspot-ticket-source.v1";
@@ -62,9 +63,13 @@ const notesBatch = z.object({
 const contactRecord = z.object({ id, archived: z.boolean().optional(), properties: z.object({ email: z.string().nullish() }) });
 
 type IdentityReason = "no_contact" | "multiple_contacts" | "missing_email" | "invalid_email" | "recipient_not_allowed";
+/** SAV-118 (N5), `SAV_V2_ENTRY_SMART=on` only: a ticket with no contact at all has no primary record (`crm_missing_primary`); every other reason, and every
+ * reason with the switch off, is the read's own, unchanged. The HubSpot read itself is the same either way. */
+export const threadlessIdentityReason = (reason: IdentityReason, env: Env): IdentityReason | typeof SAV_SMART_ENTRY_MISSING_PRIMARY =>
+  reason === "no_contact" && savV2EntrySmartOn(env) ? SAV_SMART_ENTRY_MISSING_PRIMARY : reason;
 export type ThreadlessTicketRead =
   | { status: "ready"; source: ThreadlessTicketSource }
-  | { status: "human_wait"; reason: IdentityReason; source: ThreadlessTicketSource }
+  | { status: "human_wait"; reason: IdentityReason | typeof SAV_SMART_ENTRY_MISSING_PRIMARY; source: ThreadlessTicketSource }
   | { status: "off" | "existing_thread" | "out_of_scope" | "closed" | "owner_changed" | "unavailable" };
 
 type ReadHubspot = (path: string, body?: unknown) => Promise<unknown>;
@@ -145,7 +150,7 @@ export async function readThreadlessTicket(ticketId: string, env: Env = process.
       ownerId: owner.ownerId, stageId: properties.hs_pipeline_stage, subject: properties.subject ?? "", description: properties.content ?? "",
       categories: properties.hs_ticket_category ?? "", notes, contact: identity.contact,
     };
-    return "reason" in identity ? { status: "human_wait", reason: identity.reason, source } : { status: "ready", source };
+    return "reason" in identity ? { status: "human_wait", reason: threadlessIdentityReason(identity.reason, env), source } : { status: "ready", source };
   } catch { return { status: "unavailable" }; }
 }
 
@@ -195,6 +200,7 @@ export type ThreadlessQualifyOptions = Readonly<{ accessSkillCompute?: boolean; 
  */
 export async function qualifyThreadlessTicket(source: ThreadlessTicketSource, env: Env, now = new Date(), options: ThreadlessQualifyOptions = {}): Promise<ThreadlessTicketQualification> {
   if (readSavV2QualificationScope(env, now).mode !== "open") return { status: "out_of_scope", reason: "threadless_qualification_not_configured" };
+  if (savV2EntrySmartOn(env)) return qualifySmartThreadlessTicket(source);
   const description = threadlessTicketPlainDescription(source);
   const categories = source.categories.split(";").map(category => category.trim());
   const skill = readAccessSkillMode(env) === "on";
@@ -237,4 +243,25 @@ export async function qualifyThreadlessTicket(source: ThreadlessTicketSource, en
     return decision.target === "agent" ? { status: "admitted", admission, request }
       : { status: "out_of_scope", reason: decision.reasons[0]! };
   } catch { return { status: "out_of_scope", reason: "policy_invalid" }; }
+}
+
+/**
+ * SAV-118 (N5), `SAV_V2_ENTRY_SMART=on` only: a ticket a person gave the agent takes the same door as a mail (contract V1→V2, `smart-entry-switch.ts`).
+ * Sorting: no extra model call here; the smart brain's own reading classifies the request and hands over what is sensitive (fallback of the ticket, see N5's
+ * report). Kept: the prompt-injection check (the CRM category is never a gate, Ugo 19/11), the identified contact (no
+ * contact at all: `crm_missing_primary`, set by the read). Not read: the Access block, its skill and rule, the word list on the description or the notes,
+ * the approved policy. One request, the ticket's, `other` like a mail's smart request; `decideCaseAdmission` decides it as it decides a mail's.
+ */
+function qualifySmartThreadlessTicket(source: ThreadlessTicketSource): ThreadlessTicketQualification {
+  // Ugo 19/11: never gate on hs_ticket_category; the content decides (the smart brain reads the ticket and hands a sensitive one to the team, N8).
+  // The prompt-injection check stays: a technical security control, not a topic filter (orchestrator decision, as N2's net).
+  if (containsPromptInjection(`${source.subject}\n${threadlessTicketPlainDescription(source)}`)) return { status: "human_wait", reason: "untrusted_source" };
+  if (!source.contact) return { status: "human_wait", reason: "identity_unconfirmed" };
+  const request = { id: threadlessRequestId(source), summary: "Demande support signalée dans HubSpot" };
+  const admission: CaseAdmissionInput = { policy: null, qualification: {
+    requests: [{ requestId: request.id, family: SAV_SMART_ENTRY_FAMILY, provenance: smartSupportProvenance(new Date(source.version).toISOString()) }],
+    identity: { status: "confirmed", source: threadlessTicketSourceRef(source) }, crmContext: "complete", teamSignals: [],
+  } };
+  const decision = decideCaseAdmission({ ...admission, caseSensitivity: "none" });
+  return decision.target === "agent" ? { status: "admitted", admission, request } : { status: "out_of_scope", reason: decision.reasons[0]! };
 }
