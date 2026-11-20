@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { SAV_CASE_REQUEST_FAMILIES, SAV_CASE_SENSITIVE_FAMILIES } from "@/lib/sav/cases/case-types";
+import { temporaryKnowledgePromise } from "@/lib/sav/cases/temporary-knowledge-promise";
 
 /**
  * Temporary incident (SAV-79): a declared, bounded exception the SAV agent may use
@@ -35,6 +36,8 @@ export const temporaryIncidentDocumentSchema = z.object({
   id: z.string().trim().regex(/^[a-z][a-z0-9-]{2,80}$/),
   revision: z.number().int().min(1),
   title: z.string().trim().min(3).max(200),
+  // Opt-in SAV-105 cards carry search terms. Older incident revisions remain readable.
+  keywords: z.array(z.string().trim().min(2).max(100).regex(/[\p{L}\p{N}]/u)).min(1).max(10).optional(),
   scope: z.object({
     // Only existing case families; sensitive families stay human and cannot carry an incident reply.
     // The knowledge item is implicit: the incident belongs to the family revision that carries it.
@@ -61,6 +64,10 @@ export const temporaryIncidentDocumentSchema = z.object({
   if (value.supersedes === value.id) ctx.addIssue({ code: "custom", message: "TEMPORARY_SUPERSEDES_SELF", path: ["supersedes"] });
   const claim = unprovenFixClaim(value.approvedReply, value.fix.level);
   if (claim) ctx.addIssue({ code: "custom", message: claim, path: ["approvedReply"] });
+  if (value.keywords && temporaryKnowledgePromise(value.approvedReply)) ctx.addIssue({ code: "custom", message: "TEMPORARY_KNOWLEDGE_PROMISE", path: ["approvedReply"] });
+}).transform(value => {
+  if (!value.keywords) return value;
+  return { ...value, knownSince: new Date(value.knownSince).toISOString(), validUntil: new Date(value.validUntil).toISOString() };
 });
 export type TemporaryIncident = z.infer<typeof temporaryIncidentDocumentSchema>;
 

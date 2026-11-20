@@ -13,8 +13,8 @@ describe("temporary incident state label", () => {
   it("never states the knowledge item as unpublished or inactive", () => {
     for (const label of [incidentStateLabel(row({})), incidentStateLabel(row({ revisionApproved: true, reviewState: "approved", incidentApproved: true }))]) {
       expect(label).not.toMatch(/révision non publiée|fiche non publiée|non active SAV|non indexée/i);
-      expect(label).toContain("Jamais projeté dans la fiche ni publié");
-      expect(label).toContain("non utilisé par l’agent SAV");
+      expect(label).toContain("Message conservé dans la révision canonique");
+      expect(label).not.toMatch(/non utilisé par l’agent SAV|branchement non réalisé/);
     }
   });
   it("reports the incident approval, expiry and revocation as observed", () => {

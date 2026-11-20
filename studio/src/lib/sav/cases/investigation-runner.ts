@@ -15,9 +15,9 @@ import { caseReplyTriggerOf } from "./investigation-intent";
 import type { CaseKnowledgeCoverage } from "./decision-contract";
 import type { CaseKnowledgeRead, CaseKnowledgeRequestProblem } from "./investigation-knowledge";
 import type { CaseQualificationUnavailable } from "./qualification-diagnostic";
-import { caseIncidentBindings, revalidateIncidentContext } from "./investigation-incidents";
+import { caseIncidentBindings, caseTemporaryKnowledgeRequestTexts, prioritizeCaseIncidentKnowledge, revalidateIncidentContext } from "./investigation-incidents";
 import { arrangeCaseMultiBlockKnowledge, arrangeCaseScopedKnowledge, caseScopedRecordCoverage, trimCaseScopedKnowledge, type CaseScopedKnowledge } from "./investigation-knowledge-ranking";
-import type { IncidentContext, IncidentReader } from "./investigation-incidents-contract";
+import { INCIDENT_RUNTIME_LIMIT, type IncidentContext, type IncidentRead, type IncidentReader, type TemporaryKnowledgeLookup } from "./investigation-incidents-contract";
 import { caseCustomerContextUnavailable, caseCustomerSearchText, type CaseCustomerContext } from "./investigation-customer-context";
 
 /*
@@ -233,6 +233,7 @@ export type CaseInvestigationPorts = {
   customerContext?(snapshot: CaseSnapshot, events: readonly CaseEvent[]): Promise<CaseCustomerContext>;
   /** Concrete canonical projection reader in the runtime. Absent preserves the legacy no-incident flow. */
   temporaryIncidents?: IncidentReader;
+  temporaryKnowledge?: TemporaryKnowledgeLookup;
   /** Texts of these customer messages keyed `type:id`, for resolution quote checks; an unreadable one is simply absent. */
   customerTexts(caseId: string, refs: SourceRef[]): Promise<Record<string, string>>;
   revisions(): Promise<CaseInvestigationRevisions>;
@@ -514,9 +515,36 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       const bindings = blockScopes && coverage ? Object.entries(blockScopes.scopes).flatMap(([id, scope]) => caseIncidentBindings(snapshot, knowledge,
         coverage!.filter(row => blockScopes!.requestBlocks[row.requestId] === id), scope, ports.scope.locale, ports.scope.audience, ports.now()))
         : caseIncidentBindings(snapshot, knowledge, coverage, accessScope, ports.scope.locale, ports.scope.audience, ports.now());
-      const read = await ports.temporaryIncidents(bindings, ports.now()).catch(() => ({ ok: false as const, problem: "read_failed" as const }));
+      const texts = caseTemporaryKnowledgeRequestTexts(snapshot);
+      let extraCards: SavRetrievalCandidate[] = [];
+      let read: IncidentRead;
+      try {
+        if (scoped && accessScope && texts.size && ports.temporaryKnowledge && ports.readScopeCards) {
+          const candidates = scoped.coverage.flatMap(row => {
+            const scope = blockScopes ? blockScopes.scopes[blockScopes.requestBlocks[row.requestId]!] : accessScope;
+            if (!scope || row.family !== scope.family || !texts.has(row.requestId)) return [];
+            return scope.sources.filter(ref => ref.use === "answer").map(({ knowledgeId, contentVersionId }) => (
+              { requestId: row.requestId, family: row.family, knowledgeId, contentVersionId }));
+          });
+          const matchRef = (a: KnowledgeRef, b: KnowledgeRef) => a.knowledgeId === b.knowledgeId && a.contentVersionId === b.contentVersionId;
+          const matches = (await ports.temporaryKnowledge(candidates, ports.now(), texts))
+            .filter(match => !bindings.some(bound => bound.requestId === match.requestId && matchRef(bound, match)));
+          if (matches.length > INCIDENT_RUNTIME_LIMIT) throw Error("SAV_TEMPORARY_KNOWLEDGE_SCOPE_LIMIT");
+          const refs = [...new Map(matches.map(({ knowledgeId, contentVersionId }) => [`${knowledgeId}:${contentVersionId}`, { knowledgeId, contentVersionId }])).values()];
+          if (refs.length) extraCards = (await ports.readScopeCards(refs)).filter(card =>
+            assessSavKnowledgeValidity(card, ports.scope.locale, ports.scope.audience, ports.now()).eligible);
+          bindings.push(...matches.filter(match => extraCards.some(card => card.id === match.knowledgeId && card.contentVersionId === match.contentVersionId)));
+        }
+        read = await ports.temporaryIncidents(bindings, ports.now(), texts);
+      } catch (error) {
+        read = { ok: false, problem: error instanceof Error && error.message === "SAV_TEMPORARY_KNOWLEDGE_SCOPE_LIMIT" ? "scope_limit" : "read_failed" };
+      }
       if (!read.ok) { await keep(wait("technical_wait", { temporaryIncidentProblem: read.problem })); return { status: "technical_wait", caseId, caseVersion, modelCalls }; }
       temporaryIncidents = read.context;
+      if (scoped && temporaryIncidents.entries.some(entry => entry.priority)) {
+        scoped = prioritizeCaseIncidentKnowledge(scoped, temporaryIncidents, extraCards);
+        knowledge = scoped.knowledge; coverage = scoped.coverage;
+      }
     }
     const incidentFingerprint = temporaryIncidents?.fingerprint;
     // A cached proposal was generated on THIS exact incident context, never on a newly approved/revoked replacement.
@@ -581,7 +609,9 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       // Ids and codes only, never a card's content.
       console.info("sav_v2_knowledge_selection", { caseId, caseVersion, sent: knowledge.map(card => card.id), scope: [...scoped.scopeKeys],
         dropped: scoped.dropped, added: scoped.added, scopeUnavailable: scoped.unavailable, scopeLeftOut: scoped.scopeLeftOut });
-    const decisionContext = built.context;
+    const decisionContext = temporaryIncidents?.entries.some(entry => entry.priority)
+      ? { ...built.context, usesTemporaryKnowledge: true as const }
+      : built.context;
     let proposal = prior?.proposal ?? null;
     const validate = (stored: { output: unknown; proposedOn: number }) => {
       const output = stored.output, echoed = typeof output === "object" && output !== null && (output as { caseVersion?: unknown }).caseVersion === stored.proposedOn;

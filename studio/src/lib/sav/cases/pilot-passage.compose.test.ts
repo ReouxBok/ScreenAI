@@ -123,7 +123,7 @@ async function v1Confirmed(kinds: string[] = ["support"], relation: "same" | nul
 }
 
 /** Invented dates, fixed so the export is reproducible; only the provenance reader judges them, on this clock. */
-const SYN_VERIFIED_AT = "2026-10-25T09:00:00.000Z", SYN_NOW = new Date("2026-11-04T07:00:00.000Z"), daysBefore = (days: number) => new Date(SYN_NOW.getTime() - days * 86_400_000).toISOString();
+const SYN_VERIFIED_AT = "2026-10-25T09:00:00.000Z", SYN_NOW = new Date("2026-11-04T07:00:00.000Z"), daysBefore = (days: number) => new Date(SYN_NOW.getTime() - days * 86_400_000).toISOString(), daysAfter = (days: number) => daysBefore(-days);
 const card = (id: string): SavRetrievalCandidate => ({ id, contentVersionId: `${id}-v1`, title: `Fiche ${id} (synthétique)`, content: "Procédure synthétique.", source: "fixture",
   verifiedAt: SYN_VERIFIED_AT, semanticScore: null, resolution: { steps: ["Étape synthétique"] },
   availability: { active: true, published: true, indexed: true, archived: false, aiEnabled: true, locale: "fr-FR", audience: "support" } });
@@ -538,13 +538,14 @@ describe("provenance of a pilot reply, recomputed from the recorded decision: no
     const original = { id: LOGIN.id, contentVersionId: LOGIN.contentVersionId }, familyId = randomUUID(), revisionId = randomUUID();
     LOGIN.id = randomUUID(); LOGIN.contentVersionId = randomUUID(); scope = synScope();
     try {
-      const doc = canonicalKnowledgeSchema.parse({ schemaVersion: 1, objective: "Connexion SYN", applicability: "sav_only", locale: "fr-FR", prerequisites: [], expectedResult: "Connexion", exceptions: [], escalation: "Revue humaine", steps: [{ id: "login.open", userLabel: "Ouvrir", objective: "Connexion", instruction: "Ouvrir la page de connexion", expectedResult: "Page affichée", prerequisites: [], exceptions: [], escalation: "", variants: [] }], temporaryIncident: { schemaVersion: 1, id: "syn-last-guard", revision: 1, title: "SYN délai", scope: { families: ["access"], productArea: "Connexion SYN" }, status: "active", knownSince: "2026-11-01T00:00:00Z", validUntil: "2026-11-20T00:00:00Z", approvedReply: "Un délai est connu de l’équipe.", fix: { level: "none", evidence: "" }, provenance: { source: "Déclaration synthétique", recordedAt: "2026-11-01T00:00:00Z" } } });
+      const doc = canonicalKnowledgeSchema.parse({ schemaVersion: 1, objective: "Connexion SYN", applicability: "sav_only", locale: "fr-FR", prerequisites: [], expectedResult: "Connexion", exceptions: [], escalation: "Revue humaine", steps: [{ id: "login.open", userLabel: "Ouvrir", objective: "Connexion", instruction: "Ouvrir la page de connexion", expectedResult: "Page affichée", prerequisites: [], exceptions: [], escalation: "", variants: [] }], temporaryIncident: { schemaVersion: 1, id: "syn-last-guard", revision: 1, title: "SYN délai", scope: { families: ["access"], productArea: "Connexion SYN" }, status: "active", knownSince: daysBefore(3), validUntil: daysAfter(16), approvedReply: "Un délai est connu de l’équipe.", fix: { level: "none", evidence: "" }, provenance: { source: "Déclaration synthétique", recordedAt: daysBefore(3) } } });
       await f.db.insert(contentItems).values({ id: LOGIN.id, slug: `syn-${LOGIN.id}`, type: "article", title: "Connexion SYN", ownerEmail: "staff@example.invalid" });
       await f.db.insert(contentVersions).values({ id: LOGIN.contentVersionId, itemId: LOGIN.id, version: 1, bodyMarkdown: "Connexion SYN", metadata: { intents: [], limovaPaths: [], prerequisites: [], expectedResult: "Connexion", troubleshooting: "" }, authorEmail: "staff@example.invalid", changeNote: "SYN" });
       await f.db.insert(knowledgeFamilies).values({ id: familyId, canonicalKey: `syn-${familyId}`, title: "Connexion SYN", createdBy: "staff@example.invalid", approvedRevisionId: revisionId });
-      await f.db.insert(knowledgeFamilyRevisions).values({ id: revisionId, familyId, revision: 1, canonicalHash: "syn-last-guard", document: doc, reviewState: transition === "approve" ? "pending" : "approved", reviewedBy: "ugo@limova.ai", reviewedAt: new Date("2026-11-02T00:00:00Z") });
+      await f.db.insert(knowledgeFamilyRevisions).values({ id: revisionId, familyId, revision: 1, canonicalHash: "syn-last-guard", document: doc, reviewState: transition === "approve" ? "pending" : "approved", reviewedBy: "ugo@limova.ai", reviewedAt: new Date(daysBefore(2)) });
       await f.db.insert(knowledgeProjections).values({ familyId, revisionId, surface: "sav", itemId: LOGIN.id, versionId: LOGIN.contentVersionId });
-      const mail = await queued(readRuntimeTemporaryIncidents);
+      /** One test clock: the investigation reads the incident on SYN_NOW, like the approval and the driver (provenanceDeps.now), never on the real day. */
+      const mail = await queued((bindings, _now, texts) => readRuntimeTemporaryIncidents(bindings, SYN_NOW, texts));
       expect(await readPilotReplyProvenance(mail.proposal, provenanceDeps)).toMatchObject({ status: "proven" });
       const result = await executeIntakePass(mail.replyExecutionId, options, { afterMarker: async () => {
         if (transition === "approve") await f.db.update(knowledgeFamilyRevisions).set({ reviewState: "approved" }).where(eq(knowledgeFamilyRevisions.id, revisionId));

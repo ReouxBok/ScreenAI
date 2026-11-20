@@ -11,14 +11,18 @@ const empty = { id: "", title: "", family: "usage", productArea: "", knownSince:
 const labels: Record<keyof typeof empty, string> = { id: "Référence courte (ex. incident-routines-novembre)", title: "Titre", family: "Famille concernée", productArea: "Zone produit",
   knownSince: "Début de validité (date ISO avec fuseau)", validUntil: "Fin de validité (date ISO avec fuseau, 30 jours maximum)", reply: "Texte proposé au support", source: "Origine de l’information" };
 
-export function TemporaryIncidentForm() {
+export function TemporaryIncidentForm({ withKeywords = false }: { withKeywords?: boolean }) {
   const [input, setInput] = useState(empty), [preview, setPreview] = useState<ReturnType<typeof prepareTemporaryIncidentDraft> | null>(null);
+  const [keywords, setKeywords] = useState("");
   const [draft, setDraft] = useState<SavKnowledgeDraft | null>(null), [error, setError] = useState("");
   const [uncertain, setUncertain] = useState(false);
   const [busy, startTransition] = useTransition(), locked = useRef(false);
   function prepare() {
-    try { setPreview(prepareTemporaryIncidentDraft(input)); setError(""); }
-    catch { setPreview(null); setError("Vérifiez la référence, les champs et les dates de validité. Ne présentez pas un correctif comme acquis."); }
+    try {
+      setPreview(prepareTemporaryIncidentDraft({ ...input, ...(withKeywords ? { keywords: keywords.split("\n").map(term => term.trim()).filter(Boolean) } : {}) }));
+      setError("");
+    }
+    catch { setPreview(null); setError("Vérifiez les champs et les dates. Décrivez la situation actuelle, sans promesse."); }
   }
   function save() {
     if (!preview || locked.current || draft || uncertain) return;
@@ -34,7 +38,7 @@ export function TemporaryIncidentForm() {
   }
   return <section aria-label="Proposer un incident temporaire">
     <h2>Proposer un incident temporaire</h2>
-    <p>Crée une nouvelle proposition de connaissance en brouillon. La revue humaine reste obligatoire. L’incident n’est pas utilisé par l’agent SAV.</p>
+    <p>Crée une nouvelle proposition de connaissance en brouillon. La revue humaine reste obligatoire.</p>
     {Object.keys(empty).map(key => {
       const field = key as keyof typeof empty;
       const edit = (value: string) => { setInput(previous => ({ ...previous, [field]: value })); setPreview(null); setError(""); };
@@ -43,6 +47,10 @@ export function TemporaryIncidentForm() {
         : field === "reply" ? <textarea rows={4} maxLength={2000} value={input[field]} disabled={busy || Boolean(draft) || uncertain} onChange={e => edit(e.target.value)}/>
           : <input value={input[field]} maxLength={field === "source" ? 500 : 200} disabled={busy || Boolean(draft) || uncertain} onChange={e => edit(e.target.value)}/>}</label>;
     })}
+    {withKeywords ? <label>Mots-clés ou symptômes (un par ligne)
+      <textarea rows={3} maxLength={1010} value={keywords} disabled={busy || Boolean(draft) || uncertain}
+        onChange={event => { setKeywords(event.target.value); setPreview(null); setError(""); }} />
+    </label> : null}
     <button type="button" disabled={busy || Boolean(draft) || uncertain} onClick={prepare}>Prévisualiser l’incident</button>
     {error ? <p role="alert">{error}</p> : null}
     {preview ? <section aria-label="Aperçu de l’incident proposé"><h3>{preview.title}</h3><p>{preview.document.temporaryIncident?.approvedReply}</p>

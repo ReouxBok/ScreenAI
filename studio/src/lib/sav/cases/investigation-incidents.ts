@@ -1,7 +1,8 @@
 import { assessSavKnowledgeValidity, type SavRetrievalCandidate } from "../request-retrieval";
 import { caseAccessSourceProblem, type CaseBlockScope } from "./investigation-access-scope";
-import type { CaseKnowledgeCoverage } from "./decision-contract";
-import type { CaseSnapshot } from "./case-types";
+import { isSensitiveCaseFamily, type CaseKnowledgeCoverage } from "./decision-contract";
+import { caseRequestSearchText, type CaseSnapshot } from "./case-types";
+import type { CaseScopedKnowledge } from "./investigation-knowledge-ranking";
 import { incidentContext, incidentContextSchema, type IncidentBinding, type IncidentContext, type IncidentReader } from "./investigation-incidents-contract";
 
 /** Only an exact already-retrieved ANSWER source for the admitted open request establishes the projection lookup. */
@@ -17,6 +18,49 @@ export function caseIncidentBindings(snapshot: CaseSnapshot, cards: SavRetrieval
       return [{ requestId: request.id, family: request.family, ...ref }];
     });
   });
+}
+
+/** Promote proven matches, including exact versions read outside the ordinary ranking. */
+export function prioritizeCaseIncidentKnowledge(scoped: CaseScopedKnowledge, context: IncidentContext, fetched: SavRetrievalCandidate[]): CaseScopedKnowledge {
+  const priority = context.entries.filter(entry => entry.priority).map(entry => entry.proof);
+  if (!priority.length) return scoped;
+  const key = (ref: { knowledgeId: string; contentVersionId: string }) => `${ref.knowledgeId}:${ref.contentVersionId}`;
+  const cardKey = (card: SavRetrievalCandidate) => `${card.id}:${card.contentVersionId}`;
+  const priorityKeys = new Set(priority.map(key));
+  const cards = new Map(scoped.knowledge.map(card => [cardKey(card), card]));
+  for (const card of fetched) {
+    const cardRef = cardKey(card);
+    if (priorityKeys.has(cardRef) && !cards.has(cardRef)) cards.set(cardRef, card);
+  }
+  const first = <T,>(items: T[], preferred: (item: T) => boolean) => [...items.filter(preferred), ...items.filter(item => !preferred(item))];
+  const added = [...scoped.added];
+  const coverage = scoped.coverage.map(row => {
+    const refs = priority.filter(ref => ref.requestId === row.requestId && cards.has(key(ref)));
+    if (!refs.length) return row;
+    const preferred = new Set(refs.map(key));
+    const newRefs = refs.filter(ref => !row.knowledge.some(other => key(other) === key(ref)))
+      .map(({ requestId, knowledgeId, contentVersionId }) => ({ requestId, knowledgeId, contentVersionId }));
+    added.push(...newRefs);
+    const knowledge = [...row.knowledge, ...newRefs.map(({ knowledgeId, contentVersionId }) => ({ knowledgeId, contentVersionId }))];
+    return { ...row, status: "covered" as const, knowledge: first(knowledge, ref => preferred.has(key(ref))) };
+  });
+  return {
+    ...scoped, knowledge: first([...cards.values()], card => priorityKeys.has(cardKey(card))), coverage, added,
+    scopeKeys: new Set([...scoped.scopeKeys, ...priorityKeys]),
+    scopeLeftOut: scoped.scopeLeftOut.filter(ref => !priorityKeys.has(key(ref))),
+    dropped: scoped.dropped.filter(ref => !priorityKeys.has(key(ref))),
+  };
+}
+
+export function caseTemporaryKnowledgeRequestTexts(snapshot: CaseSnapshot) {
+  const requests = snapshot.body.openRequests;
+  const texts = new Map<string, string>();
+  if (requests.some(row => row.status !== "resolved" && isSensitiveCaseFamily(row.family))) return texts;
+  for (const row of requests) {
+    const text = caseRequestSearchText(row);
+    if (row.status === "open" && text) texts.set(row.id, text);
+  }
+  return texts;
 }
 
 export function parseIncidentContext(raw: unknown): IncidentContext | null {

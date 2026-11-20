@@ -1,7 +1,7 @@
 import "server-only";
 import { sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { readRuntimeTemporaryIncidents } from "@/lib/knowledge/temporary-incidents-runtime";
+import { runtimeTemporaryIncidentReader } from "@/lib/knowledge/temporary-incidents-runtime";
 import { admissionPolicyRevisionPort, type AdmissionPolicyRecord } from "./admission-runtime";
 import type { KnowledgeRef } from "./case-types";
 import { SAV_CASE_BLOCK_SCOPES_BUNDLE, type CaseBlockScopesBundle, type CaseScopePart } from "./investigation-access-scope";
@@ -106,7 +106,7 @@ export function caseProvenanceReaders(input: Readonly<{
   const now = input.now ?? caseInvestigationClock;
   return {
     env: input.env ?? (() => process.env),
-    readTemporaryIncidents: readRuntimeTemporaryIncidents,
+    readTemporaryIncidents: runtimeTemporaryIncidentReader(input.env),
     accessScope: caseAccessScopeConfigReader(input.env), currentPolicyRevision: casePolicyRevisionReader(input.readPolicyRecord, now),
     readActiveSource: caseActiveSourceReader({ ...(input.locale ? { locale: input.locale } : {}), ...(input.audience ? { audience: input.audience } : {}) }), now,
   };
