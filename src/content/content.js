@@ -923,6 +923,14 @@ function setElementText(id, contextVersion, rawText) {
   if (Number.isInteger(element.maxLength) && element.maxLength >= 0 && text.length > element.maxLength) {
     return { ok: false, clarificationRequired: true, error: `Le texte dépasse la limite de ${element.maxLength} caractères.` };
   }
+  if (element instanceof HTMLInputElement && ['date', 'time', 'datetime-local'].includes(element.type)) {
+    // Let the browser validate its native format and min/max/step constraints
+    // on a detached field before touching the member's existing value.
+    const probe = element.cloneNode(false);
+    probe.value = text;
+    if (probe.value !== text || !probe.validity.valid) return { ok: false, clarificationRequired: true,
+      failureCode: 'invalid_field_value', error: 'La date ou l’heure ne respecte pas le format ou les limites du champ.' };
+  }
 
   element.focus();
   if (element instanceof HTMLInputElement) {
@@ -1023,7 +1031,7 @@ async function glideAgentPointer(x, y) {
   pointer.style.opacity = '1';
   await waitForPointerFrame();
   pointer.style.transform = `translate3d(${x}px, ${y}px, 0)`;
-  await waitForPointerDelay(650);
+  await waitForPointerDelay(140);
   return pointer;
 }
 
@@ -1058,7 +1066,7 @@ function ensurePointerStyles() {
       height: 34px;
       z-index: 2147483647;
       pointer-events: none;
-      transition: transform 600ms cubic-bezier(.22,.8,.25,1), opacity 220ms ease;
+      transition: transform 120ms cubic-bezier(.22,.8,.25,1), opacity 220ms ease;
     }
     #limova-computer-use-pointer svg {
       position: relative; display: block; width: 26px; height: 26px;
@@ -1104,8 +1112,8 @@ async function executeElementActionWithCursor(id, contextVersion, options = {}) 
   if (!resolved.ok) return resolved;
   const target = resolved.activationElement;
   suppressAssistantScrollUntil = Date.now() + 1_000;
-  target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
-  await waitForPointerDelay(220);
+  target.scrollIntoView({ behavior: 'instant', block: 'nearest', inline: 'nearest' });
+  await waitForPointerFrame();
 
   if (!current()) return { ok: false, cancelled: true, error: 'Demande vocale remplacée.' };
 
@@ -1160,8 +1168,8 @@ async function executeElementTextInputWithCursor(id, contextVersion, text, optio
   let resolved = resolveTextInput(id, contextVersion, { allowOffscreen: true });
   if (!resolved.ok) return resolved;
   suppressAssistantScrollUntil = Date.now() + 1_000;
-  resolved.element.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
-  await waitForPointerDelay(220);
+  resolved.element.scrollIntoView({ behavior: 'instant', block: 'nearest', inline: 'nearest' });
+  await waitForPointerFrame();
 
   resolved = resolveTextInput(id, contextVersion);
   if (!resolved.ok) return resolved;

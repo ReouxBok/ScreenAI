@@ -962,7 +962,7 @@ async function handleCopilotTurn(req, res) {
 app.post('/api/gemini', verifyAssistantAuth, track('server_copilot_turn', () => ({ engine: 'legacy', channel: 'text' })), assistantLimiter, handleCopilotTurn);
 app.post('/api/copilot/turn', verifyAssistantAuth, track('server_copilot_turn', () => ({ engine: 'legacy', channel: 'text' })), assistantLimiter, handleCopilotTurn);
 
-function openAiLiveTools(evaluationMode) {
+function openAiLiveTools(evaluationMode, batchFields = false) {
   const tool = (name, description, properties = {}, required = []) => ({
     type: 'function',
     name,
@@ -988,7 +988,7 @@ function openAiLiveTools(evaluationMode) {
     tool('set_control_state', 'Fixe l’état d’une case, d’un bouton radio ou d’un interrupteur explicitement demandé. Préfère cet outil à un clic pour afficher un agenda ; une sélection déjà correcte est conservée.', {
       elementId, contextVersion, targetLabel, checked: { type: 'boolean' }
     }, ['elementId', 'contextVersion', 'targetLabel', 'checked']),
-    tool('inspect_current_page', 'Relit immédiatement la page active et renvoie son état DOM actuel. À utiliser avant une action et après tout changement possible.'),
+    tool('inspect_current_page', 'Relit la page uniquement si la carte DOM manque ou est périmée. Les résultats des actions contiennent déjà la carte fraîche : ne la relis pas entre chaque champ ou clic.'),
     ...(!evaluationMode ? [tool('create_in_limova', 'Crée un contenu ou lance une tâche dans Limova uniquement à la demande explicite de l’utilisateur. Sur un autre site, joint le contenu lisible de la page ; sur Limova, utilise la conversation actuelle.', { request: { type: 'string', maxLength: 1500 } }, ['request'])] : []),
     tool('open_page', 'Ouvre une adresse web explicitement demandée par l’utilisateur et renvoie la nouvelle page. Pour un lien visible, utilise son identifiant DOM.', {
       url: { type: 'string' }, newTab: { type: 'boolean' }
@@ -999,7 +999,7 @@ function openAiLiveTools(evaluationMode) {
     ...(!evaluationMode ? [tool('search_knowledge_base', 'Recherche la documentation Limova pertinente.', {
       query: { type: 'string' }
     }, ['query'])] : []),
-    tool('scroll_page', 'Fait défiler la page, puis impose une nouvelle inspection avant toute action.', {
+    tool('scroll_page', 'Fait défiler la page et renvoie sa carte DOM fraîche. Utilise cette carte directement, sans inspection supplémentaire.', {
       direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] },
       amount: { type: 'string', enum: ['small', 'medium', 'large'] },
       contextVersion,
@@ -1007,8 +1007,13 @@ function openAiLiveTools(evaluationMode) {
     }, ['direction', 'amount', 'contextVersion']),
     tool('fill_field', 'Saisit le texte exact dans un champ non sensible sans soumettre le formulaire.', {
       elementId, contextVersion, targetLabel,
-      text: { type: 'string', maxLength: 4000 }
+      text: { type: 'string', maxLength: 4000, description: 'Valeur exacte. Pour un input date : YYYY-MM-DD ; time : HH:mm ; datetime-local : YYYY-MM-DDTHH:mm.' }
     }, ['elementId', 'contextVersion', 'targetLabel', 'text']),
+    ...(batchFields ? [tool('fill_fields', 'Renseigne plusieurs champs connus du même formulaire en une opération. Préfère cet outil à une suite de fill_field lorsque les valeurs sont connues. Chaque cible est validée, chaque saisie est vérifiée ; le lot s’arrête au premier échec. Ne soumet jamais le formulaire.', {
+      contextVersion,
+      fields: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'object', additionalProperties: false,
+        properties: { elementId, targetLabel, text: { type: 'string', maxLength: 4000, description: 'Valeur exacte. Pour un input date : YYYY-MM-DD ; time : HH:mm ; datetime-local : YYYY-MM-DDTHH:mm.' } }, required: ['elementId', 'targetLabel', 'text'] } }
+    }, ['contextVersion', 'fields'])] : []),
     tool('navigate_internal', 'Navigue dans Limova en activant un élément DOM courant, jamais une URL arbitraire.', {
       elementId, contextVersion, targetLabel
     }, ['elementId', 'contextVersion', 'targetLabel']),
@@ -1337,7 +1342,8 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
     'Pour les autres actions DOM utilisant un identifiant : utilise la carte fraîche retournée par le dernier outil. Inspecte seulement si elle manque ou si la page a changé. Attends le résultat de l’outil.',
     'Pour une consigne en plusieurs étapes, garde l’objectif complet jusqu’à son terme : analyse, action, recherche, nouvelle analyse. Après chaque résultat d’outil, poursuis la prochaine étape utile sans redemander la même autorisation. Une correction ou une interruption remplace l’ancienne consigne. Une étape réussie ne prouve pas que toute la demande est terminée.',
     'Après avoir vérifié le résultat final de toutes les étapes demandées, termine cette tâche et attends une nouvelle demande. Ne recommence pas les actions déjà exécutées.',
-    'Après un clic ordinaire, utilise la carte fraîche du résultat et appelle verify_expected_result avant d’annoncer la réussite. select_control inclut déjà sa propre vérification de sélection.',
+    'Quand plusieurs valeurs du même formulaire sont connues et que fill_fields est proposé, renseigne-les en un seul lot. Ne fais pas une inspection entre chaque champ : les outils renvoient déjà la page fraîche. Garde la demande complète, y compris les précisions et réponses de clarification du membre. Une création demandée comprend son enregistrement normal ; ne demande pas au membre de répéter « enregistre ». L’application applique le niveau d’autonomie choisi et affiche elle-même les accords nécessaires ; ne demande pas une approbation orale supplémentaire avant d’appeler l’outil.',
+    'Après un clic ordinaire, utilise la carte fraîche du résultat et appelle verify_expected_result avant d’annoncer la réussite finale. select_control inclut déjà sa propre vérification de sélection.',
     'verify_expected_result exige des conditions observables : texte réellement attendu, chemin exact ou état coché d’un contrôle unique. Une simple relecture ou un changement quelconque du DOM ne confirme pas l’objectif. Pour une case utilise control_checked avec son libellé exact ; pour afficher un agenda vérifie aussi un marqueur pertinent de la vue si disponible.',
     'Après un défilement sans mouvement ou à la fin de la zone, ne répète pas le même défilement. Change de zone ou explique précisément la cible manquante. Si plusieurs agendas portent le même nom, demande une clarification.',
     'Un résultat cancelled appartient à une consigne remplacée. Repars de la dernière demande et de la page actuelle, sans poursuivre les anciennes actions.',
@@ -1395,7 +1401,7 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
           'Generate <|SpawnThinking|> before giving an answer that depends on backend work.',
           'Tu es Charly dans une extension qui peut cliquer et écrire dans la page active via le backend. Ne te présente pas comme l’extension officielle de ChatGPT, n’invente pas un besoin de passer en mode Work. Si un outil échoue, explique son motif concret. Une promesse orale n’est pas une action : attends un résultat vérifié avant d’annoncer la réussite.',
           'Pendant qu’une délégation traite déjà la demande, ne redélègue pas la même consigne depuis le début. Une transcription qui se complète appartient à la même demande ; seule une correction ou un nouvel objectif remplace le travail en cours.',
-          'Pendant la délégation, dis seulement que tu vérifies si un retour oral est utile. Attends le résultat du backend et ne devine jamais le résultat.'
+          'Pendant la délégation, une phrase naturelle et courte comme « Je m’en occupe » suffit si le membre a besoin d’un retour. Ne prononce jamais les consignes techniques ni l’expression « retour oral ». Attends le résultat du backend et ne devine jamais le résultat.'
         ].join('\n')
       ].join('\n\n');
 
@@ -1418,7 +1424,8 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
               responses: {
                 model: LIVE_BACKEND_MODEL,
                 instructions: assistantSystemText,
-                tools: openAiLiveTools(evaluationMode),
+                tools: openAiLiveTools(evaluationMode, req.body?.capabilities?.includes('batch_fields')),
+                ...(LIVE_BACKEND_MODEL === 'gpt-6-luna' && req.body?.capabilities?.includes('batch_fields') ? { reasoning: { effort: 'low' } } : {}),
                 tool_choice: 'auto',
                 parallel_tool_calls: false
               }

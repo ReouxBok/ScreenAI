@@ -305,10 +305,10 @@ describe('content.js — DOM helpers', () => {
       const click = vi.spyOn(button, 'click');
 
       const action = content.executeElementActionWithCursor(5, 11);
-      await vi.advanceTimersByTimeAsync(250);
+      await vi.advanceTimersByTimeAsync(10);
       expect(document.querySelector('#limova-computer-use-pointer')).toBeTruthy();
       expect(click).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(700);
+      await vi.advanceTimersByTimeAsync(390);
 
       await expect(action).resolves.toMatchObject({ ok: true, visualized: true });
       expect(click).toHaveBeenCalledOnce();
@@ -377,6 +377,25 @@ describe('content.js — DOM helpers', () => {
   });
 
   describe('setElementText', () => {
+    it.each([['date', '2026-11-21'], ['time', '15:00'], ['datetime-local', '2026-11-21T15:00']])('fills a native %s field with a valid browser value', (type, value) => {
+      document.documentElement.dataset.limovaContextVersion = '12';
+      document.body.innerHTML = `<input type="${type}" data-lid="6">`;
+      const field = document.querySelector('input');
+      field.getBoundingClientRect = () => ({ left: 20, top: 30, width: 240, height: 40 });
+      expect(content.setElementText(6, 12, value)).toMatchObject({ ok: true });
+      expect(field.value).toBe(value);
+    });
+
+    it.each(['25:00', '15h00', '09:00'])('rejects invalid or out-of-range time %s without clearing the previous value', value => {
+      document.documentElement.dataset.limovaContextVersion = '12';
+      document.body.innerHTML = '<input type="time" min="10:00" max="18:00" value="12:00" data-lid="6">';
+      const field = document.querySelector('input');
+      field.getBoundingClientRect = () => ({ left: 20, top: 30, width: 240, height: 40 });
+      const input = vi.fn(); field.addEventListener('input', input);
+      expect(content.setElementText(6, 12, value)).toMatchObject({ ok: false, failureCode: 'invalid_field_value' });
+      expect(field.value).toBe('12:00');
+      expect(input).not.toHaveBeenCalled();
+    });
     it('fills the current non-sensitive field and emits framework-compatible events', () => {
       document.documentElement.dataset.limovaContextVersion = '12';
       document.body.innerHTML = '<textarea data-lid="6" aria-label="Instructions"></textarea>';
@@ -420,10 +439,10 @@ describe('content.js — DOM helpers', () => {
       field.getBoundingClientRect = () => ({ left: 80, top: 60, width: 220, height: 40 });
 
       const action = content.executeElementTextInputWithCursor(9, 14, 'Projet Atlas');
-      await vi.advanceTimersByTimeAsync(250);
+      await vi.advanceTimersByTimeAsync(10);
       expect(document.querySelector('#limova-computer-use-pointer')).toBeTruthy();
       expect(field.value).toBe('');
-      await vi.advanceTimersByTimeAsync(800);
+      await vi.advanceTimersByTimeAsync(390);
 
       await expect(action).resolves.toMatchObject({ ok: true, visualized: true, inputVerified: true });
       expect(field.value).toBe('Projet Atlas');

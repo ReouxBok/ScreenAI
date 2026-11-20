@@ -290,6 +290,51 @@ describe('controlled page actions', () => {
     expect(chromeMock.tabs.sendMessage.mock.calls.filter(([, msg]) => msg.type === 'EXECUTE_ELEMENT_ACTION')).toHaveLength(clicks);
   });
 
+  it('executes the matched final step of a delegated creation in full mode without literal button wording', async () => {
+    const idOf = await showPage('<main><h1>Calendrier — Nouvel événement</h1><div role="dialog"><button type="button">Valider</button></div></main>');
+    const request = 'Tu peux me créer un événement sport pour demain de quinze à seize heures';
+    await background.handleMessage({ type: 'VOICE_TRANSCRIPT', role: 'user', text: request });
+    const result = await background.proposeOrExecuteAction(idOf('Valider'), request, { toolExplicitRequest: true, targetLabel: 'Valider' });
+    expect(result.ok).toBe(true);
+    clicked(idOf('Valider'));
+    expect(sidebarMessages.some(message => message.type === 'ACTION_PROPOSAL')).toBe(false);
+  });
+
+  it('still requires an approval for the same consequential step in balanced mode', async () => {
+    await background.handleMessage({ type: 'SET_AUTONOMY_MODE', mode: 'balanced' });
+    const idOf = await showPage('<main><h1>Calendrier — Nouvel événement</h1><button type="button">Valider</button></main>');
+    const request = 'Tu peux me créer un événement sport pour demain';
+    await background.handleMessage({ type: 'VOICE_TRANSCRIPT', role: 'user', text: request });
+    const pending = background.proposeOrExecuteAction(idOf('Valider'), request, { toolExplicitRequest: true, targetLabel: 'Valider' });
+    expect(await cancelApproval(pending)).toMatchObject({ cancelled: true });
+    notClicked();
+  });
+
+  it.each(['Est-ce que tu peux créer un rendez-vous demain ?', 'Bloque un créneau dans mon agenda demain'])('treats a spoken calendar command as including Save: %s', async request => {
+    const idOf = await showPage('<main><h1>Calendrier — Nouvel événement</h1><div role="button" tabindex="0">Enregistrer</div></main>');
+    await background.handleMessage({ type: 'VOICE_TRANSCRIPT', role: 'user', text: request });
+    expect(await background.proposeOrExecuteAction(idOf('Enregistrer'), request, { toolExplicitRequest: true, targetLabel: 'Enregistrer' })).toMatchObject({ ok: true });
+    expect(sidebarMessages.some(message => message.type === 'ACTION_PROPOSAL')).toBe(false);
+  });
+
+  it('does not use full-mode delegation to save an unrelated billing form', async () => {
+    const oldTitle = document.title; document.title = 'Facturation';
+    try {
+      const idOf = await showPage('<main><h1>Facturation</h1><button type="submit">Enregistrer</button></main>');
+      const request = 'Crée un rendez-vous demain';
+      await background.handleMessage({ type: 'VOICE_TRANSCRIPT', role: 'user', text: request });
+      expect(await cancelApproval(background.proposeOrExecuteAction(idOf('Enregistrer'), request, { toolExplicitRequest: true, targetLabel: 'Enregistrer' }))).toMatchObject({ cancelled: true });
+      notClicked();
+    } finally { document.title = oldTitle; }
+  });
+
+  it.each(['Charly, comment créer un rendez-vous ?', 'Tu peux me dire comment créer un événement ?', 'Peux-tu m’expliquer comment enregistrer ?'])('does not turn an explanation into a full-access action: %s', async request => {
+    const idOf = await showPage('<main><h1>Calendrier</h1><div role="button" tabindex="0">Enregistrer</div></main>');
+    await background.handleMessage({ type: 'VOICE_TRANSCRIPT', role: 'user', text: request });
+    expect(await cancelApproval(background.proposeOrExecuteAction(idOf('Enregistrer'), request, { toolExplicitRequest: true, targetLabel: 'Enregistrer' }))).toMatchObject({ cancelled: true });
+    notClicked();
+  });
+
   it('cancels an approval if its target page changes', async () => {
     await background.handleMessage({ type: 'SET_AUTONOMY_MODE', mode: 'ask' });
     const pending = background.proposeOrExecuteAction(1, 'Clique sur Documents');

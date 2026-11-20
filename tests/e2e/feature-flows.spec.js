@@ -30,7 +30,8 @@ const limovaFixture = `<!doctype html>
         <textarea id="composerField" aria-label="Écris à Charly"></textarea>
         <button id="attachmentButton" type="button" aria-label="Ajouter une pièce jointe"><svg></svg></button>
         <button id="composerMic" type="button" title="Cliquez pour parler"><svg></svg></button>
-        <button id="sendMessage" type="button" onclick="this.dataset.clicked='true'"><svg></svg></button>
+        <button id="sendMessage" type="button" onclick="this.dataset.clicked='true'; document.getElementById('sentStatus').textContent='Message envoyé'"><svg></svg></button>
+        <p id="sentStatus" role="status"></p>
       </section>
       <div aria-hidden="true" style="height: 1800px"></div>
     </main>

@@ -81,6 +81,66 @@ test('GPT overlapping transcripts produce one bubble per utterance', async ({ me
   await panel.evaluate(() => { stopVoiceSession(); window.__remote.close(); });
 });
 
+test('a sentence resumed after a long pause still selects and verifies the requested calendar', async ({ mediaContext, mediaExtensionId }) => {
+  const { panel, web } = await setup(mediaContext, mediaExtensionId);
+  await web.evaluate(() => { window.changes = 0; document.querySelector('#agenda').addEventListener('change', () => window.changes++); });
+  await panel.evaluate(() => {
+    window.__remoteChannel.send(JSON.stringify({ type: 'session.input_transcript.delta', delta: 'Affiche mon agenda', start_ms: 0, end_ms: 100 }));
+    window.__remoteChannel.send(JSON.stringify({ type: 'session.delegation.created', offset_ms: 100, delegation: { id: 'calendar-task' } }));
+    window.__remoteChannel.send(JSON.stringify({ type: 'response.event', delegation_id: 'calendar-task', event: {
+      type: 'response.output_item.done', item: { type: 'function_call', call_id: 'read-calendar', name: 'inspect_current_page', arguments: '{}' }
+    } }));
+  });
+  await expect.poll(() => panel.evaluate(() => window.__sent.some(event => event.item?.call_id === 'read-calendar'))).toBe(true);
+  const revision = await panel.evaluate(() => voiceSession.taskRevision);
+  await panel.evaluate(() => {
+    // Session timestamps reproduce the speech pause without sleeping in the test.
+    window.__remoteChannel.send(JSON.stringify({ type: 'session.input_transcript.delta', delta: ' puis affiche celui d’Anthony', start_ms: 15000, end_ms: 15200 }));
+    window.__remoteChannel.send(JSON.stringify({ type: 'response.event', delegation_id: 'calendar-task', event: {
+      type: 'response.output_item.done', item: { type: 'function_call', call_id: 'show-calendar', name: 'select_control', arguments: JSON.stringify({ targetLabel: 'Agenda Anthony', checked: true }) }
+    } }));
+  });
+  await expect.poll(() => panel.evaluate(() => window.__sent.some(event => event.item?.call_id === 'show-calendar'))).toBe(true);
+  expect(await panel.evaluate(() => JSON.parse(window.__sent.find(event => event.item?.call_id === 'show-calendar').item.output))).toMatchObject({ status: 'ok' });
+  await expect(web.locator('#agenda')).toBeChecked();
+  expect(await web.evaluate(() => window.changes)).toBe(1);
+  expect(await panel.evaluate(() => voiceSession.taskRevision)).toBe(revision);
+  await panel.evaluate(() => window.__remoteChannel.send(JSON.stringify({ type: 'response.event', delegation_id: 'calendar-task', event: {
+    type: 'response.output_item.done', item: { type: 'function_call', call_id: 'verify-calendar', name: 'verify_expected_result', arguments: JSON.stringify({ conditions: [{ kind: 'control_checked', targetLabel: 'Agenda Anthony', checked: true }] }) }
+  } })));
+  await expect.poll(() => panel.evaluate(() => window.__sent.some(event => event.item?.call_id === 'verify-calendar' && JSON.parse(event.item.output).verification?.status === 'confirmed'))).toBe(true);
+  expect(await panel.evaluate(() => ({ ready: voiceSession.ready, steps: voiceSession.task.steps.length }))).toEqual({ ready: true, steps: 3 });
+  await panel.evaluate(() => { stopVoiceSession(); window.__remote.close(); });
+});
+
+test('a correction during result delivery never duplicates a tool output or closes the voice connection', async ({ mediaContext, mediaExtensionId }) => {
+  const { panel, web } = await setup(mediaContext, mediaExtensionId);
+  await web.evaluate(() => { window.changes = 0; document.querySelector('#agenda').addEventListener('change', () => window.changes++); });
+  await panel.evaluate(() => {
+    voiceSession.sendVisualContext = () => new Promise(resolve => { window.__releaseImage = resolve; });
+    window.__remoteChannel.send(JSON.stringify({ type: 'session.input_transcript.delta', delta: 'Affiche l’agenda d’Anthony', start_ms: 0, end_ms: 100 }));
+    window.__remoteChannel.send(JSON.stringify({ type: 'session.delegation.created', delegation: { id: 'calendar-task' } }));
+    window.__remoteChannel.send(JSON.stringify({ type: 'response.event', delegation_id: 'calendar-task', event: {
+      type: 'response.output_item.done', item: { type: 'function_call', call_id: 'select-once', name: 'select_control', arguments: JSON.stringify({ targetLabel: 'Agenda Anthony', checked: true }) }
+    } }));
+  });
+  await expect(web.locator('#agenda')).toBeChecked();
+  await expect.poll(() => panel.evaluate(() => typeof window.__releaseImage === 'function' && window.__sent.some(event => event.item?.call_id === 'select-once'))).toBe(true);
+  await panel.evaluate(async () => {
+    voiceSession.handleLiveEvent({ type: 'session.input_transcript.delta', delta: 'Non, arrête', start_ms: 5000, end_ms: 5200 });
+    window.__releaseImage(false);
+    await voiceSession.toolQueue;
+    window.__remoteChannel.send(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', code: 'invalid_command', message: 'Synthetic rejected command' } }));
+  });
+  await expect.poll(() => panel.evaluate(() => window.__sent.filter(event => event.type === 'response.create').length)).toBe(1);
+  expect(await panel.evaluate(() => window.__sent.filter(event => event.item?.call_id === 'select-once').length)).toBe(1);
+  await expect(panel.locator('.message.error')).toContainText('La conversation vocale reste active');
+  await expect(panel.locator('#voiceControls')).toBeVisible();
+  expect(await panel.evaluate(() => voiceSession.ready && !voiceSession.failed)).toBe(true);
+  expect(await web.evaluate(() => window.changes)).toBe(1);
+  await panel.evaluate(() => { stopVoiceSession(); window.__remote.close(); });
+});
+
 test('stopping GPT during microphone acquisition never revives its connection', async ({ mediaContext, mediaExtensionId }) => {
   const { panel } = await setup(mediaContext, mediaExtensionId, { deferMicrophone: true });
   await panel.evaluate(() => { stopVoiceSession(); window.__releaseMicrophone(); });
@@ -146,8 +206,17 @@ test('a spoken yes approves a pending Save once and the voice task continues to 
   }, { elementId, contextVersion: context.contextVersion });
   await expect(panel.locator('.action-card')).toContainText('Enregistrer');
   expect(await web.evaluate(() => window.saves)).toBe(0);
+  const revision = await panel.evaluate(() => voiceSession.taskRevision);
   await panel.evaluate(() => {
-    voiceSession.handleLiveEvent({ type: 'session.input_transcript.delta', delta: 'Oui, enregistre', start_ms: 5000, end_ms: 5200 });
+    voiceSession.handleLiveEvent({ type: 'session.input_transcript.delta', delta: 'Pourquoi tu me demandes de cliquer ?', start_ms: 500, end_ms: 600 });
+    voiceSession.flushTranscript('user', false);
+    voiceSession.handleLiveEvent({ type: 'session.delegation.created', delegation: { id: 'approval-clarification' } });
+  });
+  await expect(panel.locator('.action-card')).toContainText('Enregistrer');
+  expect(await panel.evaluate(() => voiceSession.taskRevision)).toBe(revision);
+  expect(await web.evaluate(() => window.saves)).toBe(0);
+  await panel.evaluate(() => {
+    voiceSession.handleLiveEvent({ type: 'session.input_transcript.delta', delta: 'Oui, tu peux l’enregistrer', start_ms: 5000, end_ms: 5200 });
     voiceSession.flushTranscript('user', false);
   });
   await pending;
@@ -158,5 +227,46 @@ test('a spoken yes approves a pending Save once and the voice task continues to 
     await voiceSession.handleToolCalls([{ id: 'verify-demo', name: 'verify_expected_result', args: { conditions: [{ kind: 'text_present', text: 'Rendez-vous enregistré' }] } }]);
   });
   await expect.poll(() => panel.evaluate(() => window.__sent.some(event => event.item?.call_id === 'verify-demo' && JSON.parse(event.item.output).verification?.status === 'confirmed'))).toBe(true);
+  await panel.evaluate(() => { stopVoiceSession(); window.__remote.close(); });
+});
+
+test('full access fills the form in one batch and validates it without a confirmation card', async ({ mediaContext, mediaExtensionId }) => {
+  const { panel, web } = await setup(mediaContext, mediaExtensionId);
+  await web.evaluate(() => {
+    window.saves = 0;
+    document.body.innerHTML = '<main><h1>Calendrier</h1><div role="dialog"><h2>Nouvel événement</h2><label for="title">Titre</label><input id="title"><label for="start">Début</label><input id="start" type="time"><label for="end">Fin</label><input id="end" type="time"><button id="save" type="button">Valider</button></div><p id="saved"></p></main>';
+    document.querySelector('#save').onclick = () => {
+      if (document.querySelector('#title').value !== 'Sport' || document.querySelector('#start').value !== '15:00' || document.querySelector('#end').value !== '16:00') return;
+      window.saves++; document.querySelector('[role="dialog"]').remove(); document.querySelector('#saved').textContent = 'Rendez-vous enregistré';
+    };
+  });
+  await web.bringToFront();
+  await panel.evaluate(async () => {
+    await chrome.runtime.sendMessage({ type: 'SET_AUTONOMY_MODE', mode: 'full' });
+    voiceSession.handleLiveEvent({ type: 'session.input_transcript.delta', delta: 'Tu peux me créer un événement sport demain de quinze à seize heures', start_ms: 0, end_ms: 100 });
+    voiceSession.handleLiveEvent({ type: 'session.delegation.created', delegation: { id: 'form-task' } });
+    await voiceSession.taskUpdate;
+  });
+  const context = await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST' }));
+  const fields = [];
+  for (const [id, targetLabel, text] of [['title', 'Titre', 'Sport'], ['start', 'Début', '15:00'], ['end', 'Fin', '16:00']]) {
+    fields.push({ elementId: Number(await web.locator('#' + id).getAttribute('data-lid')), targetLabel, text });
+  }
+  const startedAt = Date.now();
+  await panel.evaluate(({ fields, contextVersion }) => voiceSession.handleLiveEvent({ type: 'response.event', delegation_id: 'form-task', event: {
+    type: 'response.output_item.done', item: { type: 'function_call', call_id: 'fill-form', name: 'fill_fields', arguments: JSON.stringify({ fields, contextVersion }) }
+  } }), { fields, contextVersion: context.contextVersion });
+  await expect.poll(() => panel.evaluate(() => window.__sent.some(event => event.item?.call_id === 'fill-form'))).toBe(true);
+  const filled = await panel.evaluate(() => JSON.parse(window.__sent.find(event => event.item?.call_id === 'fill-form').item.output));
+  expect(filled).toMatchObject({ status: 'ok', completedFields: 3 });
+  const saveId = Number(await web.locator('#save').getAttribute('data-lid'));
+  await panel.evaluate(({ elementId, contextVersion }) => voiceSession.handleLiveEvent({ type: 'response.event', delegation_id: 'form-task', event: {
+    type: 'response.output_item.done', item: { type: 'function_call', call_id: 'save-form', name: 'click_element', arguments: JSON.stringify({ elementId, contextVersion, targetLabel: 'Valider', explicitRequest: true }) }
+  } }), { elementId: saveId, contextVersion: filled.contextVersion });
+  await expect(web.locator('#saved')).toHaveText('Rendez-vous enregistré');
+  await expect.poll(() => panel.evaluate(() => window.__sent.some(event => event.item?.call_id === 'save-form'))).toBe(true);
+  await expect(panel.locator('.action-card')).toHaveCount(0);
+  expect(await web.evaluate(() => window.saves)).toBe(1);
+  console.log('FULL_ACCESS_FORM_EVIDENCE', JSON.stringify({ elapsedMs: Date.now() - startedAt, fields: 3, saves: 1 }));
   await panel.evaluate(() => { stopVoiceSession(); window.__remote.close(); });
 });

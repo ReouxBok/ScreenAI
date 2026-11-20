@@ -1319,6 +1319,7 @@ function updateVoiceStatus({ status, error, errorKey }) {
     if (errorKey) addMessage('error', t(errorKey));
     else if (error) addMessage('error', error);
   } else updateStatus('ready');
+  if (active && error) addMessage('error', error);
 }
 
 function handleVoiceTranscript({ role, text, final }) {

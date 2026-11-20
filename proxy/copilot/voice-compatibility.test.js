@@ -88,6 +88,7 @@ test('existing WebRTC protocol still validates offers and creates OpenAI session
     assert.equal(body.session.delegation.type, 'responses');
     assert.equal(body.session.audio.output.voice, 'marin');
     const tools = body.session.delegation.responses.tools;
+    assert.ok(!tools.some(tool => tool.name === 'fill_fields'), 'Older extensions must not receive an unsupported batch tool');
     assert.ok(tools.some(tool => tool.name === 'select_control'));
     assert.ok(tools.some(tool => tool.name === 'create_in_limova'));
     assert.ok(tools.find(tool => tool.name === 'verify_expected_result').parameters.required.includes('conditions'));
@@ -97,6 +98,23 @@ test('existing WebRTC protocol still validates offers and creates OpenAI session
   const data = await response.json();
   assert.equal(data.sdp, 'answer-sdp');
   assert.equal(data.protocol, 'gpt_live_webrtc_v1');
+});
+
+test('capable GPT clients get form batching and low-latency reasoning without changing the live model or voice', async () => {
+  mockProvider(201, { session: { id: 'live-batch' }, transport: { sdp: 'answer-sdp' } }, (_url, body) => {
+    assert.equal(body.session.model, 'gpt-live-1');
+    assert.equal(body.session.audio.output.voice, 'marin');
+    const backend = body.session.delegation.responses;
+    assert.equal(backend.model, 'gpt-6-luna');
+    assert.equal(backend.reasoning.effort, 'low');
+    const batch = backend.tools.find(tool => tool.name === 'fill_fields');
+    assert.ok(batch);
+    assert.equal(batch.parameters.properties.fields.maxItems, 12);
+    assert.ok(batch.parameters.required.includes('contextVersion'));
+    assert.ok(backend.tools.find(tool => tool.name === 'inspect_current_page').description.includes('ne la relis pas'));
+    assert.match(body.session.instructions, /Accès complet/);
+  });
+  assert.equal((await post('/api/live-session', { sdp: 'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n', capabilities: ['browser_tasks', 'batch_fields'], autonomyMode: 'full' })).status, 201);
 });
 
 test('GPT training keeps transcription passive and does not delegate browser tools', async () => {
