@@ -83,7 +83,7 @@ test('existing WebRTC protocol still validates offers and creates OpenAI session
   assert.equal((await post('/api/live-session', {})).status, 400);
   mockProvider(201, { session: { id: 'live-test' }, transport: { sdp: 'answer-sdp' } }, (url, body) => {
     assert.equal(url, 'https://api.openai.com/v1/live/sessions');
-    assert.equal(body.session.model, 'gpt-live-1');
+    assert.equal(body.session.model, 'gpt-live-1.1');
     assert.equal(body.transport.type, 'webrtc');
     assert.equal(body.session.delegation.type, 'responses');
     assert.equal(body.session.audio.output.voice, 'marin');
@@ -98,12 +98,13 @@ test('existing WebRTC protocol still validates offers and creates OpenAI session
   assert.equal(response.status, 201);
   const data = await response.json();
   assert.equal(data.sdp, 'answer-sdp');
+  assert.equal(data.model, 'gpt-live-1.1');
   assert.equal(data.protocol, 'gpt_live_webrtc_v1');
 });
 
 test('capable GPT clients get form batching and low-latency reasoning without changing the live model or voice', async () => {
   mockProvider(201, { session: { id: 'live-batch' }, transport: { sdp: 'answer-sdp' } }, (_url, body) => {
-    assert.equal(body.session.model, 'gpt-live-1');
+    assert.equal(body.session.model, 'gpt-live-1.1');
     assert.equal(body.session.audio.output.voice, 'marin');
     const backend = body.session.delegation.responses;
     assert.equal(backend.model, 'gpt-6-luna');
@@ -121,7 +122,7 @@ test('capable GPT clients get form batching and low-latency reasoning without ch
 
 test('GPT training keeps transcription passive and does not delegate browser tools', async () => {
   mockProvider(201, { session: { id: 'live-training' }, transport: { sdp: 'answer-sdp' } }, (_url, body) => {
-    assert.equal(body.session.model, 'gpt-live-1');
+    assert.equal(body.session.model, 'gpt-live-1.1');
     assert.deepEqual(body.session.delegation, { type: 'client' });
     assert.ok(!body.session.instructions.includes('PRIVATE-DATA'));
   });

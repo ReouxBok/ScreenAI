@@ -1,5 +1,9 @@
 # Déploiement et publication
 
+## GPT-Live-1.1 — modèle choisi par le proxy
+
+Les nouvelles sessions `/api/live-session` utilisent `gpt-live-1.1`, annoncé le 19 novembre 2026 dans le [changelog OpenAI](https://developers.openai.com/api/docs/changelog). Le transport `gpt_live_webrtc_v1`, Marin en français, le backend GPT-6 Luna et les outils sont conservés. Le modèle est choisi sur le serveur et renvoyé avec la réponse SDP ; la 2.2.63 du Store reste compatible et ne nécessite pas de nouvelle soumission. Relancer une session vocale pour utiliser le nouveau modèle.
+
 ## Extension 2.2.63 — clics sur les champs et fenêtres superposées
 
 Les champs texte, date, heure, les zones de texte et les éditeurs peuvent recevoir un clic même sans `tabindex` explicite. Le focus constaté sur un champ compte comme un effet du clic, sans valider l’envoi du formulaire. La détection des fenêtres bloquantes suit les mêmes critères que la carte de page ; une simple classe CSS « popup » ou « overlay » ne suffit plus.
