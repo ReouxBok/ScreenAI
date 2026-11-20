@@ -143,13 +143,13 @@ function wake(input: OwnerHandoverTransition, at = DUE) {
   return runSavOwnerHandover(input, { now: () => new Date(at), deadlineMs: DUE + 240_000 });
 }
 
-async function storedMail(ticketId: string, teamLast = false, kinds: string[] = ["support"]) {
+async function storedMail(ticketId: string, teamLast = false, text = "Demande synthétique.", kinds: string[] = ["support"]) {
   const threadId = randomUUID(), messageId = randomUUID(), gmailThreadId = `thread-${threadId}`, gmailId = `message-${messageId}`;
   const receivedAt = new Date(INBOUND_AT);
   await database.db.insert(savThreads).values({ id: threadId, mailboxId, gmailThreadId, customerEmail: CLIENT, hubspotTicketId: ticketId });
   await database.db.insert(savMessages).values({
     id: messageId, threadId, mailboxId, gmailMessageId: gmailId, direction: "inbound", fromEmail: CLIENT, toEmails: [MAILBOX],
-    receivedAt, bodyCiphertext: encryptSavPayload({ text: "Demande synthétique." }),
+    receivedAt, bodyCiphertext: encryptSavPayload({ text }),
   });
   const decision = { classification: kinds.includes("cancellation") ? "cancellation" : "support", requests: kinds.map((kind, i) => ({ id: `request-${i + 1}`, kind })),
     disposition: { kind: "ticket", target: { operation: "link", ticketId, alreadyNew: true } } };
@@ -285,7 +285,7 @@ describe("SAV_V2_ENTRY_SMART=on before N8: a handed-over ticket read by the smar
 
   it("review 1D: 14 support requests + 1 cancellation (the smart entry leaves the whole mail to the team): still waits, 0 hand-back, 0 HubSpot write, no case", async () => {
     const input = await scheduled();
-    await storedMail(input.ticketId, false, [...Array(14).fill("support"), "cancellation"]);
+    await storedMail(input.ticketId, false, undefined, [...Array(14).fill("support"), "cancellation"]);
     const read = liveTicket(input.ticketId);
     // What the entry's rule port gives such a mail under the switch: no request of its own (V1's hints stay, a sensitive one included).
     fixture.relayDeps = { ...admission(), readQualification: async () => ({ requests: [], identity: { status: "confirmed", source: { type: "hubspot_object", id: "123" } },
@@ -314,11 +314,54 @@ describe("SAV_V2_ENTRY_SMART=on before N8: a handed-over ticket read by the smar
   it("review 1D: switch off, the same mixed mail is handed back as before (out_of_scope)", async () => {
     vi.stubEnv("SAV_V2_ENTRY_SMART", "");
     const input = await scheduled();
-    await storedMail(input.ticketId, false, [...Array(14).fill("support"), "cancellation"]);
+    await storedMail(input.ticketId, false, undefined, [...Array(14).fill("support"), "cancellation"]);
     liveTicket(input.ticketId);
     fixture.relayDeps = { ...admission(), readQualification: async () => ({ requests: [], identity: { status: "confirmed", source: { type: "hubspot_object", id: "123" } },
       crmContext: "complete", teamSignals: [] }) };
     await expect(wake(input)).resolves.toEqual({ status: "handed_back:out_of_scope" });
     expect(fixture.handBack).toHaveBeenCalledExactlyOnceWith(input, "out_of_scope");
+  });
+
+  /** « Traité hors Studio »: no V1 execution for the mail (SAV-99's manual handover). */
+  async function manualMail(ticketId: string, text?: string) {
+    const mail = await storedMail(ticketId, false, text);
+    await database.db.delete(savIntakeEffects).where(inArray(savIntakeEffects.executionId,
+      database.db.select({ id: savIntakeExecutions.id }).from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, mail.messageId))));
+    await database.db.delete(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, mail.messageId));
+    return mail;
+  }
+  const smartEvidence = async (_env: unknown, _messageId: string, _gmailId: string, requests: { requestId: string }[]) =>
+    requests.map(({ requestId }) => ({ requestId, family: "other", provenance: smartSupportProvenance(new Date(SETTLED_EVENT_AT).toISOString()) }));
+
+  it("SAV-118: a manual handover worded « résilier » is not handed back on words (the smart brain judges): smart pending, nothing written", async () => {
+    const input = await scheduled();
+    await manualMail(input.ticketId, "Bonjour, je veux résilier et mon Google Sheet est vide.");
+    const read = liveTicket(input.ticketId, { contact: CLIENT });
+    fixture.blockEvidence.mockImplementation(smartEvidence);
+    await expect(wake(input)).resolves.toEqual({ status: "owner_handover_smart_pending" });
+    expect(fixture.handBack).not.toHaveBeenCalled();
+    onlyReads(read);
+  });
+
+  it("SAV-118: a manual handover on a ticket with no contact goes back to the team with `crm_missing_primary` (the existing hand-back only)", async () => {
+    const input = await scheduled();
+    await manualMail(input.ticketId);
+    liveTicket(input.ticketId);
+    fixture.blockEvidence.mockImplementation(smartEvidence);
+    await expect(wake(input)).resolves.toEqual({ status: "handed_back:crm_missing_primary" });
+    expect(fixture.handBack).toHaveBeenCalledExactlyOnceWith(input, "crm_missing_primary");
+    expect(fixture.blockEvidence).not.toHaveBeenCalled();
+  });
+
+  it("SAV-118: switch off, the same mails keep their historical hand-backs (words, `no_contact`)", async () => {
+    vi.stubEnv("SAV_V2_ENTRY_SMART", "");
+    const worded = await scheduled();
+    await manualMail(worded.ticketId, "Bonjour, je veux résilier.");
+    liveTicket(worded.ticketId, { contact: CLIENT });
+    await expect(wake(worded)).resolves.toEqual({ status: "handed_back:sensitive_request" });
+    const none = await scheduled();
+    await manualMail(none.ticketId);
+    liveTicket(none.ticketId);
+    await expect(wake(none)).resolves.toEqual({ status: "handed_back:no_contact" });
   });
 });

@@ -20,12 +20,12 @@ import {
 import { ownerHandoverPollFloor } from "./owner-handover-poll";
 import { readSavV2QualificationScope } from "./qualification-scope";
 import { handBackOwnerHandoverTicket, startV2FromThreadlessTicket } from "./threadless-entry";
-import { readOwnerHandoverContact } from "./threadless-source";
+import { readOwnerHandoverContact, threadlessIdentityReason } from "./threadless-source";
+import { savV2EntrySmartOn } from "./smart-entry-switch";
 import { continueCaseAfterCommit, firstBlockEvidence, v2EntryRelayDeps } from "./v2-entry";
 import { SAV_CASE_BLOCK_REGISTRY } from "./case-block-registry";
 import { savCaseSensitiveWording } from "./investigation-return-qualify";
 import { readAccessSkillMode } from "./access-skill/access-skill-rule";
-import { savV2EntrySmartOn } from "./smart-entry-switch";
 import { decryptSavPayload } from "../crypto";
 
 const MAILBOX = "contact@limova.ai";
@@ -113,16 +113,18 @@ async function manualQualification(messageId: string, ticketId: string, env: Env
   const text = decryptSavPayload<{ text?: unknown }>(message.body)?.text;
   if (typeof text !== "string" || !text.trim()) return { handBack: "thread_unreadable" };
   // As at every entry: under SAV-97 `on` the Access skill reads sensitivity itself (a sensitive reading admits nobody); before it, the lexical veto.
-  if (readAccessSkillMode(env) !== "on" && savCaseSensitiveWording(text, message.subject)) return { handBack: "sensitive_request" };
+  // SAV-118 (N5): under `SAV_V2_ENTRY_SMART=on` no word list is read at the door; the smart brain judges sensitivity (contract V1→V2, `smart-entry-switch.ts`).
+  const smart = savV2EntrySmartOn(env);
+  if (!smart && readAccessSkillMode(env) !== "on" && savCaseSensitiveWording(text, message.subject)) return { handBack: "sensitive_request" };
   const read = await readOwnerHandoverContact(ticketId, env);
-  if (!read.contact) return { handBack: read.reason };
+  if (!read.contact) return { handBack: threadlessIdentityReason(read.reason, env) };
   if (read.contact.email !== normalizeEmailAddress(message.from)) return { handBack: "identity_mismatch" };
   const request = ownerHandoverMailRequest(message.gmailId);
   const requests = await firstBlockEvidence(env, messageId, message.gmailId, [request], SAV_CASE_BLOCK_REGISTRY,
     { run: { runId: null, runVersion: null }, accessSkillCompute: "always" });
   // SAV-117 review 1D: under `SAV_V2_ENTRY_SMART=on` a reading no block takes (support + cancellation, for one) is not handed back before N8: the relay's handover
   // gate leaves it waiting (`owner_handover_smart_pending`). Off: exactly as before.
-  if (!savV2EntrySmartOn(env) && requests.every(row => row.provenance.kind === "team_part")) return { handBack: "no_block_match" };
+  if (!smart && requests.every(row => row.provenance.kind === "team_part")) return { handBack: "no_block_match" };
   return { qualification: { requests, identity: { status: "confirmed", source: { type: "hubspot_object", id: read.contact.id } }, crmContext: "complete", teamSignals: [] } };
 }
 

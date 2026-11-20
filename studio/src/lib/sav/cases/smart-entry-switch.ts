@@ -8,6 +8,9 @@
  *   4. V2 ne vérifie plus : le bloc détecté (Accès seul), la liste de mots `sensitive-words.ts`, la politique `SAV_V2_ADMISSION_POLICY_JSON`.
  *   5. La sensibilité et l'énervement du client sont jugés ensuite par le cerveau smart (N8), jamais par une liste de mots à l'entrée.
  *
+ * Tickets attribués à l'Agent SAV dans HubSpot (SAV-118, N5) : même porte. Pas de tri V1 sur un ticket ; la lecture du cerveau smart classe la demande et passe
+ * la main sur le sensible. Un ticket sans aucun contact va à l'équipe (`crm_missing_primary`). Avant N8, un ticket admis attend : ni dossier, ni restitution.
+ *
  * `SAV_V2_ENTRY_SMART=on` is the ONLY value that switches it on (like `smart-switch.ts`). Absent, empty or any other value (`ON`, `true`, `shadow`...): off,
  * and the entry is exactly the block entry it was. Nothing else reads this switch: the admission decision recognises a smart admission by its provenance.
  */
@@ -21,3 +24,7 @@ export {
   isSmartSupportProvenance, SAV_SMART_ENTRY_ADMISSION, SAV_SMART_ENTRY_BLOCK_ID, SAV_SMART_ENTRY_FAMILY, SAV_SMART_ENTRY_POLICY_REVISION, SAV_SMART_ENTRY_RULE_ID,
   smartSupportProvenance,
 } from "./case-types";
+
+/** SAV-118 (N5): the wait reason of a HubSpot ticket handed to the agent with no contact at all (no primary record), switch on only. Nothing is invented: the
+ * ticket goes back to the team with this reason, through the existing hand-over (stage « Nouveau », no owner, one short note). */
+export const SAV_SMART_ENTRY_MISSING_PRIMARY = "crm_missing_primary";

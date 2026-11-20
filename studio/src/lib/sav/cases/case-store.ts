@@ -12,7 +12,7 @@ import { readCaseBlockHold } from "./case-block-hold";
 import { readCaseTeamPartWait } from "./case-team-part-wait";
 import { caseAdmissionStatus, caseRequestFamilyProven, decideCaseAdmission, type CaseAdmissionInput } from "./admission-policy";
 import {
-  SAV_CASE_ADMISSION_TEAM_REASONS, SAV_SMART_ENTRY_ADMISSION, SAV_CASE_CONTRACT_REVISION, SAV_CASE_DEDUPE_PATTERNS, SAV_CASE_EVENT_DIRECTIONS, SAV_CASE_EVENT_KIND_DIRECTIONS, SAV_CASE_OWNER_TRANSITIONS, SAV_CASE_OWNERS,
+  SAV_CASE_ADMISSION_TEAM_REASONS, SAV_SMART_ENTRY_ADMISSION, isSmartSupportProvenance, SAV_CASE_CONTRACT_REVISION, SAV_CASE_DEDUPE_PATTERNS, SAV_CASE_EVENT_DIRECTIONS, SAV_CASE_EVENT_KIND_DIRECTIONS, SAV_CASE_OWNER_TRANSITIONS, SAV_CASE_OWNERS,
   SAV_CASE_CONTRACT_UPGRADES, SAV_CASE_INBOUND_SETTLE_SECONDS, SAV_CASE_PHASES, SAV_CASE_SENSITIVITIES, SAV_CASE_TIMER_CANCEL_REASONS, SAV_CASE_TIMER_STATES, caseAdmissionQualificationSchema, caseBodySchema, caseDedupeKey,
   SAV_CASE_ATTACHMENT_REF, SAV_CASE_AWAITING_V2_ATTRIBUTION, SAV_CASE_CRM_CHANGES, caseAttributionProofSchema, caseAwaitsV2Attribution, SAV_CASE_HOLDS_KEEPING_TIMERS, SAV_CASE_OPEN_REQUESTS_MAX, SAV_CASE_RETIRED_TRANSITIONS, SAV_CASE_SENSITIVE_FAMILIES, caseEventIsAdmissionInput, caseObservationSchema, caseOwnerAllowsPhase, caseSensitivityForFamily, caseTimerKey, emptyCaseBody, sourceRefSchema,
   type CaseActor, type CaseAdmissionDecision, type CaseAdmissionQualification, type CaseAdmissionRecord, type CaseBody, type CaseClaim, type CaseClaimRefusal, type CaseEvent,
@@ -407,6 +407,12 @@ export async function openCaseFromHubspotTicket(input: ThreadlessCaseStart): Pro
   const { source } = detail, ticketId = source.ticketId;
   const sourceRef = threadlessTicketSourceRef(source);
   const admission = input.admission && { ...input.admission, qualification: parseQualification(input.admission.qualification) };
+  // SAV-118 (N5, with review P1B of N4): a ticket the smart entry admitted waits for the smart brain (N8). No case is opened, neither the agent's (nobody could act
+  // on it) nor the team's on a later reason such as the closed Access block (that would hand the ticket back: note, stage, owner). Nothing is written.
+  if (admission?.qualification.requests.some(request => isSmartSupportProvenance(request.provenance))) {
+    console.info("sav_v2_threadless_smart_pending", { ticketId: source.ticketId });
+    return { status: "out_of_scope" };
+  }
   const approved = admission && decideCaseAdmission({ ...admission, caseSensitivity: "none" }).target === "agent";
   if (!detail.waitReason && (!approved || !source.contact || !input.request)) return { status: "out_of_scope" };
   const owner = detail.waitReason ? "human" : "agent";
