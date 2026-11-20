@@ -25,6 +25,7 @@ import { continueCaseAfterCommit, firstBlockEvidence, v2EntryRelayDeps } from ".
 import { SAV_CASE_BLOCK_REGISTRY } from "./case-block-registry";
 import { savCaseSensitiveWording } from "./investigation-return-qualify";
 import { readAccessSkillMode } from "./access-skill/access-skill-rule";
+import { savV2EntrySmartOn } from "./smart-entry-switch";
 import { decryptSavPayload } from "../crypto";
 
 const MAILBOX = "contact@limova.ai";
@@ -119,7 +120,9 @@ async function manualQualification(messageId: string, ticketId: string, env: Env
   const request = ownerHandoverMailRequest(message.gmailId);
   const requests = await firstBlockEvidence(env, messageId, message.gmailId, [request], SAV_CASE_BLOCK_REGISTRY,
     { run: { runId: null, runVersion: null }, accessSkillCompute: "always" });
-  if (requests.every(row => row.provenance.kind === "team_part")) return { handBack: "no_block_match" };
+  // SAV-117 review 1D: under `SAV_V2_ENTRY_SMART=on` a reading no block takes (support + cancellation, for one) is not handed back before N8: the relay's handover
+  // gate leaves it waiting (`owner_handover_smart_pending`). Off: exactly as before.
+  if (!savV2EntrySmartOn(env) && requests.every(row => row.provenance.kind === "team_part")) return { handBack: "no_block_match" };
   return { qualification: { requests, identity: { status: "confirmed", source: { type: "hubspot_object", id: read.contact.id } }, crmContext: "complete", teamSignals: [] } };
 }
 

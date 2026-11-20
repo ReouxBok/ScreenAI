@@ -143,7 +143,7 @@ function wake(input: OwnerHandoverTransition, at = DUE) {
   return runSavOwnerHandover(input, { now: () => new Date(at), deadlineMs: DUE + 240_000 });
 }
 
-async function storedMail(ticketId: string, teamLast = false) {
+async function storedMail(ticketId: string, teamLast = false, kinds: string[] = ["support"]) {
   const threadId = randomUUID(), messageId = randomUUID(), gmailThreadId = `thread-${threadId}`, gmailId = `message-${messageId}`;
   const receivedAt = new Date(INBOUND_AT);
   await database.db.insert(savThreads).values({ id: threadId, mailboxId, gmailThreadId, customerEmail: CLIENT, hubspotTicketId: ticketId });
@@ -151,7 +151,7 @@ async function storedMail(ticketId: string, teamLast = false) {
     id: messageId, threadId, mailboxId, gmailMessageId: gmailId, direction: "inbound", fromEmail: CLIENT, toEmails: [MAILBOX],
     receivedAt, bodyCiphertext: encryptSavPayload({ text: "Demande synthétique." }),
   });
-  const decision = { classification: "support", requests: [{ id: "request-1", kind: "support" }],
+  const decision = { classification: kinds.includes("cancellation") ? "cancellation" : "support", requests: kinds.map((kind, i) => ({ id: `request-${i + 1}`, kind })),
     disposition: { kind: "ticket", target: { operation: "link", ticketId, alreadyNew: true } } };
   const [execution] = await database.db.insert(savIntakeExecutions).values({
     messageId, threadId, runVersion: 1, policyId, policyHash, state: "confirmed", ticketId, payloadCiphertext: encryptSavPayload({ plan: { decision } }),
@@ -281,5 +281,44 @@ describe("SAV_V2_ENTRY_SMART=on before N8: a handed-over ticket read by the smar
     expect(fixture.handBack).not.toHaveBeenCalled();
     expect(await readCaseByTicket(input.ticketId)).toBeNull();
     onlyReads(read);
+  });
+
+  it("review 1D: 14 support requests + 1 cancellation (the smart entry leaves the whole mail to the team): still waits, 0 hand-back, 0 HubSpot write, no case", async () => {
+    const input = await scheduled();
+    await storedMail(input.ticketId, false, [...Array(14).fill("support"), "cancellation"]);
+    const read = liveTicket(input.ticketId);
+    // What the entry's rule port gives such a mail under the switch: no request of its own (V1's hints stay, a sensitive one included).
+    fixture.relayDeps = { ...admission(), readQualification: async () => ({ requests: [], identity: { status: "confirmed", source: { type: "hubspot_object", id: "123" } },
+      crmContext: "complete", teamSignals: [] }) };
+    await expect(wake(input)).resolves.toEqual({ status: "owner_handover_smart_pending" });
+    expect(fixture.handBack).not.toHaveBeenCalled();
+    expect(fixture.continueCase).not.toHaveBeenCalled();
+    expect(await readCaseByTicket(input.ticketId)).toBeNull();
+    onlyReads(read);
+  });
+
+  it("review 1D: manual handover the smart entry leaves to the team (no request of its own, mixed mail): waits, 0 hand-back (no `no_block_match`), 0 HubSpot write", async () => {
+    const input = await scheduled();
+    const mail = await storedMail(input.ticketId);
+    await database.db.delete(savIntakeEffects).where(inArray(savIntakeEffects.executionId,
+      database.db.select({ id: savIntakeExecutions.id }).from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, mail.messageId))));
+    await database.db.delete(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, mail.messageId));
+    const read = liveTicket(input.ticketId, { contact: CLIENT });
+    fixture.blockEvidence.mockResolvedValue([]);
+    await expect(wake(input)).resolves.toEqual({ status: "owner_handover_smart_pending" });
+    expect(fixture.handBack).not.toHaveBeenCalled();
+    expect(await readCaseByTicket(input.ticketId)).toBeNull();
+    onlyReads(read);
+  });
+
+  it("review 1D: switch off, the same mixed mail is handed back as before (out_of_scope)", async () => {
+    vi.stubEnv("SAV_V2_ENTRY_SMART", "");
+    const input = await scheduled();
+    await storedMail(input.ticketId, false, [...Array(14).fill("support"), "cancellation"]);
+    liveTicket(input.ticketId);
+    fixture.relayDeps = { ...admission(), readQualification: async () => ({ requests: [], identity: { status: "confirmed", source: { type: "hubspot_object", id: "123" } },
+      crmContext: "complete", teamSignals: [] }) };
+    await expect(wake(input)).resolves.toEqual({ status: "handed_back:out_of_scope" });
+    expect(fixture.handBack).toHaveBeenCalledExactlyOnceWith(input, "out_of_scope");
   });
 });

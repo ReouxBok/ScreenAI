@@ -376,7 +376,7 @@ export async function relayOwnerHandoverMail(messageId: string, qualification: C
   const request = ownerHandoverMailRequest(message.gmailMessageId);
   if (qualification.requests.some(row => row.requestId !== request.requestId)) throw Error("SAV_CASE_QUALIFICATION_REQUEST_UNKNOWN");
   // SAV-117 review P1B: a smart-entry reading is decided without the historical admission policy, which is not read for it (an unreadable one blocks nothing).
-  const policy = smartQualification(qualification) ? null : deps.readAdmissionPolicy ? await deps.readAdmissionPolicy() : null;
+  const policy = savV2EntrySmartOn(deps.env ?? process.env) || smartQualification(qualification) ? null : deps.readAdmissionPolicy ? await deps.readAdmissionPolicy() : null;
   const relay: CaseRelayProof = { kind: "owner_handover_mail", messageId, ticketId: deps.ownerHandover.ticketId };
   return relayToCase({ ticketId: deps.ownerHandover.ticketId, threadId: message.threadId, gmailMessageId: message.gmailMessageId, receivedAt: message.receivedAt,
     decision: { classification: "support", requests: [] }, relay, deps, confirmedTicket: true, attribution: "pending",
@@ -435,9 +435,13 @@ async function relayToCase(input: {
     confirmedTicket: input.confirmedTicket, deps: input.deps, target: relayProof.kind === "owner_handover_mail" ? undefined
       : { ticketId: input.ticketId, executionId: relayProof.kind === "intake_effects_confirmed" ? relayProof.executionId : null, runId: relayProof.intakeRunId, runVersion: relayProof.intakeRunVersion } });
   const handover = input.deps.ownerHandover;
-  // SAV-117 review P1B: a handover the smart entry read waits for the smart brain (N8). It is neither recorded nor « out of scope »: nothing is handed back to the team,
-  // no note, stage or owner is written in HubSpot; the marker keeps its outcome and the person's assignment stays as it is.
-  if (handover && smartQualification(admission.qualification)) return { skipped: "owner_handover_smart_pending" };
+  // SAV-117 review P1B/1D: under `SAV_V2_ENTRY_SMART=on`, until the smart brain is wired (N8), EVERY handover waits, whatever its reading (the smart entry's, or
+  // a mail it leaves to the team such as support + cancellation). It is neither recorded nor « out of scope »: nothing is handed back to the team, no note, stage or
+  // owner is written in HubSpot; the marker keeps this outcome and the person's assignment stays as it is. Off: the Access check below, exactly as before.
+  if (handover && savV2EntrySmartOn(input.deps.env ?? process.env)) {
+    console.info("sav_v2_owner_handover_smart_pending", { messageId: relayProof.messageId, reading: smartQualification(admission.qualification) ? "smart_support" : "team" });
+    return { skipped: "owner_handover_smart_pending" };
+  }
   if (handover && (!admission.qualification.requests.every(request => request.family === "access"
     && (request.provenance.kind === "human" || (request.provenance.kind === "qualified_rule" && (request.provenance.blockId ?? SAV_CASE_ACCESS_BLOCK_ID) === SAV_CASE_ACCESS_BLOCK_ID)))
     || decideCaseAdmission({ ...admission, caseSensitivity: caseSensitivityOf(input.decision) }).target !== "agent")) return { skipped: "owner_handover_out_of_scope" };
