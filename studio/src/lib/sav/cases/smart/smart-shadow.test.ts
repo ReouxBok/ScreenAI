@@ -224,12 +224,11 @@ describe("porte V1 (SAV-116) : seul le « support » de V1 va au modèle", () =>
     await v1Mail({ kinds: ["support"] });
     await pass(ENV(), network());
     const [recent] = await readSmartShadowRows();
-    const old: Partial<SmartShadowStored> = { ...recent! };
-    delete old.v1Gate;
-    const report = aggregateSmartShadow([old as SmartShadowStored, recent!]);
+    const old: Omit<SmartShadowStored, "v1Gate"> = Object.fromEntries(Object.entries(recent!).filter(([key]) => key !== "v1Gate")) as Omit<SmartShadowStored, "v1Gate">;
+    const report = aggregateSmartShadow([old, recent!]);
     expect(report.unknownGate).toEqual({ mails: 1 });
     expect(report.support.mails).toBe(1);
-    expect(aggregateSmartShadow([old as SmartShadowStored])).toMatchObject({ support: { mails: 0 }, unknownGate: { mails: 1 } });
+    expect(aggregateSmartShadow([old])).toMatchObject({ support: { mails: 0 }, unknownGate: { mails: 1 } });
   });
   it("agrégat en deux blocs : support (réponses, transferts, coût, p50/p95) et écartés par V1 (nombre par raison)", async () => {
     await v1Mail({ kinds: ["support"] }); await v1Mail({ kinds: ["support"] });
