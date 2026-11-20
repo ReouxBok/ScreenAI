@@ -32,7 +32,7 @@ describe('GPT Live browser task contract', () => {
     release(); await session.toolQueue;
     expect(session.handleToolCalls).not.toHaveBeenCalled();
     expect(sent.find(event => event.item?.call_id === 'old-call').item.output).toContain('cancelled');
-    expect(chrome.runtime.sendMessage.mock.calls.filter(([request]) => request.type === 'LOCAL_VOICE_TRANSCRIPT')).toEqual([]);
+    expect(chrome.runtime.sendMessage.mock.calls.filter(([request]) => request.type === 'VOICE_TRANSCRIPT')).toEqual([]);
   });
 
   it('does not revive an old delegation when its tool arrives after a correction', async () => {
@@ -90,4 +90,64 @@ describe('GPT Live browser task contract', () => {
     expect(await session.sendVisualContext()).toBe(true);
     expect(sent[0].item.content[1]).toEqual({ type: 'input_image', image_url: 'data:image/jpeg;base64,AA==' });
   });
+  it('splits a dense unicode page without losing its last target or exceeding WebRTC messages', async () => {
+    const text = 'Élément 👋 '.repeat(18000) + 'TARGET_AT_THE_END';
+    await session.sendLegacy(JSON.stringify({ clientContent: { turns: [{ parts: [{ text }] }] } }));
+    const messages = sent.filter(event => event.type === 'response.item.create');
+    expect(messages.length).toBeGreaterThan(1);
+    expect(messages.at(-1).item.content[0].text).toContain('TARGET_AT_THE_END');
+    expect(messages.map(message => message.item.content[0].text.replace(/^\[Contexte technique[^\n]*\n/, '')).join('')).toBe(text);
+    expect(sent.every(event => new TextEncoder().encode(JSON.stringify(event)).byteLength <= 48000)).toBe(true);
+  });
+
+  it('sends the full large tool map before its compact output and next backend step', async () => {
+    const context = 'contrôle '.repeat(10000) + 'FINAL_CONTROL';
+    await session.sendLegacy(JSON.stringify({ toolResponse: { functionResponses: [{ id: 'dense', name: 'inspect_current_page', response: { status: 'ok', contextVersion: 7, pageContext: context } }] } }));
+    const outputIndex = sent.findIndex(event => event.item?.call_id === 'dense');
+    expect(sent.slice(0, outputIndex).some(event => event.item?.content?.[0]?.text.includes('FINAL_CONTROL'))).toBe(true);
+    expect(JSON.parse(sent[outputIndex].item.output).contextVersion).toBe(7);
+    expect(sent.at(-1).type).toBe('response.create');
+  });
+
+  it('persists the complete utterance only when sealed, including deltas after an idle preview', () => {
+    const events = []; const listener = event => events.push(event.detail);
+    window.addEventListener('limova-gpt-transcript', listener);
+    utterance('Ouvre mon agenda');
+    session.flushTranscript('user', false);
+    utterance(' puis cherche demain', 500);
+    session.flushTranscript('user');
+    expect(events.filter(event => event.final && event.persist)).toEqual([
+      expect.objectContaining({ text: 'Ouvre mon agenda puis cherche demain', persist: true })
+    ]);
+    window.removeEventListener('limova-gpt-transcript', listener);
+  });
+
+  it('resumes the same voice task after a spoken approval without authorizing twice', () => {
+    session.taskRevision = 4;
+    session.pendingApproval = { actionId: 'approve-save', label: 'Enregistrer' };
+    utterance('Oui, enregistre');
+    session.flushTranscript('user', false);
+    session.flushTranscript('user');
+    expect(session.taskRevision).toBe(4);
+    expect(chrome.runtime.sendMessage.mock.calls.filter(([request]) => request.type === 'CONFIRM_ACTION')).toEqual([
+      [{ type: 'CONFIRM_ACTION', actionId: 'approve-save' }]
+    ]);
+  });
+
+  it('does not treat an interrupted yes as approval of the previous action', () => {
+    session.pendingApproval = { actionId: 'old-save', label: 'Enregistrer' };
+    utterance('Oui mais change la date');
+    session.flushTranscript('user', false);
+    expect(chrome.runtime.sendMessage.mock.calls.some(([request]) => request.type === 'CONFIRM_ACTION')).toBe(false);
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'VOICE_TASK_UPDATE' }));
+  });
+
+  it('does not approve an unsealed yes when the user stops the session', () => {
+    session.pendingApproval = { actionId: 'old-save', label: 'Enregistrer' };
+    utterance('Oui');
+    session.events.addEventListener = vi.fn(); session.events.close = vi.fn(); session.socket.close = vi.fn();
+    session.stop();
+    expect(chrome.runtime.sendMessage.mock.calls.some(([request]) => request.type === 'CONFIRM_ACTION')).toBe(false);
+  });
+
 });

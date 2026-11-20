@@ -4,9 +4,9 @@ Ce document sert de référence technique pour la fiche Chrome Web Store et la p
 
 ## Traitement IA soumis au consentement
 
-Le panneau s’ouvre sans fenêtre de consentement. Un accord est demandé uniquement lorsque l’utilisateur déclenche sa première action IA : envoi d’un message, analyse de page ou démarrage vocal. Si l’utilisateur refuse, aucun contexte de page, message ou audio n’est envoyé à Gemini.
+Le panneau s’ouvre sans fenêtre de consentement. Un accord est demandé uniquement lorsque l’utilisateur déclenche sa première action IA : envoi d’un message, analyse de page ou démarrage vocal. Si l’utilisateur refuse, aucun contexte de page, message ou audio n’est envoyé aux prestataires IA.
 
-Après accord, Charly peut envoyer à Google Gemini :
+Après accord, Charly peut envoyer à Google Gemini pour le texte, ou à OpenAI GPT Live et son backend délégué pour la voix :
 
 - le titre et le chemin de la page Limova, sans query string ni fragment ;
 - les libellés, rôles, états visibles et positions approximatives des éléments DOM ;
@@ -17,11 +17,11 @@ Après accord, Charly peut envoyer à Google Gemini :
 - une capture masquée de la zone visible, uniquement sur demande ou après une cible introuvable, ambiguë ou un résultat inattendu ;
 - l’audio, uniquement pendant une session vocale explicitement démarrée.
 
-L’extension n’envoie jamais de mot de passe, clé API, valeur de formulaire ni enregistrement audio persistant. Une capture éventuelle est préparée hors écran, masque les champs, ne modifie pas la page et n’existe que pendant l’invocation Gemini. Elle n’est enregistrée ni dans Neon, ni dans Chrome, ni dans les logs. Le flux vocal reste en mémoire et s’arrête à la fermeture du panneau ou sur action de l’utilisateur.
+L’extension n’envoie jamais de mot de passe, clé API, valeur de formulaire ni enregistrement audio persistant. Une capture éventuelle est préparée hors écran, masque les champs, ne modifie pas la page et n’existe que pendant l’invocation IA. Elle n’est enregistrée ni dans Neon, ni dans Chrome, ni dans les logs. Le flux vocal reste en mémoire et s’arrête à la fermeture du panneau ou sur action de l’utilisateur.
 
 ## Actions sur la page
 
-Gemini ne peut fournir que l’identifiant numérique d’un élément cartographié localement. Aucun sélecteur, script, clic par coordonnées ni URL distant n’est exécuté. Les navigations internes à faible risque nécessitent une commande explicite. L’envoi d’un message nécessite une demande explicite associée au bouton exact. Les suppressions, publications, paiements, autorisations OAuth et autres actions sensibles sont refusés localement ; une cible ambiguë entraîne une nouvelle observation puis une clarification.
+Le modèle ne peut fournir que l’identifiant numérique d’un élément cartographié localement. Aucun sélecteur, script, clic par coordonnées ni URL distant n’est exécuté. L’envoi d’un message nécessite une demande explicite associée au bouton exact. Le membre choisit dans le panneau « Demander une approbation », « Approuver pour moi » (par défaut) ou « Accès complet ». Le niveau est conservé localement et communiqué à la session IA pour adapter son comportement. Selon ce niveau et le risque, une action attend un accord dans le panneau ou à la voix avant de poursuivre ; une cible ambiguë entraîne une nouvelle observation puis une clarification. Les approbations en attente restent en mémoire, expirent après cinq minutes et sont annulées si la consigne change ou si la session s’arrête. Charly vérifie à nouveau la page avant d’exécuter une action approuvée.
 
 ## Cookies et statistiques d’utilisation
 
@@ -34,7 +34,7 @@ Charly mesure l’utilisation du produit avec PostHog (hébergement UE, projet �
 - **Jamais collecté** : texte des messages, réponses de Charly, transcriptions, audio, contenu ou DOM des pages, valeurs de formulaire, URL complètes, captures.
 - **Opposition** : le menu « Statistiques d’utilisation » désactive immédiatement l’envoi côté extension et ajoute l’en-tête `X-Charly-Analytics: off` aux requêtes du proxy, qui cesse aussi les événements serveur. Pour les versions antérieures à 2.2.53, le support ajoute l’email à `POSTHOG_BLOCKED_SUBS`.
 
-Les journaux techniques restent locaux dans `chrome.storage.session` jusqu’à la fermeture de la session Chrome. Ils excluent les conversations, réponses Gemini, transcriptions, audio, valeurs de formulaire, corps réseau et identifiants. Ils ne quittent l’appareil que si l’utilisateur choisit explicitement de les télécharger puis de les transmettre au support.
+Les journaux techniques restent locaux dans `chrome.storage.session` jusqu’à la fermeture de la session Chrome. Ils excluent les conversations, réponses IA, transcriptions, audio, valeurs de formulaire, corps réseau et identifiants. Ils ne quittent l’appareil que si l’utilisateur choisit explicitement de les télécharger puis de les transmettre au support.
 
 Le bouton « Vérifier Charly » contacte uniquement le endpoint public `/healthz` du proxy, sans authentification ni donnée utilisateur, afin de confirmer sa disponibilité.
 
@@ -42,7 +42,7 @@ Le bouton « Vérifier Charly » contacte uniquement le endpoint public `/health
 
 - Déclarer « website content », « user activity » et « personally identifiable information » (email rattaché aux statistiques d’utilisation) selon les catégories exactes du formulaire CWS.
 - Mentionner PostHog (UE) comme sous-traitant des statistiques d’utilisation dans la politique publique.
-- Décrire Google Gemini comme prestataire de traitement et aligner la politique publique sur les flux ci-dessus.
+- Décrire Google Gemini et OpenAI comme prestataires de traitement et aligner la politique publique sur les flux ci-dessus.
 - Cocher l’engagement Limited Use et ne pas utiliser les données pour la publicité ou le scoring.
 - Fournir une justification distincte pour `storage`, `scripting`, `webNavigation`, `sidePanel` et les deux hôtes déclarés (application Limova et proxy IA). L’extension ne demande pas la permission sensible `tabs` ; l’authentification est appelée dans le contexte isolé de la page Limova.
 - Vérifier la suppression/rétention dans les contrats et journaux du proxy avant publication.

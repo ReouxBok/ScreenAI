@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures.js';
+import { test, expect, analyzePageManually } from './fixtures.js';
 
 const PROXY_ORIGIN = 'https://limova-proxy-479c7fb78ccf.herokuapp.com';
 const LIMOVA_ORIGIN = 'https://new.limova.ai';
@@ -244,6 +244,8 @@ async function openExtensionHarness(context, extensionId, options) {
   const sidebar = await context.newPage();
   await sidebar.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
   await sidebar.waitForFunction(() => document.documentElement.lang !== '');
+  // These legacy autonomous flows explicitly opt into full access.
+  await sidebar.evaluate(mode => chrome.runtime.sendMessage({ type: 'SET_AUTONOMY_MODE', mode }), options?.autonomyMode || 'full');
   await limova.bringToFront();
   return { calls, limova, sidebar };
 }
@@ -608,6 +610,8 @@ test.describe('Packaged extension — complete user flows', () => {
       });
     });
     const { calls, limova, sidebar } = await openExtensionHarness(mediaContext, mediaExtensionId);
+    // Legacy transport compatibility; GPT training is checked at its HTTP contract.
+    await sidebar.evaluate(() => { window.LimovaVoiceSession = Object.getPrototypeOf(window.LimovaVoiceSession); });
     await grantAIConsent(sidebar);
     await sidebar.locator('#menuBtn').click();
     await sidebar.locator('#trainingBtn').click();
@@ -757,7 +761,7 @@ test.describe('Packaged extension — complete user flows', () => {
     });
     await grantAIConsent(sidebar);
 
-    await sidebar.locator('#screenshotBtn').click();
+    await analyzePageManually(sidebar);
     await expect(sidebar.locator('.message.assistant .message-content')).toContainText('Écris ton brief ici.');
     await expect.poll(() => limova.locator('.limova-element-highlight').count()).toBe(1);
     const visualPart = calls.gemini[0].postDataJSON().contents.at(-1).parts
@@ -773,34 +777,40 @@ test.describe('Packaged extension — complete user flows', () => {
     expect(highlightBox.width).toBeLessThan(rowBox.width / 2);
   });
 
-  test('page analysis blocks a destructive click without opening a confirmation popup', async ({ context, extensionId }) => {
+  test('a sensitive action requests approval and never runs after cancellation', async ({ context, extensionId }) => {
     const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {
-      geminiReply: 'Vérifie cette action. {{HIGHLIGHT:1}} {{ACTION:1}}'
+      autonomyMode: 'balanced', geminiReply: 'Vérifie cette action. {{HIGHLIGHT:1}} {{ACTION:1}}'
     });
     await grantAIConsent(sidebar);
-
-    await sidebar.locator('#screenshotBtn').click();
-
-    await expect(sidebar.locator('.screenshot-bubble')).toHaveCount(0);
-    await expect(sidebar.locator('.message.assistant .message-content')).toContainText('Vérifie cette action.');
-    await expect(sidebar.locator('.action-card')).toHaveCount(0);
-    await expect.poll(() => limova.locator('div[style*="2147483645"]').count()).toBe(1);
+    await analyzePageManually(sidebar);
+    await expect(sidebar.locator('.action-card')).toHaveCount(1);
     await expect(limova.locator('#sensitiveAction')).not.toHaveAttribute('data-clicked', 'true');
-    await expect(sidebar.locator('.message.error .message-content').last()).toContainText('sensible');
+    await sidebar.locator('.action-cancel').click();
+    await expect(sidebar.locator('.action-card')).toHaveCount(0);
+    await expect(limova.locator('#sensitiveAction')).not.toHaveAttribute('data-clicked', 'true');
     expect(calls.gemini).toHaveLength(1);
   });
 
   test('diagnostics becomes degraded after repeated blocked actions', async ({ context, extensionId }) => {
     const { sidebar } = await openExtensionHarness(context, extensionId, {
-      geminiReply: 'Cette action reste bloquée. {{ACTION:1}}'
+      geminiReply: ({ body }) => {
+        const prompt = body.systemInstruction.parts[0].text;
+        const wrongTarget = prompt.match(/\[(\d+)\] clickable\(button\) "Ajouter une pièce jointe"/)?.[1];
+        return `Je sélectionne Ajouter une pièce jointe. {{ACTION:${wrongTarget}}}`;
+      }
     });
     await grantAIConsent(sidebar);
 
-    await sidebar.locator('#screenshotBtn').click();
-    await expect(sidebar.locator('.message.error .message-content').last()).toContainText('sensible');
-    await new Promise(resolve => setTimeout(resolve, 2_100));
-    await sidebar.locator('#screenshotBtn').click();
-    await expect(sidebar.locator('.message.error .message-content')).toHaveCount(2);
+    await sidebar.locator('#userInput').fill('Clique sur Supprimer le brouillon');
+    await sidebar.locator('#sendBtn').click();
+    await expect.poll(async () => (await sidebar.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_LOGS' }))).logs)
+      .toContain('ACTION_INTENT_MISMATCH');
+    await sidebar.locator('#userInput').fill('Clique sur Ouvrir mon profil');
+    await sidebar.locator('#sendBtn').click();
+    await expect.poll(async () => {
+      const { logs } = await sidebar.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_LOGS' }));
+      return (logs.match(/ACTION_INTENT_MISMATCH/g) || []).length;
+    }).toBeGreaterThanOrEqual(2);
 
     await sidebar.locator('#menuBtn').click();
     await sidebar.locator('#diagnoseBtn').click();
@@ -817,7 +827,7 @@ test.describe('Packaged extension — complete user flows', () => {
       }
     });
     await grantAIConsent(sidebar);
-    await sidebar.locator('#screenshotBtn').click();
+    await analyzePageManually(sidebar);
 
     await expect(sidebar.locator('.action-card')).toHaveCount(0);
     await expect(limova.locator('#limova-computer-use-pointer')).toBeVisible();
@@ -842,7 +852,7 @@ test.describe('Packaged extension — complete user flows', () => {
     });
     await grantAIConsent(sidebar);
 
-    await sidebar.locator('#screenshotBtn').click();
+    await analyzePageManually(sidebar);
 
     await expect(limova.locator('#ordinaryControl')).toHaveAttribute('data-clicked', 'true');
     await expect(sidebar.locator('.action-card')).toHaveCount(0);
@@ -898,7 +908,7 @@ test.describe('Packaged extension — complete user flows', () => {
     });
     await grantAIConsent(sidebar);
 
-    await sidebar.locator('#screenshotBtn').click();
+    await analyzePageManually(sidebar);
 
     await expect(limova.locator('#limova-computer-use-pointer')).toBeVisible();
     await expect(limova.locator('.integration-card')).toHaveAttribute('data-clicked', 'true');
@@ -988,8 +998,10 @@ test.describe('Packaged extension — complete user flows', () => {
 
     await sidebar.locator('#userInput').fill('Que dit cette page ?');
     await sidebar.locator('#sendBtn').click();
-    await expect(sidebar.locator('.message.error .message-content').last()).toContainText('sensible');
+    await expect(sidebar.locator('.action-card')).toContainText('Envoyer');
     expect(await outside.evaluate(() => document.body.dataset.sent || '0')).toBe('0');
+    await sidebar.locator('.action-cancel').click();
+    await expect(sidebar.locator('.action-card')).toHaveCount(0);
 
     await sidebar.locator('#userInput').fill('Envoie le formulaire');
     await sidebar.locator('#sendBtn').click();
@@ -1056,6 +1068,8 @@ test.describe('Packaged extension — complete user flows', () => {
         deprecatedAudioWarnings.push(message.text());
       }
     });
+    // Compatibility regression for already-installed Gemini clients.
+    await sidebar.evaluate(() => { window.LimovaVoiceSession = Object.getPrototypeOf(window.LimovaVoiceSession); });
     await grantAIConsent(sidebar);
 
     await sidebar.locator('#voiceBtn').click();
@@ -1089,7 +1103,7 @@ test.describe('Packaged extension — complete user flows', () => {
     expect(liveTokenPayload.pageContext).not.toContain('NEVER_TRANSMIT_THIS_SECRET');
     expect(liveTokenPayload.pageContext).not.toContain('private_token');
 
-    await sidebar.locator('#screenshotBtn').click();
+    await analyzePageManually(sidebar);
     await expect.poll(() => socketMessages.some(message =>
       message.realtimeInput?.video?.mimeType === 'image/jpeg'
     )).toBe(true);
@@ -1347,6 +1361,8 @@ test.describe('Packaged extension — complete user flows', () => {
       });
     });
     const { calls, sidebar } = await openExtensionHarness(context, mediaExtensionId);
+    // Compatibility regression for already-installed Gemini clients.
+    await sidebar.evaluate(() => { window.LimovaVoiceSession = Object.getPrototypeOf(window.LimovaVoiceSession); });
     await grantAIConsent(sidebar);
     await sidebar.locator('#voiceBtn').click();
     await expect(sidebar.locator('#statusBadge')).toContainText(/Listening|écoute|escucho/i);
@@ -1370,6 +1386,8 @@ test.describe('Packaged extension — complete user flows', () => {
       });
     });
     const { calls, sidebar } = await openExtensionHarness(mediaContext, mediaExtensionId);
+    // Compatibility regression for already-installed Gemini clients.
+    await sidebar.evaluate(() => { window.LimovaVoiceSession = Object.getPrototypeOf(window.LimovaVoiceSession); });
     await grantAIConsent(sidebar);
     await sidebar.locator('#voiceBtn').click();
     await expect(sidebar.locator('.message.error .message-content').last()).toContainText('Connexion vocale fermée');
@@ -1394,6 +1412,8 @@ test.describe('Packaged extension — complete user flows', () => {
       });
     });
     const { sidebar } = await openExtensionHarness(context, mediaExtensionId);
+    // Compatibility regression for already-installed Gemini clients.
+    await sidebar.evaluate(() => { window.LimovaVoiceSession = Object.getPrototypeOf(window.LimovaVoiceSession); });
     await grantAIConsent(sidebar);
     await sidebar.locator('#voiceBtn').click();
     await expect(sidebar.locator('#statusBadge')).toContainText(/Listening|écoute|escucho/i);
@@ -1426,6 +1446,8 @@ test.describe('Packaged extension — complete user flows', () => {
       });
     });
     const { calls, sidebar } = await openExtensionHarness(context, extensionId);
+    // Compatibility regression for already-installed Gemini clients.
+    await sidebar.evaluate(() => { window.LimovaVoiceSession = Object.getPrototypeOf(window.LimovaVoiceSession); });
     await grantAIConsent(sidebar);
 
     await sidebar.locator('#voiceBtn').click();

@@ -172,6 +172,30 @@ describe('POST /api/knowledge/search', () => {
     expect(options.headers.Authorization).toBe(`Bearer ${'x'.repeat(40)}`);
   });
 
+  it('retries one transient knowledge failure without changing the request', async () => {
+    fetch.mockResolvedValueOnce(new Response('{}', { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ revision: 'recovered', results: [] }), { status: 200 }));
+    const response = await req().post('/api/knowledge/search').send({ query: 'connecter gmail' });
+    expect(response.status).toBe(200);
+    expect(response.body.revision).toBe('recovered');
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch.mock.calls[0][1].body).toBe(fetch.mock.calls[1][1].body);
+  });
+
+  it('rejects an invalid successful knowledge payload instead of recording a false success', async () => {
+    fetch.mockResolvedValueOnce(new Response(JSON.stringify({ error: 'invalid upstream payload' }), { status: 200 }));
+    const response = await req().post('/api/knowledge/search').send({ query: 'connecter gmail' });
+    expect(response.status).toBe(502);
+    expect(response.body.error).toBe('Invalid knowledge response');
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry a knowledge authentication failure', async () => {
+    fetch.mockResolvedValueOnce(new Response('{}', { status: 401 }));
+    expect((await req().post('/api/knowledge/search').send({ query: 'connecter gmail' })).status).toBe(401);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it('rejects invalid payloads before the upstream call', async () => {
     const res = await req().post('/api/knowledge/search').send({ query: 'x' });
     expect(res.status).toBe(400);
@@ -179,7 +203,7 @@ describe('POST /api/knowledge/search', () => {
   });
 
   it('returns a stable 503 when the studio is unavailable', async () => {
-    fetch.mockRejectedValueOnce(new Error('timeout'));
+    fetch.mockRejectedValue(new Error('timeout'));
     const res = await req().post('/api/knowledge/search').send({ query: 'connecter gmail' });
     expect(res.status).toBe(503);
     expect(res.body.error).toBe('Knowledge service unavailable');
@@ -591,5 +615,18 @@ describe('Body size limit', () => {
       .set('Content-Type', 'application/json')
       .send({ blob: big });
     expect(res.status).toBe(413);
+  });
+});
+
+describe('unpublished onboarding template', () => {
+  it('returns a deliberate empty state as 200 and caches it', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 61_000);
+    fetch.mockResolvedValueOnce(new Response(JSON.stringify({ revision: 'onboarding_fallback', template: null }), { status: 200 }));
+    const first = await req().get('/api/onboarding/template');
+    const second = await req().get('/api/onboarding/template');
+    expect(first.status).toBe(200);
+    expect(first.body).toEqual({ revision: 'onboarding_fallback', template: null });
+    expect(second.body).toEqual(first.body);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

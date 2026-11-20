@@ -1019,7 +1019,7 @@ body {
   margin: var(--spacing-sm) var(--spacing-md);
 }
 
-.screenshot-btn,
+.autonomy-btn,
 .voice-btn {
   display: flex;
   align-items: center;
@@ -1068,7 +1068,7 @@ body {
 .voice-mute-btn[aria-pressed="true"] { background: var(--color-error-light); color: #9a2f22; }
 .voice-mute-status { align-self: center; color: #9a2f22; font-size: 10px; font-weight: 700; white-space: nowrap; }
 
-.screenshot-btn:hover,
+.autonomy-btn:hover,
 .voice-btn:hover {
   color: var(--color-gray-700);
   box-shadow: var(--shadow-md);
@@ -1300,3 +1300,23 @@ input:focus-visible {
 [hidden] {
   display: none !important;
 }
+
+/* Autonomy is chosen by the member, independently from the voice transport. */
+.header-menu { max-height: calc(100dvh - 88px); overflow-y: auto; }
+.autonomy-control { position: relative; flex: 0 0 auto; }
+.autonomy-btn { width: 40px; gap: 3px; color: var(--color-dark); }
+.autonomy-btn[aria-expanded="true"] { box-shadow: 0 0 0 2px var(--color-gray-300); }
+.autonomy-btn[data-autonomy-mode="full"] { color: var(--color-accent); }
+.autonomy-btn [data-autonomy-icon] { display: none; }
+.autonomy-btn [data-autonomy-icon].is-current { display: inline; }
+.autonomy-menu { position: absolute; bottom: calc(100% + 12px); left: 0; z-index: 60; width: min(320px, calc(100vw - 48px)); max-height: calc(100dvh - 140px); overflow-y: auto; padding: 8px 0; border: 1px solid var(--color-gray-200); border-radius: var(--radius-lg); background: var(--color-white); box-shadow: var(--shadow-md); }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+.autonomy-picker { border: 0; min-width: 0; padding: 10px 8px 4px; margin: 0; }
+.autonomy-picker legend { padding: 0 8px; font-size: 12px; color: var(--color-gray-500); }
+.autonomy-option { display: flex; align-items: flex-start; gap: 10px; padding: 10px 8px; border-radius: 8px; cursor: pointer; }
+.autonomy-option:hover, .autonomy-option:has(input:checked) { background: var(--color-gray-100); }
+.autonomy-option input { flex: 0 0 auto; margin: 3px 0 0; accent-color: var(--color-dark); }
+.autonomy-option strong { display: block; font-weight: 500; font-size: 14px; line-height: 1.35; }
+.autonomy-option small { display: block; color: var(--color-gray-500); font-size: 12px; line-height: 1.4; margin-top: 3px; }
+.autonomy-status { font-size: 11px; line-height: 1.4; color: var(--color-gray-500); padding: 0 8px; }
+.action-card-detail { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 160px; overflow-y: auto; padding: 8px; background: var(--color-white); border-radius: 6px; }

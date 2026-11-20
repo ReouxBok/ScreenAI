@@ -21,8 +21,8 @@ Charly est une extension Chrome (Manifest V3) qui guide les nouveaux utilisateur
 - **Analyse de page** — carte DOM locale et métadonnées d'interface, sans valeur de formulaire ; capture masquée uniquement à la demande ou pour une récupération silencieuse.
 - **Orchestration Google ADK** — sessions texte explicites, outils typés et compacting à 32 000 tokens, avec Gemini exclusivement.
 - **Highlighting** — overlay visuel sur les éléments de la page pour guider l'utilisateur.
-- **Actions contrôlées** — navigation interne sur demande et confirmation obligatoire pour les actions sensibles.
-- **Voix temps réel** — conversation Gemini Live explicitement démarrée, avec interruption naturelle.
+- **Autonomie au choix** — « Demander une approbation », « Approuver pour moi » ou « Accès complet » ; les actions en attente reprennent après confirmation dans le panneau ou à la voix.
+- **Voix temps réel** — conversation GPT Live (`gpt-live-1`) explicitement démarrée, voix Marin en français, avec interruption naturelle.
 - **Base de connaissances** — recherche locale TF-IDF dans 106 articles Limova (refresh via `npm run kb:refresh`).
 - **Plan d'onboarding** — 6 étapes structurées pour les nouveaux utilisateurs.
 - **Multilingue** — FR / EN / ES, détection auto + override persisté.
@@ -32,12 +32,12 @@ Charly est une extension Chrome (Manifest V3) qui guide les nouveaux utilisateur
 
 ```
 ┌─────────────────────┐     ┌──────────────────┐     ┌────────────────────┐
-│ Extension Chrome    │────▶│  Proxy Heroku    │────▶│ Gemini Text / Live │
+│ Extension Chrome    │────▶│  Proxy Heroku    │────▶│ Gemini / GPT Live │
 │ (aucune clé API)    │     │  (clés sécurisées)│    │ API                │
 └─────────────────────┘     └──────────────────┘     └────────────────────┘
 ```
 
-L'extension ne contient **aucune clé API**. Le texte passe par le proxy Express (`proxy/index.js`). Pour réduire la latence vocale, le proxy délivre un jeton Gemini Live à usage unique et la sidebar ouvre ensuite une connexion directe, limitée et éphémère.
+L'extension ne contient **aucune clé API**. Le texte passe par le proxy Express (`proxy/index.js`). Pour réduire la latence vocale, le proxy authentifie la création d’une session GPT Live puis la sidebar utilise WebRTC. La clé OpenAI reste sur le serveur. Les anciens clients Gemini restent compatibles avec `/api/live-token`.
 
 Voir [`ARCHITECTURE.md`](./ARCHITECTURE.md) pour le détail des flux de messages entre service worker, content script, sidebar, proxy.
 

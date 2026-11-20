@@ -86,8 +86,25 @@ test('existing WebRTC protocol still validates offers and creates OpenAI session
     assert.equal(body.session.model, 'gpt-live-1');
     assert.equal(body.transport.type, 'webrtc');
     assert.equal(body.session.delegation.type, 'responses');
+    assert.equal(body.session.audio.output.voice, 'marin');
+    const tools = body.session.delegation.responses.tools;
+    assert.ok(tools.some(tool => tool.name === 'select_control'));
+    assert.ok(tools.some(tool => tool.name === 'create_in_limova'));
+    assert.ok(tools.find(tool => tool.name === 'verify_expected_result').parameters.required.includes('conditions'));
   });
   const response = await post('/api/live-session', { sdp: 'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n' });
   assert.equal(response.status, 201);
-  assert.equal((await response.json()).sdp, 'answer-sdp');
+  const data = await response.json();
+  assert.equal(data.sdp, 'answer-sdp');
+  assert.equal(data.protocol, 'gpt_live_webrtc_v1');
+});
+
+test('GPT training keeps transcription passive and does not delegate browser tools', async () => {
+  mockProvider(201, { session: { id: 'live-training' }, transport: { sdp: 'answer-sdp' } }, (_url, body) => {
+    assert.equal(body.session.model, 'gpt-live-1');
+    assert.deepEqual(body.session.delegation, { type: 'client' });
+    assert.ok(!body.session.instructions.includes('PRIVATE-DATA'));
+  });
+  const response = await post('/api/live-session', { trainingMode: true, sdp: 'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n', pageContext: 'PRIVATE-DATA' });
+  assert.equal(response.status, 201);
 });

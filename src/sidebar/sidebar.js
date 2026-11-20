@@ -92,15 +92,84 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateLangSwitcher();
   renderAnnouncements();
   initEventListeners();
+  await loadAutonomyMode();
   await loadInitialState();
   document.documentElement.dataset.sidebarReady = 'true';
 });
 
+function applyAutonomyMode(mode) {
+  const key = { ask: 'autonomyAsk', balanced: 'autonomyBalanced', full: 'autonomyFull' }[mode];
+  if (!key) return;
+  for (const input of document.querySelectorAll('input[name="autonomyMode"]')) input.checked = input.value === mode;
+  const button = document.getElementById('autonomyBtn');
+  button.dataset.autonomyMode = mode;
+  button.dataset.i18nTitle = key;
+  button.title = t(key);
+  const label = document.getElementById('autonomyModeLabel');
+  label.dataset.i18n = key;
+  label.textContent = t(key);
+  for (const icon of button.querySelectorAll('[data-autonomy-icon]')) icon.classList.toggle('is-current', icon.dataset.autonomyIcon === mode);
+}
+
+function closeAutonomyMenu(restoreFocus = false) {
+  const menu = document.getElementById('autonomyMenu');
+  if (menu.hidden) return;
+  menu.hidden = true;
+  document.getElementById('autonomyBtn').setAttribute('aria-expanded', 'false');
+  if (restoreFocus) document.getElementById('autonomyBtn').focus();
+}
+
+async function loadAutonomyMode() {
+  const settings = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }).catch(() => ({}));
+  applyAutonomyMode(settings?.autonomyMode || 'balanced');
+}
+
 function initEventListeners() {
+  const autonomyButton = document.getElementById('autonomyBtn');
+  const autonomyMenu = document.getElementById('autonomyMenu');
+  let pointerChoice = false;
+  autonomyMenu.addEventListener('pointerdown', () => { pointerChoice = true; });
+  autonomyMenu.addEventListener('keydown', () => { pointerChoice = false; });
+  const openAutonomyMenu = () => {
+    document.getElementById('headerMenu').hidden = true;
+    autonomyMenu.hidden = false;
+    autonomyButton.setAttribute('aria-expanded', 'true');
+    autonomyMenu.querySelector('input:checked')?.focus();
+  };
+  autonomyButton.addEventListener('click', () => autonomyMenu.hidden ? openAutonomyMenu() : closeAutonomyMenu(true));
+  autonomyButton.addEventListener('keydown', event => {
+    if (event.key === 'ArrowDown') { event.preventDefault(); openAutonomyMenu(); }
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && !autonomyMenu.hidden) { event.preventDefault(); closeAutonomyMenu(true); }
+  });
+  document.addEventListener('click', event => {
+    if (!event.target.closest('.autonomy-control')) closeAutonomyMenu();
+  });
+  document.addEventListener('focusin', event => {
+    if (!event.target.closest('.autonomy-control')) closeAutonomyMenu();
+  });
+  for (const input of document.querySelectorAll('input[name="autonomyMode"]')) {
+    input.addEventListener('change', async () => {
+      if (!input.checked) return;
+      const closeAfterSave = pointerChoice;
+      const result = await chrome.runtime.sendMessage({ type: 'SET_AUTONOMY_MODE', mode: input.value }).catch(() => null);
+      const savedKey = elements.chatContainer.querySelector('.action-card') ? 'autonomySavedPending' : 'autonomySaved';
+      document.getElementById('autonomyStatus').textContent = t(result?.ok ? savedKey : 'autonomySaveFailed');
+      if (!result?.ok) await loadAutonomyMode();
+      else {
+        applyAutonomyMode(result.autonomyMode || input.value);
+        if (closeAfterSave) closeAutonomyMenu(true);
+      }
+    });
+  }
   elements.userInput.addEventListener('input', handleInputChange);
   elements.userInput.addEventListener('keydown', handleInputKeydown);
   elements.sendBtn.addEventListener('click', sendMessage);
-  elements.screenshotBtn.addEventListener('click', analyzePage);
+  elements.screenshotBtn.addEventListener('click', () => {
+    document.getElementById('headerMenu').hidden = true;
+    analyzePage();
+  });
   elements.voiceBtn.addEventListener('click', toggleVoice);
   elements.voiceMuteBtn?.addEventListener('click', toggleVoiceMute);
   elements.authEmailForm?.addEventListener('submit', requestAuthenticationCode);
@@ -120,6 +189,7 @@ function initEventListeners() {
   if (menuBtn) {
     menuBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      closeAutonomyMenu();
       headerMenu.hidden = !headerMenu.hidden;
     });
   }
@@ -828,8 +898,18 @@ function handleBackgroundMessage(message) {
       addMessage('system', t('agentStopped'));
       break;
 
+    case 'AUTONOMY_MODE_CHANGED':
+      applyAutonomyMode(message.mode);
+      voiceSession?.setAutonomyMode?.(message.mode);
+      break;
+    case 'ACTION_APPROVAL_RESOLVED':
+      elements.chatContainer.querySelector(`[data-pending-action="${CSS.escape(message.actionId)}"]`)?.remove();
+      if (voiceSession?.pendingApproval?.actionId === message.actionId) voiceSession.pendingApproval = null;
+      break;
     case 'ACTION_PROPOSAL':
       renderActionProposal(message);
+      voiceSession?.requestApproval?.(message);
+      updateStatus('voice', t('approvalWaiting'));
       break;
 
     case 'ACTION_RESULT':
@@ -850,6 +930,7 @@ function handleBackgroundMessage(message) {
 }
 
 function renderActionProposal(action) {
+  if (elements.chatContainer.querySelector(`[data-pending-action="${CSS.escape(action.actionId)}"]`)) return;
   const card = document.createElement('div');
   card.className = 'action-card';
   card.dataset.pendingAction = action.actionId;
@@ -868,8 +949,16 @@ function renderActionProposal(action) {
   cancel.dataset.decision = 'cancel';
   cancel.textContent = t('actionCancel');
   actions.append(confirm, cancel);
-  card.append(text, actions);
+  card.append(text);
+  if (action.detail) {
+    const detail = document.createElement('p'); detail.className = 'action-card-detail'; detail.textContent = action.detail; card.append(detail);
+  }
+  card.append(actions);
   elements.chatContainer.appendChild(card);
+  const keepAlive = setInterval(() => {
+    if (!card.isConnected) return clearInterval(keepAlive);
+    chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }).catch(() => {});
+  }, 15_000);
   scrollToBottom();
 }
 
@@ -878,7 +967,7 @@ async function handleActionDecision(actionId, confirmed) {
   card?.querySelectorAll('button').forEach(button => { button.disabled = true; });
   const result = await chrome.runtime.sendMessage({ type: confirmed ? 'CONFIRM_ACTION' : 'CANCEL_ACTION', actionId });
   card?.remove();
-  if (!result?.ok && result?.error) addMessage('error', result.error);
+  if (!result?.ok && !result?.cancelled && result?.error) addMessage('error', result.error);
 }
 
 // ============================================================================

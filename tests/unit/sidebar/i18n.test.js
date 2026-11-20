@@ -76,20 +76,13 @@ describe('sidebar/i18n.js', () => {
       expect(document.querySelector('button').title).toBeTruthy();
     });
 
-    it('expands {CAPTURE_ICON} into an inline SVG node', () => {
+    it('renders welcome guidance for the autonomy selector beside the message box', () => {
       Object.defineProperty(navigator, 'language', { value: 'en-US', configurable: true });
       document.body.innerHTML = '<p data-i18n="howItWorks3"></p>';
       i18n.applyTranslations();
       const p = document.querySelector('p');
-      const icon = p.querySelector('svg.inline-icon');
-      expect(icon).toBeTruthy();
-      expect(icon.querySelector('path').getAttribute('d')).toBe(
-        'M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z'
-      );
-      expect(icon.querySelector('circle').getAttribute('cy')).toBe('13');
-      expect(icon.querySelector('circle').getAttribute('r')).toBe('4');
-      // No literal placeholder leaks through
-      expect(p.textContent).not.toContain('{CAPTURE_ICON}');
+      expect(p.textContent).toMatch(/autonomy level.*message box/i);
+      expect(p.querySelector('svg')).toBeNull();
     });
 
     it('updates document.documentElement.lang', () => {

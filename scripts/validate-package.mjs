@@ -62,6 +62,12 @@ if (!extensionCsp.includes('connect-src') || !extensionCsp.includes('https://ver
   failures.push('CSP must allow the Vercel Blob client upload API');
 }
 if (/unsafe-(?:eval|inline)/.test(extensionCsp)) failures.push('CSP must not allow unsafe-eval or unsafe-inline');
+if (!extensionCsp.includes('https://api.openai.com')) failures.push('CSP must allow GPT Live WebRTC negotiation');
+const sidebarHtml = fs.readFileSync(path.join(target, 'src/sidebar/sidebar.html'), 'utf8');
+for (const script of ['voice.js', 'voice-openai.js', 'voice-thread.js']) {
+  if (!sidebarHtml.includes(`src="${script}"`)) failures.push(`GPT Live release must load ${script}`);
+}
+
 
 Object.values(manifest.icons || {}).forEach(file => requireFile(file, 'icons'));
 requireFile(manifest.action?.default_icon, 'action.default_icon');

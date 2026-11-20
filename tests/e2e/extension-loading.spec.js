@@ -77,7 +77,7 @@ test.describe('Extension — messaging', () => {
     const result = await page.evaluate(() =>
       chrome.runtime.sendMessage({ type: 'GET_SETTINGS' })
     );
-    expect(result).toEqual({ hasApiKey: true });
+    expect(result).toEqual({ hasApiKey: true, autonomyMode: 'balanced' });
     await page.close();
   });
 });

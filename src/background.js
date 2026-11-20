@@ -184,6 +184,9 @@ let lastUserTurn = null;
 let userTurnSequence = 0;
 let voiceSessionActive = false;
 let voiceSessionGeneration = 0;
+let voiceContextWindowId = null;
+let voiceContextTabId = null;
+let voicePermissionTabId = null;
 let voiceTaskRevision = 0;
 let voiceTaskProgress = { phase: 'not_started', stepCount: 0 };
 const userPageInteractionSequences = new Map();
@@ -196,6 +199,9 @@ const externalPopupTabs = new Map();
 let externalPopupFlow = null;
 let externalPopupCloseTimer = null;
 const pendingActions = new Map();
+const AUTONOMY_KEY = 'charly_autonomy_mode_v1';
+const AUTONOMY_MODES = new Set(['ask', 'balanced', 'full']);
+let autonomyMode = 'balanced';
 const recentRejectedActionTargets = new Map();
 const loadingRetries = new Map();
 let onboardingTemplateCache = null;
@@ -315,6 +321,9 @@ const loggerInitializationPromise = Logger.initialize({
 
 const initializationPromise = loggerInitializationPromise.then(() => Promise.all([
   restoreSession(),
+  chrome.storage.local.get(AUTONOMY_KEY).then(data => {
+    if (AUTONOMY_MODES.has(data[AUTONOMY_KEY])) autonomyMode = data[AUTONOMY_KEY];
+  }).catch(() => {}),
   restoreTrainingState(),
   analytics.initialize().then(syncUninstallUrl).catch(() => {}),
   // The pre-2.2 opt-in flag belonged to a removed analytics implementation;
@@ -694,6 +703,7 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
 
 async function handleTabActivated(tabId) {
   if (!sessionState.lockedTabId) return;
+  if (tabId === voicePermissionTabId) return;
   if (tabId === sessionState.lockedTabId) {
     broadcastToSidebar({ type: 'CORRECT_TAB' });
     return;
@@ -715,6 +725,7 @@ async function handleTabActivated(tabId) {
     if (externalPopupTabs.has(tabId)) return;
   }
   if (tabId === sessionState.lockedTabId) return;
+  if (tabId === voicePermissionTabId) return;
   if (await followActivatedTab(tabId)) return;
   broadcastToSidebar({ type: 'WRONG_TAB' });
 }
@@ -723,6 +734,10 @@ async function handleTabActivated(tabId) {
 // switching to another web page moves it there and refreshes what it sees.
 // Training and flow tests stay bound to their Limova tab.
 async function followActivatedTab(tabId) {
+  if (voiceContextWindowId != null) {
+    const candidate = await chrome.tabs.get(tabId).catch(() => null);
+    if (candidate && candidate.windowId !== voiceContextWindowId) return true;
+  }
   if (trainingState.active || evaluationState.active) return false;
   // A tab opened by a handoff or open_page is driven by that operation; an
   // automatic page analysis there would talk over the chat being sent.
@@ -745,6 +760,7 @@ async function followActivatedTab(tabId) {
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === voicePermissionTabId) voicePermissionTabId = null;
   handleExternalPopupClosed(tabId).catch(error => Logger.warn('popup', 'External popup close handling failed', error));
   if (tabId === sessionState.lockedTabId) {
     sessionState.lockedTabId = null;
@@ -868,7 +884,15 @@ async function handleMessage(request, sender) {
       return { active: sessionState.isActive, training: trainingState.active };
 
     case 'GET_SETTINGS':
-      return { hasApiKey: true }; // Keys are on the proxy server
+      return { hasApiKey: true, autonomyMode };
+
+    case 'SET_AUTONOMY_MODE':
+      if (!AUTONOMY_MODES.has(request.mode)) return { ok: false, error: 'Niveau d’autonomie invalide.' };
+      autonomyMode = request.mode;
+      await chrome.storage.local.set({ [AUTONOMY_KEY]: autonomyMode });
+      Logger.event('settings', 'AUTONOMY_MODE_CHANGED', { mode: autonomyMode });
+      broadcastToSidebar({ type: 'AUTONOMY_MODE_CHANGED', mode: autonomyMode });
+      return { ok: true, autonomyMode }; // Keys are on the proxy server
 
     case 'SAVE_SETTINGS':
       return { ok: true }; // Keys are managed server-side now
@@ -960,6 +984,21 @@ async function handleMessage(request, sender) {
       analytics.track('action_confirmation', { decision: 'cancelled', risk: pendingActions.get(request.actionId)?.risk });
       return cancelPendingAction(request.actionId);
 
+    case 'VOICE_PERMISSION_TAB_OPENED': {
+      if (!Number.isInteger(request.tabId)) return { ok: false };
+      const tab = await chrome.tabs.get(request.tabId).catch(() => null);
+      if (!tab || (voiceContextWindowId != null && tab.windowId !== voiceContextWindowId)) return { ok: false };
+      voicePermissionTabId = tab.id;
+      return { ok: true };
+    }
+
+    case 'GET_VOICE_PAGE_CONTEXT':
+    case 'GET_LOCAL_VOICE_PAGE_CONTEXT': // Compatibility with the local lab.
+      return prepareVoicePageContext(request);
+
+    case 'GET_LIVE_SESSION':
+      return getLiveToken({ ...(request.context || {}), sdp: request.sdp });
+
     case 'GET_LIVE_TOKEN':
       return getLiveToken(request.context || {});
 
@@ -977,6 +1016,7 @@ async function handleMessage(request, sender) {
     case 'VOICE_TASK_BEGIN':
     case 'VOICE_TASK_UPDATE':
       if (request.type === 'VOICE_TASK_UPDATE' && (!Number.isSafeInteger(request.revision) || request.revision <= voiceTaskRevision)) return { ok: false };
+      clearPendingActions();
       voiceTaskRevision = request.type === 'VOICE_TASK_BEGIN' ? voiceTaskRevision + 1 : request.revision;
       voiceTaskProgress = { phase: request.type === 'VOICE_TASK_BEGIN' ? 'not_started' : 'listening', stepCount: 0 };
       for (const tabId of [...presenceTabs]) hideAgentPresence(tabId, { stop: true });
@@ -985,6 +1025,7 @@ async function handleMessage(request, sender) {
       return { ok: true, revision: voiceTaskRevision };
 
     case 'VOICE_TASK_PROGRESS':
+      if (request.taskRevision !== voiceTaskRevision) return cancelledOperation();
       if (!['executing', 'continuing', 'verified', 'needs_attention', 'cancelled'].includes(request.phase)) return { ok: false };
       voiceTaskProgress = { phase: request.phase, stepCount: Math.max(0, Math.min(100, Number(request.stepCount) || 0)) };
       return { ok: true };
@@ -999,7 +1040,11 @@ async function handleMessage(request, sender) {
         selectVoiceControl(request.targetLabel, request.checked)
       );
 
+    case 'LOCAL_VOICE_TRANSCRIPT':
+      return storeVoiceUtterance(request);
+
     case 'VOICE_TRANSCRIPT': {
+      if (request.utteranceId) return storeVoiceUtterance(request);
       const role = request.role === 'assistant' ? 'assistant' : 'user';
       countVoiceAnalytics(role === 'assistant' ? 'assistantTurns' : 'userTurns');
       analytics.track('voice_turn', { role });
@@ -1045,6 +1090,12 @@ async function handleMessage(request, sender) {
     case 'VOICE_SESSION_STATE':
       if (request.active !== true || !voiceSessionActive) {
         voiceSessionGeneration += 1;
+        if (request.active !== true) {
+          clearPendingActions();
+          voiceContextWindowId = null;
+          voiceContextTabId = null;
+          voicePermissionTabId = null;
+        }
         for (const controller of voiceTokenControllers) controller.abort();
       }
       // Ending the conversation also stops a Limova message Charly is still writing.
@@ -1147,7 +1198,7 @@ async function startTraining(rawToken) {
   if (activeAbortController) activeAbortController.abort();
   sessionState.isActive = false;
   lastUserMessage = '';
-  pendingActions.clear();
+  clearPendingActions();
   trainingEventQueue = Promise.resolve();
   pendingTrainingOutcomeTasks.clear();
   recentTrainingContextEvents.clear();
@@ -1360,6 +1411,7 @@ async function recordEvaluationEvent(event) {
 async function runEvaluatedVoiceTool(toolName, targetLabel, operation) {
   const result = await operation();
   if (result?.cancelled) return result;
+  if (result?.ok && voiceSessionActive && lastUserTurn?.source === 'voice' && Date.now() - lastUserTurn.createdAt <= ACTION_INTENT_MAX_AGE_MS) lastUserTurn.createdAt = Date.now();
   const status = result?.retryWithFreshContext === true
     ? 'not_found'
     : result?.status === 'not_found'
@@ -1477,12 +1529,12 @@ async function runDiagnostics(client = {}) {
     'DIAGNOSTIC_CONSENT_STATE'
   );
 
-  const tab = await getLimovaTabForAuthentication().catch(() => null);
+  const tab = await getVoiceContextTab().catch(() => null);
   if (!tab?.id) {
-    addCheck('limovaTab', 'error', 'Aucun onglet Limova ouvert', 'DIAGNOSTIC_LIMOVA_TAB_MISSING');
-    addCheck('contentScript', 'error', 'Content script non vérifiable sans onglet Limova', 'DIAGNOSTIC_CONTENT_SCRIPT_UNAVAILABLE');
+    addCheck('activePage', 'error', 'Aucune page web accessible dans la fenêtre de Charly', 'DIAGNOSTIC_PAGE_MISSING');
+    addCheck('contentScript', 'info', 'Pilote non vérifiable sans page web accessible', 'DIAGNOSTIC_CONTENT_SCRIPT_UNAVAILABLE');
   } else {
-    addCheck('limovaTab', 'ok', 'Onglet Limova détecté', 'DIAGNOSTIC_LIMOVA_TAB_OK');
+    addCheck('activePage', 'ok', 'Page web active détectée', 'DIAGNOSTIC_PAGE_OK');
     try {
       const pong = await Promise.race([
         sendContentMessage(tab.id, { type: 'DIAGNOSTIC_PING' }),
@@ -1610,6 +1662,7 @@ async function runDiagnostics(client = {}) {
 function rememberUserTurn(text, source = 'text') {
   const message = String(text || '').trim().slice(0, 8_000);
   if (!message) return null;
+  if (source === 'text') clearPendingActions();
   userTurnSequence += 1;
   lastUserMessage = message;
   lastUserTurn = {
@@ -3351,7 +3404,7 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           url: `${window.location.origin}${generalizedPath(window.location.pathname)}`,
           viewport: `${window.innerWidth}x${window.innerHeight}`,
           surface: activeModalSurface ? 'modal' : 'page',
-          elements: elementMap.slice(0, 150),
+          elements: elementMap,
           readable: limovaOrigins.includes(window.location.origin) ? null : getReadableText(),
           network
         };
@@ -3534,11 +3587,14 @@ function handleResetSession() {
   userPageInteractionSequences.clear();
   voiceSessionActive = false;
   voiceSessionGeneration += 1;
+  voiceContextWindowId = null;
+  voiceContextTabId = null;
+  voicePermissionTabId = null;
   externalPopupTabs.clear();
   externalPopupFlow = null;
   if (externalPopupCloseTimer) clearTimeout(externalPopupCloseTimer);
   externalPopupCloseTimer = null;
-  pendingActions.clear();
+  clearPendingActions();
   loadingRetries.clear();
 
   if (sessionState.lockedTabId) {
@@ -3913,7 +3969,7 @@ async function deleteCopilotData() {
   return { ok: true };
 }
 
-async function persistVoiceTranscript(role, content, generation = sessionGeneration) {
+async function persistVoiceTranscript(role, content, generation = sessionGeneration, utteranceId = null) {
   if (generation !== sessionGeneration) return;
   const controller = new AbortController();
   voiceTranscriptControllers.add(controller);
@@ -3923,7 +3979,7 @@ async function persistVoiceTranscript(role, content, generation = sessionGenerat
     const response = await authorizedProxyFetch('/api/copilot/voice-turn', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role, text: content, sessionId, idempotencyKey: `voice:${crypto.randomUUID()}` }),
+      body: JSON.stringify({ role, text: content, sessionId, idempotencyKey: utteranceId ? `voice:${utteranceId}` : `voice:${crypto.randomUUID()}` }),
       signal: controller.signal
     });
     if (response.ok && generation === sessionGeneration) {
@@ -3956,21 +4012,23 @@ async function getLiveToken(context) {
       ? { pageContext: '', contextVersion: pageContextVersion }
       : await getFreshVoiceContext(operationId, { operation });
     if (!isCurrentOperation(operation)) return cancelledOperation();
-    const response = await authorizedProxyFetch('/api/live-token', {
+    const response = await authorizedProxyFetch(context.sdp ? '/api/live-session' : '/api/live-token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: controller.signal,
       body: JSON.stringify({
         lang: currentLang,
+        autonomyMode,
+        ...(context.sdp ? { sdp: context.sdp } : {}),
         trainingMode,
         // Tells the proxy this extension follows every site and handles
         // open_page and create_in_limova.
-        capabilities: ['any_site', 'limova_handoff'],
+        capabilities: ['any_site', 'limova_handoff', 'browser_tasks', 'structured_verification'],
         ...(sessionState.resetContext ? { resetContext: true } : {}),
         ...(trainingMode || evaluationMode ? {} : await userFirstNameField()),
         ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
         ...(sessionId ? { sessionId } : {}),
-        pageContext: trainingMode ? '' : String(freshContext.pageContext || context.pageContext || lastPageContext).slice(0, 12_000),
+        pageContext: trainingMode ? '' : String(freshContext.pageContext || context.pageContext || lastPageContext),
         history: trainingMode || evaluationMode ? [] : boundedConversationHistory(
           sessionState.conversationHistory,
           CONVERSATION_HISTORY_MAX_MESSAGES,
@@ -3986,6 +4044,9 @@ async function getLiveToken(context) {
       const error = codedError(code, data.error?.message || data.error || 'Session vocale indisponible.');
       Logger.error('voice', 'Live token request failed', error, code, operationId);
       throw error;
+    }
+    if (context.sdp && data.protocol !== 'gpt_live_webrtc_v1') {
+      throw codedError('LIVE_SESSION_PROTOCOL_MISMATCH', 'Le service vocal doit être mis à jour pour cette version de Charly.');
     }
     Logger.event('voice', 'LIVE_TOKEN_REQUEST_SUCCEEDED', { model: data.model || 'unknown' }, operationId);
     return {
@@ -4033,7 +4094,7 @@ async function getFreshVoiceContext(parentOperationId = null, { capture = false,
   if (!isCurrentOperation(pageOperation)) return cancelledOperation();
   const result = {
     ok: true,
-    pageContext: pageContext.slice(0, 12_000),
+    pageContext: pageContext,
     contextVersion: pageContextVersion,
     elementCount: lastPageElements.size,
     visualCapture
@@ -4091,7 +4152,7 @@ async function handleUserPageInteraction(rawInteraction, sender) {
       : kind === 'input'
         ? `Interaction utilisateur observée : champ « ${label || 'sans libellé'} » modifié (${zone}), sans lire sa valeur.`
         : 'Interaction utilisateur observée : la vue a été défilée.';
-    const contextualUpdate = `${interactionSummary}\n${pageContext}`.slice(0, 12_000);
+    const contextualUpdate = `${interactionSummary}\n${pageContext}`;
     const visualCapture = voiceSessionActive && kind !== 'input'
       ? await capturePageAnalysis(tabId, operationId)
       : null;
@@ -4121,6 +4182,37 @@ async function handleUserPageInteraction(rawInteraction, sender) {
     }, 'USER_PAGE_INTERACTION_REFRESH_FAILED', operationId);
     return { ok: false, error: 'Le contexte de page n’a pas pu être rafraîchi.' };
   }
+}
+
+async function storeVoiceUtterance({ role, text, utteranceId, final = true }) {
+  const generation = sessionGeneration;
+  if (!['user', 'assistant'].includes(role) || !/^[a-zA-Z0-9:_-]{1,160}$/.test(utteranceId || '')) return { ok: false };
+  if (!(await hasAIProcessingConsent()) || generation !== sessionGeneration) return { ok: false };
+  const content = String(text || '').trim().slice(0, 4000);
+  if (!content) return { ok: false };
+  if (trainingState.active || evaluationState.active) return final ? storeVoiceTranscript(role, content) : { ok: true };
+  const previous = sessionState.conversationHistory.find(item => item.voiceUtteranceId === utteranceId);
+  if (previous && previous.role !== role) return { ok: false };
+  if (role === 'user' && previous?.content !== content) rememberUserTurn(content, 'voice');
+  if (previous) previous.content = content;
+  else {
+    const sequence = Number(utteranceId.split(':').at(-1));
+    const prefix = utteranceId.split(':')[0] + ':';
+    const before = sessionState.conversationHistory.findIndex(item => item.voiceUtteranceId?.startsWith(prefix) && Number(item.voiceUtteranceId.split(':').at(-1)) > sequence);
+    const item = { role, content, voiceUtteranceId: utteranceId };
+    sessionState.conversationHistory.splice(before < 0 ? sessionState.conversationHistory.length : before, 0, item);
+    countVoiceAnalytics(role === 'user' ? 'userTurns' : 'assistantTurns');
+    analytics.track('voice_turn', { role });
+  }
+  sessionState.conversationHistory = sessionState.conversationHistory.slice(-CONVERSATION_HISTORY_MAX_MESSAGES);
+  scheduleSave();
+  const item = sessionState.conversationHistory.find(item => item.voiceUtteranceId === utteranceId);
+  if (final && item && item.voicePersistedText !== content) {
+    item.voicePersistedText = content;
+    // Stable utterance ID prevents duplicate remote turns on delivery retries.
+    await persistVoiceTranscript(role, content, generation, utteranceId);
+  }
+  return { ok: generation === sessionGeneration };
 }
 
 async function storeVoiceTranscript(role, text) {
@@ -4228,7 +4320,7 @@ async function getKnowledgeSearchResult(rawQuery, options = {}) {
   let remoteAvailable = false;
   if (query.length >= 2) {
     options.signal?.throwIfAborted();
-    const deadline = AbortSignal.timeout(8_000);
+    const deadline = AbortSignal.timeout(12_000);
     const controller = new AbortController();
     const forwardDeadline = () => controller.abort(deadline.reason);
     const forwardCancellation = () => controller.abort(options.signal.reason);
@@ -4266,11 +4358,17 @@ async function getKnowledgeSearchResult(rawQuery, options = {}) {
 }
 
 async function getPublishedOnboardingTemplate() {
-  if (onboardingTemplateCache && onboardingTemplateCacheExpiresAt > Date.now()) return onboardingTemplateCache;
+  if (onboardingTemplateCacheExpiresAt > Date.now()) return onboardingTemplateCache;
   try {
     const response = await authorizedProxyFetch('/api/onboarding/template', { method: 'GET' });
     if (!response.ok) throw new Error(`ONBOARDING_TEMPLATE_HTTP_${response.status}`);
     const template = await response.json();
+    if (template?.revision === 'onboarding_fallback' && template.template === null) {
+      onboardingTemplateCache = null;
+      onboardingTemplateCacheExpiresAt = Date.now() + 60_000;
+      Logger.event('knowledge', 'ONBOARDING_TEMPLATE_NOT_PUBLISHED');
+      return null;
+    }
     if (!template || !Array.isArray(template.steps) || template.steps.length === 0) return null;
     onboardingTemplateCache = template;
     onboardingTemplateCacheExpiresAt = Date.now() + 60_000;
@@ -4462,6 +4560,10 @@ async function scrollVoicePage(rawDirection, rawAmount, rawElementId, requestedC
     return { ok: false, status: 'unexpected', error: 'La zone de défilement n’existe plus.', retryWithFreshContext: true };
   }
 
+  if (autonomyMode === 'ask' && !operation.userApproved) {
+    return requestActionApproval({ kind: 'scroll', label: 'Faire défiler la page', risk: 'low', operation },
+      () => scrollVoicePage(rawDirection, rawAmount, rawElementId, requestedContextVersion, { ...operation, userApproved: true }));
+  }
   const operationId = Logger.createOperationId('scroll');
   let result;
   try {
@@ -4559,7 +4661,7 @@ function resolveCurrentTextField(elementId, requestedVersion, targetLabel = '') 
     if (labelled.length > 1) return { id: null, element: null, reason: 'ambiguous_label', candidateCount: labelled.length };
   }
 
-  if (writableFields.length === 1) {
+  if (!targetLabel && writableFields.length === 1) {
     const [id, element] = writableFields[0];
     return { id, element, reason: 'single_writable_field', candidateCount: 1 };
   }
@@ -4626,7 +4728,12 @@ async function typeVoiceText(elementId, rawText, requestedContextVersion, target
     }
   }
 
-  const resolution = resolveCurrentTextField(elementId, requestedVersion, targetLabel);
+  let resolution = resolveCurrentTextField(elementId, requestedVersion, targetLabel);
+  if (!resolution.id && resolution.candidateCount === 0) {
+    const fresh = await getFreshVoiceContext(operationId, { operation }).catch(() => null);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    if (fresh?.ok) resolution = resolveCurrentTextField(elementId, requestedVersion, targetLabel);
+  }
   const element = resolution.element;
   if (!resolution.id || !element) {
     const ambiguous = resolution.candidateCount > 1;
@@ -4669,6 +4776,11 @@ async function typeVoiceText(elementId, rawText, requestedContextVersion, target
     return rejectWithFreshContext('Le texte dicté est trop long. Demande une version plus courte.', { element, clarificationRequired: true, failureCode: 'field_length_limit' });
   }
 
+  if (autonomyMode === 'ask' && !operation.userApproved) {
+    const approvedVersion = pageContextVersion;
+    return requestActionApproval({ kind: 'text_input', elementId: resolvedElementId, label: `Renseigner « ${element.text || targetLabel || 'ce champ'} »`, detail: text,
+      risk: 'low', operation, operationId }, () => typeVoiceText(resolvedElementId, text, approvedVersion, targetLabel || element.text, { ...operation, userApproved: true }));
+  }
   Logger.event('action', 'TEXT_INPUT_STARTED', {
     elementId: resolvedElementId,
     requestedElementId: elementId,
@@ -5084,11 +5196,46 @@ function isStrictExplicitRequest(intent, { toolExplicitRequest = false, toolTarg
     && (intent.kind !== 'implicit' || intent.spoken || SHORT_AFFIRMATIVE_PATTERN.test(normalizeActionLanguage(userMessage)));
 }
 
+// A requested calendar/note/draft edit includes its ordinary Save step.
+// A model's explicitRequest flag alone is never enough for this exception.
+const SAVE_CONTROL = /^(?:enregistrer|sauvegarder|save|guardar)(?: (?:les modifications|les changements|le brouillon|changes|draft|cambios))?$/;
+const SAVE_VERB = /\b(?:enregistre|enregistrer|sauvegarde|sauvegarder|save|guarda|guardar)\b/;
+const SAVE_HOLD = /\b(?:ne pas|ne jamais)\s+(?:enregistr\w*|sauvegard\w*)\b|\b(?:ne|n)\b.{0,30}\b(?:enregistre\w*|sauvegard\w*|save|guard\w*)\b.{0,25}\b(?:pas|jamais)\b|\b(?:sans|without|avant de|avant d|before)\b.{0,20}\b(?:enregistr\w*|sauvegard\w*|saving|save|guardar)\b|\b(?:do not|don t|no|never)\s+(?:save|guarda\w*)\b|\b(?:attends?|wait)\b/;
+const SAVE_INFORMATION_QUERY = /^(?:comment|pourquoi|explique|how|why|explain|como|a quoi|qu est ce|que se passe|what happens|dis moi comment|est ce que|peux tu m expliquer|tu peux m expliquer|can you explain)\b/;
+const SAVE_NEGATED_TASK = /\b(?:ne|n)\b.{0,20}\b(?:cree|creer|ajoute|ajouter|modifie|modifier|deplace|deplacer|planifie|programme)\b.{0,15}\b(?:pas|jamais)\b|\b(?:ne pas|ne jamais|do not|don t|never)\s+(?:cree\w*|ajout\w*|modifi\w*|create|add|edit|update|schedule)\b/;
+const SAVE_DANGERS = /\b(?:paiement|payer|payment|pay|achat|purchase|carte bancaire|credit card|facturation|billing|abonnement|subscription|publier|publish|autoriser|authorize|permission|mot de passe|password|invite|inviter|invitation|envoyer|send|supprimer|delete)\b/;
+
+function isPlainSaveControl(element) {
+  return element?.type === 'clickable' && !element.disabled && !element.external && !element.hrefPath
+    && SAVE_CONTROL.test(normalizeActionLanguage(element.text));
+}
+
+function requestedSave(element, userMessage, pageContext) {
+  if (!isPlainSaveControl(element)) return false;
+  const request = normalizeActionLanguage(userMessage);
+  if (!request || SAVE_HOLD.test(request) || SAVE_NEGATED_TASK.test(request)
+    || SAVE_INFORMATION_QUERY.test(request)) return false;
+  const target = normalizeActionLanguage(`${element.text} ${(element.aliases || []).join(' ')} ${element.section || ''}`);
+  if (SAVE_DANGERS.test(target)) return false;
+  if (SAVE_VERB.test(request)) return !SAVE_DANGERS.test(request);
+  if (!/\b(?:cree|creer|ajoute|ajouter|planifie|planifier|programme|programmer|organise|organiser|modifie|modifier|deplace|deplacer|mets|mettre|create|add|schedule|edit|update|move|crea|crear|anade|modifica)\b/.test(request)) return false;
+  const context = normalizeActionLanguage(`${pageContext} ${element.section || ''}`);
+  // Match the requested resource family to the actual page/form, so "create
+  // an event" cannot authorize a Save in an unrelated billing or access form.
+  return [
+    /\b(?:agenda|calendrier|calendar|calendario|rendez vous|rdv|evenement|event|reunion|meeting|appointment|evento|cita)\b/,
+    /\b(?:note|notes|nota|brouillon|draft|borrador)\b/,
+    /\b(?:tache|task|tarea)\b/,
+    /\b(?:contact|contacts|contacto)\b/
+  ].some(resource => resource.test(request) && resource.test(context));
+}
+
 function classifyActionRisk(element, {
   explicitRequest = false,
   strictExplicitRequest = explicitRequest,
   userMessage = '',
-  messageSendRequest = false
+  messageSendRequest = false,
+  pageContext = ''
 } = {}) {
   const label = String(element?.text || 'cet élément');
   const consequential = element?.buttonType === 'submit'
@@ -5099,6 +5246,13 @@ function classifyActionRisk(element, {
     return explicitRequest && !sensitiveSelection
       ? { level: 'low', label, reason: 'explicit_state_control' }
       : { level: 'sensitive', label, reason: 'state_control_requires_confirmation' };
+  }
+  if (isPlainSaveControl(element) && (SAVE_HOLD.test(normalizeActionLanguage(userMessage)) || SAVE_NEGATED_TASK.test(normalizeActionLanguage(userMessage)))) {
+    return { level: 'sensitive', label, reason: 'save_explicitly_withheld' };
+  }
+  if (isPlainSaveControl(element) && SAVE_INFORMATION_QUERY.test(normalizeActionLanguage(userMessage))) return { level: 'sensitive', label, reason: 'save_requires_confirmation' };
+  if (requestedSave(element, userMessage, pageContext)) {
+    return { level: 'low', label, reason: 'requested_save' };
   }
   const clickableControl = element?.type === 'clickable'
     && !element?.external
@@ -5278,7 +5432,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
     if (!payload.retryWithFreshContext) broadcastToSidebar({ type: 'ACTION_RESULT', ...payload });
     return payload;
   }
-  const risk = classifyActionRisk(element, { explicitRequest, strictExplicitRequest, userMessage, messageSendRequest });
+  const risk = classifyActionRisk(element, { explicitRequest, strictExplicitRequest, userMessage, messageSendRequest, pageContext: lastPageContext });
   Logger.event('action', 'ACTION_CLASSIFIED', {
     elementId,
     risk: risk.level,
@@ -5301,57 +5455,48 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
     ...safeElementDiagnostic(element)
   }, operationId);
 
-  if (risk.level === 'low') {
-    if (typeof options.desiredChecked === 'boolean' && element.checked === options.desiredChecked) {
-      return { ok: true, unchanged: true, pageContext: lastPageContext, contextVersion: pageContextVersion,
-        verification: { status: 'confirmed', checks: [{ kind: 'control_checked', matched: true }] } };
-    }
-    return executeElementAction({
-      elementId,
-      contextVersion: pageContextVersion,
-      label: risk.label,
-      risk: risk.level,
-      targetDescriptor: element,
-      operationId,
-      userTurnId: intent.turnId,
-      desiredChecked: options.desiredChecked,
-      operation
-    });
-  }
-
-  if (risk.level === 'sensitive') {
-    const payload = {
-      ok: false,
-      status: 'blocked',
-      label: risk.label,
-      error: 'Cette action sensible ne peut pas être exécutée automatiquement.'
-    };
-    analytics.track('action_executed', { result: 'blocked', risk: risk.level });
-    Logger.warn('action', 'Sensitive autonomous action blocked', {
-      elementId,
-      risk: risk.level
-    }, 'ACTION_SENSITIVE_BLOCKED', operationId);
-    broadcastToSidebar({ type: 'ACTION_RESULT', ...payload });
-    return payload;
-  }
-
-  const actionId = crypto.randomUUID();
+  if (risk.reason === 'save_explicitly_withheld') return { ok: false, cancelled: true, status: 'cancelled' };
   const action = {
-    actionId,
-    elementId,
-    contextVersion: pageContextVersion,
-    label: risk.label,
-    risk: risk.level,
-    targetDescriptor: element,
-    operationId,
-    operation,
-    expiresAt: Date.now() + 30_000
+    elementId, contextVersion: pageContextVersion, label: risk.label,
+    risk: risk.level, targetDescriptor: element, operationId,
+    userTurnId: intent.turnId, desiredChecked: options.desiredChecked, detail: element.section || '', operation
   };
-  pendingActions.set(actionId, action);
-  Logger.event('action', 'ACTION_CONFIRMATION_REQUESTED', { actionId, elementId, risk: risk.level }, operationId);
-  analytics.track('action_confirmation', { decision: 'requested', risk: risk.level });
-  broadcastToSidebar({ type: 'ACTION_PROPOSAL', ...action });
-  return { ok: true, status: 'confirmation_requested', actionId };
+  if (typeof options.desiredChecked === 'boolean' && element.checked === options.desiredChecked) {
+    return { ok: true, unchanged: true, pageContext: lastPageContext, contextVersion: pageContextVersion,
+      verification: { status: 'confirmed', checks: [{ kind: 'control_checked', matched: true }] } };
+  }
+  const consequential = element.buttonType === 'submit'
+    || /supprim|delete|remove|payer|payment|achat|buy|purchase|send|envoyer|publish|publier|autoriser|authorize|allow|grant|confirmer|confirm|valider|submit|invite|déconnect|disconnect|revoke|révoqu/i.test(String(element.text || ''));
+  const approve = risk.reason === 'save_requires_confirmation' || autonomyMode === 'ask'
+    || (autonomyMode === 'balanced' && (risk.level === 'sensitive' || (consequential && risk.reason !== 'requested_save')))
+    || (autonomyMode === 'full' && risk.level === 'sensitive' && !strictExplicitRequest);
+  if (approve) return requestActionApproval(action, () => executeElementAction(action));
+  return executeElementAction(action);
+}
+
+async function requestActionApproval(action, execute) {
+  const targetTab = action.operation.tabId != null ? await chrome.tabs.get(action.operation.tabId).catch(() => null) : null;
+  if (!isCurrentOperation(action.operation)) return Promise.resolve(cancelledOperation());
+  const existing = [...pendingActions.values()].find(pending => pending.operation?.generation === action.operation.generation
+    && pending.operation?.taskRevision === action.operation.taskRevision && pending.elementId === action.elementId && pending.kind === action.kind);
+  if (existing) return existing.promise;
+  const actionId = crypto.randomUUID();
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  const pending = { ...action, userTurnId: action.userTurnId || lastUserTurn?.id, targetUrl: targetTab?.url, actionId, execute, resolve, promise, expiresAt: Date.now() + 5 * 60_000 };
+  pending.timer = setTimeout(() => cancelPendingAction(actionId, 'expired'), 5 * 60_000);
+  pending.abortListener = () => cancelPendingAction(actionId);
+  action.operation.signal?.addEventListener('abort', pending.abortListener, { once: true });
+  pendingActions.set(actionId, pending);
+  Logger.event('action', 'ACTION_CONFIRMATION_REQUESTED', { actionId, elementId: action.elementId, risk: action.risk, kind: action.kind || 'click' }, action.operationId);
+  analytics.track('action_confirmation', { decision: 'requested', risk: action.risk });
+  broadcastToSidebar({ type: 'ACTION_PROPOSAL', actionId, label: action.label, risk: action.risk,
+    kind: action.kind || 'click', detail: action.detail || '', expiresAt: pending.expiresAt });
+  return promise;
+}
+
+function clearPendingActions() {
+  for (const id of [...pendingActions.keys()]) cancelPendingAction(id);
 }
 
 async function executeElementAction(action) {
@@ -5612,6 +5757,14 @@ async function sendContentMessage(tabId, message, allowRepair = true, operation 
       if (!isCurrentOperation(operation)) return cancelledOperation();
       const failureReason = await contentScriptRepairFailureReason(tabId, repairError);
       if (!isCurrentOperation(operation)) return cancelledOperation();
+      if (failureReason === 'tab_closed') {
+        Logger.warn('content_script', 'CONTENT_SCRIPT_TAB_CLOSED', { failureReason });
+        return cancelledOperation();
+      }
+      if (failureReason === 'navigation_race') {
+        Logger.warn('content_script', 'CONTENT_SCRIPT_NAVIGATION_RETRY', { failureReason });
+        return { ok: false, retryWithFreshContext: true, failureCode: failureReason, error: 'La page change. Relis-la avant de reprendre.' };
+      }
       Logger.error('content_script', 'Content script repair failed', {
         name: repairError?.name || 'Error',
         message: repairError?.message,
@@ -5638,16 +5791,40 @@ async function contentScriptRepairFailureReason(tabId, error) {
 
 async function confirmPendingAction(actionId) {
   const action = pendingActions.get(actionId);
+  if (!action) return { ok: false, cancelled: true, error: 'Cette demande n’est plus en attente.' };
+  if (action.expiresAt < Date.now()) return cancelPendingAction(actionId, 'expired');
   pendingActions.delete(actionId);
-  if (!action || action.expiresAt < Date.now()) return { ok: false, error: 'Cette confirmation a expiré.' };
-  return executeElementAction(action);
+  clearTimeout(action.timer);
+  action.operation.signal?.removeEventListener('abort', action.abortListener);
+  let result;
+  try {
+    if (!isCurrentOperation(action.operation)) result = cancelledOperation();
+    else {
+      const currentTab = action.operation.tabId != null ? await chrome.tabs.get(action.operation.tabId).catch(() => null) : null;
+      if (action.targetUrl && currentTab?.url !== action.targetUrl) {
+        result = { ok: false, cancelled: true, error: 'La page a changé pendant la demande d’approbation.' };
+      } else if (action.operation.tabId != null) await getPageContext(action.operation.tabId, action.operation);
+      if (!result && lastUserTurn && lastUserTurn.id === action.userTurnId) lastUserTurn.createdAt = Date.now();
+      if (!result) result = isCurrentOperation(action.operation) ? await action.execute() : cancelledOperation();
+    }
+  } catch (error) {
+    result = { ok: false, error: userFacingErrorMessage(error) };
+  }
+  action.resolve(result);
+  broadcastToSidebar({ type: 'ACTION_APPROVAL_RESOLVED', actionId });
+  return result;
 }
 
-function cancelPendingAction(actionId) {
+function cancelPendingAction(actionId, reason = 'cancelled') {
   const action = pendingActions.get(actionId);
-  const existed = pendingActions.delete(actionId);
-  if (action) Logger.event('action', 'ACTION_CANCELLED', { actionId, elementId: action.elementId }, action.operationId);
-  return { ok: existed };
+  if (!action) return { ok: true, cancelled: true };
+  pendingActions.delete(actionId);
+  clearTimeout(action.timer);
+  action.operation.signal?.removeEventListener('abort', action.abortListener);
+  action.resolve({ ok: false, cancelled: true, status: 'cancelled', reason });
+  Logger.event('action', 'ACTION_CANCELLED', { actionId, elementId: action.elementId }, action.operationId);
+  broadcastToSidebar({ type: 'ACTION_APPROVAL_RESOLVED', actionId, cancelled: true });
+  return { ok: true, cancelled: true };
 }
 
 // Port-based communication with sidebar (reliable for large payloads)
@@ -5690,10 +5867,13 @@ function pauseWhileSidebarClosed() {
   activeAbortController = null;
   if (urlChangeTimeout) clearTimeout(urlChangeTimeout);
   urlChangeTimeout = null;
-  pendingActions.clear();
+  clearPendingActions();
   for (const controller of voiceTokenControllers) controller.abort();
   voiceSessionActive = false;
   voiceSessionGeneration += 1;
+  voiceContextWindowId = null;
+  voiceContextTabId = null;
+  voicePermissionTabId = null;
   for (const tabId of [...presenceTabs]) hideAgentPresence(tabId);
   for (const tabId of highlightTabs) {
     if (tabId !== sessionState.lockedTabId) chrome.tabs.sendMessage(tabId, { type: 'CLEAR_ASSISTANT_OVERLAYS' }).catch(() => {});
@@ -5735,7 +5915,7 @@ function stopAgent() {
   sessionGeneration += 1;
   activeAbortController?.abort();
   activeAbortController = null;
-  pendingActions.clear();
+  clearPendingActions();
   for (const tabId of [...presenceTabs]) hideAgentPresence(tabId, { stop: true });
   broadcastToSidebar({ type: 'AGENT_STOPPED' });
   broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
@@ -5798,13 +5978,17 @@ function normalizeRequestedPageUrl(rawUrl) {
   }
 }
 
-async function openPageForUser(rawUrl, { newTab = false } = {}) {
+async function openPageForUser(rawUrl, { newTab = false, userApproved = false } = {}) {
   const operation = { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration, taskRevision: voiceTaskRevision };
   const url = normalizeRequestedPageUrl(rawUrl);
   if (!url) return { ok: false, error: 'Adresse web invalide. Donne une adresse comme lemonde.fr.' };
   if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
-  const [current] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  const current = voiceContextWindowId != null ? await getVoiceContextTab() : (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0];
   if (!isCurrentOperation(operation)) return cancelledOperation();
+  if (autonomyMode === 'ask' && !userApproved) {
+    return requestActionApproval({ kind: 'navigation', label: `Ouvrir ${privacySafeUrl(url)}`, risk: 'low', operation },
+      () => openPageForUser(rawUrl, { newTab, userApproved: true }));
+  }
   const keepCurrent = newTab || !current?.id || isLimovaUrl(current.url);
   let tab;
   tabOpeningsInProgress += 1;
@@ -5814,7 +5998,8 @@ async function openPageForUser(rawUrl, { newTab = false } = {}) {
         url,
         active: true,
         ...(Number.isInteger(current?.index) ? { index: current.index + 1 } : {}),
-        ...(current?.id ? { openerTabId: current.id } : {})
+        ...(current?.id ? { openerTabId: current.id } : {}),
+        ...(Number.isInteger(current?.windowId) ? { windowId: current.windowId } : {})
       });
     } else {
       tab = await chrome.tabs.update(current.id, { url });
@@ -5852,7 +6037,7 @@ async function sendComposeRequest(tabId, message, operation) {
 
 // Everything happens in the extension: read the page the user is on, open
 // Limova, then write and send the request in its chat like the user would.
-async function handoffToLimova(rawRequest, { voice = false } = {}) {
+async function handoffToLimova(rawRequest, { voice = false, userApproved = false } = {}) {
   const request = String(rawRequest || '').trim().slice(0, 1500);
   if (!request) return { ok: false, error: 'Demande vide.' };
   if (!(await hasAIProcessingConsent())) {
@@ -5862,11 +6047,21 @@ async function handoffToLimova(rawRequest, { voice = false } = {}) {
   const operation = voice
     ? { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration }
     : { generation: sessionGeneration };
-  const [source] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
-  if (!source?.id || !isExternalSiteUrl(source.url)) {
+  const source = voice ? await getVoiceContextTab() : (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0];
+  if (!source?.id || !isAssistedUrl(source.url)) {
     return { ok: false, error: 'Ouvre la page à utiliser avant de demander un contenu.' };
   }
+  if (autonomyMode === 'ask' && !userApproved) {
+    return requestActionApproval({ kind: 'handoff', label: 'Créer dans Limova', detail: request, risk: 'sensitive', operation },
+      () => handoffToLimova(rawRequest, { voice, userApproved: true }));
+  }
   const handoffId = `handoff-${Date.now()}-${++handoffSequence}`;
+  if (isLimovaUrl(source.url)) {
+    const result = await sendComposeRequest(source.id, { type: 'LIMOVA_COMPOSE_AND_SEND', handoffId, prompt: request }, operation);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    if (result?.ok) lockTab(source.id);
+    return { ...result, limovaTabId: source.id };
+  }
   Logger.event('handoff', 'LIMOVA_HANDOFF_STARTED', { origin: new URL(source.url).origin, handoffId });
 
   await showAgentPresence(source.id);
@@ -5888,6 +6083,7 @@ async function handoffToLimova(rawRequest, { voice = false } = {}) {
       url: `${LIMOVA_DOMAIN}/`,
       index: Number.isInteger(source.index) ? source.index + 1 : undefined,
       openerTabId: source.id,
+      ...(Number.isInteger(source.windowId) ? { windowId: source.windowId } : {}),
       active: true
     });
     await waitForTabLoaded(limovaTab.id);
@@ -5964,12 +6160,37 @@ async function getActiveAssistedTab() {
   return getActiveLimovaTab();
 }
 
-// Voice follows the page in front, Limova or any other site; on a browser
-// page it falls back to the signed-in Limova tab.
+// Bind voice to the panel window before microphone consent can borrow focus.
+async function prepareVoicePageContext({ windowId, initialTabId }) {
+  const operation = { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration };
+  if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
+  if (!Number.isInteger(windowId) || !Number.isInteger(initialTabId)) return { ok: false, error: 'Ouvre une page web dans cette fenêtre.' };
+  const tab = await chrome.tabs.get(initialTabId).catch(() => null);
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  if (!tab?.active || tab.windowId !== windowId || !isAssistedUrl(tab.url)) {
+    return { ok: false, code: 'VOICE_CONTEXT_TAB_MISSING', error: 'Ouvre une page web pour que Charly puisse l’analyser et la piloter.' };
+  }
+  voiceContextWindowId = windowId;
+  voiceContextTabId = tab.id;
+  return getFreshVoiceContext(null, { operation });
+}
+
 async function getVoiceContextTab() {
-  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
-  if (active?.id && isAssistedUrl(active.url)) return active;
-  return getLimovaTabForAuthentication();
+  const query = voiceContextWindowId == null
+    ? { active: true, lastFocusedWindow: true }
+    : { active: true, windowId: voiceContextWindowId };
+  const [active] = await chrome.tabs.query(query).catch(() => []);
+  if (active?.id && isAssistedUrl(active.url)) {
+    voiceContextTabId = active.id;
+    return active;
+  }
+  // Only our temporary microphone helper may borrow focus. A Chrome settings
+  // or Web Store page must never silently redirect control to another site.
+  if (active?.id === voicePermissionTabId || active?.url === chrome.runtime.getURL('src/sidebar/microphone-permission.html')) {
+    const saved = await chrome.tabs.get(voiceContextTabId ?? sessionState.lockedTabId).catch(() => null);
+    if (saved?.windowId === (voiceContextWindowId ?? active.windowId) && isAssistedUrl(saved.url)) return saved;
+  }
+  return null;
 }
 
 // Named exports keep critical privacy and policy boundaries directly testable.

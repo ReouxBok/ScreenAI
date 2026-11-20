@@ -9,9 +9,9 @@ Page Limova ── DOM filtré / action ID ──► service worker ── sessi
      ▲                                      │                               │
      └──── observation / clic validé ───────┘                               ├─ Google ADK / Gemini 3.6 Flash
                                                                             ├─ mémoire chiffrée Neon
-                                                                            └─ jeton Gemini Live éphémère
+                                                                            └─ session GPT Live authentifiée
 Sidebar ── consentement / chat / micro ──► service worker
-Sidebar ── audio WebSocket avec jeton contraint ───────────────────────────► Gemini Live
+Sidebar ── audio WebRTC + événements ──────────────────────────────────────► GPT Live
 ```
 
 ## Analyse de page
@@ -26,11 +26,13 @@ Le membre s’authentifie auprès de Charly par OTP Resend. Le proxy vérifie qu
 
 Le texte utilise un `Runner` Google ADK avec `CharlySessionService`, `CharlyMemoryService`, sept outils typés et un `TokenBasedContextCompactor` à 32 000 tokens conservant 24 événements récents. L’extension ne fournit plus de prompt système au protocole v2. Le déploiement est commandé par `ADK_TEXT_MODE=off|shadow|canary|on` et `ADK_CANARY_PERCENT`; `/api/gemini` reste le fallback pendant la transition.
 
-Pour la voix, le proxy crée un jeton Gemini Live à usage unique, contraint au modèle `gemini-3.1-flash-live-preview`, à l’audio et à une expiration courte. La sidebar ouvre ensuite un WebSocket direct. Le texte et la voix utilisent le même `sessionId` et la même mémoire, mais le runtime Live reste direct tant que le runtime JavaScript ADK Live n’est pas retenu.
+Pour la voix, le proxy crée une session `gpt-live-1` via `/api/live-session`, en WebRTC, avec la voix `marin`. Le backend délégué `gpt-6-luna` utilise les outils gardés du service worker. L’onglet est lié à la fenêtre du panneau avant l’autorisation du micro. La carte DOM complète est conservée et les grands résultats sont découpés en messages WebRTC ordonnés. Le texte et la voix utilisent le même `sessionId` et la même mémoire. Les anciens clients Gemini conservent `/api/live-token`. Le proxy doit être déployé avant l’extension : la réponse GPT annonce le protocole `gpt_live_webrtc_v1`, exigé par le nouveau client pour éviter un contrat d’outils incompatible.
 
 ## Actions contrôlées
 
-ADK appelle `inspect_current_page`, `capture_current_view`, `click_element`, `fill_field`, `navigate_internal`, `verify_expected_result` ou `search_knowledge_base`. Les outils Chrome suspendent le run, sont exécutés localement, puis le résultat reprend le run. Le service worker refuse tout ID absent ou obsolète et classe le risque à partir des métadonnées locales. « Envoyer le message » exige une demande explicite et la cible exacte. Une navigation interne faible peut être exécutée ; une action sensible est refusée localement. Aucun clic par coordonnées, sélecteur distant, script ou URL arbitraire n’est accepté. L’ancien marqueur `{{ACTION:id}}` reste uniquement dans le fallback de transition.
+ADK appelle `inspect_current_page`, `capture_current_view`, `click_element`, `fill_field`, `navigate_internal`, `verify_expected_result` ou `search_knowledge_base`. Les outils Chrome suspendent le run, sont exécutés localement, puis le résultat reprend le run. Le service worker vérifie les identifiants et classe le risque à partir des métadonnées locales. « Envoyer le message » exige une demande explicite et la cible exacte. Aucun clic par coordonnées, sélecteur distant, script ou URL arbitraire n’est accepté. L’ancien marqueur `{{ACTION:id}}` reste uniquement dans le fallback de transition.
+
+Le membre choisit un niveau persistant : « Demander une approbation » demande avant les modifications et commandes ; « Approuver pour moi » (par défaut) demande pour les actions risquées ; « Accès complet » exécute les actions couvertes par la demande et demande rarement avant d’agir. Une création ou modification demandée inclut son enregistrement normal. Une action nécessitant un accord attend une confirmation dans le panneau ou à la voix ; le résultat réel reprend ensuite le run. La confirmation expire après cinq minutes et relit la page avant exécution ; une navigation, une nouvelle consigne ou un arrêt annule l’action en attente. Une cible ambiguë exige une clarification et une consigne explicite de ne pas enregistrer reste respectée.
 
 ## Sessions, mémoire et onboarding
 

@@ -40,9 +40,9 @@ const translations = {
     inputPlaceholder: 'Écris à Charly...',
     greeting: 'Bonjour ! Je suis Charly, ton assistante onboarding Limova',
     howItWorksTitle: 'Voici comment ça va fonctionner',
-    howItWorks1: 'Navigue sur Limova, je vois chaque page automatiquement',
+    howItWorks1: 'Je m’adapte automatiquement à la page que tu consultes',
     howItWorks2: 'Je te guide étape par étape',
-    howItWorks3: 'Si tu es bloqué, clique sur {CAPTURE_ICON} en bas à gauche',
+    howItWorks3: 'Choisis mon niveau d’autonomie à côté de la zone de saisie',
     howItWorks4: 'Pose-moi n\'importe quelle question en chemin',
     cta: 'Prêt ? Dis-moi ce que tu veux faire sur Limova, ou rends-toi sur la plateforme pour commencer !',
     stepLabel: 'Étape :',
@@ -75,8 +75,19 @@ const translations = {
     agentStopped: 'Charly s’est arrêtée à ta demande.',
     onboardingComplete: 'Onboarding terminé !',
     screenshotCaptured: 'Page analysée',
+    autonomyTitle: 'Autonomie',
+    autonomyAsk: 'Demander une approbation',
+    autonomyAskDescription: 'Demande avant modifications et commandes',
+    autonomyBalanced: 'Approuver pour moi',
+    autonomyBalancedDescription: 'Demande seulement si c’est risqué',
+    autonomyFull: 'Accès complet',
+    autonomyFullDescription: 'Demande rarement avant d’agir',
+    autonomySaved: 'Niveau mémorisé.',
+    autonomySavedPending: 'Niveau mémorisé. Les confirmations déjà affichées restent à valider.',
+    autonomySaveFailed: 'Le niveau n’a pas pu être mémorisé. Réessaie.',
+    approvalWaiting: 'En attente de ton approbation',
     aiConsentTitle: 'Activer l’intelligence de Charly',
-    aiConsentText: 'Avec ton accord, Charly utilise Google Gemini pour traiter la structure de la page Limova, une capture temporaire avec les valeurs masquées, les erreurs filtrées et tes messages. Tes conversations peuvent être conservées jusqu’à 12 mois pour reprendre tes objectifs. Les captures, DOM, requêtes et valeurs de formulaires ne sont jamais mémorisés. Tu gardes le contrôle dans le menu.',
+    aiConsentText: 'Avec ton accord, Charly utilise Google Gemini pour le texte et OpenAI GPT Live pour la voix afin de traiter la structure de la page affichée, une capture temporaire avec les valeurs masquées, les erreurs filtrées et tes messages. Tes conversations peuvent être conservées jusqu’à 12 mois pour reprendre tes objectifs. Les captures, DOM, requêtes et valeurs de formulaires ne sont jamais mémorisés. Tu gardes le contrôle dans le menu.',
     privacyLink: 'Politique de confidentialité',
     aiConsentAccept: 'Activer Charly',
     aiConsentDecline: 'Pas maintenant',
@@ -123,9 +134,9 @@ const translations = {
     inputPlaceholder: 'Write to Charly...',
     greeting: 'Hi! I\'m Charly, your Limova onboarding assistant',
     howItWorksTitle: 'Here\'s how it works',
-    howItWorks1: 'Browse Limova, I see every page automatically',
+    howItWorks1: 'I automatically follow the page you are viewing',
     howItWorks2: 'I guide you step by step',
-    howItWorks3: 'If you\'re stuck, click {CAPTURE_ICON} at the bottom left',
+    howItWorks3: 'Choose my autonomy level next to the message box',
     howItWorks4: 'Ask me any question along the way',
     cta: 'Ready? Tell me what you want to do on Limova, or head to the platform to get started!',
     stepLabel: 'Step:',
@@ -158,8 +169,19 @@ const translations = {
     agentStopped: 'Charly stopped as you asked.',
     onboardingComplete: 'Onboarding complete!',
     screenshotCaptured: 'Page analyzed',
+    autonomyTitle: 'Autonomy',
+    autonomyAsk: 'Ask for approval',
+    autonomyAskDescription: 'Ask before modifications and commands',
+    autonomyBalanced: 'Approve for me',
+    autonomyBalancedDescription: 'Ask only if it’s risky',
+    autonomyFull: 'Full access',
+    autonomyFullDescription: 'Rarely ask before acting',
+    autonomySaved: 'Level saved.',
+    autonomySavedPending: 'Level saved. Existing approval requests still need your decision.',
+    autonomySaveFailed: 'Could not save the level. Try again.',
+    approvalWaiting: 'Waiting for your approval',
     aiConsentTitle: 'Enable Charly’s intelligence',
-    aiConsentText: 'With your consent, Charly uses Google Gemini to process the Limova page structure, a temporary capture with masked values, filtered errors, and your messages. Conversations may be retained for up to 12 months to resume your goals. Captures, DOM, requests, and form values are never added to memory. You stay in control from the menu.',
+    aiConsentText: 'With your consent, Charly uses Google Gemini for text and OpenAI GPT Live for voice to process the current page structure, a temporary capture with masked values, filtered errors, and your messages. Conversations may be retained for up to 12 months to resume your goals. Captures, DOM, requests, and form values are never added to memory. You stay in control from the menu.',
     privacyLink: 'Privacy policy',
     aiConsentAccept: 'Enable Charly',
     aiConsentDecline: 'Not now',
@@ -206,9 +228,9 @@ const translations = {
     inputPlaceholder: 'Escribe a Charly...',
     greeting: '¡Hola! Soy Charly, tu asistente de onboarding de Limova',
     howItWorksTitle: 'Así es como funciona',
-    howItWorks1: 'Navega por Limova, veo cada página automáticamente',
+    howItWorks1: 'Me adapto automáticamente a la página que estás viendo',
     howItWorks2: 'Te guío paso a paso',
-    howItWorks3: 'Si te bloqueas, haz clic en {CAPTURE_ICON} abajo a la izquierda',
+    howItWorks3: 'Elige mi nivel de autonomía junto al cuadro de mensaje',
     howItWorks4: 'Hazme cualquier pregunta en el camino',
     cta: '¿Listo? Dime qué quieres hacer en Limova, ¡o ve a la plataforma para empezar!',
     stepLabel: 'Paso:',
@@ -241,8 +263,19 @@ const translations = {
     agentStopped: 'Charly se detuvo como pediste.',
     onboardingComplete: '¡Onboarding completado!',
     screenshotCaptured: 'Página analizada',
+    autonomyTitle: 'Autonomía',
+    autonomyAsk: 'Pedir aprobación',
+    autonomyAskDescription: 'Pregunta antes de modificaciones y comandos',
+    autonomyBalanced: 'Aprobar por mí',
+    autonomyBalancedDescription: 'Pregunta solo si es arriesgado',
+    autonomyFull: 'Acceso completo',
+    autonomyFullDescription: 'Pregunta rara vez antes de actuar',
+    autonomySaved: 'Nivel guardado.',
+    autonomySavedPending: 'Nivel guardado. Las aprobaciones pendientes siguen esperando tu decisión.',
+    autonomySaveFailed: 'No se pudo guardar el nivel. Inténtalo de nuevo.',
+    approvalWaiting: 'Esperando tu aprobación',
     aiConsentTitle: 'Activar la inteligencia de Charly',
-    aiConsentText: 'Con tu consentimiento, Charly usa Google Gemini para procesar la estructura de la página Limova, una captura temporal con los valores ocultos, errores filtrados y tus mensajes. Las conversaciones pueden conservarse hasta 12 meses para retomar tus objetivos. Las capturas, el DOM, las solicitudes y los valores de formularios nunca se añaden a la memoria. Mantienes el control desde el menú.',
+    aiConsentText: 'Con tu consentimiento, Charly usa Google Gemini para texto y OpenAI GPT Live para voz para procesar la estructura de la página actual, una captura temporal con los valores ocultos, errores filtrados y tus mensajes. Las conversaciones pueden conservarse hasta 12 meses para retomar tus objetivos. Las capturas, el DOM, las solicitudes y los valores de formularios nunca se añaden a la memoria. Mantienes el control desde el menú.',
     privacyLink: 'Política de privacidad',
     aiConsentAccept: 'Activar Charly',
     aiConsentDecline: 'Ahora no',
@@ -317,41 +350,9 @@ function t(key) {
  * data-i18n-placeholder="key" → sets placeholder
  * data-i18n-title="key" → sets title attribute
  */
-function createCaptureIcon() {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('class', 'inline-icon');
-  svg.setAttribute('width', '14');
-  svg.setAttribute('height', '14');
-  svg.setAttribute('viewBox', '0 0 24 24');
-  svg.setAttribute('fill', 'none');
-  svg.setAttribute('stroke', 'currentColor');
-  svg.setAttribute('stroke-width', '2');
-  svg.setAttribute('stroke-linecap', 'round');
-  svg.setAttribute('stroke-linejoin', 'round');
-  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  // Keep the onboarding hint identical to the page-analysis button.
-  path.setAttribute('d', 'M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z');
-  const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-  circle.setAttribute('cx', '12');
-  circle.setAttribute('cy', '13');
-  circle.setAttribute('r', '4');
-  svg.append(path, circle);
-  return svg;
-}
-
 function applyTranslations() {
   document.querySelectorAll('[data-i18n]').forEach(el => {
-    const text = t(el.dataset.i18n);
-    if (text.includes('{CAPTURE_ICON}')) {
-      // Split around the placeholder and build DOM nodes
-      const parts = text.split('{CAPTURE_ICON}');
-      el.textContent = '';
-      el.appendChild(document.createTextNode(parts[0]));
-      el.appendChild(createCaptureIcon());
-      if (parts[1]) el.appendChild(document.createTextNode(parts[1]));
-    } else {
-      el.textContent = text;
-    }
+    el.textContent = t(el.dataset.i18n);
   });
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
     el.placeholder = t(el.dataset.i18nPlaceholder);

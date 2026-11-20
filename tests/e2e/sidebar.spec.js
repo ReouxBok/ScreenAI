@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures.js';
+import { test, expect, analyzePageManually } from './fixtures.js';
 
 test.describe('Sidebar UI', () => {
   test.beforeEach(async ({ context, serviceWorker }) => {
@@ -211,7 +211,8 @@ test.describe('Sidebar UI', () => {
       const page = await context.newPage();
       await page.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
       if (action.prepare) await action.prepare(page);
-      await page.locator(action.target).click();
+      if (action.target === '#screenshotBtn') await analyzePageManually(page);
+      else await page.locator(action.target).click();
       await expect(page.locator('#aiConsentPanel')).toBeVisible();
       await expect(page.locator('#aiConsentPanel')).toContainText('Google Gemini');
       await expect(page.locator('#aiConsentPanel a[href*="politique-de-confidentialite"]')).toHaveCount(1);
@@ -235,7 +236,7 @@ test.describe('Sidebar UI', () => {
 
     await page.reload();
     await expect(page.locator('#aiConsentPanel')).toBeHidden();
-    await page.locator('#screenshotBtn').click();
+    await analyzePageManually(page);
     await expect(page.locator('#aiConsentPanel')).toBeHidden();
     await page.close();
   });

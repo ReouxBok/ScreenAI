@@ -78,6 +78,9 @@ app.get('/healthz', (_req, res) => res.json({
   status: 'ok',
   service: 'limova-proxy',
   agentScope: 'extension_onboarding',
+  voiceModel: LIVE_MODEL,
+  voiceConfigured: Boolean(OPENAI_API_KEY),
+  voiceProtocol: 'gpt_live_webrtc_v1',
   adkTextMode: ADK_TEXT_MODE,
   adkCanaryPercent: ADK_CANARY_PERCENT,
   knowledgeConfigured: Boolean(KNOWLEDGE_API_URL && KNOWLEDGE_SERVICE_TOKEN),
@@ -302,7 +305,8 @@ async function fetchPublishedOnboardingTemplate(requestId = crypto.randomUUID())
     });
     if (!response.ok) return null;
     const data = await response.json().catch(() => null);
-    if (!data || !Array.isArray(data.steps) || data.steps.length === 0) return null;
+    const notPublished = data?.revision === 'onboarding_fallback' && data.template === null;
+    if (!notPublished && (!Array.isArray(data?.steps) || data.steps.length === 0)) return null;
     onboardingTemplateCache = data;
     onboardingTemplateCacheExpiresAt = Date.now() + 60_000;
     return data;
@@ -313,7 +317,7 @@ async function fetchPublishedOnboardingTemplate(requestId = crypto.randomUUID())
 }
 
 function formatOnboardingTemplate(template) {
-  if (!template) return null;
+  if (!Array.isArray(template?.steps) || !template.steps.length) return null;
   const outline = template.steps.map((step, index) => {
     const indent = '  '.repeat(Math.max(0, Math.min(2, Number(step.depth) || 0)));
     return `${indent}${index + 1}. ${String(step.name || 'Étape')} — à proposer ${String(step.trigger || 'si pertinent')}${step.optional ? ' (optionnelle)' : ''}\n${indent}   ${String(step.description || '').slice(0, 3_000)}`;
@@ -839,12 +843,22 @@ app.post('/api/knowledge/search', verifyAssistantAuth, track('server_knowledge_s
   }
   const startedAt = Date.now();
   try {
-    const response = await fetch(`${KNOWLEDGE_API_URL}/api/internal/knowledge/search`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${KNOWLEDGE_SERVICE_TOKEN}`, 'Content-Type': 'application/json', 'X-Request-Id': requestId },
-      body: JSON.stringify({ query, path, locale, contentTypes, limit }),
-      signal: AbortSignal.timeout(8_000)
-    });
+    const budget = AbortSignal.timeout(9_000);
+    let response;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        response = await fetch(`${KNOWLEDGE_API_URL}/api/internal/knowledge/search`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${KNOWLEDGE_SERVICE_TOKEN}`, 'Content-Type': 'application/json', 'X-Request-Id': requestId },
+          body: JSON.stringify({ query, path, locale, contentTypes, limit }),
+          signal: AbortSignal.any([budget, AbortSignal.timeout(4_000)])
+        });
+        if (![502, 503, 504].includes(response.status) || attempt === 1) break;
+        await response.body?.cancel();
+      } catch (error) {
+        if (attempt === 1 || budget.aborted) throw error;
+      }
+    }
     let validJson = true;
     const data = await response.json().catch(() => {
       validJson = false;
@@ -870,6 +884,9 @@ app.post('/api/knowledge/search', verifyAssistantAuth, track('server_knowledge_s
           : data.revision === 'kb_empty' ? 'empty_base'
             : resultCount > 0 ? 'matched' : 'no_results';
     res.locals.analytics = { result_count: resultCount, knowledge_outcome: knowledgeOutcome };
+    if (response.ok && (!validJson || !Array.isArray(data?.results))) {
+      return res.status(502).json({ error: 'Invalid knowledge response', requestId });
+    }
     console.info(JSON.stringify({ type: 'knowledge_search', requestId, status: response.status, revision: data?.revision || null, articleIds: Array.isArray(data?.results) ? data.results.map(result => result.id) : [], latencyMs: Date.now() - startedAt }));
     res.set('X-Request-Id', requestId);
     return res.status(response.status).json(data);
@@ -886,10 +903,10 @@ app.post('/api/knowledge/search', verifyAssistantAuth, track('server_knowledge_s
 app.get('/api/onboarding/template', verifyAssistantAuth, track('server_onboarding_template'), assistantLimiter, async (req, res) => {
   const requestId = crypto.randomUUID();
   const template = await fetchPublishedOnboardingTemplate(requestId);
-  res.locals.analytics = { template_outcome: template ? 'available' : 'unavailable' };
+  res.locals.analytics = { template_outcome: template?.template === null ? 'not_published' : template ? 'available' : 'unavailable' };
   res.set('X-Request-Id', requestId);
   if (!template) return res.status(503).json({ error: 'Onboarding template unavailable', requestId });
-  console.info(JSON.stringify({ type: 'onboarding_template', requestId, revision: template.revision || null, stepCount: template.steps.length }));
+  console.info(JSON.stringify({ type: 'onboarding_template', requestId, revision: template.revision || null, stepCount: template.steps?.length || 0 }));
   return res.json(template);
 });
 
@@ -972,6 +989,7 @@ function openAiLiveTools(evaluationMode) {
       elementId, contextVersion, targetLabel, checked: { type: 'boolean' }
     }, ['elementId', 'contextVersion', 'targetLabel', 'checked']),
     tool('inspect_current_page', 'Relit immédiatement la page active et renvoie son état DOM actuel. À utiliser avant une action et après tout changement possible.'),
+    ...(!evaluationMode ? [tool('create_in_limova', 'Crée un contenu ou lance une tâche dans Limova uniquement à la demande explicite de l’utilisateur. Sur un autre site, joint le contenu lisible de la page ; sur Limova, utilise la conversation actuelle.', { request: { type: 'string', maxLength: 1500 } }, ['request'])] : []),
     tool('open_page', 'Ouvre une adresse web explicitement demandée par l’utilisateur et renvoie la nouvelle page. Pour un lien visible, utilise son identifiant DOM.', {
       url: { type: 'string' }, newTab: { type: 'boolean' }
     }, ['url']),
@@ -1270,7 +1288,7 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
   if (evaluationCode && !evaluationContext) return res.status(410).json({ error: 'Evaluation expired', requestId });
   const evaluationMode = Boolean(evaluationContext);
   const pageContext = trainingMode ? '' : String(req.body?.pageContext || '');
-  const browserMode = AUTH_DISABLED && process.env.CHARLY_LOCAL_BROWSER_MODE === 'true';
+  const browserMode = !trainingMode && !evaluationMode && (req.body?.capabilities?.includes('browser_tasks') || (AUTH_DISABLED && process.env.CHARLY_LOCAL_BROWSER_MODE === 'true'));
   const history = trainingMode || evaluationMode ? '' : formatConversationHistory(req.body?.history);
   const onboardingTemplate = trainingMode || evaluationMode || browserMode ? null : await fetchPublishedOnboardingTemplate(requestId);
   const onboardingTemplateText = formatOnboardingTemplate(onboardingTemplate);
@@ -1282,6 +1300,12 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
   const personalContext = trainingMode || evaluationMode
     ? null
     : await getMemoryContext(req.auth.memoryUserKey, lastUserMessage, requestId, liveSessionId);
+
+  const autonomyInstruction = {
+    ask: 'Le membre a choisi « Demander une approbation ». Propose les actions nécessaires via les outils : l’application demandera son accord avant chaque modification ou commande. Attends le résultat avant de continuer.',
+    balanced: 'Le membre a choisi « Approuver pour moi ». Exécute les étapes courantes de la demande ; l’application demandera un accord pour les actions risquées.',
+    full: 'Le membre a choisi « Accès complet ». Exécute les actions couvertes par sa demande et demande rarement avant d’agir. Une cible ou une intention ambiguë nécessite une clarification.'
+  }[req.body?.autonomyMode] || 'Le membre choisit son niveau d’autonomie dans le panneau. L’application détermine les approbations nécessaires.';
 
   const languageInstruction = lang === 'fr'
     ? 'Parle exclusivement en français de France, avec un accent français métropolitain neutre.'
@@ -1311,6 +1335,8 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
     'Tu pilotes réellement le navigateur de l’utilisateur via les outils de cette extension Charly. Consulter des informations et afficher ces informations dans sa page sont deux résultats distincts. Pour « affiche son agenda », appelle select_control directement avec le nom de la personne. Ne remplace pas une action demandée par un lien inventé ou des instructions manuelles.',
     'Si la demande comporte plusieurs étapes, conserve son objectif complet et exécute les étapes autorisées dans l’ordre jusqu’au résultat demandé. Une inspection ou un clic intermédiaire ne termine pas la demande. Après chaque changement de page, relis son état avant de poursuivre ; n’utilise jamais les identifiants de la page précédente.',
     'Pour les autres actions DOM utilisant un identifiant : utilise la carte fraîche retournée par le dernier outil. Inspecte seulement si elle manque ou si la page a changé. Attends le résultat de l’outil.',
+    'Pour une consigne en plusieurs étapes, garde l’objectif complet jusqu’à son terme : analyse, action, recherche, nouvelle analyse. Après chaque résultat d’outil, poursuis la prochaine étape utile sans redemander la même autorisation. Une correction ou une interruption remplace l’ancienne consigne. Une étape réussie ne prouve pas que toute la demande est terminée.',
+    'Après avoir vérifié le résultat final de toutes les étapes demandées, termine cette tâche et attends une nouvelle demande. Ne recommence pas les actions déjà exécutées.',
     'Après un clic ordinaire, utilise la carte fraîche du résultat et appelle verify_expected_result avant d’annoncer la réussite. select_control inclut déjà sa propre vérification de sélection.',
     'verify_expected_result exige des conditions observables : texte réellement attendu, chemin exact ou état coché d’un contrôle unique. Une simple relecture ou un changement quelconque du DOM ne confirme pas l’objectif. Pour une case utilise control_checked avec son libellé exact ; pour afficher un agenda vérifie aussi un marqueur pertinent de la vue si disponible.',
     'Après un défilement sans mouvement ou à la fin de la zone, ne répète pas le même défilement. Change de zone ou explique précisément la cible manquante. Si plusieurs agendas portent le même nom, demande une clarification.',
@@ -1323,7 +1349,9 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
     SERVER_PROMPT,
     `Tu es Charly, l'assistante dédiée à l'onboarding Limova. Tu peux comprendre, expliquer et piloter la page avec les outils autorisés. Réponds avec précision et concision. ${languageInstruction}`,
     discoveryInstruction,
-    browserMode ? 'MODE PILOTAGE LOCAL : l’utilisateur teste une tâche concrète dans son navigateur. Exécute sa demande et réponds brièvement. Ne lance aucun questionnaire d’onboarding, ne te représente pas, n’explore pas son activité professionnelle.' : adaptiveOnboardingInstruction,
+    browserMode ? 'MODE PILOTAGE : l’utilisateur demande une tâche concrète dans son navigateur. Exécute sa demande et réponds brièvement. Ne lance aucun questionnaire d’onboarding, ne te représente pas, n’explore pas son activité professionnelle.' : adaptiveOnboardingInstruction,
+    autonomyInstruction,
+    'Une action nécessitant un accord n’est pas un refus : appelle l’outil pour présenter la demande d’approbation dans le panneau, puis attends son résultat. Ne demande pas une deuxième autorisation après un accord déjà reçu. Une création ou modification demandée comprend son enregistrement normal ; ne t’arrête pas après avoir seulement rempli le formulaire.',
     actionInstruction,
     evaluationMode ? '' : onboardingTemplateText || 'Si aucun objectif précis n’a été exprimé, commence par demander ce que l’utilisateur veut accomplir aujourd’hui. Pose une seule question par tour.',
     'La carte DOM la plus récente est la seule source fiable pour les éléments visibles. N’invente jamais un contrôle, un état, un identifiant ou le succès d’une action.',
@@ -1342,6 +1370,7 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
     ? `Mode transcription de démonstration Limova. Transcris fidèlement en ${lang === 'fr' ? 'français' : lang === 'es' ? 'espagnol' : 'anglais'}. Reste silencieuse et n’appelle aucun outil.`
     : [
         `Tu es Charly, l’assistante vocale d’onboarding Limova. ${languageInstruction} Parle naturellement, brièvement et guide une étape à la fois.`,
+        autonomyInstruction,
         discoveryInstruction,
         browserMode ? 'MODE PILOTAGE : attends la demande de navigation de l’utilisateur. Un salut bref suffit. Ne présente pas ton rôle, ne récite aucun onboarding et ne demande pas son métier. Pour une action claire, délègue directement puis annonce le résultat vérifié en une phrase.' : adaptiveOnboardingInstruction,
         'Backchannel policy: Utilise de rares acquiescements très courts sans interrompre l’utilisateur.',
@@ -1351,11 +1380,13 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
           'Backend tools:',
           '- Lire l’état DOM actuel de la page active et identifier les contrôles visibles, sur Limova ou un autre site.',
           '- Cliquer un élément, naviguer, faire défiler la page et écrire dans un champ non sensible.',
+          '- Créer un contenu ou lancer une tâche dans Limova à partir de la demande et, si utile, de la page affichée.',
           '- Vérifier le résultat réel d’une action avant de l’annoncer.',
           '- Rechercher la documentation produit Limova.',
           'Generate <|SpawnThinking|> when:',
           '- L’utilisateur demande de regarder, trouver, montrer, ouvrir, cliquer, sélectionner, naviguer, faire défiler, remplir ou écrire quelque chose sur la page active.',
           '- La réponse dépend de l’état actuel de la page, du DOM ou de la documentation produit.',
+          '- L’utilisateur demande de rédiger, créer ou lancer un contenu ou une tâche dans Limova.',
           '- Une correction modifie une action déjà demandée.',
           '- Tu dois vérifier qu’une action a réellement réussi.',
           'Do not generate <|SpawnThinking|> when:',
@@ -1363,6 +1394,7 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
           '- La demande est trop ambiguë pour agir : pose alors une seule question courte.',
           'Generate <|SpawnThinking|> before giving an answer that depends on backend work.',
           'Tu es Charly dans une extension qui peut cliquer et écrire dans la page active via le backend. Ne te présente pas comme l’extension officielle de ChatGPT, n’invente pas un besoin de passer en mode Work. Si un outil échoue, explique son motif concret. Une promesse orale n’est pas une action : attends un résultat vérifié avant d’annoncer la réussite.',
+          'Pendant qu’une délégation traite déjà la demande, ne redélègue pas la même consigne depuis le début. Une transcription qui se complète appartient à la même demande ; seule une correction ou un nouvel objectif remplace le travail en cours.',
           'Pendant la délégation, dis seulement que tu vérifies si un retour oral est utile. Attends le résultat du backend et ne devine jamais le résultat.'
         ].join('\n')
       ].join('\n\n');
@@ -1404,7 +1436,7 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
         .json({ error: data?.error?.message || 'Voice service unavailable', requestId });
     }
     console.info(JSON.stringify({ type: 'openai_live_session_created', requestId, model: LIVE_MODEL, trainingMode, sdpShape }));
-    return res.status(201).json({ id: data.session?.id, sdp: data.transport.sdp, model: LIVE_MODEL, requestId });
+    return res.status(201).json({ id: data.session?.id, sdp: data.transport.sdp, model: LIVE_MODEL, protocol: 'gpt_live_webrtc_v1', requestId });
   } catch (error) {
     console.error(JSON.stringify({ type: 'openai_live_session_error', requestId, code: technicalErrorCode(error) }));
     return res.status(502).json({ error: 'Voice service unavailable', requestId });

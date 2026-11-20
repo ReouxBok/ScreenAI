@@ -1,5 +1,22 @@
 # Déploiement et publication
 
+## Extension 2.2.60 — GPT Live et autonomie
+
+Le paquet standard utilise GPT Live (`gpt-live-1`), la voix Marin et un backend délégué `gpt-6-luna`. Le proxy conserve `/api/live-token` pour les anciens clients Gemini.
+
+Ordre de publication :
+
+1. Fusionner les correctifs de l’extension et du proxy sur `main` après validation.
+2. Comparer l’arbre `proxy/` au commit Heroku courant, puis déployer uniquement ce sous-arbre en fast-forward.
+3. Vérifier `/healthz` : `voiceConfigured: true`, `voiceModel: gpt-live-1` et `voiceProtocol: gpt_live_webrtc_v1`. Vérifier aussi l’authentification, une session WebRTC et les outils de page.
+4. Soumettre `dist/limova-ai-extension-2.2.60.zip` au Chrome Web Store après contrôle du checksum. Ce paquet utilise le proxy de production ; le dossier « Charly GPT Live FR » du bureau reste un laboratoire local distinct.
+
+Le niveau par défaut est « Approuver pour moi ». Les niveaux « Demander une approbation » et « Accès complet » sont mémorisés localement. Une confirmation reprend l’action en attente une seule fois ; un changement de consigne, un arrêt ou une expiration l’annule.
+
+Le sélecteur d’autonomie se trouve à côté de la zone de saisie. L’analyse manuelle de la page reste disponible dans le menu ; les navigations et changements de page continuent d’actualiser le contexte automatiquement.
+
+Une soumission au Chrome Web Store reste en attente de la validation Google ; elle ne prouve pas que les utilisateurs ont déjà reçu la version.
+
 ## Extension 2.2.44 et Studio
 
 La CI obligatoire exécute les audits de sévérité haute, les tests unitaires de l’extension, du Studio et du proxy, le typage, le lint, le build Next.js, les parcours Playwright et la validation du paquet. Le build final produit :

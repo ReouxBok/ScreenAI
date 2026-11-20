@@ -1,4 +1,4 @@
-/* Loaded only by scripts/local/build-gpt-live.mjs. Reuses Charly's guarded tools. */
+/* GPT Live voice transport. Authentication and guarded browser tools stay in the service worker. */
 class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
   constructor(options = {}) {
     super(options);
@@ -17,25 +17,66 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
 
   sendEvent(event) {
     if (this.events?.readyState !== 'open') return false;
-    this.events.send(JSON.stringify({ event_id: crypto.randomUUID(), ...event }));
+    const payload = JSON.stringify({ event_id: crypto.randomUUID(), ...event });
+    if (new TextEncoder().encode(payload).byteLength > 48_000) throw new Error('Message vocal trop volumineux.');
+    this.events.send(payload);
     return true;
   }
 
-  // Adapter for the existing tool execution and context refresh code.
+  async sendBackendItem(item, lifecycle = this.lifecycleId) {
+    const dc = this.events;
+    if (!dc || lifecycle !== this.lifecycleId || dc.readyState !== 'open') return false;
+    if (dc.bufferedAmount > 64_000) {
+      await new Promise((resolve, reject) => {
+        const cleanup = () => { clearTimeout(timer); dc.removeEventListener('bufferedamountlow', done); dc.removeEventListener('close', done); };
+        const done = () => { cleanup(); resolve(); };
+        const timer = setTimeout(() => { cleanup(); reject(new Error('Transmission du contexte vocal expirée.')); }, 10_000);
+        dc.bufferedAmountLowThreshold = 32_000;
+        dc.addEventListener('bufferedamountlow', done);
+        dc.addEventListener('close', done);
+        if (dc.bufferedAmount <= 32_000) done();
+      });
+    }
+    return lifecycle === this.lifecycleId && dc === this.events && this.sendEvent({ type: 'response.item.create', item });
+  }
+
+  async sendBackendContext(text, lifecycle = this.lifecycleId) {
+    // WebRTC messages have a byte limit. Split the complete map into ordered
+    // text items; no control or tail of the page is silently discarded.
+    const parts = [];
+    let chunk = '', bytes = 0;
+    const encoder = new TextEncoder();
+    for (const character of text) {
+      const size = encoder.encode(JSON.stringify(character)).byteLength - 2;
+      if (bytes + size > 24_000) { parts.push(chunk); chunk = ''; bytes = 0; }
+      chunk += character; bytes += size;
+    }
+    if (chunk) parts.push(chunk);
+    for (let index = 0; index < parts.length; index++) {
+      const value = parts.length === 1 ? parts[index] : `[Contexte technique ${index + 1}/${parts.length} — attends la fin de la carte avant d’agir]\n${parts[index]}`;
+      if (!(await this.sendBackendItem({ type: 'message', role: 'user', content: [{ type: 'input_text', text: value }] }, lifecycle))) return false;
+    }
+    return true;
+  }
+
   async sendLegacy(raw) {
+    const lifecycle = this.lifecycleId;
     const message = JSON.parse(raw);
     if (message.toolResponse) {
       for (const result of message.toolResponse.functionResponses) {
-        this.sendEvent({ type: 'response.item.create', item: {
-          type: 'function_call_output', call_id: result.id, output: JSON.stringify(result.response)
-        } });
+        let output = JSON.stringify(result.response);
+        if (new TextEncoder().encode(output).byteLength > 24_000 && result.response.pageContext) {
+          await this.sendBackendContext(`Carte DOM courante, version ${result.response.contextVersion}. Source : résultat ${result.name || 'outil'}.\n${result.response.pageContext}`, lifecycle);
+          output = JSON.stringify({ ...result.response, pageContext: 'Carte complète transmise dans les messages techniques précédents.' });
+        }
+        if (!(await this.sendBackendItem({ type: 'function_call_output', call_id: result.id, output }, lifecycle))) return;
       }
       await this.sendVisualContext();
-      this.sendEvent({ type: 'response.create' });
+      if (lifecycle === this.lifecycleId) this.sendEvent({ type: 'response.create' });
     } else if (message.clientContent) {
       const text = message.clientContent.turns.flatMap(t => t.parts.map(p => p.text || '')).join('\n');
       this.sendEvent({ type: 'session.thinking.append', delegation_id: null, content: text.slice(0, 350) });
-      this.sendEvent({ type: 'response.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } });
+      await this.sendBackendContext(text, lifecycle);
       this.diagnostic('VOICE_BACKEND_CONTEXT_QUEUED', { characterCount: text.length });
     }
   }
@@ -44,22 +85,30 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
     if (this.active || this.starting) return;
     const lifecycle = ++this.lifecycleId;
     this.starting = true;
+    this.failed = false;
     this.operationId = `gpt-live-${crypto.randomUUID()}`;
     this.seenCalls.clear();
     this.transcripts = { user: null, assistant: null };
     this.toolQueue = Promise.resolve();
     this.outgoingQueue = Promise.resolve();
     this.delegations.clear();
+    this.task = null;
     this.emit('limova-voice-status', { status: 'connecting' });
     let timeout;
     try {
       // Remember the panel's window and its web tab before microphone consent
       // opens a temporary extension tab (possibly stealing window focus).
       const panelWindow = await chrome.windows.getCurrent();
+      this.contextWindowId = panelWindow.id;
       const [initialTab] = await chrome.tabs.query({ active: true, windowId: panelWindow.id });
-      const initialContext = await chrome.runtime.sendMessage({ type: 'GET_LOCAL_VOICE_PAGE_CONTEXT', windowId: panelWindow.id, initialTabId: initialTab?.id });
+      const initialContext = await chrome.runtime.sendMessage({ type: 'GET_VOICE_PAGE_CONTEXT', windowId: panelWindow.id, initialTabId: initialTab?.id });
       if (lifecycle !== this.lifecycleId) return;
-      if (!initialContext?.ok) throw new Error(initialContext?.error || 'Ouvre une page web dans cette fenêtre avant de démarrer Charly.');
+      if (!initialContext?.ok) {
+        if (initialContext?.consentRequired) this.emit('limova-voice-consent-required');
+        const error = new Error(initialContext?.error || 'Ouvre une page web dans cette fenêtre avant de démarrer Charly.');
+        error.voiceDiagnosticCode = initialContext?.code || (initialContext?.consentRequired ? 'VOICE_CONSENT_REQUIRED' : 'VOICE_CONTEXT_UNAVAILABLE');
+        throw error;
+      }
       const task = await chrome.runtime.sendMessage({ type: 'VOICE_TASK_BEGIN' });
       this.taskRevision = task.revision;
       this.taskUpdate = Promise.resolve(task);
@@ -67,6 +116,7 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
       const stream = await this.requestMicrophone(lifecycle);
       if (lifecycle !== this.lifecycleId) return;
       this.stream = stream;
+      stream.getAudioTracks().forEach(track => { track.enabled = !this.microphoneMuted; });
       // Close only the permission helper opened by this session, after grant.
       // Until it closes, Chrome still considers that helper the active tab.
       if (this.microphonePermissionTabId != null) await chrome.tabs.remove(this.microphonePermissionTabId).catch(() => {});
@@ -74,13 +124,18 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
       const peer = this.peer = new RTCPeerConnection();
       const audio = this.audio = new Audio();
       audio.autoplay = true;
-      audio.controls = true;
+      audio.controls = false;
+      audio.hidden = true;
       audio.setAttribute('aria-label', 'Voix française GPT Live');
       document.body.append(audio);
       peer.addEventListener('track', event => {
         if (lifecycle !== this.lifecycleId) return;
         audio.srcObject = new MediaStream([event.track]);
-        audio.play().catch(() => this.emit('limova-voice-status', { status: 'listening', error: 'Appuie sur lecture pour écouter GPT Live.' }));
+        audio.play().catch(() => {
+          if (lifecycle !== this.lifecycleId) return;
+          audio.controls = true; audio.hidden = false;
+          this.emit('limova-voice-status', { status: 'listening', error: 'Appuie sur lecture pour écouter GPT Live.' });
+        });
       });
       for (const track of stream.getAudioTracks()) peer.addTrack(track, stream);
       const dc = this.events = peer.createDataChannel('oai-events');
@@ -132,7 +187,11 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
         trainingMode: this.trainingMode, windowId: panelWindow.id, initialTabId: initialTab?.id, permissionTabId: this.microphonePermissionTabId
       } });
       if (lifecycle !== this.lifecycleId) return;
-      if (!result?.ok || !result.sdp) throw new Error(result?.error || 'GPT Live indisponible.');
+      if (!result?.ok || !result.sdp) {
+        const error = new Error(result?.error || 'GPT Live indisponible.');
+        error.voiceDiagnosticCode = result?.code || 'LIVE_SESSION_SERVICE_FAILED';
+        throw error;
+      }
       await peer.setRemoteDescription({ type: 'answer', sdp: result.sdp });
       await started;
       if (lifecycle !== this.lifecycleId) return;
@@ -156,6 +215,39 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
     }
   }
 
+  setAutonomyMode(mode) {
+    const label = { ask: 'Demander une approbation', balanced: 'Approuver pour moi', full: 'Accès complet' }[mode];
+    if (!label || !this.ready) return;
+    this.socket?.send(JSON.stringify({ clientContent: { turns: [{ parts: [{ text: `[RÉGLAGE UTILISATEUR — aucune nouvelle tâche] Niveau d’autonomie : ${label}. L’application applique ce choix ; les approbations déjà affichées attendent toujours la décision du membre.` }] }] } }));
+  }
+
+  requestApproval(action) {
+    this.pendingApproval = action;
+    this.sendEvent({ type: 'session.thinking.append', delegation_id: null,
+      content: `Une approbation attend pour l’action ${JSON.stringify(action.label)}. Rien n’est encore exécuté. Demande une confirmation courte. L’utilisateur peut cliquer sur le bouton du panneau ou dire oui ; l’application exécutera cette action une seule fois après son accord. Ne relance pas cette action avec un autre outil.` });
+  }
+
+  resolveSpokenApproval(segment) {
+    if (!segment.approvalId || segment.approvalHandled || this.pendingApproval?.actionId !== segment.approvalId) return;
+    segment.approvalHandled = true;
+    const text = segment.text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    const yes = /^(?:oui|ouais|yes|ok|okay|d accord|vas y|go|confirme|enregistre|autorise|approuve)(?: (?:oui|vas y|tu peux|fais le|enregistre|confirme|merci|s il te plait))*$/.test(text);
+    const no = /^(?:non|no|annule|annuler|stop|arrete|cancel)(?: (?:merci|s il te plait))*$/.test(text);
+    if (yes || no) {
+      segment.approvalDecision = yes ? 'approved' : 'cancelled';
+      this.pendingApproval = null;
+      chrome.runtime.sendMessage({ type: yes ? 'CONFIRM_ACTION' : 'CANCEL_ACTION', actionId: segment.approvalId }).catch(() => {});
+    } else {
+      // A changed instruction cancels the pending decision instead of treating
+      // a partial "oui, mais…" as approval of the old action.
+      this.pendingApproval = null;
+      this.taskRevision += 1;
+      this.task = { revision: this.taskRevision, utteranceId: segment.id, instruction: segment.text, phase: 'listening', steps: [] };
+      for (const delegation of this.delegations.values()) if (delegation.user?.id === segment.id) delegation.revision = this.taskRevision;
+      this.taskUpdate = chrome.runtime.sendMessage({ type: 'VOICE_TASK_UPDATE', revision: this.taskRevision });
+    }
+  }
+
   handleLiveEvent(event) {
     if (event.type === 'session.delegation.created') {
       const id = event.delegation?.id || event.delegation_id;
@@ -171,18 +263,19 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
       if (!segment || at - segment.end > 2000) {
         this.flushTranscript(role);
         segment = this.transcripts[role] = { id: `${this.operationId}:${role}:${++this.transcriptSequence}`, role, text: '', end: at, timer: null };
-        if (role === 'user' && !this.trainingMode) {
+        if (role === 'user' && !this.trainingMode && this.pendingApproval) segment.approvalId = this.pendingApproval.actionId;
+        if (role === 'user' && !this.trainingMode && !segment.approvalId) {
           this.taskRevision += 1;
           this.task = { revision: this.taskRevision, utteranceId: segment.id, instruction: '', phase: 'listening', steps: [] };
           this.taskUpdate = chrome.runtime.sendMessage({ type: 'VOICE_TASK_UPDATE', revision: this.taskRevision });
         }
       }
-      segment.text += event.delta || '';
+      segment.text += String(event.delta || '').replace(/\uFFFD/g, '');
       segment.end = Number.isFinite(event.end_ms) ? event.end_ms : at;
       if (role === 'user') {
         this.currentUserTurnText = segment.text.slice(-4000);
         if (this.task) this.task.instruction = this.currentUserTurnText;
-        if (!segment.interrupted && /(?:^|[.!?,]\s*)(?:non\b|arrête\b|arrete\b|stop\b|annule\b)/iu.test(segment.text)) {
+        if (!segment.approvalId && !segment.interrupted && /(?:^|[.!?,]\s*)(?:non\b|arrête\b|arrete\b|stop\b|annule\b)/iu.test(segment.text)) {
           segment.interrupted = true;
           this.taskRevision += 1;
           if (this.task) { this.task.revision = this.taskRevision; this.task.phase = 'corrected'; }
@@ -192,7 +285,7 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
       if (this.trainingMode) this.emitSafeTranscript(role, event.delta || '');
       else this.emit('limova-gpt-transcript', { role, text: segment.text, utteranceId: segment.id, final: false });
       clearTimeout(segment.timer);
-      segment.timer = setTimeout(() => this.flushTranscript(role), 2500);
+      segment.timer = setTimeout(() => this.flushTranscript(role, false), 2500);
     } else if (event.type === 'response.event' && event.event?.type === 'response.output_item.done') {
       const call = event.event.item;
       if (call?.type !== 'function_call' || this.seenCalls.has(call.call_id)) return;
@@ -201,8 +294,8 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
       try { args = JSON.parse(call.arguments || '{}'); }
       catch { args = {}; }
       const lifecycle = this.lifecycleId;
-      const delegation = this.delegations.get(event.delegation_id) || { revision: this.taskRevision, user: this.transcripts.user };
-      const revision = delegation.revision;
+      const delegation = this.delegations.get(event.delegation_id) || (event.delegation_id ? { revision: -1 } : { revision: this.taskRevision, user: this.transcripts.user });
+      let revision = delegation.revision;
       const user = delegation.user;
       const isCurrent = () => lifecycle === this.lifecycleId && revision === this.taskRevision;
       const cancelled = () => {
@@ -212,10 +305,12 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
           response: { status: 'cancelled', reason: 'La demande a changé. Relis la dernière consigne avant toute action.' } }] } }));
       };
       this.toolQueue = this.toolQueue.then(async () => {
+        revision = delegation.revision;
         await this.taskUpdate;
+        if (user?.approvalDecision && !['inspect_current_page', 'capture_current_view', 'verify_expected_result'].includes(call.name)) return cancelled();
         if (!isCurrent()) return cancelled();
         if (user?.text.trim()) {
-          await chrome.runtime.sendMessage({ type: 'LOCAL_VOICE_TRANSCRIPT', role: 'user', text: user.text, utteranceId: user.id });
+          await chrome.runtime.sendMessage({ type: 'VOICE_TRANSCRIPT', role: 'user', text: user.text, utteranceId: user.id, final: false, taskRevision: revision });
         }
         if (!isCurrent()) return cancelled();
         if (this.task) this.task.phase = 'executing';
@@ -226,16 +321,18 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
     }
   }
 
-  flushTranscript(role) {
+  flushTranscript(role, persist = true) {
     for (const speaker of role ? [role] : ['user', 'assistant']) {
       const segment = this.transcripts[speaker];
       if (!segment) continue;
+      if (speaker === 'user') this.resolveSpokenApproval(segment);
       clearTimeout(segment.timer);
       segment.timer = null;
-      if (segment.finalizedText === segment.text) continue;
+      if (segment.finalizedText === segment.text && (!persist || segment.persisted)) continue;
+      if (persist) segment.persisted = true;
       segment.finalizedText = segment.text;
       if (this.trainingMode) this.emit('limova-voice-transcript', { role: speaker, text: '', final: true });
-      else this.emit('limova-gpt-transcript', { role: speaker, text: segment.text, utteranceId: segment.id, final: true });
+      else this.emit('limova-gpt-transcript', { role: speaker, text: segment.text, utteranceId: segment.id, final: true, persist });
     }
   }
 
@@ -291,6 +388,11 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
   isOutputBusy() { return this.toolCallsInFlight > 0; }
 
   fail(error) {
+    if (this.failed) return;
+    this.failed = true;
+    const code = error.voiceDiagnosticCode || 'VOICE_SESSION_FAILED';
+    this.diagnostic(code, { name: error.name });
+    if (!['VOICE_MIC_DISMISSED', 'VOICE_CONSENT_REQUIRED'].includes(code)) this.trackEvent('voice_session_failed', { code });
     this.stop(false, 'error');
     this.emit('limova-voice-status', { status: 'error', error: error.message });
   }
@@ -299,6 +401,7 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
     const dc = this.events;
     const peer = this.peer;
     const audio = this.audio;
+    this.pendingApproval = null;
     this.flushTranscript();
     // Stop microphone immediately; keep the transport briefly for final usage.
     this.sendEvent({ type: 'session.close' });
@@ -308,7 +411,7 @@ class LimovaOpenAiVoiceSession extends window.LimovaVoiceSession {
     audio?.pause();
     if (audio) { audio.srcObject = null; audio.remove(); }
     const cleanup = () => { clearTimeout(timer); dc?.close(); peer?.close(); };
-    const timer = setTimeout(cleanup, 15_000);
+    const timer = dc || peer ? setTimeout(cleanup, 15_000) : null;
     dc?.addEventListener('message', ({ data }) => { try { if (JSON.parse(data).type === 'session.closed') cleanup(); } catch {} });
     super.stop(notify, reason);
   }

@@ -78,3 +78,8 @@ export const test = base.extend({
 });
 
 export const expect = test.expect;
+
+export async function analyzePageManually(page) {
+  if (!(await page.locator('#screenshotBtn').isVisible())) await page.locator('#menuBtn').click();
+  await page.locator('#screenshotBtn').click();
+}
