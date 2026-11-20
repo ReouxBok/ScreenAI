@@ -30,6 +30,7 @@ import { enqueueApprovedCaseReply, submitCaseReplyProposal, type CaseEffectNote,
 import { savCaseReplyValidations } from "./case-reply-validation-table";
 import { caseReplyNoteEnabled, caseReplySummaryInteractionId, caseReplySummaryText } from "./case-reply-summary-note";
 import { readCase } from "./case-store";
+import { smartEntryEffectsHold } from "./smart-entry-switch";
 import { decryptSavPayload } from "../crypto";
 import type { CaseDecisionReplyDraft } from "./investigation-intent";
 
@@ -259,6 +260,9 @@ async function pendingSupervisedExecutions(limit: number, skipIds: ReadonlySet<s
  */
 export async function runCaseEffectsPass(deps: CaseRuntimeDeps): Promise<CaseRuntimePassResult> {
   const env = deps.env();
+  // SAV-117 review 1F: the central hold before N8 (`smartEntryEffectsHold`, to remove in N8): nothing claimed, marked or sent; everything stays due.
+  const hold = smartEntryEffectsHold(env);
+  if (hold) return skip(hold);
   if (readCaseEffectsMode(env).mode !== "supervised") return skip("effects_off");
   let config: ReturnType<typeof intakeExecutionConfig>;
   try { config = intakeExecutionConfig(env); } catch (error) { return skip(code(error)); }

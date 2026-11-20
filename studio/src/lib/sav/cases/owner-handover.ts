@@ -21,7 +21,7 @@ import { ownerHandoverPollFloor } from "./owner-handover-poll";
 import { readSavV2QualificationScope } from "./qualification-scope";
 import { handBackOwnerHandoverTicket, startV2FromThreadlessTicket } from "./threadless-entry";
 import { readOwnerHandoverContact, threadlessIdentityReason } from "./threadless-source";
-import { savV2EntrySmartOn } from "./smart-entry-switch";
+import { savV2EntrySmartOn, smartEntryEffectsHold } from "./smart-entry-switch";
 import { continueCaseAfterCommit, firstBlockEvidence, v2EntryRelayDeps } from "./v2-entry";
 import { SAV_CASE_BLOCK_REGISTRY } from "./case-block-registry";
 import { savCaseSensitiveWording } from "./investigation-return-qualify";
@@ -145,6 +145,9 @@ async function processOwnerHandover(input: OwnerHandoverTransition, claim: Claim
 
   // SAV-99 (Ugo 19/11): a ticket the agent does not take goes back to the team, once, with no mail (`handBackOwnerHandoverTicket`).
   const handBack = async (reason: string) => {
+    // SAV-117 review 1F: the central hold before N8 (`smartEntryEffectsHold`, to remove in N8): no hand-back, no HubSpot write; the reason is only logged.
+    const hold = smartEntryEffectsHold(env);
+    if (hold) { console.info("sav_v2_owner_handover_held", { hold, reason }); return hold; }
     if (!await ownerHandoverClaimIsCurrent(claim) || await relayPaused(db)) return "superseded_or_paused";
     const back = await handBackOwnerHandoverTicket(input, reason);
     return back.status === "human_wait" ? `handed_back:${back.reason}` : `handback_${back.status}`;

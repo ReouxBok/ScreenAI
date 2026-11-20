@@ -343,14 +343,17 @@ describe("SAV_V2_ENTRY_SMART=on before N8: a handed-over ticket read by the smar
     onlyReads(read);
   });
 
-  it("SAV-118: a manual handover on a ticket with no contact goes back to the team with `crm_missing_primary` (the existing hand-back only)", async () => {
+  it("SAV-118 + review 1F: a manual handover on a ticket with no contact keeps `crm_missing_primary` but waits before N8: 0 hand-back, 0 HubSpot write", async () => {
     const input = await scheduled();
     await manualMail(input.ticketId);
-    liveTicket(input.ticketId);
+    const read = liveTicket(input.ticketId);
     fixture.blockEvidence.mockImplementation(smartEvidence);
-    await expect(wake(input)).resolves.toEqual({ status: "handed_back:crm_missing_primary" });
-    expect(fixture.handBack).toHaveBeenCalledExactlyOnceWith(input, "crm_missing_primary");
+    const info = vi.spyOn(console, "info");
+    await expect(wake(input)).resolves.toEqual({ status: "smart_entry_awaiting_n8" });
+    expect(info).toHaveBeenCalledWith("sav_v2_owner_handover_held", { hold: "smart_entry_awaiting_n8", reason: "crm_missing_primary" });
+    expect(fixture.handBack).not.toHaveBeenCalled();
     expect(fixture.blockEvidence).not.toHaveBeenCalled();
+    onlyReads(read);
   });
 
   it("SAV-118: switch off, the same mails keep their historical hand-backs (words, `no_contact`)", async () => {

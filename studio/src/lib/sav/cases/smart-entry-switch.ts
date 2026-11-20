@@ -28,3 +28,14 @@ export {
 /** SAV-118 (N5): the wait reason of a HubSpot ticket handed to the agent with no contact at all (no primary record), switch on only. Nothing is invented: the
  * ticket goes back to the team with this reason, through the existing hand-over (stage « Nouveau », no owner, one short note). */
 export const SAV_SMART_ENTRY_MISSING_PRIMARY = "crm_missing_primary";
+
+/**
+ * SAV-117 review 1F — THE central hold of external effects before N8 (TO REMOVE IN N8, here only: make it return null, then drop its call sites).
+ * While `SAV_V2_ENTRY_SMART=on` and the smart brain is not wired, no external effect of the Agent SAV leaves: no hand-back of a HubSpot-assigned ticket
+ * (`owner-handover.ts`), no Gmail send nor HubSpot write of the case effects executor (`runCaseEffectsPass`: thread replies, first mail of a ticket, CRM
+ * journal, summary note) nor of the ticket stage executor (`runCaseTicketStagePass`). Each executor stops BEFORE claiming or marking anything, with this
+ * reason: nothing is consumed, nothing irreversible is written, the work stays due. It is a guard against an accidental switch-on, not a filter.
+ * Off: null, every executor exactly as before.
+ */
+export const SAV_SMART_ENTRY_EFFECTS_HOLD = "smart_entry_awaiting_n8";
+export const smartEntryEffectsHold = (env: Env): typeof SAV_SMART_ENTRY_EFFECTS_HOLD | null => savV2EntrySmartOn(env) ? SAV_SMART_ENTRY_EFFECTS_HOLD : null;
