@@ -1011,6 +1011,10 @@ function transientPopupCandidate() {
   }
   return [...candidates].filter(popup => isVisiblyRendered(popup))
     .filter(popup => !popup.querySelector('form, textarea, [contenteditable="true"]'))
+    // An expanded trigger can also own the entire event editor (Radix
+    // dialogs, for example). That relationship alone is not a popup license.
+    .filter(popup => popup.matches('[role="menu"], [role="listbox"], [role="tree"], [role="grid"]')
+      || !popup.querySelector('input:not([type="hidden"]):not([type="button"]):not([type="submit"])'))
     .sort((a, b) => { const x = a.getBoundingClientRect(), y = b.getBoundingClientRect(); return x.width * x.height - y.width * y.height; })
     .map(popup => ({ popup, trigger: owned.get(popup) }))[0] || null;
 }

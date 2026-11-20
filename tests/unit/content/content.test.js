@@ -248,7 +248,8 @@ describe('content.js — DOM helpers', () => {
 
     it('does not press Escape on the main event editor when no transient popup exists', async () => {
       document.documentElement.dataset.limovaContextVersion = '10';
-      document.body.innerHTML = '<section role="dialog"><input value="Sport"><button>Enregistrer</button></section>';
+      document.body.innerHTML = '<button aria-expanded="true" aria-controls="event-editor">Créer</button><section role="dialog" id="event-editor"><input value="Sport"><button>Enregistrer</button></section>';
+      for (const el of document.querySelectorAll('section,input,button')) el.getBoundingClientRect = () => ({ left:0,top:0,right:600,bottom:400,width:600,height:400 });
       const escape = vi.fn(); document.addEventListener('keydown', escape);
       await expect(content.dismissTransientPopup({ contextVersion: 10 })).resolves.toMatchObject({ ok:true, unchanged:true, dismissed:false });
       expect(escape).not.toHaveBeenCalled(); document.removeEventListener('keydown', escape);
