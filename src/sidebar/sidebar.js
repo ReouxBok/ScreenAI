@@ -92,13 +92,31 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateLangSwitcher();
   renderAnnouncements();
   initEventListeners();
-  loadAutonomyMode();
+  await loadAutonomyMode();
   await loadInitialState();
   document.documentElement.dataset.sidebarReady = 'true';
 });
 
 function applyAutonomyMode(mode) {
+  const key = { ask: 'autonomyAsk', balanced: 'autonomyBalanced', full: 'autonomyFull' }[mode];
+  if (!key) return;
   for (const input of document.querySelectorAll('input[name="autonomyMode"]')) input.checked = input.value === mode;
+  const button = document.getElementById('autonomyBtn');
+  button.dataset.autonomyMode = mode;
+  button.dataset.i18nTitle = key;
+  button.title = t(key);
+  const label = document.getElementById('autonomyModeLabel');
+  label.dataset.i18n = key;
+  label.textContent = t(key);
+  for (const icon of button.querySelectorAll('[data-autonomy-icon]')) icon.classList.toggle('is-current', icon.dataset.autonomyIcon === mode);
+}
+
+function closeAutonomyMenu(restoreFocus = false) {
+  const menu = document.getElementById('autonomyMenu');
+  if (menu.hidden) return;
+  menu.hidden = true;
+  document.getElementById('autonomyBtn').setAttribute('aria-expanded', 'false');
+  if (restoreFocus) document.getElementById('autonomyBtn').focus();
 }
 
 async function loadAutonomyMode() {
@@ -107,18 +125,51 @@ async function loadAutonomyMode() {
 }
 
 function initEventListeners() {
+  const autonomyButton = document.getElementById('autonomyBtn');
+  const autonomyMenu = document.getElementById('autonomyMenu');
+  let pointerChoice = false;
+  autonomyMenu.addEventListener('pointerdown', () => { pointerChoice = true; });
+  autonomyMenu.addEventListener('keydown', () => { pointerChoice = false; });
+  const openAutonomyMenu = () => {
+    document.getElementById('headerMenu').hidden = true;
+    autonomyMenu.hidden = false;
+    autonomyButton.setAttribute('aria-expanded', 'true');
+    autonomyMenu.querySelector('input:checked')?.focus();
+  };
+  autonomyButton.addEventListener('click', () => autonomyMenu.hidden ? openAutonomyMenu() : closeAutonomyMenu(true));
+  autonomyButton.addEventListener('keydown', event => {
+    if (event.key === 'ArrowDown') { event.preventDefault(); openAutonomyMenu(); }
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && !autonomyMenu.hidden) { event.preventDefault(); closeAutonomyMenu(true); }
+  });
+  document.addEventListener('click', event => {
+    if (!event.target.closest('.autonomy-control')) closeAutonomyMenu();
+  });
+  document.addEventListener('focusin', event => {
+    if (!event.target.closest('.autonomy-control')) closeAutonomyMenu();
+  });
   for (const input of document.querySelectorAll('input[name="autonomyMode"]')) {
     input.addEventListener('change', async () => {
       if (!input.checked) return;
+      const closeAfterSave = pointerChoice;
       const result = await chrome.runtime.sendMessage({ type: 'SET_AUTONOMY_MODE', mode: input.value }).catch(() => null);
-      document.getElementById('autonomyStatus').textContent = t(result?.ok ? 'autonomySaved' : 'autonomySaveFailed');
+      const savedKey = elements.chatContainer.querySelector('.action-card') ? 'autonomySavedPending' : 'autonomySaved';
+      document.getElementById('autonomyStatus').textContent = t(result?.ok ? savedKey : 'autonomySaveFailed');
       if (!result?.ok) await loadAutonomyMode();
+      else {
+        applyAutonomyMode(result.autonomyMode || input.value);
+        if (closeAfterSave) closeAutonomyMenu(true);
+      }
     });
   }
   elements.userInput.addEventListener('input', handleInputChange);
   elements.userInput.addEventListener('keydown', handleInputKeydown);
   elements.sendBtn.addEventListener('click', sendMessage);
-  elements.screenshotBtn.addEventListener('click', analyzePage);
+  elements.screenshotBtn.addEventListener('click', () => {
+    document.getElementById('headerMenu').hidden = true;
+    analyzePage();
+  });
   elements.voiceBtn.addEventListener('click', toggleVoice);
   elements.voiceMuteBtn?.addEventListener('click', toggleVoiceMute);
   elements.authEmailForm?.addEventListener('submit', requestAuthenticationCode);
@@ -138,6 +189,7 @@ function initEventListeners() {
   if (menuBtn) {
     menuBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      closeAutonomyMenu();
       headerMenu.hidden = !headerMenu.hidden;
     });
   }

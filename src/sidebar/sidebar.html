@@ -45,13 +45,10 @@
             </svg>
           </button>
           <div class="header-menu" id="headerMenu" hidden>
-            <fieldset class="autonomy-picker" aria-describedby="autonomyStatus">
-              <legend data-i18n="autonomyTitle">Autonomie</legend>
-              <label class="autonomy-option"><input type="radio" name="autonomyMode" value="ask"><span><strong data-i18n="autonomyAsk">Demander une approbation</strong><small data-i18n="autonomyAskDescription">Demande avant modifications et commandes</small></span></label>
-              <label class="autonomy-option"><input type="radio" name="autonomyMode" value="balanced" checked><span><strong data-i18n="autonomyBalanced">Approuver pour moi</strong><small data-i18n="autonomyBalancedDescription">Demande seulement si c’est risqué</small></span></label>
-              <label class="autonomy-option"><input type="radio" name="autonomyMode" value="full"><span><strong data-i18n="autonomyFull">Accès complet</strong><small data-i18n="autonomyFullDescription">Demande rarement avant d’agir</small></span></label>
-              <p class="autonomy-status" id="autonomyStatus" role="status" aria-live="polite"></p>
-            </fieldset>
+            <button class="menu-item" id="screenshotBtn" data-i18n-aria-label="screenshotTitle">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+              <span data-i18n="screenshotTitle">Analyser la page actuelle</span>
+            </button>
             <div class="menu-divider"></div>
             <button class="menu-item" id="trainingBtn">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 10 12 5 2 10l10 5 10-5Z"/><path d="M6 12v5c3 2 9 2 12 0v-5"/></svg>
@@ -164,9 +161,9 @@
       <div class="how-it-works">
         <h2 class="how-it-works-headline" data-i18n="howItWorksTitle">Voici comment ça va fonctionner</h2>
         <ul class="how-it-works-list">
-          <li data-i18n="howItWorks1">Navigue sur Limova, je vois chaque page automatiquement</li>
+          <li data-i18n="howItWorks1">Je m’adapte automatiquement à la page que tu consultes</li>
           <li data-i18n="howItWorks2">Je te guide étape par étape</li>
-          <li data-i18n="howItWorks3">Si tu es bloqué, clique sur <svg class="inline-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg></li>
+          <li data-i18n="howItWorks3">Choisis mon niveau d’autonomie à côté de la zone de saisie</li>
           <li data-i18n="howItWorks4">Pose-moi n'importe quelle question en chemin</li>
         </ul>
       </div>
@@ -216,12 +213,27 @@
 
     <!-- Input Area -->
     <div class="input-area">
-      <button class="screenshot-btn" id="screenshotBtn" data-i18n-title="screenshotTitle" data-i18n-aria-label="screenshotTitle" title="Analyser la page actuelle">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
-          <circle cx="12" cy="13" r="4"></circle>
-        </svg>
-      </button>
+      <div class="autonomy-control" id="autonomyControl">
+        <button class="autonomy-btn" id="autonomyBtn" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="autonomyMenu" aria-labelledby="autonomyTriggerTitle autonomyModeLabel" data-i18n-title="autonomyBalanced" title="Approuver pour moi" data-autonomy-mode="balanced">
+          <span class="visually-hidden" id="autonomyTriggerTitle" data-i18n="autonomyTitle">Autonomie</span>
+          <span class="visually-hidden" id="autonomyModeLabel" data-i18n="autonomyBalanced">Approuver pour moi</span>
+          <svg width="15" height="15" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+            <g data-autonomy-icon="ask"><rect x="4" y="3" width="4" height="14" rx="1"/><rect x="12" y="3" width="4" height="14" rx="1"/></g>
+            <g data-autonomy-icon="balanced" class="is-current"><path d="M5 3.5a1 1 0 0 1 1.5-.86l10 6.5a1 1 0 0 1 0 1.72l-10 6.5A1 1 0 0 1 5 16.5z"/></g>
+            <g data-autonomy-icon="full"><path d="M2 4a1 1 0 0 1 1.6-.8L10 8V4a1 1 0 0 1 1.6-.8l7 6a1 1 0 0 1 0 1.6l-7 6A1 1 0 0 1 10 16v-4l-6.4 4.8A1 1 0 0 1 2 16z"/></g>
+          </svg>
+          <svg width="8" height="8" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m3 4.5 3 3 3-3"/></svg>
+        </button>
+        <div class="autonomy-menu" id="autonomyMenu" role="dialog" aria-labelledby="autonomyTitle" hidden>
+            <fieldset class="autonomy-picker" aria-describedby="autonomyStatus">
+              <legend id="autonomyTitle" data-i18n="autonomyTitle">Autonomie</legend>
+              <label class="autonomy-option"><input type="radio" name="autonomyMode" value="ask"><span><strong data-i18n="autonomyAsk">Demander une approbation</strong><small data-i18n="autonomyAskDescription">Demande avant modifications et commandes</small></span></label>
+              <label class="autonomy-option"><input type="radio" name="autonomyMode" value="balanced" checked><span><strong data-i18n="autonomyBalanced">Approuver pour moi</strong><small data-i18n="autonomyBalancedDescription">Demande seulement si c’est risqué</small></span></label>
+              <label class="autonomy-option"><input type="radio" name="autonomyMode" value="full"><span><strong data-i18n="autonomyFull">Accès complet</strong><small data-i18n="autonomyFullDescription">Demande rarement avant d’agir</small></span></label>
+              <p class="autonomy-status" id="autonomyStatus" role="status" aria-live="polite"></p>
+            </fieldset>
+        </div>
+      </div>
       <button class="voice-btn" id="voiceBtn" data-i18n-title="voiceStart" data-i18n-aria-label="voiceStart" title="Démarrer une conversation vocale" aria-pressed="false">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
       </button>

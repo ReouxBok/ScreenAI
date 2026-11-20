@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures.js';
+import { test, expect, analyzePageManually } from './fixtures.js';
 
 const PROXY_ORIGIN = 'https://limova-proxy-479c7fb78ccf.herokuapp.com';
 const LIMOVA_ORIGIN = 'https://new.limova.ai';
@@ -761,7 +761,7 @@ test.describe('Packaged extension — complete user flows', () => {
     });
     await grantAIConsent(sidebar);
 
-    await sidebar.locator('#screenshotBtn').click();
+    await analyzePageManually(sidebar);
     await expect(sidebar.locator('.message.assistant .message-content')).toContainText('Écris ton brief ici.');
     await expect.poll(() => limova.locator('.limova-element-highlight').count()).toBe(1);
     const visualPart = calls.gemini[0].postDataJSON().contents.at(-1).parts
@@ -782,7 +782,7 @@ test.describe('Packaged extension — complete user flows', () => {
       autonomyMode: 'balanced', geminiReply: 'Vérifie cette action. {{HIGHLIGHT:1}} {{ACTION:1}}'
     });
     await grantAIConsent(sidebar);
-    await sidebar.locator('#screenshotBtn').click();
+    await analyzePageManually(sidebar);
     await expect(sidebar.locator('.action-card')).toHaveCount(1);
     await expect(limova.locator('#sensitiveAction')).not.toHaveAttribute('data-clicked', 'true');
     await sidebar.locator('.action-cancel').click();
@@ -827,7 +827,7 @@ test.describe('Packaged extension — complete user flows', () => {
       }
     });
     await grantAIConsent(sidebar);
-    await sidebar.locator('#screenshotBtn').click();
+    await analyzePageManually(sidebar);
 
     await expect(sidebar.locator('.action-card')).toHaveCount(0);
     await expect(limova.locator('#limova-computer-use-pointer')).toBeVisible();
@@ -852,7 +852,7 @@ test.describe('Packaged extension — complete user flows', () => {
     });
     await grantAIConsent(sidebar);
 
-    await sidebar.locator('#screenshotBtn').click();
+    await analyzePageManually(sidebar);
 
     await expect(limova.locator('#ordinaryControl')).toHaveAttribute('data-clicked', 'true');
     await expect(sidebar.locator('.action-card')).toHaveCount(0);
@@ -908,7 +908,7 @@ test.describe('Packaged extension — complete user flows', () => {
     });
     await grantAIConsent(sidebar);
 
-    await sidebar.locator('#screenshotBtn').click();
+    await analyzePageManually(sidebar);
 
     await expect(limova.locator('#limova-computer-use-pointer')).toBeVisible();
     await expect(limova.locator('.integration-card')).toHaveAttribute('data-clicked', 'true');
@@ -1103,7 +1103,7 @@ test.describe('Packaged extension — complete user flows', () => {
     expect(liveTokenPayload.pageContext).not.toContain('NEVER_TRANSMIT_THIS_SECRET');
     expect(liveTokenPayload.pageContext).not.toContain('private_token');
 
-    await sidebar.locator('#screenshotBtn').click();
+    await analyzePageManually(sidebar);
     await expect.poll(() => socketMessages.some(message =>
       message.realtimeInput?.video?.mimeType === 'image/jpeg'
     )).toBe(true);

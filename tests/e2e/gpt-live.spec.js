@@ -92,9 +92,8 @@ test('stopping GPT during microphone acquisition never revives its connection', 
 
 test('autonomy labels match the requested wording and the level survives reopening', async ({ mediaContext, mediaExtensionId }) => {
   const { panel } = await setup(mediaContext, mediaExtensionId);
-  await panel.evaluate(() => stopVoiceSession());
   await panel.setViewportSize({ width: 360, height: 800 });
-  await panel.locator('#menuBtn').click();
+  await panel.locator('#autonomyBtn').click();
   await expect(panel.locator('.autonomy-picker')).toContainText('Demander une approbation');
   await expect(panel.locator('.autonomy-picker')).toContainText('Demande avant modifications et commandes');
   await expect(panel.locator('.autonomy-picker')).toContainText('Approuver pour moi');
@@ -102,14 +101,26 @@ test('autonomy labels match the requested wording and the level survives reopeni
   await expect(panel.locator('.autonomy-picker')).toContainText('Accès complet');
   await expect(panel.locator('.autonomy-picker')).toContainText('Demande rarement avant d’agir');
   await expect(panel.locator('input[name="autonomyMode"][value="balanced"]')).toBeChecked();
+  const revision = await panel.evaluate(() => voiceSession.taskRevision);
   await panel.locator('input[name="autonomyMode"][value="ask"]').check();
   await expect(panel.locator('#autonomyStatus')).toContainText('mémorisé');
+  await expect(panel.locator('#autonomyBtn')).toHaveAccessibleName('Autonomie Demander une approbation');
+  expect(await panel.evaluate(revision => voiceSession.ready && voiceSession.taskRevision === revision, revision)).toBe(true);
+  await panel.evaluate(() => stopVoiceSession());
   await panel.reload();
   await panel.waitForFunction(() => document.documentElement.dataset.sidebarReady === 'true');
   await expect(panel.locator('input[name="autonomyMode"][value="ask"]')).toBeChecked();
-  await panel.locator('#menuBtn').click();
-  await expect(panel.locator('#headerMenu')).toBeVisible();
-  expect(await panel.locator('#headerMenu').evaluate(menu => menu.getBoundingClientRect().left)).toBeGreaterThanOrEqual(0);
+  await panel.locator('#autonomyBtn').click();
+  await expect(panel.locator('#autonomyMenu')).toBeVisible();
+  expect(await panel.locator('#autonomyMenu').evaluate(menu => menu.getBoundingClientRect().left)).toBeGreaterThanOrEqual(0);
+  await panel.keyboard.press('ArrowDown');
+  await expect(panel.locator('input[name="autonomyMode"][value="balanced"]')).toBeChecked();
+  await expect(panel.locator('#autonomyMenu')).toBeVisible();
+  await panel.keyboard.press('Escape');
+  await expect(panel.locator('#autonomyMenu')).toBeHidden();
+  await expect(panel.locator('#autonomyBtn')).toBeFocused();
+  await panel.locator('#autonomyBtn').click();
+  await expect(panel.locator('#autonomyMenu')).toBeVisible();
   await panel.screenshot({ path: 'build/autonomy-menu-fr.png', animations: 'disabled' });
 });
 
