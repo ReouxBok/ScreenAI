@@ -186,6 +186,9 @@ describe("SAV-105 temporary knowledge", () => {
     ["Nous ne pouvons pas garantir de délai.", false],
     ["Nous ne pouvons pas garantir que la fonctionnalité sera disponible demain.", false],
     ["Nous ignorons quand la fonctionnalité sera disponible.", false],
+    ["Nous ignorons quand, et si, la fonctionnalité sera disponible.", false],
+    ["Nous ignorons quand elle apparaîtra sur votre compte, mais la fonctionnalité sera disponible vendredi.", true],
+    ["La fonctionnalité sera disponible vendredi, même si nous ignorons quand elle apparaîtra sur votre compte.", true],
     ["Nous livrerons cette fonctionnalité vendredi.", true],
     ["Nous allons ajouter cette fonctionnalité vendredi.", true],
     ["Nous ne pouvons pas garantir de délai, mais nous livrerons cette fonctionnalité vendredi.", true],
@@ -206,10 +209,12 @@ describe("SAV-105 temporary knowledge", () => {
       expect(result.report).toMatchObject({ status: "recorded", outcome: "accepted" });
       const { proposal } = await draftOf(c, s);
       expect(await readPilotReplyProvenance(proposal, depsFor(s))).toMatchObject({ status: "proven" });
-      const corrected = { ...proposal, text: finalReplyText("Bonjour, nous livrerons cette fonctionnalité vendredi.") };
-      expect(await readPilotReplyProvenance(corrected, depsFor(s), { humanCorrection: true })).toMatchObject({
-        status: "unproven", reasons: ["temporary_incident_claim_unproven"],
-      });
+      for (const promise of ["Bonjour, nous livrerons cette fonctionnalité vendredi.", "Bonjour, nous ignorons quand elle apparaîtra sur votre compte, mais la fonctionnalité sera disponible vendredi."]) {
+        const corrected = { ...proposal, text: finalReplyText(promise) };
+        expect(await readPilotReplyProvenance(corrected, depsFor(s), { humanCorrection: true })).toMatchObject({
+          status: "unproven", reasons: ["temporary_incident_claim_unproven"],
+        });
+      }
     }
   });
 

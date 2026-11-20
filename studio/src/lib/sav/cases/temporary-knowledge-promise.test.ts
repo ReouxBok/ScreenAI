@@ -29,6 +29,11 @@ describe("temporaryKnowledgePromise (SAV-105)", () => {
     "Nous ne savons pas quand exactement ; la fonctionnalité sera disponible vendredi.",
     "La fonctionnalité sera disponible vendredi, même si nous ignorons quand elle apparaîtra sur votre compte.",
     "La fonctionnalité sera disponible vendredi même si nous ignorons quand elle apparaîtra sur votre compte.",
+    "Nous ignorons quand elle apparaîtra sur votre compte, mais la fonctionnalité sera disponible vendredi.",
+    "Nous ignorons quand elle apparaîtra sur votre compte, cependant la fonctionnalité sera disponible vendredi.",
+    "Nous ignorons quand elle apparaîtra sur votre compte, toutefois la fonctionnalité sera disponible vendredi.",
+    "Nous ignorons quand elle apparaîtra sur votre compte, en revanche la fonctionnalité sera disponible vendredi.",
+    "Nous ignorons quand elle apparaîtra sur votre compte, néanmoins la fonctionnalité sera disponible vendredi.",
     "We will fix it on Friday, even if we don't know when it will show on your account.",
   ])("a commitment of the support, simple or near future, is a promise: %s", wording => {
     expect(temporaryKnowledgePromise(wording)).toBe(true);

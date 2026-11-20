@@ -27,13 +27,20 @@ function clauseIsPromise(clause: string, outcomeUncertain: boolean) {
   return isPromise(unknown ? clause.slice(0, unknown.index) : clause, outcomeUncertain);
 }
 
+/* The uncertainty ends where a contrast (« mais », « cependant », « toutefois », « en revanche », « néanmoins ») introduces an independent statement. */
+const CONTRAST = /\b(?:mais|but|cependant|toutefois|en revanche|neanmoins|however)\b/;
+
 export function temporaryKnowledgePromise(text: string) {
   return sentencesOf(text).some(sentence => {
     let outcomeUncertain = false;
     return sentence.split(",").some(part => {
-      const clauses = normalize(part).replace(/[^\p{L}\p{N}]+/gu, " ").split(/\b(?:mais|but)\b/);
-      const promise = clauses.some(clause => clauseIsPromise(clause, outcomeUncertain));
-      if (clauses.some(clause => UNKNOWN_DATE.test(clause))) outcomeUncertain = true;
+      const clauses = normalize(part).replace(/[^\p{L}\p{N}]+/gu, " ").split(CONTRAST);
+      let promise = false;
+      clauses.forEach((clause, index) => {
+        if (index > 0) outcomeUncertain = false;
+        if (clauseIsPromise(clause, outcomeUncertain)) promise = true;
+        if (UNKNOWN_DATE.test(clause)) outcomeUncertain = true;
+      });
       return promise;
     });
   });
