@@ -147,7 +147,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'EXECUTE_ELEMENT_ACTION') {
     executeElementActionWithCursor(request.id, request.contextVersion, request)
       .then(sendResponse)
-      .catch(() => sendResponse({ ok: false, error: 'Le clic automatique a échoué.' }));
+      .catch(() => sendResponse({ ok: false, failureCode: 'action_dispatch_failed', error: 'Le clic automatique a échoué.' }));
     return true;
   }
 
@@ -595,7 +595,31 @@ function getActiveModalSurface() {
   );
   const shallow = [...document.body.children].flatMap(element => [element, ...element.children]);
   const candidates = [...new Set([...signaled, ...shallow])]
-    .filter(element => isLikelyModal(element) && isVisiblyRendered(element));
+    .filter(element => {
+      if (!(element instanceof HTMLElement) || !isVisiblyRendered(element)) return false;
+      // Match the page map's modal rules. Ordinary page sections named
+      // "popup"/"overlay" must not invalidate targets the map just exposed.
+      const readable = element.tagName !== 'IFRAME'
+        && element.querySelector('a[href], button, input, select, textarea, [role="button"], [role="link"], [tabindex]:not([tabindex="-1"])');
+      if (!readable) return false;
+      const role = element.getAttribute('role');
+      if (role === 'dialog' || role === 'alertdialog' || element.getAttribute('aria-modal') === 'true'
+        || (element.tagName === 'DIALOG' && element.hasAttribute('open'))) return true;
+      const rect = element.getBoundingClientRect();
+      const coversCenter = rect.left <= window.innerWidth / 2 && rect.right >= window.innerWidth / 2
+        && rect.top <= window.innerHeight / 2 && rect.bottom >= window.innerHeight / 2;
+      const coverage = rect.width * rect.height / Math.max(1, window.innerWidth * window.innerHeight);
+      if (!coversCenter || coverage <= 0.12) return false;
+      const style = window.getComputedStyle(element);
+      if (style.position === 'fixed' && (Number.parseInt(style.zIndex, 10) || 0) >= 10) return true;
+      if (!MODAL_CLASS_PATTERNS.test(String(element.className || '')) || rect.width <= 100 || rect.height <= 100) return false;
+      for (let current = element; current && current !== document.body; current = current.parentElement) {
+        const ancestorStyle = window.getComputedStyle(current);
+        if (ancestorStyle.position === 'fixed'
+          || (ancestorStyle.position === 'absolute' && (Number.parseInt(ancestorStyle.zIndex, 10) || 0) >= 10)) return true;
+      }
+      return false;
+    });
   if (!candidates.length) return null;
 
   const score = element => {
@@ -853,15 +877,15 @@ function selectionActivationSurface(element) {
 }
 
 function resolveElementAction(id, contextVersion, options = {}) {
-  if (!Number.isInteger(id) || id < 1) return { ok: false, error: 'Identifiant invalide.' };
+  if (!Number.isInteger(id) || id < 1) return { ok: false, failureCode: 'invalid_target', error: 'Identifiant invalide.' };
   if (document.documentElement.dataset.limovaContextVersion !== String(contextVersion)) {
-    return { ok: false, error: 'La page a changé.' };
+    return { ok: false, failureCode: 'stale_context', error: 'La page a changé.' };
   }
 
   const element = getElementByLid(id);
-  if (!(element instanceof HTMLElement)) return { ok: false, error: 'Élément introuvable.' };
+  if (!(element instanceof HTMLElement)) return { ok: false, failureCode: 'target_missing', error: 'Élément introuvable.' };
   const activationElement = selectionActivationSurface(element);
-  if (!activationElement) return { ok: false, error: 'Contrôle sans surface visible.' };
+  if (!activationElement) return { ok: false, failureCode: 'target_hidden', error: 'Contrôle sans surface visible.' };
   const style = window.getComputedStyle(activationElement);
   const rect = activationElement.getBoundingClientRect();
   const disabled = element.matches(':disabled, [aria-disabled="true"]');
@@ -869,13 +893,14 @@ function resolveElementAction(id, contextVersion, options = {}) {
     'button, a[href], [role="button"], [role="tab"], [role="menuitem"], [role="link"], ' +
     'input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"], ' +
     'input[type="submit"], input[type="button"], [tabindex="0"], [class*="btn"], ' +
+    'input:not([type="hidden"]):not([type="password"]):not([type="file"]), textarea, [contenteditable="true"], ' +
     '[onclick], [class*="cursor-pointer"], [class*="clickable"]'
   );
   if (!actionable || disabled || style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0) {
-    return { ok: false, error: 'Élément non disponible.' };
+    return { ok: false, failureCode: disabled ? 'target_disabled' : !actionable ? 'target_not_actionable' : 'target_hidden', error: 'Élément non disponible.' };
   }
   if (!isElementOnActiveSurface(activationElement, options)) {
-    return { ok: false, status: 'unexpected', error: 'Une fenêtre au premier plan bloque cet élément.' };
+    return { ok: false, status: 'unexpected', failureCode: 'target_occluded', error: 'Une fenêtre au premier plan bloque cet élément.' };
   }
 
   return { ok: true, element, activationElement };
@@ -995,7 +1020,8 @@ function dispatchCompletePointerClick(element, clientX, clientY) {
   mouse('mouseenter');
   pointer('pointerdown');
   mouse('mousedown');
-  try { eventTarget.focus({ preventScroll: true }); } catch (_) { eventTarget.focus?.(); }
+  const focusTarget = element.matches('input, textarea, [contenteditable="true"]') ? element : eventTarget;
+  try { focusTarget.focus({ preventScroll: true }); } catch (_) { focusTarget.focus?.(); }
   pointer('pointerup');
   mouse('mouseup', { buttons: 0 });
   eventTarget.click();
@@ -1157,7 +1183,11 @@ async function executeElementActionWithCursor(id, contextVersion, options = {}) 
     clickDispatched: true,
     interactionMode: click.sequence,
     retargetedToChild: click.retargetedToChild,
-    targetTag: click.targetTag
+    targetTag: click.targetTag,
+    // Focusing a field is a real result even when its text did not change.
+    // It does not imply that the encompassing form has been submitted.
+    fieldFocused: resolved.element.matches('input, textarea, [contenteditable="true"]')
+      && document.activeElement === resolved.element
   };
 }
 

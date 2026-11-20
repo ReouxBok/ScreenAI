@@ -282,6 +282,39 @@ describe('content.js — DOM helpers', () => {
       expect(modalClick).toHaveBeenCalledOnce();
     });
 
+    it.each([
+      '<input type="text">', '<input type="date">', '<input type="time">',
+      '<textarea></textarea>', '<div contenteditable="true"></div>'
+    ])('allows clicking a visible native editor without an explicit tabindex: %s', markup => {
+      document.documentElement.dataset.limovaContextVersion = '10';
+      document.body.innerHTML = markup;
+      const field = document.body.firstElementChild;
+      field.dataset.lid = '7';
+      field.getBoundingClientRect = () => ({ left: 20, top: 20, right: 220, bottom: 60, width: 200, height: 40 });
+      const click = vi.spyOn(field, 'click');
+      expect(content.executeElementAction(7, 10)).toEqual({ ok: true });
+      expect(click).toHaveBeenCalledOnce();
+    });
+
+    it('does not treat an ordinary popup-named section as a blocking window', () => {
+      document.documentElement.dataset.limovaContextVersion = '10';
+      document.body.innerHTML = '<button data-lid="7">Ouvrir le calendrier</button><section class="popup-help"><button>Aide</button></section>';
+      for (const element of document.querySelectorAll('button,section')) {
+        element.getBoundingClientRect = () => ({ left: 20, top: 20, right: 220, bottom: 220, width: 200, height: 200 });
+      }
+      expect(content.executeElementAction(7, 10)).toEqual({ ok: true });
+    });
+
+    it('distinguishes a disabled target from a field covered by another window', () => {
+      document.documentElement.dataset.limovaContextVersion = '10';
+      document.body.innerHTML = '<button disabled data-lid="7">Valider</button><input data-lid="8"><section role="dialog"><button>Fermer</button></section>';
+      for (const element of document.querySelectorAll('button,input,section')) {
+        element.getBoundingClientRect = () => ({ left: 20, top: 20, right: 220, bottom: 220, width: 200, height: 200 });
+      }
+      expect(content.resolveElementAction(7, 10)).toMatchObject({ ok: false, failureCode: 'target_disabled' });
+      expect(content.resolveElementAction(8, 10)).toMatchObject({ ok: false, failureCode: 'target_occluded' });
+    });
+
     it('activates a transparent native checkbox through its visible label surface', async () => {
       vi.useFakeTimers();
       window.requestAnimationFrame = callback => setTimeout(callback, 0);

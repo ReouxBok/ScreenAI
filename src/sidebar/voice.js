@@ -951,7 +951,7 @@ class LimovaVoiceSession {
       } else if (result?.knowledge) {
         response.knowledgeBase = String(result.knowledge).slice(0, 6_000);
       }
-      for (const key of ['moved', 'atStart', 'atEnd', 'unchanged', 'cancelled', 'verification', 'verificationRequired', 'retryWithFreshContext', 'matches', 'targetLabel', 'checked', 'durationMs']) {
+      for (const key of ['moved', 'atStart', 'atEnd', 'unchanged', 'cancelled', 'verification', 'verificationRequired', 'retryWithFreshContext', 'matches', 'targetLabel', 'checked', 'durationMs', 'failureCode']) {
         if (result?.[key] !== undefined) response[key] = result[key];
       }
       if (call.name === 'fill_fields') { response.fieldResults = result.fieldResults; response.completedFields = result.completedFields; }
@@ -963,7 +963,7 @@ class LimovaVoiceSession {
       } else if (response.status === 'ok' && VOICE_PAGE_ACTION_TOOLS.has(call.name)) {
         response.nextStep = VOICE_CONTINUATION_HINT;
       }
-      this.diagnostic('VOICE_TOOL_COMPLETED', { tool: call.name, status: response.status, verified: response.verification?.status === 'confirmed' });
+      this.diagnostic('VOICE_TOOL_COMPLETED', { tool: call.name, status: response.status, verified: response.verification?.status === 'confirmed', failureCode: result?.ok ? null : result?.failureCode || null });
       this.onToolResult?.(call, response);
         functionResponses.push({
         id: call.id,
