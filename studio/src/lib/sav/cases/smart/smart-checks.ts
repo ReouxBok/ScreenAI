@@ -92,6 +92,11 @@ const COMMITMENTS: readonly RegExp[] = [
   // Astra, N2 review (P1): the PROCEDURE given to the customer to cancel their Limova subscription or contract (« vous pouvez résilier votre
   // abonnement depuis vos paramètres », « résiliez depuis… », « pour mettre fin à votre contrat, … »). Cancelling a routine stays allowed.
   new RegExp(String.raw`\b(?:vous pouvez|vous pourrez|vous pourriez|il (?:vous )?suffit d[e']|pour|afin d[e']|vous devez|il faut|merci d[e']|n'hesitez pas a)\s*(?:\w+ ){0,2}(?:resilier\b|(?:annuler|arreter|stopper|suspendre|interrompre|mettre fin a|ne pas renouveler|desactiver|clore|cloturer|fermer) (?:le renouvellement (?:de |d')?)?(?:votre|l'|le|ce|cet|son) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement|compte limova)\b)`),
+  // Orchestrator decision after the second review (Ugo: cancellation is never handled by the agent on its own): on OUR reply only, any word of
+  // cancellation (« résilier », « résiliation », « Résilier mon abonnement »…) or « mettre fin à / arrêter / annuler / stopper / suspendre » +
+  // abonnement, contrat or compte Limova refuses, whatever the wording. Cancelling a routine, a task or a scheduled send still passes.
+  /\bresili\w*/,
+  /\b(?:mettre fin|mis fin|mettez fin|met fin|arret\w*|annul\w*|stopp?\w*|suspend\w*|interromp\w*)\b(?: \w+){0,3} (?:a |au |a l')?(?:votre |mon |notre |son |l'|le |ce |cet )?(?:abonnement|contrat|compte limova)\b/,
   /\b(?:resiliez|(?:annulez|arretez|stoppez|suspendez|mettez fin a|cloturez|fermez) (?:votre|l'|le) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement|compte limova))\b/,
 ];
 /** True when the reply commits to a sensitive action on the account (exported for the tests and the shadow report). */

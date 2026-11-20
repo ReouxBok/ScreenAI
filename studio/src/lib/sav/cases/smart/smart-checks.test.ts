@@ -61,9 +61,11 @@ describe("contrôles serveur sans modèle (lot D3)", () => {
       expect(smartSensitiveCommitment(sentence), sentence).toBe(false);
       expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toEqual([]);
     }
-    expect(smartSensitiveCommitment("Nous ne pouvons pas annuler votre abonnement nous-mêmes.")).toBe(false);
+    // Orchestrator decision (second review): abonnement + annuler in OUR reply refuses even in the negative; the turn goes to the team.
+    expect(smartSensitiveCommitment("Nous ne pouvons pas annuler votre abonnement nous-mêmes.")).toBe(true);
     expect(smartSensitiveCommitment("Je vous suggère de supprimer le fichier puis de le réimporter.")).toBe(false);
-    expect(check(`${SMART_GOOD_REPLY} Pour toute question de résiliation, je transmets votre message à l'équipe.`)).toEqual([]);
+    // Orchestrator decision (second review): any word of cancellation in OUR reply refuses, even a mention; the turn then goes to the team.
+    expect(check(`${SMART_GOOD_REPLY} Pour toute question de résiliation, je transmets votre message à l'équipe.`)).toContain("sensitive_commitment");
   });
   it("revue N2 (P1 Astra) : la procédure donnée au client pour résilier ou annuler son abonnement ou son contrat est refusée ; annuler une routine passe", () => {
     for (const sentence of [
@@ -73,11 +75,19 @@ describe("contrôles serveur sans modèle (lot D3)", () => {
       "Pour annuler votre abonnement, ouvrez vos paramètres.",
       "Il vous suffit de mettre fin à votre contrat depuis votre espace.",
       "Annulez le renouvellement depuis votre compte.",
+      // Second review (PORTE_1C): the button label, whatever the wording.
+      "Dans vos paramètres Limova, cliquez sur “Résilier mon abonnement”, puis confirmez.",
+      "La résiliation se fait en un clic depuis votre espace.",
+      "Vous pouvez arrêter votre abonnement à tout moment.",
+      "Pour mettre fin au contrat, écrivez-nous.",
     ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toContain("sensitive_commitment");
     for (const sentence of [
       "Vous pouvez annuler la routine depuis vos paramètres.",
       "Pour arrêter la routine, supprimez-la depuis sa conversation.",
       "Vous pouvez annuler l'envoi programmé avant 8 h.",
+      "Vous pouvez annuler une tâche en cours depuis la conversation.",
+      "Votre facture est disponible dans votre espace, rubrique Facturation.",
+      "Votre abonnement n'est pas en cause : le souci vient de la connexion Gmail.",
     ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toEqual([]);
   });
   it("N2, enquête : demander l'URL de la conversation, des captures ou le numéro de téléphone du client n'est pas une demande de secret", () => {

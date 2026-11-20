@@ -98,6 +98,14 @@ describe("contrôles serveur, relecture et une correction", () => {
     expect(result.reasons).toEqual(expect.arrayContaining(["refused_after_correction", "check:sensitive_commitment"]));
     expect(calls.map(call => call.kind)).toEqual(["understand", "decide", "verify", "correct", "reverify"]);
   });
+  it("seconde revue N2 (PORTE_1C) : « cliquez sur “Résilier mon abonnement” », lecture et relecture fautives : équipe, aucun texte client", async () => {
+    const button = smartGoodDecision({ reply: `${SMART_GOOD_REPLY}\n\nDans vos paramètres Limova, cliquez sur “Résilier mon abonnement”, puis confirmez.` });
+    const { result, calls } = await run({ understand: { output: smartReading() }, decide: { output: button }, verify: { output: SMART_CONFORME }, correct: { output: button }, reverify: { output: SMART_CONFORME } });
+    expect(result.checks.first).toContain("sensitive_commitment");
+    expect(result).toMatchObject({ outcome: "handoff", replyWithFooter: null });
+    expect(result.reasons).toEqual(expect.arrayContaining(["refused_after_correction", "check:sensitive_commitment"]));
+    expect(calls.map(call => call.kind)).toEqual(["understand", "decide", "verify", "correct", "reverify"]);
+  });
   it("revue N2, témoin : « vous pouvez annuler la routine depuis vos paramètres » reste une réponse", async () => {
     const routine = smartGoodDecision({ reply: `${SMART_GOOD_REPLY}\n\nVous pouvez annuler la routine depuis vos paramètres.` });
     const { result } = await run({ understand: { output: smartReading() }, decide: { output: routine }, verify: { output: SMART_CONFORME } });
