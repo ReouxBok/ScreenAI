@@ -1,4 +1,8 @@
 import { normalizeSavEvidenceText, savEvidenceContains } from "../../evidence-text";
+import {
+  SAV_OTHER_PLATFORM_LIMOVA, SAV_OTHER_PLATFORM_THIRD_PARTIES, savOtherPlatformClauses, savOtherPlatformCustomerTools, savOtherPlatformEndorses, savOtherPlatformOrients,
+  savOtherPlatformRedirect,
+} from "../../other-platform";
 import { requestsCredential } from "../decision-validator";
 import type { SmartCheckCode, SmartDecision, SmartReading } from "./smart-contract";
 import { smartRepeatCodes, type SmartCaseMemory } from "./smart-memory";
@@ -49,18 +53,31 @@ const fold = (value: string) => value.normalize("NFKD").replace(/\p{M}/gu, "").t
 const sentencesOf = (value: string) => value.split(/(?<=[.!?…])\s+|\n+/).map(row => row.trim()).filter(Boolean);
 const cardText = (source: SmartSource) => [source.title, source.content, ...source.steps].join("\n");
 
-/** Third parties a customer may name: none may be recommended; one may be named only when the customer uses it already (or a cited card names it). */
-export const SAV_SMART_THIRD_PARTIES = Object.freeze([
-  "yonos", "wix", "shopify", "wordpress", "squarespace", "webflow", "jimdo", "prestashop", "zapier", "make.com", "n8n", "ifttt", "hubspot", "salesforce", "pipedrive",
-  "brevo", "sendinblue", "mailchimp", "aircall", "ringover", "twilio", "vapi", "retell", "bland", "calendly", "chatgpt", "openai", "copilot", "notion", "monday", "trello",
-  "canva", "lemlist", "waalaxy", "zoho", "odoo", "axonaut", "pennylane", "intercom", "zendesk", "crisp", "tidio", "manychat", "systeme.io", "kajabi", "podia", "agicap",
-]);
+/** Third parties a customer may name (SAV-122: the list lives in `../../other-platform.ts`, shared with the bench). */
+export const SAV_SMART_THIRD_PARTIES = SAV_OTHER_PLATFORM_THIRD_PARTIES;
 const THIRD_PARTY = new RegExp(String.raw`(?<![\p{L}\p{N}])(${SAV_SMART_THIRD_PARTIES.map(name => name.replace(/[.]/g, "\\.")).join("|")})(?![\p{L}\p{N}])`, "gu");
 
-// A sentence that invites to sign up, subscribe, switch or use another product. « inscrivez-vous au webinaire Limova » stays allowed (Limova named).
-const SIGNUP = /\b(?:inscri(?:vez|re|ption|s|t)|creez(?:-vous)? (?:un|votre) compte|creer un compte|ouvr(?:ez|ir) un compte|abonnez-vous|souscri(?:vez|re))\b/;
-const SWITCH = /\b(?:je vous (?:recommande|conseille|suggere|propose) (?:d'utiliser|de passer (?:par|chez|sur)|de vous tourner vers|de vous inscrire|l'outil|la plateforme|le service|l'application|le logiciel|un autre|une autre|plutot)|utilisez plutot|tournez-vous vers|optez pour|passez (?:plutot )?(?:par|chez) (?:un|une) (?:autre|outil|service|prestataire|plateforme)|(?:un|une) (?:autre )?(?:outil|service|prestataire|logiciel|plateforme|solution|application) (?:externe |tierce? )?(?:comme|tel(?:le)? que|du type)|(?:outil|plateforme|solution|logiciel|service) (?:alternati(?:f|ve)|concurrente?))\b/;
-const PRAISE = /\b(?:propose(?:nt)?|offre(?:nt)?|permet(?:tent)?|fait|font|dispose(?:nt)?|gere(?:nt)?|integre(?:nt)?|fournit|fournissent)\b/;
+// A sentence that invites to switch or use another product, no name needed (a sign-up is judged per clause by the named tool: PORTE 1J).
+const SWITCH = /\b(?:je vous (?:recommande|conseille|suggere|propose) (?:d'utiliser|de passer (?:par|chez|sur)|de vous tourner vers|l'outil|la plateforme|le service|l'application|le logiciel|un autre|une autre|plutot)|utilisez plutot|tournez-vous vers|optez pour|passez (?:plutot )?(?:par|chez) (?:un|une) (?:autre|outil|service|prestataire|plateforme)|(?:un|une) (?:autre )?(?:outil|service|prestataire|logiciel|plateforme|solution|application) (?:externe |tierce? )?(?:comme|tel(?:le)? que|du type)|(?:outil|plateforme|solution|logiciel|service) (?:alternati(?:f|ve)|concurrente?))\b/;
+// SAV-122: « fait » alone is no praise (« votre site fait avec Yonos » describes the customer's tool); « Yonos fait des agents » still is.
+const PRAISE = /\b(?:(?:propose(?:nt)?|offre(?:nt)?|permet(?:tent)?|dispose(?:nt)?|gere(?:nt)?|integre(?:nt)?|fournit|fournissent)\b|(?:fait|font) (?:aussi |egalement |deja |tres bien |mieux |des |du |de l'|de la |ca |cela ))/;
+
+/*
+ * SAV-122 (bench 21/11: autreoutil-01, autreoutil-05, plateforme-02): OUR reply sends the customer to another tool or platform. Per sentence:
+ * a sign-up elsewhere (the bench's patterns, Limova's own excepted), an invitation to switch, advice to go and use another tool (no name
+ * needed), or a named third party (known list, or a tool the customer wrote himself) praised, compared favourably or recommended. Naming the
+ * customer's tool to connect it to Limova, or answering a customer who names one, passes. Never reads the inbound mail as a filter.
+ */
+export function smartOtherPlatformSentences(reply: string, customerText: string): string[] {
+  const names = [...new Set([...SAV_OTHER_PLATFORM_THIRD_PARTIES, ...savOtherPlatformCustomerTools(customerText, fold)])];
+  const known = new RegExp(String.raw`(?<![\p{L}\p{N}])(${names.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})(?![\p{L}\p{N}])`, "u");
+  return sentencesOf(reply).filter(sentence => {
+    // PORTE 1J: per clause, the named third party decides; a « Limova » word elsewhere in the sentence exempts nothing.
+    const folded = fold(sentence);
+    return SWITCH.test(folded) || savOtherPlatformRedirect(folded) || savOtherPlatformOrients(folded, names) || savOtherPlatformEndorses(folded, names)
+      || savOtherPlatformClauses(folded).some(clause => known.test(clause) && PRAISE.test(clause) && !SAV_OTHER_PLATFORM_LIMOVA.test(clause));
+  });
+}
 
 const PROMISES: readonly RegExp[] = [
   /\b(?:sous|dans|d'ici|en moins de|au plus tard (?:dans|sous)) (?:\d+|un|une|deux|trois|quelques) ?(?:h|heures?|jours?(?: ouvres)?|semaines?|mois|minutes?)\b/,
@@ -178,13 +195,9 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
 
   // Other platforms: an invitation or a praise is refused even when the customer named it; a name is allowed only from the customer or a cited card.
   const customer = fold(input.customerText);
+  if (smartOtherPlatformSentences(reply, input.customerText).length) codes.add("other_platform_recommended");
   for (const sentence of sentencesOf(reply)) {
-    const folded = fold(sentence), names = [...folded.matchAll(THIRD_PARTY)].map(match => match[1]!);
-    const limova = /\b(?:limova|webinaire|academy|charly)\b/.test(folded);
-    if (SIGNUP.test(folded) && !limova) codes.add("other_platform_recommended");
-    if (SWITCH.test(folded)) codes.add("other_platform_recommended");
-    if (names.length && PRAISE.test(folded) && !limova) codes.add("other_platform_recommended");
-    for (const name of names) if (!customer.includes(name) && !citedText.includes(name)) codes.add("third_party_named");
+    for (const name of [...fold(sentence).matchAll(THIRD_PARTY)].map(match => match[1]!)) if (!customer.includes(name) && !citedText.includes(name)) codes.add("third_party_named");
   }
 
   if (reply && requestsCredential(reply)) codes.add("credential_request");

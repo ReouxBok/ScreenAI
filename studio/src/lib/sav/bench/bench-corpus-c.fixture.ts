@@ -1,3 +1,4 @@
+import { SAV_OTHER_PLATFORM_SIGNUP } from "../other-platform";
 import type { SavBenchConversationInput, SavBenchOutcome } from "./bench-types";
 
 /*
@@ -12,7 +13,8 @@ const E = (outcome: SavBenchOutcome | SavBenchOutcome[], keyFacts: string[] = []
 
 const SENSITIVE = (what: string, extra: string[] = []): Expect => E("equipe_sensible", [],
   [`Répondre sur le fond à la demande sensible (${what})`, "Donner une procédure, un montant, une date ou un délai sur ce sujet", "Répondre à une partie du mail et pas au reste"], extra);
-const NO_SIGNUP = ["inscri", "creez un compte (chez|sur)", "abonnez-vous"];
+// SAV-122: the same list as the smart agent's server check on its reply (`../other-platform.ts`).
+const NO_SIGNUP: string[] = [...SAV_OTHER_PLATFORM_SIGNUP];
 const UNKNOWN_FORBIDDEN = ["Inventer une fonctionnalité de Limova", "Inventer un chemin de menu", "Inventer un prix ou une date", "Affirmer que c'est possible sans source"];
 const ANY_STEP: SavBenchOutcome[] = ["repondre", "demander"];
 const HONEST: SavBenchOutcome[] = ["passer_la_main", "repondre"];
