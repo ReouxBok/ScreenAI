@@ -215,6 +215,43 @@ describe("a dossier still re-analysed after a release (decision waiting for its 
   });
 });
 
+describe("a new customer mail on a dossier whose attempts are exhausted (SAV-120, N7 fix 1)", () => {
+  it("gets its own attempt counter and is analysed; the exhausted version stays exhausted, its counter untouched", async () => {
+    const m = await stored("Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.");
+    // Pre-fix history: eight counted attempts on the first mail, then a version never scheduled again.
+    let id = (await enqueueSavIntakeMessage(m.id, release(0).config))!, exhaustedConfig = release(0).config;
+    for (let n = 1; n <= SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage; n++) {
+      const [run] = await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id));
+      await f.db.update(savIntakeRuns).set({ attempts: 1, state: "observed", payloadCiphertext: encryptSavPayload({ ...decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext), plan: { synthetic: true } }) }).where(eq(savIntakeRuns.id, id));
+      exhaustedConfig = release(n).config;
+      id = (await enqueueSavIntakeMessage(m.id, exhaustedConfig))!;
+    }
+    // The lifetime total is reached: the version is never scheduled (the exact claim refusal is covered above).
+    await f.db.update(savIntakeRuns).set({ updatedAt: new Date(Date.now() - 3600_000) }).where(eq(savIntakeRuns.id, id));
+    await refreshIntakeConsole();
+    expect(await blockedCause()).toBe("attempts_exhausted");
+    const exhaustedKinds = await kinds(id);
+    const before = (await runsOf(m.id)).map(r => ({ id: r.id, attempts: r.attempts })).sort((a, b) => a.id.localeCompare(b.id));
+    // No new mail: nothing restarts (no replay), whatever the passes.
+    expect(await catchupSavIntake(exhaustedConfig)).toBe(0);
+    expect((await runsOf(m.id)).find(r => r.isCurrent)?.id).toBe(id);
+    // The customer writes again: a new entry version, bound to the new mail.
+    const reply = await stored("Toujours la même erreur 500 ce matin, pouvez-vous regarder ?");
+    expect(await catchupSavIntake(exhaustedConfig)).toBe(1);
+    const [next] = await runsOf(reply.id);
+    expect(next).toMatchObject({ isCurrent: true, attempts: 0, state: "pending" });
+    expect(await kinds(next.id)).not.toContain("attempts_exhausted");
+    const lease = await claimSavIntakeRun(next.id, exhaustedConfig);
+    expect(lease).toBeTruthy();
+    expect((await runsOf(reply.id))[0].attempts).toBe(1);
+    // Never a reset: the first mail keeps every counter and its marker.
+    expect((await runsOf(m.id)).map(r => ({ id: r.id, attempts: r.attempts })).sort((a, b) => a.id.localeCompare(b.id))).toEqual(before);
+    expect(await kinds(id)).toEqual(expect.arrayContaining(exhaustedKinds));
+    expect((await runsOf(m.id)).find(r => r.id === id)?.state).not.toBe("observed");
+    expect((await readIntakeRunDiagnostics(threadId))?.attemptBudget).toMatchObject({ runAttempts: 1, total: 1, exhausted: null });
+  });
+});
+
 describe("console label of an exhausted dossier never claimed again", () => {
   it("says the attempts are exhausted, not that the next pass will take it", async () => {
     const m = await stored("Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.");
