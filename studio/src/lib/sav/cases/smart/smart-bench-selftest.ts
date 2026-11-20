@@ -8,6 +8,7 @@ import { SAV_BENCH_CORPUS, SAV_BENCH_CORPUS_REVISION } from "../../bench/bench-c
 import { createSavBenchGeminiJudge, SAV_BENCH_JUDGE_REVISION, type SavBenchJudge } from "../../bench/bench-judge";
 import { runSavBench, savBenchMetrics, type SavBenchConversationRow, type SavBenchTurnRow } from "../../bench/bench-run";
 import type { SavBenchAgent, SavBenchConversation } from "../../bench/bench-types";
+import { buildSavBenchVariants, SAV_BENCH_VARIANTS_REVISION } from "../../bench/bench-variants";
 import { resolveCaseV2GeminiKey, SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
 import { readCaseV2TransportPolicy } from "../investigation-v2-spend";
 import { SAV_SMART_MAX_MODEL_CALLS } from "./smart-agent";
@@ -31,6 +32,11 @@ import { SAV_SMART_PROMPT_REVISION, smartPromptPinned, smartPromptSha256 } from 
  * Time: skipped below 90 s; a conversation starts only with 150 s left; each call bounded by the time left.
  * Report: one log line `sav_smart_bench_selftest` (codes and numbers), and `readSmartBenchSelfTestReport(runId)` for root (aggregates by family and
  * criterion, current/new comparison, failures with their conversation id).
+ *
+ * Corpus and passes (Ugo 20/11, cost control): `_SET` = `base` (default: the 132 conversations, unchanged) | `variants` (their paraphrase
+ * variants, `bench-variants.ts`) | `all` (both) | `risky` (every sensitive conversation and every trap family, base and variants). `_PASSES` = 1
+ * (default) or 2: pass 2 replays the same conversations under a distinct item key (`:p2`), claimed and paid on its own, to measure stability; every
+ * stored row and log line carries its pass. Cap: default 10 000 000 µUSD, `_MAX_MICRO_USD` may raise it up to 15 000 000 (Ugo's 15 USD per run).
  */
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -39,8 +45,14 @@ export const SAV_SMART_BENCH_SELFTEST_ID_ENV = "SAV_V2_SMART_BENCH_SELFTEST_ID";
 export const SAV_SMART_BENCH_SELFTEST_AGENT_ENV = "SAV_V2_SMART_BENCH_SELFTEST_AGENT";
 export const SAV_SMART_BENCH_SELFTEST_BATCH_ENV = "SAV_V2_SMART_BENCH_SELFTEST_BATCH";
 export const SAV_SMART_BENCH_SELFTEST_CAP_ENV = "SAV_V2_SMART_BENCH_SELFTEST_MAX_MICRO_USD";
+export const SAV_SMART_BENCH_SELFTEST_SET_ENV = "SAV_V2_SMART_BENCH_SELFTEST_SET";
+export const SAV_SMART_BENCH_SELFTEST_PASSES_ENV = "SAV_V2_SMART_BENCH_SELFTEST_PASSES";
 export const SAV_SMART_BENCH_SELFTEST_PREFIX = "sav-v2-smart-bench-selftest.v1";
-export const SAV_SMART_BENCH_SELFTEST_MAX_CAP_MICRO_USD = 10_000_000;
+/** Ceiling of the run's cap (Ugo 20/11: 15 USD per run); without the env the cap stays at the default 10 000 000 µUSD. */
+export const SAV_SMART_BENCH_SELFTEST_MAX_CAP_MICRO_USD = 15_000_000, SAV_SMART_BENCH_SELFTEST_DEFAULT_CAP_MICRO_USD = 10_000_000;
+export const SAV_SMART_BENCH_SELFTEST_SETS = ["base", "variants", "all", "risky"] as const;
+export type SmartBenchSelfTestSet = typeof SAV_SMART_BENCH_SELFTEST_SETS[number];
+export type SmartBenchPass = 1 | 2;
 export const SAV_SMART_BENCH_SELFTEST_DEFAULT_BATCH = 6, SAV_SMART_BENCH_SELFTEST_MAX_BATCH = 20;
 const RUN_ID = /^[A-Za-z0-9._-]{1,64}$/, INTEGER = /^[0-9]{1,12}$/;
 const STEP_MIN_MS = 90_000, CONVERSATION_MIN_MS = 150_000, CALL_MAX_MS = 45_000, CALL_MIN_MS = 8_000, CALL_MARGIN_MS = 3_000;
@@ -51,11 +63,27 @@ export const SAV_SMART_BENCH_CURRENT_CALLS = 3, SAV_SMART_BENCH_NEW_CALLS = SAV_
 /** The self-test corpus: the 120 bench conversations, plus the new agent's multi-turn cases (memory and progress rule, 20/11). */
 export const SAV_SMART_BENCH_SELFTEST_CORPUS: readonly SavBenchConversation[] = [...SAV_BENCH_CORPUS, ...SAV_SMART_BENCH_MULTITURN];
 export const SAV_SMART_BENCH_SELFTEST_CORPUS_REVISION = `${SAV_BENCH_CORPUS_REVISION}+${SAV_SMART_BENCH_MULTITURN_REVISION}`;
+/** The paraphrase variants of those 132 conversations (3 each), expectations copied from their origin. */
+export const SAV_SMART_BENCH_SELFTEST_VARIANTS: readonly SavBenchConversation[] = buildSavBenchVariants(SAV_SMART_BENCH_SELFTEST_CORPUS);
+
+/** Sensitive: a turn (or a conditional reply) that expects the whole mail to go to the team. Risky set = sensitive or a trap family. */
+const smartBenchSensitive = (row: SavBenchConversation) =>
+  row.turns.some(turn => [turn.expect.outcome, ...turn.variants.map(variant => variant.expect?.outcome ?? [])].flat().includes("equipe_sensible"));
+export const smartBenchRisky = (row: SavBenchConversation) => smartBenchSensitive(row) || row.family.startsWith("piege_");
+/** The conversations of a set, in a stable order (base first, then variants). */
+export function smartBenchSelfTestSet(set: SmartBenchSelfTestSet, base = SAV_SMART_BENCH_SELFTEST_CORPUS, variants = SAV_SMART_BENCH_SELFTEST_VARIANTS): readonly SavBenchConversation[] {
+  if (set === "base") return base;
+  if (set === "variants") return variants;
+  const all = [...base, ...variants];
+  return set === "all" ? all : all.filter(smartBenchRisky);
+}
+export const smartBenchSelfTestCorpusRevision = (set: SmartBenchSelfTestSet) =>
+  set === "base" ? SAV_SMART_BENCH_SELFTEST_CORPUS_REVISION : `${SAV_SMART_BENCH_SELFTEST_CORPUS_REVISION}+${SAV_BENCH_VARIANTS_REVISION}:${set}`;
 
 export type SmartBenchSelfTestConfig =
   | Readonly<{ mode: "off" }>
-  | Readonly<{ mode: "refused"; reason: "id_invalid" | "agent_invalid" | "batch_invalid" | "cap_invalid" }>
-  | Readonly<{ mode: "run"; runId: string; agents: readonly SmartBenchAgentName[]; batch: number; capMicroUsd: number }>;
+  | Readonly<{ mode: "refused"; reason: "id_invalid" | "agent_invalid" | "batch_invalid" | "cap_invalid" | "set_invalid" | "passes_invalid" }>
+  | Readonly<{ mode: "run"; runId: string; agents: readonly SmartBenchAgentName[]; batch: number; capMicroUsd: number; set: SmartBenchSelfTestSet; passes: SmartBenchPass }>;
 
 export function readSmartBenchSelfTestConfig(env: Env): SmartBenchSelfTestConfig {
   if (env[SAV_SMART_BENCH_SELFTEST_ENV] !== "run") return { mode: "off" };
@@ -71,17 +99,25 @@ export function readSmartBenchSelfTestConfig(env: Env): SmartBenchSelfTestConfig
   };
   const batch = integer(SAV_SMART_BENCH_SELFTEST_BATCH_ENV, SAV_SMART_BENCH_SELFTEST_DEFAULT_BATCH, SAV_SMART_BENCH_SELFTEST_MAX_BATCH);
   if (batch === null) return { mode: "refused", reason: "batch_invalid" };
-  const capMicroUsd = integer(SAV_SMART_BENCH_SELFTEST_CAP_ENV, SAV_SMART_BENCH_SELFTEST_MAX_CAP_MICRO_USD, SAV_SMART_BENCH_SELFTEST_MAX_CAP_MICRO_USD);
+  const capMicroUsd = integer(SAV_SMART_BENCH_SELFTEST_CAP_ENV, SAV_SMART_BENCH_SELFTEST_DEFAULT_CAP_MICRO_USD, SAV_SMART_BENCH_SELFTEST_MAX_CAP_MICRO_USD);
   if (capMicroUsd === null) return { mode: "refused", reason: "cap_invalid" };
-  return { mode: "run", runId, agents: agent === "both" ? ["current", "new"] : [agent], batch, capMicroUsd };
+  const set = env[SAV_SMART_BENCH_SELFTEST_SET_ENV] ?? "base";
+  if (!(SAV_SMART_BENCH_SELFTEST_SETS as readonly string[]).includes(set)) return { mode: "refused", reason: "set_invalid" };
+  const passes = integer(SAV_SMART_BENCH_SELFTEST_PASSES_ENV, 1, 2);
+  if (passes === null) return { mode: "refused", reason: "passes_invalid" };
+  return { mode: "run", runId, agents: agent === "both" ? ["current", "new"] : [agent], batch, capMicroUsd, set: set as SmartBenchSelfTestSet, passes: passes as SmartBenchPass };
 }
 
 /** Model calls an agent may make on one turn (the judge adds one): the current runner's ceiling, the new agent's five. */
 export const smartBenchCallsPerTurn = (agent: SmartBenchAgentName) => (agent === "current" ? SAV_SMART_BENCH_CURRENT_CALLS : SAV_SMART_BENCH_NEW_CALLS) + 1;
-export const smartBenchItem = (runId: string, agent: SmartBenchAgentName, conversationId: string) => `${runId}:${agent}:${conversationId}`;
+/** One item per (pass, agent, conversation); pass 1 keeps the historical key, pass 2 has its own (`:p2`), so it is claimed and paid separately. */
+export const smartBenchItem = (runId: string, agent: SmartBenchAgentName, conversationId: string, pass: SmartBenchPass = 1) =>
+  `${runId}:${agent}:${conversationId}${pass === 1 ? "" : `:p${pass}`}`;
 
 export type SmartBenchStored = Readonly<{
-  runId: string; agent: SmartBenchAgentName; agentRevision: string; judgeRevision: string; corpusRevision: string; model: string; codeSha: string | null;
+  runId: string; agent: SmartBenchAgentName; agentRevision: string;
+  /** 1 or 2 (absent on rows stored before passes existed: pass 1). */
+  pass?: SmartBenchPass; set?: SmartBenchSelfTestSet; judgeRevision: string; corpusRevision: string; model: string; codeSha: string | null;
   conversationId: string; costMicroUsd: number; calls: number; durationMs: number;
   /** Why the conversation stopped early: the meter (`call_budget`, `deadline`), the bench (`sensitive_admitted`), or null. */
   stopped: string | null;
@@ -138,16 +174,17 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
   const inputCap = smartInputCap(env, now);
   if (inputCap === null) return { skipped: "price_unavailable" };
 
-  const corpus = deps.corpus ?? SAV_SMART_BENCH_SELFTEST_CORPUS;
+  const corpus = deps.corpus ?? smartBenchSelfTestSet(config.set), corpusRevision = smartBenchSelfTestCorpusRevision(config.set);
+  const passes: readonly SmartBenchPass[] = config.passes === 2 ? [1, 2] : [1];
   const claimed = new Set((await requireDb().select({ key: savSyncState.key }).from(savSyncState)
     .where(like(savSyncState.key, smartBenchRunPattern(config.runId)))).map(row => row.key));
-  const todo = config.agents.flatMap(agent => corpus.map(conversation => ({ agent, conversation })))
-    .filter(({ agent, conversation }) => !claimed.has(smartItemKey(SAV_SMART_BENCH_SELFTEST_PREFIX, smartBenchItem(config.runId, agent, conversation.id))));
+  const todo = passes.flatMap(pass => config.agents.flatMap(agent => corpus.map(conversation => ({ pass, agent, conversation }))))
+    .filter(({ pass, agent, conversation }) => !claimed.has(smartItemKey(SAV_SMART_BENCH_SELFTEST_PREFIX, smartBenchItem(config.runId, agent, conversation.id, pass))));
   let ran = 0, stoppedBy: Extract<SmartBenchSelfTestPass, { ran: number }>["stoppedBy"] = todo.length ? "batch" : "done";
-  for (const { agent: agentName, conversation } of todo) {
+  for (const { pass, agent: agentName, conversation } of todo) {
     if (ran >= config.batch) { stoppedBy = "batch"; break; }
     if (left() < CONVERSATION_MIN_MS) { stoppedBy = "deadline"; break; }
-    const item = smartBenchItem(config.runId, agentName, conversation.id), maxCalls = conversation.turns.length * smartBenchCallsPerTurn(agentName);
+    const item = smartBenchItem(config.runId, agentName, conversation.id, pass), maxCalls = conversation.turns.length * smartBenchCallsPerTurn(agentName);
     const worst = maxCalls * prices.modelReserve;
     const claim = await claimSmartItem({ prefix: SAV_SMART_BENCH_SELFTEST_PREFIX, scope: config.runId, item, worstMicroUsd: worst, capMicroUsd: config.capMicroUsd, maxItems: null, now: deps.now() });
     if (claim.status === "refused") { if (claim.reason === "already_claimed") continue; stoppedBy = "money_cap"; break; }
@@ -182,11 +219,11 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
     let stored: SmartBenchStored;
     try {
       const report = await runSavBench({ conversations: [conversation], agent, judge, passes: 1, stopOnSensitiveAdmitted: true, shouldStop: () => meterStop });
-      stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, judgeRevision: SAV_BENCH_JUDGE_REVISION, corpusRevision: SAV_SMART_BENCH_SELFTEST_CORPUS_REVISION, model,
+      stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, pass, set: config.set, judgeRevision: SAV_BENCH_JUDGE_REVISION, corpusRevision, model,
         codeSha: env.VERCEL_GIT_COMMIT_SHA?.slice(0, 40) ?? null, conversationId: conversation.id, costMicroUsd: cost, calls, durationMs: clock() - startedAt,
         stopped: meterStop ?? report.stopped?.reason ?? null, conversation: report.conversations[0] ?? null, turns: report.turns };
     } catch {
-      stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, judgeRevision: SAV_BENCH_JUDGE_REVISION, corpusRevision: SAV_SMART_BENCH_SELFTEST_CORPUS_REVISION, model,
+      stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, pass, set: config.set, judgeRevision: SAV_BENCH_JUDGE_REVISION, corpusRevision, model,
         codeSha: null, conversationId: conversation.id, costMicroUsd: worst, calls, durationMs: clock() - startedAt, stopped: "crashed", conversation: null, turns: [] };
       cost = Math.max(cost, worst);
       stored = { ...stored, costMicroUsd: cost };
@@ -200,22 +237,25 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
   }
   const spentMicroUsd = smartLedgerSpent(await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, config.runId));
   const remaining = Math.max(0, todo.length - ran);
-  const pass = { ran, stoppedBy: ran === todo.length && stoppedBy === "batch" ? "done" as const : stoppedBy, spentMicroUsd, remaining };
-  log("sav_smart_bench_selftest", { ...pass, runId: config.runId, agents: config.agents, model, revision: SAV_SMART_PROMPT_REVISION, promptSha256: smartPromptSha256().slice(0, 16) });
+  const result = { ran, stoppedBy: ran === todo.length && stoppedBy === "batch" ? "done" as const : stoppedBy, spentMicroUsd, remaining };
+  log("sav_smart_bench_selftest", { ...result, runId: config.runId, agents: config.agents, set: config.set, passes: config.passes, model, revision: SAV_SMART_PROMPT_REVISION, promptSha256: smartPromptSha256().slice(0, 16) });
   // Run complete: the aggregated report (the same as `readSmartBenchSelfTestReport`), codes and numbers only, on every pass until switched off.
   if (remaining === 0) {
     try { log("sav_smart_bench_report", smartBenchReportLine(config.runId, aggregateSmartBenchSelfTest(await readSmartBenchSelfTestRows(config.runId)))); }
     catch { /* the report never fails the pass */ }
   }
-  return pass;
+  return result;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 // Report for root: aggregates by family and criterion, current/new comparison, failures with their conversation id. Codes and numbers only.
 // ---------------------------------------------------------------------------------------------------------------------------------
-export function aggregateSmartBenchSelfTest(rows: readonly SmartBenchStored[]) {
-  const per = (agent: SmartBenchAgentName) => {
-    const mine = rows.filter(row => row.agent === agent);
+export const smartBenchStoredPass = (row: SmartBenchStored): SmartBenchPass => row.pass ?? 1;
+export function aggregateSmartBenchSelfTest(allRows: readonly SmartBenchStored[]) {
+  // The metrics, failures and comparison read pass 1; pass 2 has its own metrics and the stability list (conversations that changed).
+  const rows = allRows.filter(row => smartBenchStoredPass(row) === 1);
+  const per = (agent: SmartBenchAgentName, source: readonly SmartBenchStored[] = rows) => {
+    const mine = source.filter(row => row.agent === agent);
     const turns = mine.flatMap(row => row.turns), conversations = mine.flatMap(row => row.conversation ? [row.conversation] : []);
     const metrics = savBenchMetrics(turns, conversations);
     const failures = turns.filter(row => !row.verdict.passed).map(row => ({ conversationId: row.conversationId, family: row.family, turn: row.turn, expected: row.expected, outcome: row.outcome,
@@ -229,8 +269,20 @@ export function aggregateSmartBenchSelfTest(rows: readonly SmartBenchStored[]) {
   const paired = rows.filter(row => row.agent === "new" && both.has(row.conversationId)).map(row => row.conversationId);
   const passedBy = (agent: SmartBenchAgentName) => new Set(rows.filter(row => row.agent === agent && row.conversation?.passed).map(row => row.conversationId));
   const currentPassed = passedBy("current"), newPassed = passedBy("new");
+  const second = allRows.filter(row => smartBenchStoredPass(row) === 2);
+  const stability = (agent: SmartBenchAgentName) => {
+    const firstBy = new Map(rows.filter(row => row.agent === agent).map(row => [row.conversationId, row]));
+    const signature = (row: SmartBenchStored) => `${row.conversation?.passed ?? false}|${row.turns.map(turn => turn.outcome).join(",")}`;
+    const compared = second.filter(row => row.agent === agent && firstBy.has(row.conversationId));
+    return { compared: compared.length, unstable: compared.filter(row => signature(row) !== signature(firstBy.get(row.conversationId)!)).map(row => {
+      const first = firstBy.get(row.conversationId)!;
+      return { conversationId: row.conversationId, family: row.conversation?.family ?? first.conversation?.family ?? null,
+        pass1: { passed: first.conversation?.passed ?? false, outcomes: first.turns.map(turn => turn.outcome) }, pass2: { passed: row.conversation?.passed ?? false, outcomes: row.turns.map(turn => turn.outcome) } };
+    }) };
+  };
   return {
     current, new: next,
+    pass2: second.length ? { current: per("current", second), new: per("new", second), stability: { current: stability("current"), new: stability("new") } } : null,
     comparison: { paired: paired.length, bothPass: paired.filter(id => currentPassed.has(id) && newPassed.has(id)).length,
       onlyNewPasses: paired.filter(id => newPassed.has(id) && !currentPassed.has(id)), onlyCurrentPasses: paired.filter(id => currentPassed.has(id) && !newPassed.has(id)),
       bothFail: paired.filter(id => !currentPassed.has(id) && !newPassed.has(id)).length },
@@ -242,7 +294,7 @@ const turnFailure = (row: SavBenchTurnRow) => ({ turn: row.turn, expected: row.e
   failed: Object.entries(row.verdict.criteria).filter(([, value]) => value.final === "echec").map(([criterion]) => criterion), checks: row.checks.map(hit => hit.code), failure: row.failure });
 /** The per-conversation log line: verdict, failed turns with their failed criteria and check codes, cost. Never a reply or a judge's text. */
 export function smartBenchConversationLine(stored: SmartBenchStored) {
-  return { runId: stored.runId, agent: stored.agent, conversationId: stored.conversationId, family: stored.conversation?.family ?? null,
+  return { runId: stored.runId, pass: stored.pass ?? 1, agent: stored.agent, conversationId: stored.conversationId, family: stored.conversation?.family ?? null,
     passed: stored.conversation?.passed ?? false, endedBy: stored.conversation?.endedBy ?? null, turnsPlayed: stored.conversation?.turnsPlayed ?? 0,
     failedTurns: stored.turns.filter(row => !row.verdict.passed).map(turnFailure), stopped: stored.stopped, costMicroUsd: stored.costMicroUsd, calls: stored.calls };
 }
@@ -251,7 +303,10 @@ export function smartBenchReportLine(runId: string, report: ReturnType<typeof ag
   const side = (agent: ReturnType<typeof aggregateSmartBenchSelfTest>["current"]) => ({
     conversationsStored: agent.conversationsStored, costMicroUsd: agent.costMicroUsd, calls: agent.calls, revisions: agent.revisions, stopped: agent.stopped,
     metrics: agent.metrics, failuresCount: agent.failures.length, failures: agent.failures.slice(0, SMART_BENCH_REPORT_MAX_FAILURES) });
-  return { runId, current: side(report.current), new: side(report.new), comparison: report.comparison };
+  const stabilityLine = (value: NonNullable<typeof report.pass2>["stability"]["current"]) => ({ compared: value.compared, unstableCount: value.unstable.length, unstable: value.unstable.slice(0, SMART_BENCH_REPORT_MAX_FAILURES) });
+  return { runId, current: side(report.current), new: side(report.new), comparison: report.comparison,
+    pass2: report.pass2 ? { current: side(report.pass2.current), new: side(report.pass2.new),
+      stability: { current: stabilityLine(report.pass2.stability.current), new: stabilityLine(report.pass2.stability.new) } } : null };
 }
 
 export async function readSmartBenchSelfTestRows(runId: string): Promise<SmartBenchStored[]> {
