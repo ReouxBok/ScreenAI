@@ -1,5 +1,13 @@
 # Déploiement et publication
 
+## Extension 2.2.63 — clics sur les champs et fenêtres superposées
+
+Les champs texte, date, heure, les zones de texte et les éditeurs peuvent recevoir un clic même sans `tabindex` explicite. Le focus constaté sur un champ compte comme un effet du clic, sans valider l’envoi du formulaire. La détection des fenêtres bloquantes suit les mêmes critères que la carte de page ; une simple classe CSS « popup » ou « overlay » ne suffit plus.
+
+Les rejets de clic remontent un code précis (cible masquée, désactivée, absente ou contexte périmé) dans le résultat de l’outil et les diagnostics, sans journaliser le texte de la page. GPT Live, Marin en français, les permissions et les niveaux d’autonomie sont conservés.
+
+L’outil `dismiss_popup` ferme les sélecteurs, menus et listes temporaires par Échap ou un clic dans une zone neutre, puis renvoie la page fraîche. Il préserve le formulaire principal et vérifie la fermeture. Le proxy propose cet outil uniquement aux extensions qui annoncent cette capacité. Déployer ce proxy avant la nouvelle extension. Soumettre `dist/limova-ai-extension-2.2.63.zip` après validation ; remplacer l’examen en attente de la 2.2.62 si nécessaire.
+
 ## Extension 2.2.62 — autonomie, accord vocal et formulaires rapides
 
 Les accords vocaux naturels reprennent une action en attente une seule fois. Une réponse ambiguë conserve la carte d’approbation ; un refus ou une modification explicite l’annule. Le mode « Accès complet » accepte les étapes ordinaires d’une tâche vocale dont la cible a été vérifiée, sans exiger que le membre prononce le libellé exact du bouton final. Les restrictions explicites du membre et les contrôles des cibles sont conservés.

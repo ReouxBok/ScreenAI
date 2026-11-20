@@ -5,7 +5,7 @@
 // The Live model tends to stop after each tool and wait for the user. Each
 // successful page action reminds it to finish the user's goal on its own.
 const VOICE_PAGE_ACTION_TOOLS = new Set([
-  'click_element', 'set_control_state', 'navigate_internal', 'request_page_action', 'fill_field', 'fill_fields', 'type_text_into_page', 'scroll_page', 'open_page'
+  'click_element', 'set_control_state', 'navigate_internal', 'request_page_action', 'fill_field', 'fill_fields', 'type_text_into_page', 'scroll_page', 'open_page', 'dismiss_popup'
 ]);
 // create_in_limova opens a tab and sends a message: it only runs when the
 // sentence the user is saying right now asks for it or says yes to it, never
@@ -798,6 +798,9 @@ class LimovaVoiceSession {
           resultCharacters: String(result?.knowledge || '').length,
           ...(!result?.ok && result?.failureCode ? { failureCode: result.failureCode } : {})
         });
+      } else if (call.name === 'dismiss_popup') {
+        result = await sendToolMessage({ type: 'VOICE_DISMISS_POPUP_REQUEST', contextVersion: call.args?.contextVersion })
+          .catch(() => ({ ok: false, error: 'La page est indisponible.' }));
       } else if (call.name === 'fill_fields') {
         const fields = call.args?.fields;
         const valid = Number.isInteger(call.args?.contextVersion) && Array.isArray(fields) && fields.length > 0 && fields.length <= 12
@@ -951,7 +954,7 @@ class LimovaVoiceSession {
       } else if (result?.knowledge) {
         response.knowledgeBase = String(result.knowledge).slice(0, 6_000);
       }
-      for (const key of ['moved', 'atStart', 'atEnd', 'unchanged', 'cancelled', 'verification', 'verificationRequired', 'retryWithFreshContext', 'matches', 'targetLabel', 'checked', 'durationMs']) {
+      for (const key of ['moved', 'atStart', 'atEnd', 'unchanged', 'cancelled', 'verification', 'verificationRequired', 'retryWithFreshContext', 'matches', 'targetLabel', 'checked', 'durationMs', 'failureCode', 'dismissed']) {
         if (result?.[key] !== undefined) response[key] = result[key];
       }
       if (call.name === 'fill_fields') { response.fieldResults = result.fieldResults; response.completedFields = result.completedFields; }
@@ -963,7 +966,7 @@ class LimovaVoiceSession {
       } else if (response.status === 'ok' && VOICE_PAGE_ACTION_TOOLS.has(call.name)) {
         response.nextStep = VOICE_CONTINUATION_HINT;
       }
-      this.diagnostic('VOICE_TOOL_COMPLETED', { tool: call.name, status: response.status, verified: response.verification?.status === 'confirmed' });
+      this.diagnostic('VOICE_TOOL_COMPLETED', { tool: call.name, status: response.status, verified: response.verification?.status === 'confirmed', failureCode: result?.ok ? null : result?.failureCode || null });
       this.onToolResult?.(call, response);
         functionResponses.push({
         id: call.id,

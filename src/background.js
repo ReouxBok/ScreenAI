@@ -364,6 +364,18 @@ function safeFailureReason(value) {
   return SAFE_FAILURE_REASONS.has(value) ? value : null;
 }
 
+const SAFE_ACTION_FAILURE_CODES = new Set([
+  'invalid_target', 'stale_context', 'target_missing', 'target_hidden',
+  'target_disabled', 'target_not_actionable', 'target_occluded',
+  'content_script_unavailable', 'action_dispatch_failed', 'action_cancelled',
+  'control_state_unverified'
+]);
+
+function actionFailureCode(result) {
+  if (result?.ok === true) return null;
+  return SAFE_ACTION_FAILURE_CODES.has(result?.failureCode) ? result.failureCode : 'content_action_failed';
+}
+
 globalThis.addEventListener?.('unhandledrejection', event => {
   Logger.error('service_worker', 'Unhandled promise rejection', event.reason, 'UNHANDLED_REJECTION');
 });
@@ -1068,6 +1080,9 @@ async function handleMessage(request, sender) {
       return runEvaluatedVoiceTool('fill_field', request.targetLabel, () =>
         typeVoiceText(request.elementId, request.text, request.contextVersion, request.targetLabel)
       );
+
+    case 'VOICE_DISMISS_POPUP_REQUEST':
+      return runEvaluatedVoiceTool('dismiss_popup', '', () => dismissVoicePopup(request.contextVersion));
 
     case 'VOICE_SCROLL_REQUEST':
       return runEvaluatedVoiceTool('scroll_page', '', () =>
@@ -4027,7 +4042,7 @@ async function getLiveToken(context) {
         trainingMode,
         // Tells the proxy this extension follows every site and handles
         // open_page and create_in_limova.
-        capabilities: ['any_site', 'limova_handoff', 'browser_tasks', 'structured_verification', 'batch_fields'],
+        capabilities: ['any_site', 'limova_handoff', 'browser_tasks', 'structured_verification', 'batch_fields', 'dismiss_popup'],
         ...(sessionState.resetContext ? { resetContext: true } : {}),
         ...(trainingMode || evaluationMode ? {} : await userFirstNameField()),
         ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
@@ -4444,6 +4459,20 @@ async function proposeVoiceAction(elementId, requestedContextVersion, toolIntent
     requestedContextVersion,
     operation
   });
+}
+
+async function dismissVoicePopup(contextVersion, operation = captureVoiceOperation()) {
+  if (trainingState.active || !(await hasAIProcessingConsent()) || !isCurrentOperation(operation) || !operation.tabId) return { ok: false };
+  if (contextVersion !== pageContextVersion) return { ok: false, status: 'unexpected', retryWithFreshContext: true, error: 'La carte DOM a changé.' };
+  const result = await sendContentMessage(operation.tabId, {
+    type: 'DISMISS_TRANSIENT_POPUP', contextVersion, taskRevision: operation.taskRevision
+  }, true, operation).catch(() => ({ ok: false, failureCode: 'content_script_unavailable' }));
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  const fresh = await getFreshVoiceContext(null, { capture: true, operation });
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  Logger.event('action', 'POPUP_DISMISS_COMPLETED', { ok: result?.ok === true, dismissed: result?.dismissed === true,
+    method: ['escape', 'outside_pointer'].includes(result?.dismissalMethod) ? result.dismissalMethod : null });
+  return { ...fresh, ...result };
 }
 
 async function setVoiceControlState(elementId, checked, contextVersion, targetLabel) {
@@ -5025,6 +5054,7 @@ async function refreshAndRetryElementCommand({
     recoveredId: command.id,
     expectedContextVersion,
     recoveredContextVersion: command.contextVersion,
+    ...(commandType === 'action' ? { failureCode: actionFailureCode(result) } : {}),
     ...safeElementDiagnostic(descriptor)
   }, operationId);
   return { fresh, command, result };
@@ -5613,7 +5643,7 @@ async function executeElementAction(action) {
       ...(typeof action.desiredChecked === 'boolean' ? { desiredChecked: action.desiredChecked } : {})
     }, true, operation);
   } catch (_) {
-    result = { ok: false, error: 'La page Limova ne répond plus.' };
+    result = { ok: false, failureCode: 'content_script_unavailable', error: 'La page Limova ne répond plus.' };
   }
   if (!isCurrentOperation(operation)) return result?.ok === true ? reportClickOpenedFollowedTab() : cancelledOperation();
   if (result?.ok !== true) {
@@ -5639,12 +5669,15 @@ async function executeElementAction(action) {
       contextBeforeClick = recovery.fresh.pageContext;
       tabBeforeClick = await chrome.tabs.get(operation.tabId).catch(() => tabBeforeClick);
       if (!isCurrentOperation(operation)) return cancelledOperation();
+    } else if (recovery?.result) {
+      result = recovery.result;
     }
   }
   let payload = {
     type: 'ACTION_RESULT',
     ok: result?.ok === true,
     label: activeAction.label,
+    failureCode: actionFailureCode(result),
     error: result?.error || (result?.ok === true ? undefined : 'Action refusée par la page.')
   };
   if (result?.ok === true && sessionState.lockedTabId) {
@@ -5653,7 +5686,7 @@ async function executeElementAction(action) {
     const comparable = value => String(value || '').replace(/\b\d+ms\b/g, 'Nms').replace(/\s+/g, ' ').trim();
     let refreshedContext = await getPageContext(operation.tabId, operation).catch(() => '');
     if (!isCurrentOperation(operation)) return reportClickOpenedFollowedTab();
-    if (!refreshedContext || comparable(contextBeforeClick) === comparable(refreshedContext)) {
+    if (!result.fieldFocused && (!refreshedContext || comparable(contextBeforeClick) === comparable(refreshedContext))) {
       await new Promise(resolve => setTimeout(resolve, 700));
       if (!isCurrentOperation(operation)) return reportClickOpenedFollowedTab();
       refreshedContext = await getPageContext(operation.tabId, operation).catch(() => '');
@@ -5678,7 +5711,8 @@ async function executeElementAction(action) {
       const newTabOpened = Boolean(childTabOpenedSince(operation.tabId, actionStartedAt));
       const networkObserved = technical.network.length > 0;
       const networkFailed = technical.network.some(entry => entry.status === 0 || entry.status >= 400);
-      payload.effectObserved = routeChanged || domChanged || popupObserved || newTabOpened || networkObserved;
+      const fieldFocused = activeAction.targetDescriptor?.type === 'input' && result.fieldFocused === true;
+      payload.effectObserved = routeChanged || domChanged || popupObserved || newTabOpened || networkObserved || fieldFocused;
       payload.effectEvidence = {
         routeChanged,
         domChanged,
@@ -5686,6 +5720,7 @@ async function executeElementAction(action) {
         newTabOpened,
         networkObserved,
         networkFailed,
+        fieldFocused,
         consoleErrorCount: technical.console.filter(entry => entry.level === 'error').length
       };
       if (!payload.effectObserved) {
@@ -5724,7 +5759,7 @@ async function executeElementAction(action) {
     verificationRequired: Boolean(payload.verificationRequired),
     interactionMode: result?.interactionMode || null,
     retargetedToChild: Boolean(result?.retargetedToChild),
-    errorCode: result?.error ? 'content_action_failed' : null,
+    errorCode: actionFailureCode(result),
     userTurnId: activeAction.userTurnId || null,
     contextVersion: activeAction.contextVersion,
     ...safeElementDiagnostic(activeAction.targetDescriptor)

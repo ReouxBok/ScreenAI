@@ -225,6 +225,36 @@ describe('content.js — DOM helpers', () => {
   });
 
   describe('executeElementAction', () => {
+    it.each(['escape', 'outside_pointer'])('dismisses a transient calendar with %s while preserving the event editor', async method => {
+      vi.useFakeTimers();
+      window.requestAnimationFrame = callback => setTimeout(callback, 0);
+      document.documentElement.dataset.limovaContextVersion = '10';
+      document.body.innerHTML = '<section role="dialog" id="editor"><input value="Brouillon privé"><div id="space"></div><div role="dialog" id="calendar" style="position:absolute;z-index:20"><div role="grid"><button>21</button></div></div><button id="save">Enregistrer</button></section>';
+      for (const el of document.querySelectorAll('section,div,button,input')) el.getBoundingClientRect = () => ({ left:0,top:0,right:600,bottom:400,width:600,height:400 });
+      const popup = document.querySelector('#calendar'), save = vi.fn();
+      document.querySelector('#save').onclick = save;
+      if (method === 'escape') popup.addEventListener('keydown', event => { if (event.key === 'Escape') popup.remove(); });
+      else document.querySelector('#space').addEventListener('mousedown', () => popup.remove());
+      document.elementFromPoint = vi.fn(() => document.querySelector('#space'));
+      const result = content.dismissTransientPopup({ contextVersion: 10 });
+      await vi.advanceTimersByTimeAsync(1000);
+      await expect(result).resolves.toMatchObject({ ok: true, dismissed: true, dismissalMethod: method });
+      expect(document.querySelector('#editor input').value).toBe('Brouillon privé');
+      expect(document.querySelector('#editor')).toBeTruthy();
+      expect(save).not.toHaveBeenCalled();
+      delete document.elementFromPoint;
+      vi.useRealTimers();
+    });
+
+    it('does not press Escape on the main event editor when no transient popup exists', async () => {
+      document.documentElement.dataset.limovaContextVersion = '10';
+      document.body.innerHTML = '<button aria-expanded="true" aria-controls="event-editor">Créer</button><section role="dialog" id="event-editor"><input value="Sport"><button>Enregistrer</button></section>';
+      for (const el of document.querySelectorAll('section,input,button')) el.getBoundingClientRect = () => ({ left:0,top:0,right:600,bottom:400,width:600,height:400 });
+      const escape = vi.fn(); document.addEventListener('keydown', escape);
+      await expect(content.dismissTransientPopup({ contextVersion: 10 })).resolves.toMatchObject({ ok:true, unchanged:true, dismissed:false });
+      expect(escape).not.toHaveBeenCalled(); document.removeEventListener('keydown', escape);
+    });
+
     it('clicks only a current, visible element identified by data-lid', () => {
       document.documentElement.dataset.limovaContextVersion = '7';
       document.body.innerHTML = '<button data-lid="4">Open</button>';
@@ -280,6 +310,39 @@ describe('content.js — DOM helpers', () => {
       expect(content.executeElementAction(8, 10)).toEqual({ ok: true });
       expect(backgroundClick).not.toHaveBeenCalled();
       expect(modalClick).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      '<input type="text">', '<input type="date">', '<input type="time">',
+      '<textarea></textarea>', '<div contenteditable="true"></div>'
+    ])('allows clicking a visible native editor without an explicit tabindex: %s', markup => {
+      document.documentElement.dataset.limovaContextVersion = '10';
+      document.body.innerHTML = markup;
+      const field = document.body.firstElementChild;
+      field.dataset.lid = '7';
+      field.getBoundingClientRect = () => ({ left: 20, top: 20, right: 220, bottom: 60, width: 200, height: 40 });
+      const click = vi.spyOn(field, 'click');
+      expect(content.executeElementAction(7, 10)).toEqual({ ok: true });
+      expect(click).toHaveBeenCalledOnce();
+    });
+
+    it('does not treat an ordinary popup-named section as a blocking window', () => {
+      document.documentElement.dataset.limovaContextVersion = '10';
+      document.body.innerHTML = '<button data-lid="7">Ouvrir le calendrier</button><section class="popup-help"><button>Aide</button></section>';
+      for (const element of document.querySelectorAll('button,section')) {
+        element.getBoundingClientRect = () => ({ left: 20, top: 20, right: 220, bottom: 220, width: 200, height: 200 });
+      }
+      expect(content.executeElementAction(7, 10)).toEqual({ ok: true });
+    });
+
+    it('distinguishes a disabled target from a field covered by another window', () => {
+      document.documentElement.dataset.limovaContextVersion = '10';
+      document.body.innerHTML = '<button disabled data-lid="7">Valider</button><input data-lid="8"><section role="dialog"><button>Fermer</button></section>';
+      for (const element of document.querySelectorAll('button,input,section')) {
+        element.getBoundingClientRect = () => ({ left: 20, top: 20, right: 220, bottom: 220, width: 200, height: 200 });
+      }
+      expect(content.resolveElementAction(7, 10)).toMatchObject({ ok: false, failureCode: 'target_disabled' });
+      expect(content.resolveElementAction(8, 10)).toMatchObject({ ok: false, failureCode: 'target_occluded' });
     });
 
     it('activates a transparent native checkbox through its visible label surface', async () => {

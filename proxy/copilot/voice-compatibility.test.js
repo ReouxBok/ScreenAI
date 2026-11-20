@@ -89,6 +89,7 @@ test('existing WebRTC protocol still validates offers and creates OpenAI session
     assert.equal(body.session.audio.output.voice, 'marin');
     const tools = body.session.delegation.responses.tools;
     assert.ok(!tools.some(tool => tool.name === 'fill_fields'), 'Older extensions must not receive an unsupported batch tool');
+    assert.ok(!tools.some(tool => tool.name === 'dismiss_popup'), 'Older extensions must not receive an unsupported dismissal tool');
     assert.ok(tools.some(tool => tool.name === 'select_control'));
     assert.ok(tools.some(tool => tool.name === 'create_in_limova'));
     assert.ok(tools.find(tool => tool.name === 'verify_expected_result').parameters.required.includes('conditions'));
@@ -111,10 +112,11 @@ test('capable GPT clients get form batching and low-latency reasoning without ch
     assert.ok(batch);
     assert.equal(batch.parameters.properties.fields.maxItems, 12);
     assert.ok(batch.parameters.required.includes('contextVersion'));
+    assert.ok(backend.tools.find(tool => tool.name === 'dismiss_popup').parameters.required.includes('contextVersion'));
     assert.ok(backend.tools.find(tool => tool.name === 'inspect_current_page').description.includes('ne la relis pas'));
     assert.match(body.session.instructions, /Accès complet/);
   });
-  assert.equal((await post('/api/live-session', { sdp: 'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n', capabilities: ['browser_tasks', 'batch_fields'], autonomyMode: 'full' })).status, 201);
+  assert.equal((await post('/api/live-session', { sdp: 'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n', capabilities: ['browser_tasks', 'batch_fields', 'dismiss_popup'], autonomyMode: 'full' })).status, 201);
 });
 
 test('GPT training keeps transcription passive and does not delegate browser tools', async () => {

@@ -814,6 +814,34 @@ describe('controlled page actions', () => {
     });
   });
 
+  it('recognizes observed field focus without claiming form submission', async () => {
+    document.body.innerHTML = '<label for="start">Heure de début</label><input id="start">';
+    const context = await background.getPageContext(17);
+    const fieldId = Number(context.match(/\[(\d+)\] input\(text\)/)?.[1]);
+    chromeMock.tabs.sendMessage.mockImplementation(async (_tabId, message) => {
+      if (message.type === 'EXECUTE_ELEMENT_ACTION') return { ok: true, clickDispatched: true, fieldFocused: true };
+      return { ok: true };
+    });
+    const result = await background.proposeOrExecuteAction(fieldId, 'Clique sur Heure de début');
+    expect(result).toMatchObject({ ok: true, effectObserved: true, effectEvidence: { fieldFocused: true, domChanged: false } });
+    expect(result.verificationRequired).not.toBe(true);
+  });
+
+  it('keeps the precise rejection from the refreshed target and does not log private error text', async () => {
+    const { default: Logger } = await import('../../../src/utils/logger.js');
+    chromeMock.tabs.sendMessage.mockImplementation(async (_tabId, message) => {
+      if (message.type === 'EXECUTE_ELEMENT_ACTION') return {
+        ok: false, failureCode: 'target_occluded', error: 'Une fenêtre bloque le contenu privé du calendrier.'
+      };
+      return { ok: true };
+    });
+    const result = await background.proposeOrExecuteAction(1, 'Clique sur Documents');
+    expect(result).toMatchObject({ ok: false, failureCode: 'target_occluded' });
+    const diagnostic = Logger.logs.findLast(entry => entry.code === 'ACTION_EXECUTION_FAILED');
+    expect(diagnostic.data.errorCode).toBe('target_occluded');
+    expect(JSON.stringify(diagnostic)).not.toContain('contenu privé');
+  });
+
   it('executes the typed ADK fill tool on the exact current DOM field', async () => {
     chromeMock.tabs.get.mockResolvedValue({ id: 17, active: true, windowId: 4, title: 'Limova', url: 'https://new.limova.ai/' });
     const result = await background.executeCopilotTool({

@@ -147,7 +147,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'EXECUTE_ELEMENT_ACTION') {
     executeElementActionWithCursor(request.id, request.contextVersion, request)
       .then(sendResponse)
-      .catch(() => sendResponse({ ok: false, error: 'Le clic automatique a échoué.' }));
+      .catch(() => sendResponse({ ok: false, failureCode: 'action_dispatch_failed', error: 'Le clic automatique a échoué.' }));
+    return true;
+  }
+
+  if (request.type === 'DISMISS_TRANSIENT_POPUP') {
+    dismissTransientPopup(request).then(sendResponse)
+      .catch(() => sendResponse({ ok: false, failureCode: 'popup_not_dismissed', error: 'Le sélecteur n’a pas pu être fermé.' }));
     return true;
   }
 
@@ -595,7 +601,31 @@ function getActiveModalSurface() {
   );
   const shallow = [...document.body.children].flatMap(element => [element, ...element.children]);
   const candidates = [...new Set([...signaled, ...shallow])]
-    .filter(element => isLikelyModal(element) && isVisiblyRendered(element));
+    .filter(element => {
+      if (!(element instanceof HTMLElement) || !isVisiblyRendered(element)) return false;
+      // Match the page map's modal rules. Ordinary page sections named
+      // "popup"/"overlay" must not invalidate targets the map just exposed.
+      const readable = element.tagName !== 'IFRAME'
+        && element.querySelector('a[href], button, input, select, textarea, [role="button"], [role="link"], [tabindex]:not([tabindex="-1"])');
+      if (!readable) return false;
+      const role = element.getAttribute('role');
+      if (role === 'dialog' || role === 'alertdialog' || element.getAttribute('aria-modal') === 'true'
+        || (element.tagName === 'DIALOG' && element.hasAttribute('open'))) return true;
+      const rect = element.getBoundingClientRect();
+      const coversCenter = rect.left <= window.innerWidth / 2 && rect.right >= window.innerWidth / 2
+        && rect.top <= window.innerHeight / 2 && rect.bottom >= window.innerHeight / 2;
+      const coverage = rect.width * rect.height / Math.max(1, window.innerWidth * window.innerHeight);
+      if (!coversCenter || coverage <= 0.12) return false;
+      const style = window.getComputedStyle(element);
+      if (style.position === 'fixed' && (Number.parseInt(style.zIndex, 10) || 0) >= 10) return true;
+      if (!MODAL_CLASS_PATTERNS.test(String(element.className || '')) || rect.width <= 100 || rect.height <= 100) return false;
+      for (let current = element; current && current !== document.body; current = current.parentElement) {
+        const ancestorStyle = window.getComputedStyle(current);
+        if (ancestorStyle.position === 'fixed'
+          || (ancestorStyle.position === 'absolute' && (Number.parseInt(ancestorStyle.zIndex, 10) || 0) >= 10)) return true;
+      }
+      return false;
+    });
   if (!candidates.length) return null;
 
   const score = element => {
@@ -853,15 +883,15 @@ function selectionActivationSurface(element) {
 }
 
 function resolveElementAction(id, contextVersion, options = {}) {
-  if (!Number.isInteger(id) || id < 1) return { ok: false, error: 'Identifiant invalide.' };
+  if (!Number.isInteger(id) || id < 1) return { ok: false, failureCode: 'invalid_target', error: 'Identifiant invalide.' };
   if (document.documentElement.dataset.limovaContextVersion !== String(contextVersion)) {
-    return { ok: false, error: 'La page a changé.' };
+    return { ok: false, failureCode: 'stale_context', error: 'La page a changé.' };
   }
 
   const element = getElementByLid(id);
-  if (!(element instanceof HTMLElement)) return { ok: false, error: 'Élément introuvable.' };
+  if (!(element instanceof HTMLElement)) return { ok: false, failureCode: 'target_missing', error: 'Élément introuvable.' };
   const activationElement = selectionActivationSurface(element);
-  if (!activationElement) return { ok: false, error: 'Contrôle sans surface visible.' };
+  if (!activationElement) return { ok: false, failureCode: 'target_hidden', error: 'Contrôle sans surface visible.' };
   const style = window.getComputedStyle(activationElement);
   const rect = activationElement.getBoundingClientRect();
   const disabled = element.matches(':disabled, [aria-disabled="true"]');
@@ -869,13 +899,14 @@ function resolveElementAction(id, contextVersion, options = {}) {
     'button, a[href], [role="button"], [role="tab"], [role="menuitem"], [role="link"], ' +
     'input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"], ' +
     'input[type="submit"], input[type="button"], [tabindex="0"], [class*="btn"], ' +
+    'input:not([type="hidden"]):not([type="password"]):not([type="file"]), textarea, [contenteditable="true"], ' +
     '[onclick], [class*="cursor-pointer"], [class*="clickable"]'
   );
   if (!actionable || disabled || style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0) {
-    return { ok: false, error: 'Élément non disponible.' };
+    return { ok: false, failureCode: disabled ? 'target_disabled' : !actionable ? 'target_not_actionable' : 'target_hidden', error: 'Élément non disponible.' };
   }
   if (!isElementOnActiveSurface(activationElement, options)) {
-    return { ok: false, status: 'unexpected', error: 'Une fenêtre au premier plan bloque cet élément.' };
+    return { ok: false, status: 'unexpected', failureCode: 'target_occluded', error: 'Une fenêtre au premier plan bloque cet élément.' };
   }
 
   return { ok: true, element, activationElement };
@@ -957,6 +988,85 @@ function waitForPointerDelay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
+function transientPopupCandidate() {
+  const layered = element => {
+    for (let node = element; node && node !== document.body; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (style.position === 'fixed' || (style.position === 'absolute' && Number.parseInt(style.zIndex, 10) >= 10)) return true;
+    }
+    return false;
+  };
+  const expanded = [...document.querySelectorAll('[aria-expanded="true"][aria-controls]')];
+  const owned = new Map();
+  for (const trigger of expanded) {
+    for (const id of trigger.getAttribute('aria-controls').split(/\s+/)) {
+      const popup = document.getElementById(id);
+      if (popup && isVisiblyRendered(trigger)) owned.set(popup, trigger);
+    }
+  }
+  const candidates = new Set([...owned.keys()]);
+  for (const node of document.querySelectorAll('[role="menu"], [role="listbox"], [role="tree"], [role="grid"], [popover]')) {
+    const popup = node.closest('[role="dialog"], [role="menu"], [role="listbox"], [popover]') || node;
+    if (layered(popup) && !popup.querySelector('form, textarea, [contenteditable="true"], input:not([type="hidden"]):not([type="button"]):not([type="submit"])')) candidates.add(popup);
+  }
+  return [...candidates].filter(popup => isVisiblyRendered(popup))
+    .filter(popup => !popup.querySelector('form, textarea, [contenteditable="true"]'))
+    // An expanded trigger can also own the entire event editor (Radix
+    // dialogs, for example). That relationship alone is not a popup license.
+    .filter(popup => popup.matches('[role="menu"], [role="listbox"], [role="tree"], [role="grid"]')
+      || !popup.querySelector('input:not([type="hidden"]):not([type="button"]):not([type="submit"])'))
+    .sort((a, b) => { const x = a.getBoundingClientRect(), y = b.getBoundingClientRect(); return x.width * x.height - y.width * y.height; })
+    .map(popup => ({ popup, trigger: owned.get(popup) }))[0] || null;
+}
+
+async function dismissTransientPopup(request = {}) {
+  const current = () => request.taskRevision === undefined || request.taskRevision === voiceTaskRevision;
+  if (!current()) return { ok: false, cancelled: true };
+  if (document.documentElement.dataset.limovaContextVersion !== String(request.contextVersion)) {
+    return { ok: false, failureCode: 'stale_context', error: 'La page a changé.' };
+  }
+  const candidate = transientPopupCandidate();
+  // Never press Escape blindly: it could discard the main editor instead.
+  if (!candidate) return { ok: true, unchanged: true, dismissed: false };
+  const { popup, trigger } = candidate;
+  const gone = () => !popup.isConnected || !isVisiblyRendered(popup)
+    || (trigger?.isConnected && trigger.getAttribute('aria-expanded') === 'false');
+  const target = popup.contains(document.activeElement) || document.activeElement === trigger
+    ? document.activeElement : popup;
+  for (const type of ['keydown', 'keyup']) target.dispatchEvent(new KeyboardEvent(type, {
+    key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true, composed: true
+  }));
+  await waitForPointerFrame();
+  await waitForPointerDelay(120);
+  if (!current()) return { ok: false, cancelled: true };
+  if (gone()) return { ok: true, dismissed: true, dismissalMethod: 'escape' };
+
+  // Some widgets listen only for outside pointer events. Click neutral space
+  // within the enclosing editor, never a Save button or its backdrop.
+  const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open]')]
+    .filter(node => node !== popup && !popup.contains(node) && isVisiblyRendered(node));
+  const editor = trigger?.closest('[role="dialog"], [aria-modal="true"], dialog[open]')
+    || popup.parentElement?.closest('[role="dialog"], [aria-modal="true"], dialog[open]')
+    || dialogs.find(node => node.querySelector('input,textarea,[contenteditable="true"]'));
+  const scope = editor || document.body;
+  const rect = editor?.getBoundingClientRect() || { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+  const interactive = 'button,a,input,textarea,select,label,[contenteditable="true"],[role="button"],[role="option"],[role="menuitem"],[onclick]';
+  for (const fx of [0.1, 0.5, 0.9]) {
+    for (const fy of [0.1, 0.5, 0.9]) {
+      const x = Math.round(rect.left + rect.width * fx), y = Math.round(rect.top + rect.height * fy);
+      const hit = document.elementFromPoint?.(x, y);
+      if (!(hit instanceof HTMLElement) || !scope.contains(hit) || popup.contains(hit) || hit.closest(interactive)) continue;
+      if (!current()) return { ok: false, cancelled: true };
+      dispatchCompletePointerClick(hit, x, y);
+      await waitForPointerFrame();
+      await waitForPointerDelay(120);
+      return gone() ? { ok: true, dismissed: true, dismissalMethod: 'outside_pointer' }
+        : { ok: false, failureCode: 'popup_not_dismissed', error: 'Le sélecteur est encore ouvert ; son état doit être relu.' };
+    }
+  }
+  return { ok: false, failureCode: 'popup_not_dismissed', error: 'Aucune surface neutre ne permet de fermer ce sélecteur.' };
+}
+
 function dispatchCompletePointerClick(element, clientX, clientY) {
   if (!(element instanceof HTMLElement)) return { ok: false, error: 'Cible de clic invalide.' };
   const pointTarget = document.elementFromPoint?.(clientX, clientY);
@@ -995,7 +1105,8 @@ function dispatchCompletePointerClick(element, clientX, clientY) {
   mouse('mouseenter');
   pointer('pointerdown');
   mouse('mousedown');
-  try { eventTarget.focus({ preventScroll: true }); } catch (_) { eventTarget.focus?.(); }
+  const focusTarget = element.matches('input, textarea, [contenteditable="true"]') ? element : eventTarget;
+  try { focusTarget.focus({ preventScroll: true }); } catch (_) { focusTarget.focus?.(); }
   pointer('pointerup');
   mouse('mouseup', { buttons: 0 });
   eventTarget.click();
@@ -1157,7 +1268,11 @@ async function executeElementActionWithCursor(id, contextVersion, options = {}) 
     clickDispatched: true,
     interactionMode: click.sequence,
     retargetedToChild: click.retargetedToChild,
-    targetTag: click.targetTag
+    targetTag: click.targetTag,
+    // Focusing a field is a real result even when its text did not change.
+    // It does not imply that the encompassing form has been submitted.
+    fieldFocused: resolved.element.matches('input, textarea, [contenteditable="true"]')
+      && document.activeElement === resolved.element
   };
 }
 

@@ -270,3 +270,76 @@ test('full access fills the form in one batch and validates it without a confirm
   console.log('FULL_ACCESS_FORM_EVIDENCE', JSON.stringify({ elapsedMs: Date.now() - startedAt, fields: 3, saves: 1 }));
   await panel.evaluate(() => { stopVoiceSession(); window.__remote.close(); });
 });
+
+test('voice clicks native time editors and visible popup controls without false blocking', async ({ mediaContext, mediaExtensionId }) => {
+  const { panel, web } = await setup(mediaContext, mediaExtensionId);
+  await web.evaluate(() => {
+    document.body.innerHTML = '<aside class="popup-help" style="width:200px;height:160px"><button>Aide</button></aside><main><label for="start">Heure de début</label><input id="start"><button id="choose">Choisir un horaire</button><section role="dialog" id="picker" hidden><button id="slot">15:00</button></section></main>';
+    document.querySelector('#choose').onclick = () => { document.querySelector('#picker').hidden = false; };
+    document.querySelector('#slot').onclick = () => {
+      document.querySelector('#start').value = '15:00'; document.querySelector('#picker').hidden = true;
+    };
+  });
+  await web.bringToFront();
+  await panel.evaluate(async () => {
+    await chrome.runtime.sendMessage({ type: 'SET_AUTONOMY_MODE', mode: 'full' });
+    voiceSession.handleLiveEvent({ type: 'session.input_transcript.delta', delta: 'Clique sur Heure de début puis choisis quinze heures', start_ms: 0, end_ms: 100 });
+    voiceSession.handleLiveEvent({ type: 'session.delegation.created', delegation: { id: 'time-task' } });
+    await voiceSession.taskUpdate;
+  });
+  let result = await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST' }));
+  for (const [id, targetLabel] of [['start', 'Heure de début'], ['choose', 'Choisir un horaire'], ['slot', '15:00']]) {
+    const elementId = Number(await web.locator('#' + id).getAttribute('data-lid'));
+    await panel.evaluate(({ elementId, contextVersion, targetLabel, id }) => voiceSession.handleLiveEvent({
+      type: 'response.event', delegation_id: 'time-task', event: {
+        type: 'response.output_item.done', item: { type: 'function_call', call_id: id, name: 'click_element',
+          arguments: JSON.stringify({ elementId, contextVersion, targetLabel, explicitRequest: true }) }
+      }
+    }), { elementId, contextVersion: result.contextVersion, targetLabel, id });
+    await expect.poll(() => panel.evaluate(id => window.__sent.some(event => event.item?.call_id === id), id)).toBe(true);
+    result = await panel.evaluate(id => JSON.parse(window.__sent.find(event => event.item?.call_id === id).item.output), id);
+    expect(result.status).toBe('ok');
+    if (id === 'start') expect(await web.locator('#start').evaluate(field => document.activeElement === field)).toBe(true);
+  }
+  await expect(web.locator('#start')).toHaveValue('15:00');
+  await expect(panel.locator('.action-card')).toHaveCount(0);
+  await panel.evaluate(() => { stopVoiceSession(); window.__remote.close(); });
+});
+
+for (const method of ['escape', 'outside_pointer']) {
+  test(`voice closes a blocking date picker with ${method} then resumes Save without user assistance`, async ({ mediaContext, mediaExtensionId }) => {
+    const { panel, web } = await setup(mediaContext, mediaExtensionId);
+    await web.evaluate(method => {
+      document.body.innerHTML = '<section role="dialog" id="editor" style="position:relative;width:600px;height:500px"><h2>Nouvel événement</h2><input aria-label="Titre" value="Sport"><button id="save">Enregistrer</button><div role="dialog" id="picker" style="position:absolute;left:150px;top:100px;width:250px;height:200px;z-index:30;background:white"><div role="grid"><button>21</button></div></div><p id="saved"></p></section>';
+      const popup = document.querySelector('#picker');
+      if (method === 'escape') popup.addEventListener('keydown', event => { if (event.key === 'Escape') popup.remove(); });
+      else document.querySelector('#editor').addEventListener('mousedown', event => { if (!popup.contains(event.target)) popup.remove(); });
+      document.querySelector('#save').onclick = () => { document.querySelector('#saved').textContent = 'Événement enregistré'; };
+    }, method);
+    await web.bringToFront();
+    await panel.evaluate(async () => {
+      await chrome.runtime.sendMessage({ type: 'SET_AUTONOMY_MODE', mode: 'full' });
+      voiceSession.handleLiveEvent({ type: 'session.input_transcript.delta', delta: 'Crée mon rendez-vous Sport et enregistre-le', start_ms: 0, end_ms: 100 });
+      voiceSession.handleLiveEvent({ type: 'session.delegation.created', delegation: { id: 'picker-task' } });
+      await voiceSession.taskUpdate;
+    });
+    const before = await panel.evaluate(() => chrome.runtime.sendMessage({ type:'VOICE_CONTEXT_REQUEST' }));
+    expect(before.pageContext).not.toContain('Enregistrer');
+    await panel.evaluate(contextVersion => voiceSession.handleLiveEvent({ type:'response.event', delegation_id:'picker-task', event: {
+      type:'response.output_item.done', item: { type:'function_call', call_id:'dismiss-date', name:'dismiss_popup', arguments:JSON.stringify({contextVersion}) }
+    }}), before.contextVersion);
+    await expect.poll(() => panel.evaluate(() => window.__sent.some(event => event.item?.call_id === 'dismiss-date'))).toBe(true);
+    const result = await panel.evaluate(() => JSON.parse(window.__sent.find(event => event.item?.call_id === 'dismiss-date').item.output));
+    expect(result).toMatchObject({ status:'ok', dismissed:true });
+    expect(result.pageContext).toContain('Enregistrer');
+    await expect(web.locator('input')).toHaveValue('Sport');
+    await expect(web.locator('#saved')).toBeEmpty();
+    const elementId = Number(await web.locator('#save').getAttribute('data-lid'));
+    await panel.evaluate(({elementId,contextVersion}) => voiceSession.handleLiveEvent({type:'response.event',delegation_id:'picker-task',event:{
+      type:'response.output_item.done',item:{type:'function_call',call_id:'save-after-picker',name:'click_element',arguments:JSON.stringify({elementId,contextVersion,targetLabel:'Enregistrer',explicitRequest:true})}
+    }}), {elementId,contextVersion:result.contextVersion});
+    await expect(web.locator('#saved')).toHaveText('Événement enregistré');
+    await expect(panel.locator('.action-card')).toHaveCount(0);
+    await panel.evaluate(() => { stopVoiceSession(); window.__remote.close(); });
+  });
+}

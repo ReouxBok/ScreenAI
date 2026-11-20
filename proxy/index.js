@@ -962,7 +962,7 @@ async function handleCopilotTurn(req, res) {
 app.post('/api/gemini', verifyAssistantAuth, track('server_copilot_turn', () => ({ engine: 'legacy', channel: 'text' })), assistantLimiter, handleCopilotTurn);
 app.post('/api/copilot/turn', verifyAssistantAuth, track('server_copilot_turn', () => ({ engine: 'legacy', channel: 'text' })), assistantLimiter, handleCopilotTurn);
 
-function openAiLiveTools(evaluationMode, batchFields = false) {
+function openAiLiveTools(evaluationMode, batchFields = false, dismissPopup = false) {
   const tool = (name, description, properties = {}, required = []) => ({
     type: 'function',
     name,
@@ -989,6 +989,7 @@ function openAiLiveTools(evaluationMode, batchFields = false) {
       elementId, contextVersion, targetLabel, checked: { type: 'boolean' }
     }, ['elementId', 'contextVersion', 'targetLabel', 'checked']),
     tool('inspect_current_page', 'Relit la page uniquement si la carte DOM manque ou est périmée. Les résultats des actions contiennent déjà la carte fraîche : ne la relis pas entre chaque champ ou clic.'),
+    ...(dismissPopup ? [tool('dismiss_popup', 'Ferme un sélecteur de date, menu ou liste temporaire sans annuler le formulaire principal. Utilise si une fenêtre au premier plan bloque la prochaine action ou si tu dois sortir d’un sélecteur. Renvoie la page fraîche : poursuis la tâche, sans demander au membre de fermer lui-même cette fenêtre.', { contextVersion }, ['contextVersion'])] : []),
     ...(!evaluationMode ? [tool('create_in_limova', 'Crée un contenu ou lance une tâche dans Limova uniquement à la demande explicite de l’utilisateur. Sur un autre site, joint le contenu lisible de la page ; sur Limova, utilise la conversation actuelle.', { request: { type: 'string', maxLength: 1500 } }, ['request'])] : []),
     tool('open_page', 'Ouvre une adresse web explicitement demandée par l’utilisateur et renvoie la nouvelle page. Pour un lien visible, utilise son identifiant DOM.', {
       url: { type: 'string' }, newTab: { type: 'boolean' }
@@ -1340,6 +1341,7 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
     'Tu pilotes réellement le navigateur de l’utilisateur via les outils de cette extension Charly. Consulter des informations et afficher ces informations dans sa page sont deux résultats distincts. Pour « affiche son agenda », appelle select_control directement avec le nom de la personne. Ne remplace pas une action demandée par un lien inventé ou des instructions manuelles.',
     'Si la demande comporte plusieurs étapes, conserve son objectif complet et exécute les étapes autorisées dans l’ordre jusqu’au résultat demandé. Une inspection ou un clic intermédiaire ne termine pas la demande. Après chaque changement de page, relis son état avant de poursuivre ; n’utilise jamais les identifiants de la page précédente.',
     'Pour les autres actions DOM utilisant un identifiant : utilise la carte fraîche retournée par le dernier outil. Inspecte seulement si elle manque ou si la page a changé. Attends le résultat de l’outil.',
+    'Un sélecteur de date, une liste de suggestions ou un menu ouvert est une étape de navigation normale. Si dismiss_popup est proposé, utilise-le pour en sortir lorsqu’il bloque la suite, puis reprends avec les identifiants frais. Ne demande pas au membre de cliquer à l’extérieur à ta place. Ne répète pas un clic bloqué ou une inspection identique sans changer de stratégie.',
     'Pour une consigne en plusieurs étapes, garde l’objectif complet jusqu’à son terme : analyse, action, recherche, nouvelle analyse. Après chaque résultat d’outil, poursuis la prochaine étape utile sans redemander la même autorisation. Une correction ou une interruption remplace l’ancienne consigne. Une étape réussie ne prouve pas que toute la demande est terminée.',
     'Après avoir vérifié le résultat final de toutes les étapes demandées, termine cette tâche et attends une nouvelle demande. Ne recommence pas les actions déjà exécutées.',
     'Quand plusieurs valeurs du même formulaire sont connues et que fill_fields est proposé, renseigne-les en un seul lot. Ne fais pas une inspection entre chaque champ : les outils renvoient déjà la page fraîche. Garde la demande complète, y compris les précisions et réponses de clarification du membre. Une création demandée comprend son enregistrement normal ; ne demande pas au membre de répéter « enregistre ». L’application applique le niveau d’autonomie choisi et affiche elle-même les accords nécessaires ; ne demande pas une approbation orale supplémentaire avant d’appeler l’outil.',
@@ -1424,7 +1426,7 @@ app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_i
               responses: {
                 model: LIVE_BACKEND_MODEL,
                 instructions: assistantSystemText,
-                tools: openAiLiveTools(evaluationMode, req.body?.capabilities?.includes('batch_fields')),
+                tools: openAiLiveTools(evaluationMode, req.body?.capabilities?.includes('batch_fields'), req.body?.capabilities?.includes('dismiss_popup')),
                 ...(LIVE_BACKEND_MODEL === 'gpt-6-luna' && req.body?.capabilities?.includes('batch_fields') ? { reasoning: { effort: 'low' } } : {}),
                 tool_choice: 'auto',
                 parallel_tool_calls: false
