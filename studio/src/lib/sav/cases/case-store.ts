@@ -12,7 +12,7 @@ import { readCaseBlockHold } from "./case-block-hold";
 import { readCaseTeamPartWait } from "./case-team-part-wait";
 import { caseAdmissionStatus, caseRequestFamilyProven, decideCaseAdmission, type CaseAdmissionInput } from "./admission-policy";
 import {
-  SAV_CASE_ADMISSION_TEAM_REASONS, SAV_CASE_CONTRACT_REVISION, SAV_CASE_DEDUPE_PATTERNS, SAV_CASE_EVENT_DIRECTIONS, SAV_CASE_EVENT_KIND_DIRECTIONS, SAV_CASE_OWNER_TRANSITIONS, SAV_CASE_OWNERS,
+  SAV_CASE_ADMISSION_TEAM_REASONS, SAV_SMART_ENTRY_ADMISSION, SAV_CASE_CONTRACT_REVISION, SAV_CASE_DEDUPE_PATTERNS, SAV_CASE_EVENT_DIRECTIONS, SAV_CASE_EVENT_KIND_DIRECTIONS, SAV_CASE_OWNER_TRANSITIONS, SAV_CASE_OWNERS,
   SAV_CASE_CONTRACT_UPGRADES, SAV_CASE_INBOUND_SETTLE_SECONDS, SAV_CASE_PHASES, SAV_CASE_SENSITIVITIES, SAV_CASE_TIMER_CANCEL_REASONS, SAV_CASE_TIMER_STATES, caseAdmissionQualificationSchema, caseBodySchema, caseDedupeKey,
   SAV_CASE_ATTACHMENT_REF, SAV_CASE_AWAITING_V2_ATTRIBUTION, SAV_CASE_CRM_CHANGES, caseAttributionProofSchema, caseAwaitsV2Attribution, SAV_CASE_HOLDS_KEEPING_TIMERS, SAV_CASE_OPEN_REQUESTS_MAX, SAV_CASE_RETIRED_TRANSITIONS, SAV_CASE_SENSITIVE_FAMILIES, caseEventIsAdmissionInput, caseObservationSchema, caseOwnerAllowsPhase, caseSensitivityForFamily, caseTimerKey, emptyCaseBody, sourceRefSchema,
   type CaseActor, type CaseAdmissionDecision, type CaseAdmissionQualification, type CaseAdmissionRecord, type CaseBody, type CaseClaim, type CaseClaimRefusal, type CaseEvent,
@@ -301,7 +301,8 @@ async function attributeLocked(tx: CaseTx, row: CaseRow, proof: CaseAttributionP
   const current = toSnapshot(row);
   if (done || !caseAwaitsV2Attribution(current) || current.sensitivity !== "none" || current.body.openRequests.length >= SAV_CASE_OPEN_REQUESTS_MAX) return row;
   const decision = decideCaseAdmission({ policy: admission.policy, qualification: admission.qualification, caseSensitivity: current.sensitivity });
-  if (decision.target !== "agent" || !await attributionProven(tx, proof, current.ticketId)) return row;
+  // SAV-117 review P1B: a smart-entry admission never gives the case to the agent until the smart brain is wired (N8): the case stays with the team, waiting.
+  if (decision.target !== "agent" || decision.admission === SAV_SMART_ENTRY_ADMISSION || !await attributionProven(tx, proof, current.ticketId)) return row;
   const moved = await recordAdmission(tx, row, decision, admission.qualification, sourceRef, {
     owner: "agent", phase, payloadCiphertext: encryptSavPayload(parseBody({ ...current.body, handoff: null })),
   });
@@ -354,7 +355,8 @@ export async function openCaseEvent(input: OpenCaseEventInput) {
     if (!row) {
       // Sensitivity starts at none and is raised by the admission recorded just below.
       const decision = decideCaseAdmission({ policy: input.admission.policy, qualification, caseSensitivity: "none" });
-      const waits = decision.target === "agent" && input.attribution !== undefined;
+      // SAV-117 review P1B: a smart-entry admission waits like a pending attribution (team owner) until the smart brain is wired (N8).
+      const waits = decision.target === "agent" && (input.attribution !== undefined || decision.admission === SAV_SMART_ENTRY_ADMISSION);
       const owner: CaseOwner = decision.target === "agent" && !waits ? "agent" : "human";
       const body = owner === "agent" ? emptyCaseBody() : { ...emptyCaseBody(), handoff: { reason: waits ? SAV_CASE_AWAITING_V2_ATTRIBUTION : decision.reasons[0]! } };
       [row] = await tx.insert(savCases).values({

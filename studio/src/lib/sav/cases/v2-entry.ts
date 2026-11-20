@@ -107,14 +107,13 @@ export async function firstBlockEvidence(env: Env, messageId: string, gmailMessa
 
 /**
  * SAV-117 (N4), `SAV_V2_ENTRY_SMART=on` only (contract V1→V2: `smart-entry-switch.ts`): every request V1 classified `support` is the agent's, whatever its topic.
- * The WHOLE mail stays with the team (nothing returned, so `no_request`) when one request is not support (finance, cancellation, commercial...), when the mail
- * holds more requests than one reply covers, or when the stored mail cannot be read. No block detector, word list, model or policy is read here; identity, CRM
- * and the case's sensitivity are still decided by `decideCaseAdmission`. Dated by the mail it reads, so a re-evaluation of the same mail gives the same evidence.
+ * The WHOLE mail stays with the team (nothing returned, so `no_request`) when one request is not support (finance, cancellation, commercial...) or the stored mail
+ * cannot be read. Every request is kept, however many V1 relayed (review P1B: what one reply covers is the treatment's concern, never a second filter here).
+ * No block detector, word list, model or policy is read here; identity, CRM and the case's sensitivity are still decided by `decideCaseAdmission`. Dated by the mail it reads, so a re-evaluation of the same mail gives the same evidence.
  */
 async function smartSupportEvidence(messageId: string, gmailMessageId: string, requests: CaseRelayRequest[]): Promise<CaseAdmissionQualification["requests"]> {
   const outcome = (code: string) => console.info("sav_v2_entry_smart", { messageId, requests: requests.length, outcome: code });
   if (!requests.length || requests.some(request => request.kind !== "support")) { outcome("not_all_support"); return []; }
-  if (requests.length > SAV_CASE_AGENT_REQUESTS_PER_MAIL) { outcome("request_limit"); return []; }
   const mail = await storedEntryMail(messageId, gmailMessageId);
   if (!mail) { outcome("mail_unavailable"); return []; }
   outcome("support");

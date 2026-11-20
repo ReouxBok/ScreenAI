@@ -91,10 +91,9 @@ describe("switch on: every support mail is admitted, whatever its topic", () => 
     expect(await evidence({ ...ON, SAV_V2_ADMISSION_RULES_JSON: "{not json", SAV_V2_ACCESS_SKILL: "on" })).toHaveLength(1);
   });
 
-  it("a mail of several support requests: each is the agent's, up to the four one reply covers; beyond, the whole mail is the team's", async () => {
+  it("a mail of several support requests: every one is the agent's, however many V1 relayed (review P1B: no cap at the door)", async () => {
     mail(SHEET);
-    expect((await evidence(ON, support(4))).map(row => row.requestId)).toEqual(["gm-syn/r1", "gm-syn/r2", "gm-syn/r3", "gm-syn/r4"]);
-    expect(await evidence(ON, support(5))).toEqual([]);
+    for (const n of [4, 5, 15]) expect((await evidence(ON, support(n))).map(row => row.requestId)).toEqual(support(n).map(row => row.requestId));
   });
 
   it("support + cancellation (or finance, or any non-support request) in the same mail: the whole mail is the team's", async () => {
