@@ -17,9 +17,10 @@ import { accessSkillWireAnswer } from "../access-skill/access-skill-wire";
 import { createSavBenchAgent, smartBenchTurn } from "./smart-bench-agent";
 import { smartEmptyMemory } from "./smart-memory";
 import {
-  readSmartBenchSelfTestConfig, readSmartBenchSelfTestReport, readSmartBenchSelfTestRows, runSmartBenchSelfTestPass, smartBenchRunPattern, SAV_SMART_BENCH_NEW_CALLS, SAV_SMART_BENCH_SELFTEST_CORPUS, SAV_SMART_BENCH_SELFTEST_PREFIX, type SmartBenchSelfTestDeps,
+  readSmartBenchSelfTestConfig, readSmartBenchSelfTestReport, readSmartBenchSelfTestRows, runSmartBenchSelfTestPass, smartBenchItem, smartBenchReportLine, smartBenchRisky, smartBenchRunPattern, smartBenchSelfTestSet,
+  aggregateSmartBenchSelfTest, SAV_SMART_BENCH_NEW_CALLS, SAV_SMART_BENCH_SELFTEST_CORPUS, SAV_SMART_BENCH_SELFTEST_PREFIX, SAV_SMART_BENCH_SELFTEST_VARIANTS, type SmartBenchSelfTestDeps,
 } from "./smart-bench-selftest";
-import { readSmartLedger } from "./smart-ledger";
+import { readSmartLedger, smartItemKey } from "./smart-ledger";
 import { SAV_SMART_SHADOW_MODEL_CALLS } from "./smart-shadow";
 import { SMART_CONFORME, smartGoodDecision, smartReading } from "./smart-test-doubles";
 
@@ -79,13 +80,19 @@ describe("interrupteurs", () => {
     expect(net.calls).toEqual([]);
     expect(fetches).not.toHaveBeenCalled();
   });
-  it("valeurs bornées : identifiant, agent, lot ≤ 20, plafond ≤ 10 000 000 µUSD", () => {
-    expect(readSmartBenchSelfTestConfig(ENV())).toEqual({ mode: "run", runId: "run-1", agents: ["current", "new"], batch: 6, capMicroUsd: 10_000_000 });
+  it("valeurs bornées : identifiant, agent, lot ≤ 20, plafond par défaut 10 000 000 µUSD et ≤ 15 000 000, jeu, passes", () => {
+    expect(readSmartBenchSelfTestConfig(ENV())).toEqual({ mode: "run", runId: "run-1", agents: ["current", "new"], batch: 6, capMicroUsd: 10_000_000, set: "base", passes: 1 });
+    expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_MAX_MICRO_USD: "15000000" }))).toMatchObject({ mode: "run", capMicroUsd: 15_000_000 });
+    expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_MAX_MICRO_USD: "15000001" }))).toEqual({ mode: "refused", reason: "cap_invalid" });
+    expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_MAX_MICRO_USD: "0" }))).toEqual({ mode: "refused", reason: "cap_invalid" });
+    for (const set of ["base", "variants", "all", "risky"]) expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_SET: set }))).toMatchObject({ mode: "run", set });
+    for (const set of ["", "ALL", "tout", "base,risky"]) expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_SET: set }))).toEqual({ mode: "refused", reason: "set_invalid" });
+    expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_PASSES: "2" }))).toMatchObject({ mode: "run", passes: 2 });
+    for (const passes of ["0", "3", "", "deux", "1.5"]) expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_PASSES: passes }))).toEqual({ mode: "refused", reason: "passes_invalid" });
     expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_AGENT: "new" }))).toMatchObject({ agents: ["new"] });
     expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_ID: "a b" }))).toEqual({ mode: "refused", reason: "id_invalid" });
     expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_AGENT: "tous" }))).toEqual({ mode: "refused", reason: "agent_invalid" });
     expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_BATCH: "21" }))).toEqual({ mode: "refused", reason: "batch_invalid" });
-    expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_MAX_MICRO_USD: "10000001" }))).toEqual({ mode: "refused", reason: "cap_invalid" });
     expect(SAV_SMART_BENCH_NEW_CALLS).toBe(SAV_SMART_SHADOW_MODEL_CALLS);
     // v2: understand + 3 decide passes + verify + correct + reverify; the corpus is the 120 conversations plus the 12 multi-turn ones.
     expect(SAV_SMART_BENCH_NEW_CALLS).toBe(7);
@@ -124,7 +131,8 @@ describe("allumé : un paiement par conversation, 0 effet", () => {
     expect(lines).toHaveLength(3);
     for (const line of lines) {
       expect(line).toMatchObject({ runId: "run-log", agent: "new", passed: expect.any(Boolean), costMicroUsd: expect.any(Number) });
-      expect(Object.keys(line).sort()).toEqual(["agent", "calls", "conversationId", "costMicroUsd", "endedBy", "failedTurns", "family", "passed", "runId", "stopped", "turnsPlayed"]);
+      expect(Object.keys(line).sort()).toEqual(["agent", "calls", "conversationId", "costMicroUsd", "endedBy", "failedTurns", "family", "pass", "passed", "runId", "stopped", "turnsPlayed"]);
+      expect(line.pass).toBe(1);
     }
     const reports = logs.filter(([event]) => event === "sav_smart_bench_report").map(([, fields]) => fields);
     expect(reports).toHaveLength(1);
@@ -149,6 +157,69 @@ describe("allumé : un paiement par conversation, 0 effet", () => {
     const report = await readSmartBenchSelfTestReport("run-3");
     expect(report.current.conversationsStored + report.new.conversationsStored).toBe(6);
     expect(report.comparison.paired).toBe(3);
+  });
+});
+
+describe("jeux de conversations et seconde passe (coût maîtrisé)", () => {
+  it("base = les 132 inchangées ; variants = 3 par conversation ; all = les deux ; risky = sensibles + pièges, base et variantes", () => {
+    expect(smartBenchSelfTestSet("base")).toBe(SAV_SMART_BENCH_SELFTEST_CORPUS);
+    expect(smartBenchSelfTestSet("variants")).toHaveLength(3 * SAV_SMART_BENCH_SELFTEST_CORPUS.length);
+    const all = smartBenchSelfTestSet("all"), risky = smartBenchSelfTestSet("risky");
+    expect(all).toHaveLength(4 * SAV_SMART_BENCH_SELFTEST_CORPUS.length);
+    expect(new Set(all.map(row => row.id)).size).toBe(all.length);
+    expect(risky.length).toBeGreaterThan(0);
+    expect(risky.every(smartBenchRisky)).toBe(true);
+    expect(risky).toEqual(all.filter(smartBenchRisky));
+    // Every trap and every sensitive conversation is in it, from the base and from the variants.
+    for (const row of all.filter(row => row.family.startsWith("piege_") || row.turns.some(turn => [turn.expect.outcome].flat().includes("equipe_sensible"))))
+      expect(risky.map(r => r.id), row.id).toContain(row.id);
+    expect(risky.some(row => SAV_SMART_BENCH_SELFTEST_VARIANTS.includes(row))).toBe(true);
+    expect(risky.some(row => SAV_SMART_BENCH_SELFTEST_CORPUS.includes(row))).toBe(true);
+  });
+  it("clé de la passe 2 distincte, passe 1 inchangée", () => {
+    expect(smartBenchItem("r", "new", "nylas-01")).toBe("r:new:nylas-01");
+    expect(smartBenchItem("r", "new", "nylas-01", 1)).toBe("r:new:nylas-01");
+    expect(smartBenchItem("r", "new", "nylas-01", 2)).toBe("r:new:nylas-01:p2");
+  });
+  it("_PASSES=2 : chaque conversation réservée et payée une fois par passe, journal et rapport portent la passe, liste de stabilité", async () => {
+    const net = network(), logs: [string, Record<string, unknown>][] = [];
+    const env = ENV({ SAV_V2_SMART_BENCH_SELFTEST_AGENT: "new", SAV_V2_SMART_BENCH_SELFTEST_ID: "run-p2", SAV_V2_SMART_BENCH_SELFTEST_PASSES: "2" });
+    expect(await runSmartBenchSelfTestPass(deps(env, net, { log: (event, fields) => logs.push([event, fields]) }))).toMatchObject({ ran: 6, stoppedBy: "done", remaining: 0 });
+    const callsAfter = net.calls.length;
+    expect(await runSmartBenchSelfTestPass(deps(env, net))).toMatchObject({ ran: 0, stoppedBy: "done" });
+    expect(net.calls).toHaveLength(callsAfter);
+    expect(await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, "run-p2")).toMatchObject({ items: 6, open: {} });
+    const keys = (await f.db.select({ key: savSyncState.key }).from(savSyncState).where(like(savSyncState.key, smartBenchRunPattern("run-p2")))).map(row => row.key).sort();
+    expect(keys).toEqual(CORPUS.flatMap(row => [1, 2].map(pass => smartItemKey(SAV_SMART_BENCH_SELFTEST_PREFIX, smartBenchItem("run-p2", "new", row.id, pass as 1 | 2)))).sort());
+    const lines = logs.filter(([event]) => event === "sav_smart_bench_conversation").map(([, fields]) => fields);
+    expect(lines.map(line => line.pass)).toEqual([1, 1, 1, 2, 2, 2]);
+    expect(logs.find(([event]) => event === "sav_smart_bench_selftest")?.[1]).toMatchObject({ set: "base", passes: 2 });
+    const rows = await readSmartBenchSelfTestRows("run-p2");
+    expect(rows.map(row => row.pass).sort()).toEqual([1, 1, 1, 2, 2, 2]);
+    const report = aggregateSmartBenchSelfTest(rows);
+    expect(report.new.conversationsStored).toBe(3);
+    expect(report.pass2?.new.conversationsStored).toBe(3);
+    expect(report.pass2?.stability.new).toEqual({ compared: 3, unstable: [] });
+    // A pass 2 row that changed verdict is listed as unstable.
+    const flipped = rows.map(row => row.pass === 2 && row.conversationId === CORPUS[0]!.id && row.conversation ? { ...row, conversation: { ...row.conversation, passed: !row.conversation.passed } } : row);
+    const unstable = aggregateSmartBenchSelfTest(flipped).pass2!.stability.new;
+    expect(unstable.unstable.map(row => row.conversationId)).toEqual([CORPUS[0]!.id]);
+    expect(smartBenchReportLine("run-p2", aggregateSmartBenchSelfTest(flipped)).pass2?.stability.new).toMatchObject({ compared: 3, unstableCount: 1 });
+    // Rows stored before passes existed count as pass 1.
+    expect(aggregateSmartBenchSelfTest(rows.filter(row => row.pass === 1).map(row => ({ ...row, pass: undefined }))).new.conversationsStored).toBe(3);
+  });
+  it("_PASSES=2 sous plafond : la passe 2 est réservée avec son pire cas comme la passe 1, arrêt au plafond avant tout appel", async () => {
+    const net = network();
+    expect(await runSmartBenchSelfTestPass(deps(ENV({ SAV_V2_SMART_BENCH_SELFTEST_PASSES: "2", SAV_V2_SMART_BENCH_SELFTEST_MAX_MICRO_USD: "3" }), net))).toMatchObject({ ran: 0, stoppedBy: "money_cap" });
+    expect(net.calls).toEqual([]);
+  });
+  it("jeu refusé ou passes refusées : rien n'est lu ni appelé, raison fermée journalisée", async () => {
+    state.db = null;
+    const net = network(), logs: [string, Record<string, unknown>][] = [];
+    expect(await runSmartBenchSelfTestPass(deps(ENV({ SAV_V2_SMART_BENCH_SELFTEST_SET: "tout" }), net, { log: (event, fields) => logs.push([event, fields]) }))).toEqual({ skipped: "refused", reason: "set_invalid" });
+    expect(await runSmartBenchSelfTestPass(deps(ENV({ SAV_V2_SMART_BENCH_SELFTEST_PASSES: "3" }), net, { log: (event, fields) => logs.push([event, fields]) }))).toEqual({ skipped: "refused", reason: "passes_invalid" });
+    expect(logs).toEqual([["sav_smart_bench_selftest_refused", { reason: "set_invalid" }], ["sav_smart_bench_selftest_refused", { reason: "passes_invalid" }]]);
+    expect(net.calls).toEqual([]);
   });
 });
 

@@ -125,3 +125,17 @@ export class SavBenchStop extends Error { constructor(readonly detail: string) {
 
 /** Lower case, accents removed, apostrophes unified: what every deterministic comparison reads. */
 export const savBenchNormalize = (value: string) => value.normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[’`]/g, "'").toLowerCase();
+
+/**
+ * A paraphrase variant of a bench conversation (`bench-variants.ts`): wording only. Family, cards, canary, risky flag and every expectation
+ * are copied from the origin when it is built. `turns`: the customer's texts for the origin's first N turns (N between the variant's minimum
+ * and the origin's turn count); `alt`: optional rewordings of that turn's conditional replies, in the origin's order.
+ */
+export const SAV_BENCH_VARIANT_STYLES = ["court", "colere", "anxieux", "anglais", "fil_cite", "formel"] as const;
+export type SavBenchVariantStyle = typeof SAV_BENCH_VARIANT_STYLES[number];
+export type SavBenchVariantInput = Readonly<{
+  id: string; origin: string; style: SavBenchVariantStyle;
+  customer: Readonly<{ name: string; email: string }>;
+  subject: string;
+  turns: readonly (string | Readonly<{ text: string; alt?: readonly string[] }>)[];
+}>;
