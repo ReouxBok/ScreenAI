@@ -545,7 +545,7 @@ describe("provenance of a pilot reply, recomputed from the recorded decision: no
       await f.db.insert(knowledgeFamilyRevisions).values({ id: revisionId, familyId, revision: 1, canonicalHash: "syn-last-guard", document: doc, reviewState: transition === "approve" ? "pending" : "approved", reviewedBy: "ugo@limova.ai", reviewedAt: new Date(daysBefore(2)) });
       await f.db.insert(knowledgeProjections).values({ familyId, revisionId, surface: "sav", itemId: LOGIN.id, versionId: LOGIN.contentVersionId });
       /** One test clock: the investigation reads the incident on SYN_NOW, like the approval and the driver (provenanceDeps.now), never on the real day. */
-      const mail = await queued((bindings, _now, texts) => readRuntimeTemporaryIncidents(bindings, SYN_NOW, texts));
+      const mail = await queued(bindings => readRuntimeTemporaryIncidents(bindings, SYN_NOW));
       expect(await readPilotReplyProvenance(mail.proposal, provenanceDeps)).toMatchObject({ status: "proven" });
       const result = await executeIntakePass(mail.replyExecutionId, options, { afterMarker: async () => {
         if (transition === "approve") await f.db.update(knowledgeFamilyRevisions).set({ reviewState: "approved" }).where(eq(knowledgeFamilyRevisions.id, revisionId));
