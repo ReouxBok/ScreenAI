@@ -761,3 +761,40 @@ describe("SAV-97 : dernier contrôle avant envoi d'un dossier admis par le skill
     expect(sends).toBe(1);
   });
 });
+
+/*
+ * SAV-123 (N8): the smart reply's last look on the real executor (`smart/smart-send-fence.ts`), whoever approved it. A case the smart entry admitted
+ * (`smart_support`, `SAV_V2_ENTRY_SMART=on` in the process): OUR text with a cancellation word or an invitation to another platform is cancelled, never sent;
+ * a clean reply leaves once; a pause holds it.
+ */
+describe("SAV-123 : dernier contrôle avant envoi d'un dossier smart (filet sur notre réponse)", () => {
+  const SMART_ADMITTED = { policy: null, qualification: { ...ADMITTED.qualification, requests: [{ requestId: "r1", family: "other" as const,
+    provenance: { kind: "qualified_rule" as const, ruleId: "smart-entry", revision: "smart-entry.v1", at: AT, blockId: "smart-support" } }] } } as unknown as typeof ADMITTED;
+  beforeEach(() => { vi.stubEnv("SAV_V2_ENTRY_SMART", "on"); vi.stubEnv("SAV_V2_SMART_SUPPORT_MODE", "auto"); });
+
+  it("une réponse smart propre part une fois", async () => {
+    const s = await scenario("answer", { admission: SMART_ADMITTED, text: "Ouvrez l'onglet Intégrations puis reconnectez Google Sheets." });
+    expect((await readCase(s.caseId))!.admission).toMatchObject({ admission: "smart_support" });
+    const { id } = await admit(s);
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+  });
+  it.each([
+    ["résiliation", "Pour résilier votre abonnement, rendez-vous dans les paramètres.", "SAV_CASE_EFFECT_CANCELLED_REPLY_SENSITIVE_WORDING"],
+    ["autre plateforme", "Je vous recommande d'utiliser Zapier pour remplir votre tableau.", "SAV_CASE_EFFECT_CANCELLED_REPLY_OTHER_PLATFORM"],
+  ])("même approuvée (mode auto), une réponse smart bloquée par le filet (%s) est annulée, jamais envoyée", async (_label, text, reason) => {
+    const s = await scenario("answer", { admission: SMART_ADMITTED, text });
+    const { id } = await admit(s);
+    expect(await run(id)).toMatchObject({ reason });
+    expect(await effectsOf(id)).toEqual([]);
+    expect(sends).toBe(0);
+  });
+  it("pause d'Ugo active : la réponse smart approuvée attend, rien ne part", async () => {
+    const s = await scenario("answer", { admission: SMART_ADMITTED, text: "Ouvrez l'onglet Intégrations puis reconnectez Google Sheets." });
+    const { id } = await admit(s);
+    await setV2Pause("fully_paused");
+    await run(id);
+    expect(sends).toBe(0);
+    expect((await execution(id)).state).not.toBe("confirmed");
+  });
+});

@@ -128,6 +128,12 @@ export const smartSensitiveCommitment = (reply: string) => {
   return COMMITMENTS.some(pattern => pattern.test(folded)) || (SUBSCRIPTION_OBJECT.test(folded) && STOP_VERB.test(folded));
 };
 
+/** SAV-123 (N8): an invitation to use, switch to or praise another platform, sentence by sentence (the same rules as `other_platform_recommended` below). */
+export const smartOtherPlatformInvite = (reply: string) => sentencesOf(reply).some(sentence => {
+  const folded = fold(sentence), limova = /\b(?:limova|webinaire|academy|charly)\b/.test(folded), named = [...folded.matchAll(THIRD_PARTY)].length > 0;
+  return (SIGNUP.test(folded) && !limova) || SWITCH.test(folded) || (named && PRAISE.test(folded) && !limova);
+});
+
 const URL_RE = /\bhttps?:\/\/[^\s<>"')\]]+/giu;
 const DOMAIN = /(?<![\p{L}\p{N}@./-])(?:www\.)?[a-z0-9][a-z0-9-]{1,62}(?:\.[a-z0-9-]{1,62})*\.(?:com|fr|io|ai|net|org|co|app|eu|be|ch|ca|me|so|dev)(?![\p{L}\p{N}-])/giu;
 

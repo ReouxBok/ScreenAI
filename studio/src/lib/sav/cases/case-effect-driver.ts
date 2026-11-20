@@ -32,6 +32,8 @@ import {
 } from "./case-effects";
 import { readCaseReplyFacts } from "./case-reply-facts";
 import { accessSkillSendProblem } from "./access-skill/access-skill-send-fence";
+import { smartSendProblem } from "./smart/smart-send-fence";
+import { caseReplyEditableBody } from "./case-reply-outbound";
 import { caseReplyStoredTextProblem, caseReplyTextProblemForBasis } from "./case-reply-mode";
 import { judgeCurrentTicketOwner, readCaseTicketId, type CaseOwnerRefusal, type CaseTicketOwnerPort } from "./case-ticket-owner";
 import { findCaseReplySituationTakerForExecution } from "./case-reply-situation";
@@ -229,6 +231,11 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     if (phase === "reply") {
       const skill = accessSkillSendProblem({ env: deps.env(), admission: facts.admissionRecord ?? null, text: proposal.text, purpose: proposal.purpose });
       if (skill) return fault(skill);
+      // SAV-123 (N8): the smart reply's last look, whoever approved it (person or rule); an unreadable body is judged on the whole text.
+      let body = proposal.text;
+      try { body = caseReplyEditableBody(proposal.text); } catch { body = proposal.text; }
+      const smart = smartSendProblem({ admission: facts.admissionRecord as Parameters<typeof smartSendProblem>[0]["admission"], body, purpose: proposal.purpose });
+      if (smart) return fault(smart);
     }
     // A note describes an interaction that already happened: it is held by the mode, the pauses and the lease, not by what came after (but never by a LOCAL human).
     const live: CaseEffectLive = {

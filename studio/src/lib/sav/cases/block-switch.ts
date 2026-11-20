@@ -26,11 +26,16 @@ export const SAV_BLOCK_SWITCH_DEFAULT = Object.freeze({ mode: "off" as SavBlockM
 // Temporary compatibility exception. Never add new blocks; remove Access after an explicit setting is saved.
 export const SAV_BLOCK_SWITCH_LEGACY_AUTO_BLOCKS: readonly string[] = Object.freeze([SAV_CASE_ACCESS_BLOCK_ID]);
 /**
- * SAV-123 (N8, Ugo): the smart block (`smart-support`) is in `draft` with no row, and never more than `draft` even when its row says `auto`: every smart reply
- * is proposed for a person, never approved by a rule nor sent automatically. Automatic sending is Ugo's go, not this code's. `off` and the pause still apply.
+ * SAV-123 (N8, Ugo): the smart block (`smart-support`) is not in the Studio's block list. Its mode is `draft` by default: every smart reply is proposed for a
+ * person. It is `auto` only when `SAV_V2_SMART_SUPPORT_MODE=auto` (exactly; any other value keeps `draft`): then A's rule MAY approve, every other gate still
+ * applying (global automatic reply and approver, validator, proofs, owner, budgets, duplicates, pauses, the smart send fence). A row for the block can only
+ * restrict (`off`, pause, `draft`), never raise it above the variable.
  */
+export const SAV_V2_SMART_SUPPORT_MODE_ENV = "SAV_V2_SMART_SUPPORT_MODE";
 export const SAV_BLOCK_SWITCH_DRAFT_ONLY_BLOCKS: readonly string[] = Object.freeze([SAV_SMART_ENTRY_BLOCK_ID]);
-const draftOnly = (blockId: string, mode: SavBlockMode): SavBlockMode => SAV_BLOCK_SWITCH_DRAFT_ONLY_BLOCKS.includes(blockId) && mode === "auto" ? "draft" : mode;
+type Env = Readonly<Record<string, string | undefined>>;
+const smartAuto = (env: Env) => env[SAV_V2_SMART_SUPPORT_MODE_ENV] === "auto";
+const draftOnly = (blockId: string, mode: SavBlockMode, env: Env): SavBlockMode => SAV_BLOCK_SWITCH_DRAFT_ONLY_BLOCKS.includes(blockId) && mode === "auto" && !smartAuto(env) ? "draft" : mode;
 export const savBlockSwitchKey = (blockId: string) => `${SAV_BLOCK_SWITCH_REVISION}:${blockId}`;
 export const savBlockSwitchSchema = z.object({
   revision: z.literal(SAV_BLOCK_SWITCH_REVISION), blockId: z.string().regex(SAV_CASE_BLOCK_ID), mode: z.enum(SAV_BLOCK_MODES), paused: z.boolean(),
@@ -39,13 +44,13 @@ export const savBlockSwitchSchema = z.object({
 export type SavBlockSwitch = z.infer<typeof savBlockSwitchSchema>;
 export type SavBlockSwitchState = Readonly<{ blockId: string; mode: SavBlockMode; paused: boolean; setting: SavBlockSwitch | null; invalid: boolean }>;
 
-export async function readSavBlockSwitch(db: Reader, blockId: string): Promise<SavBlockSwitchState> {
+export async function readSavBlockSwitch(db: Reader, blockId: string, env: Env = process.env): Promise<SavBlockSwitchState> {
   const [row] = await db.select({ cursor: savSyncState.cursor }).from(savSyncState).where(eq(savSyncState.key, savBlockSwitchKey(blockId)));
-  if (!row) return { blockId, ...SAV_BLOCK_SWITCH_DEFAULT, mode: SAV_BLOCK_SWITCH_LEGACY_AUTO_BLOCKS.includes(blockId) ? "auto" : SAV_BLOCK_SWITCH_DRAFT_ONLY_BLOCKS.includes(blockId) ? "draft" : "off", setting: null, invalid: false };
+  if (!row) return { blockId, ...SAV_BLOCK_SWITCH_DEFAULT, mode: SAV_BLOCK_SWITCH_LEGACY_AUTO_BLOCKS.includes(blockId) ? "auto" : SAV_BLOCK_SWITCH_DRAFT_ONLY_BLOCKS.includes(blockId) ? (smartAuto(env) ? "auto" : "draft") : "off", setting: null, invalid: false };
   try {
     const setting = savBlockSwitchSchema.parse(decryptSavPayload(row.cursor!));
     if (setting.blockId !== blockId) throw Error("SAV_BLOCK_SWITCH_KEY_MISMATCH");
-    return { blockId, mode: draftOnly(blockId, setting.mode), paused: setting.paused, setting, invalid: false };
+    return { blockId, mode: draftOnly(blockId, setting.mode, env), paused: setting.paused, setting, invalid: false };
   } catch { return { blockId, mode: "off", paused: false, setting: null, invalid: true }; }
 }
 

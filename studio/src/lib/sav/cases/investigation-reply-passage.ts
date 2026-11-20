@@ -24,7 +24,9 @@ import { readCaseInvestigationProgress } from "./investigation-record";
 import { caseAdmissionNamesLatestInput, latestInvestigationInput } from "./investigation-runner";
 import { runCaseInvestigationRuntime, type CaseInvestigationRuntimeDeps, type CaseInvestigationRuntimeReport } from "./investigation-runtime";
 import { readPilotReplyProvenance, type PilotProvenanceDeps } from "./pilot-passage-provenance";
-import { isSmartSupportStamp, smartSupportStampInForce } from "./smart-support-scope";
+import { caseSmartSupportOpen, isSmartSupportStamp, smartSupportStampInForce } from "./smart-support-scope";
+import { savV2EntrySmartOn } from "./smart-entry-switch";
+import { smartSendProblem } from "./smart/smart-send-fence";
 
 /*
  * B (4/11, LOCAL and OFF): from the investigation of an admitted case to the NORMAL send plan, and nothing else. B proposes the recorded
@@ -83,8 +85,8 @@ async function latestDraft(caseId: string, provenance: PilotProvenanceDeps, env:
  * one block in draft leaves the whole reply to a person. The entry already moved a stricter block's requests to the team, so this only bites when a
  * switch changed between the entry and the reply.
  */
-async function blockReplyGate(blockIds: readonly string[]): Promise<{ blockId: string; gate: ReturnType<typeof savBlockReplyGate> }> {
-  const gates = await Promise.all(blockIds.map(async blockId => ({ blockId, gate: savBlockReplyGate(await readSavBlockSwitch(requireDb(), blockId)) })));
+async function blockReplyGate(blockIds: readonly string[], env: Record<string, string | undefined>): Promise<{ blockId: string; gate: ReturnType<typeof savBlockReplyGate> }> {
+  const gates = await Promise.all(blockIds.map(async blockId => ({ blockId, gate: savBlockReplyGate(await readSavBlockSwitch(requireDb(), blockId, env)) })));
   return gates.find(row => row.gate.send === "never") ?? gates.find(row => row.gate.send === "person") ?? gates[0]!;
 }
 
@@ -107,7 +109,13 @@ async function autoFacts(caseId: string, deps: CaseReplyPassageDeps, decision: {
     decision: decision ? { accepted: true, scopeCurrent: decision.draft.replyLimit !== "access_scope_unknown" && decision.draft.replyLimit !== "access_scope_changed",
       shownSourcesVerified: proven, nextAction: decision.nextAction } : null,
     ownerNow,
+    ...(decision && isSmartSupportStamp(decision.draft.accessScope) && caseSmartSupportOpen(snapshot) && savV2EntrySmartOn(deps.store.env()) ? { smartSupport: true } : {}),
   };
+  // SAV-123 (N8): the smart send fence on the text the rule would approve (the effect driver looks again before sending).
+  if (decision?.draft.reply) {
+    const net = smartSendProblem({ admission: snapshot.admission, body: decision.draft.reply.text, purpose: decision.draft.reply.purpose });
+    if (net) reasons.push(net.toLowerCase());
+  }
   return { facts, reasons };
 }
 
@@ -121,7 +129,7 @@ export function caseAccessAutoReplyAuthorizer(deps: Pick<CaseReplyPassageDeps, "
   return async request => {
     // The block's switch first: off, paused or draft, the rule never approves (a person still may, through C's own path).
     const current = await latestDraft(request.caseId, deps.provenance, deps.store.env());
-    const { gate } = await blockReplyGate(current.draft ? current.blockIds : [SAV_CASE_ACCESS_BLOCK_ID]);
+    const { gate } = await blockReplyGate(current.draft ? current.blockIds : [SAV_CASE_ACCESS_BLOCK_ID], deps.store.env());
     if (gate.send !== "rule") return { allowed: false, reason: gate.code };
     const [row] = await requireDb().select().from(savCaseReplyValidations).where(and(eq(savCaseReplyValidations.caseId, request.caseId),
       eq(savCaseReplyValidations.replyKey, request.replyKey), eq(savCaseReplyValidations.payloadHash, request.payloadHash)));
@@ -157,7 +165,7 @@ export async function passCaseInvestigationToReplyPlan(caseId: string, deps: Cas
     if (!queued?.ok) return { status: "proposal_refused", caseId, code: "team_part_handoff_unavailable", detail: queued ? (queued.why ?? queued.code) : deps.policy ? "notice_unreadable" : "execution_policy_absent" };
   }
   // Per-block switch (12/11): off or paused, nothing is proposed for this block; the case waits visibly with the block's code (never a silent skip).
-  const { blockId: gateBlock, gate } = await blockReplyGate(latest.blockIds);
+  const { blockId: gateBlock, gate } = await blockReplyGate(latest.blockIds, deps.store.env());
   if (gate.send === "never") return { status: "block_held", caseId, blockId: gateBlock, reason: gate.code, detail: gateBlock };
   // Pre-checks before any write: the configured rule, the facts, the provenance of the reply B is about to propose.
   // The language is resolved ONCE, as C will (same input, same function); the provenance is proven on the text prepared once, in that
@@ -183,7 +191,8 @@ export async function passCaseInvestigationToReplyPlan(caseId: string, deps: Cas
     else {
       if (facts.case.owner !== "agent" || !facts.case.admitted) reasons.push("case_not_admitted");
       if (facts.case.sensitivity !== "none") reasons.push("sensitive");
-      if (!facts.openFamilies.length || facts.openFamilies.some(family => family !== "access")) reasons.push("not_access_only");
+      const family = facts.smartSupport ? "other" : "access";
+      if (!facts.openFamilies.length || facts.openFamilies.some(open => open !== family)) reasons.push("not_access_only");
       if (!["answer", "ask"].includes(latest.nextAction) && !(closingHandoffReplyEnabled(deps.store.env()) && isTerminalReply(draft.reply.purpose))) reasons.push("decision_not_reply");
       if (!facts.decision?.scopeCurrent) reasons.push("scope_not_current");
       if (facts.ownerNow !== "v2") reasons.push(facts.ownerNow === "unknown" ? "owner_unread" : "owner_not_v2");

@@ -38,7 +38,8 @@ import { SMART_CONFORME, smartGoodDecision, smartReading, smartScriptedModel } f
  * with the production wiring (pilot scope port closed: no scope at all, no block policy: revision null) → the smart brain chosen by the real provider
  * selection (scripted model, fake Gemini network never called) → the decision recorded with the smart stamp → B's passage to C's store: a proposal for a
  * PERSON (`smart-support` block in draft by default, never the rule) → a person approves → the reply effect is planned (one execution, nothing sent).
- * Switched off, or a source that is no longer fresh: nothing goes. No key, no network, no effect run.
+ * Switched off, or a source that is no longer fresh: nothing goes. `SAV_V2_SMART_SUPPORT_MODE=auto` lets A's rule approve (every other gate kept). No key, no
+ * network, no effect run.
  */
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId = "", policyId = "", seq = 9_123_000;
@@ -210,6 +211,32 @@ describe("SAV-123 (N8): from the stored mail to the planned reply effect, the sm
       expect(await caseAccessAutoReplyAuthorizer(passage())({ action: "approve", approverId: APPROVER, caseId: mail.caseId, replyKey: row!.replyKey, payloadHash: row!.payloadHash, purpose: "answer" }))
         .toEqual({ allowed: false, reason: "block_draft" });
     } finally { await f.db.delete(savSyncState).where(eq(savSyncState.key, key)); }
+    expect((await rows(mail.caseId)).effects).toBe(0);
+  });
+
+  it("SAV_V2_SMART_SUPPORT_MODE=auto (and the global automatic reply): the rule approves the proven smart reply and queues it, once, in the automated mode", async () => {
+    const { mail } = await decided();
+    const deps = passage({ env: { SAV_V2_SMART_SUPPORT_MODE: "auto" } });
+    const report = await passCaseInvestigationToReplyPlan(mail.caseId, deps);
+    expect(report).toMatchObject({ status: "queued", created: true });
+    const [row] = await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, mail.caseId));
+    expect(row).toMatchObject({ state: "approved", decidedBy: APPROVER, authorizationBasis: "auto_access.v1" });
+    expect(readCaseReplyDisclosure(decryptSavPayload<{ text: string }>(row!.proposalCiphertext).text)?.mode).toBe("automated");
+    expect(await passCaseInvestigationToReplyPlan(mail.caseId, deps)).toMatchObject({ status: "queued", created: false });
+    expect((await rows(mail.caseId)).effects).toBe(1);
+  });
+
+  it.each(["AUTO", "on", "true", ""])("SAV_V2_SMART_SUPPORT_MODE=%j (anything but `auto`): draft, a person validates", async value => {
+    const { mail } = await decided();
+    expect(await passCaseInvestigationToReplyPlan(mail.caseId, passage({ env: { SAV_V2_SMART_SUPPORT_MODE: value } })))
+      .toMatchObject({ status: "awaiting_person", reasons: ["block_draft"] });
+    expect((await rows(mail.caseId)).effects).toBe(0);
+  });
+
+  it("auto, but the global automatic reply is off: a person validates (the smart mode bypasses no gate)", async () => {
+    const { mail } = await decided();
+    expect(await passCaseInvestigationToReplyPlan(mail.caseId, passage({ env: { SAV_V2_SMART_SUPPORT_MODE: "auto", SAV_V2_AUTO_REPLY: undefined } })))
+      .toMatchObject({ status: "awaiting_person", reasons: ["auto_disabled"] });
     expect((await rows(mail.caseId)).effects).toBe(0);
   });
 
