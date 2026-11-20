@@ -50,14 +50,19 @@ describe("contrat (lot A)", () => {
     expect(parseSmartOutput(smartVerdictSchema, { verdict: "non_conforme", problems: [] }).ok).toBe(false);
     expect(parseSmartOutput(smartDecisionSchema, smartGoodDecision({ reply: "x".repeat(6_001) })).ok).toBe(false);
   });
-  it("v2 : une étape « final » porte une décision ; « tools » porte 1 à 3 appels ; une décision v1 nue est refusée comme étape", () => {
+  it("v2 : une étape « final » porte une décision ; « tools » porte 1 à 3 appels ; une décision écrite à plat est lue comme étape finale (v4)", () => {
     expect(parseSmartOutput(smartStepSchema, { thinking: "ok", action: "final", calls: [], decision: smartGoodDecision() }).ok).toBe(true);
     expect(parseSmartOutput(smartStepSchema, { action: "final", calls: [] }).ok).toBe(false);
     expect(parseSmartOutput(smartStepSchema, { action: "tools", calls: [] }).ok).toBe(false);
-    expect(parseSmartOutput(smartStepSchema, smartGoodDecision()).ok).toBe(false);
+    // v4 (20/11): a decision written flat is read as a final step (it still goes through every check); a bare string is still refused.
+    expect(parseSmartOutput(smartStepSchema, smartGoodDecision())).toMatchObject({ ok: true, value: { action: "final", calls: [] } });
+    expect(parseSmartOutput(smartStepSchema, "final").ok).toBe(false);
     const call = (id: string) => ({ id, tool: "chercher_fiches", needId: "n1", args: { recherche: "connexion" } });
-    expect(parseSmartOutput(smartStepSchema, { action: "tools", calls: [call("t1"), call("t2"), call("t3"), call("t4")] }).ok).toBe(false);
-    expect(parseSmartOutput(smartStepSchema, { action: "tools", calls: [call("t1"), call("t1")] }).ok).toBe(false);
+    // v4 (20/11): a 4th call is dropped (the runner ran 3 per pass anyway); repeated ids are renumbered t1..tn instead of failing the turn.
+    const four = parseSmartOutput(smartStepSchema, { action: "tools", calls: [call("t1"), call("t2"), call("t3"), call("t4")] });
+    expect(four.ok && four.value.calls.map(row => row.id)).toEqual(["t1", "t2", "t3"]);
+    const twice = parseSmartOutput(smartStepSchema, { action: "tools", calls: [call("t1"), call("t1")] });
+    expect(twice.ok && twice.value.calls.map(row => row.id)).toEqual(["t1", "t2"]);
   });
   it("v2 : la note d'équipe est un objet ; une note texte du modèle devient le besoin (jamais perdue)", () => {
     const parsed = parseSmartOutput(smartDecisionSchema, smartGoodDecision({ outcome: "handoff", teamNote: "Le client ne reçoit plus ses mails." }));

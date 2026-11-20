@@ -1,7 +1,7 @@
 import { savReplyFooter } from "../../reply-format";
 import { smartServerChecks, type SmartSource } from "./smart-checks";
 import {
-  parseSmartOutput, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartVerdictSchema,
+  parseSmartOutput, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchema,
   type SmartCallKind, type SmartCheckCode, type SmartDecision, type SmartReading, type SmartTeamNote, type SmartTurnOutcome, type SmartVerdict,
 } from "./smart-contract";
 import { renderSmartTeamNote, smartFallbackNote, smartSensitiveNote } from "./smart-handoff-note";
@@ -281,7 +281,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   corrected = true;
   const fixed = await call("correct", smartCorrectionPrompt(), { ...lastPayload, tools: [], lastStep: true, previousDecision: decision, problems }, 0.3);
   if (fixed.status === "failed") return fixed.problem === "deadline" ? end("interrupted", [...reasons, "correct:deadline"]) : handoff([...reasons, `correct:${fixed.problem}`, "refused_once"], "panne");
-  const output = fixed.output as { decision?: unknown } | null;
+  const output = smartUnwrapOutput(fixed.output) as { decision?: unknown } | null;
   const parsedFix = parseSmartOutput(smartDecisionSchema, output && typeof output === "object" && "decision" in output ? output.decision : output);
   if (!parsedFix.ok) return handoff([...reasons, "correct:output_invalid", "refused_once"], "panne");
   decision = gate.mustHandOff && parsedFix.value.outcome !== "handoff" ? forceHandoff(parsedFix.value, "trop_d_echanges") : parsedFix.value;
