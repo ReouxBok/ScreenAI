@@ -41,7 +41,7 @@ function network(options: { onCall?: (kind: Kind) => void; decide?: unknown } = 
     const system: string = body.systemInstruction.parts[0].text, payload = JSON.parse(body.contents[0].parts[0].text);
     const kind: Kind = system.startsWith("Tu lis un mail") ? "understand" : system.startsWith("RELECTURE") ? "verify" : "decide";
     calls.push({ kind, payload }); options.onCall?.(kind);
-    const output = kind === "understand" ? smartReading() : kind === "verify" ? SMART_CONFORME : options.decide ?? smartGoodDecision();
+    const output = kind === "understand" ? smartReading() : kind === "verify" ? SMART_CONFORME : { thinking: "", action: "final", calls: [], decision: options.decide ?? smartGoodDecision() };
     return Response.json(accessSkillWireAnswer(output, { inputTokens: 1_000, outputTokens: 200 }));
   };
   return { fn, calls };
@@ -208,6 +208,7 @@ describe("rapport", () => {
     expect(report).toMatchObject({ mails: 2, outcomes: { handoff: 1, team_sensitive: 1 }, sensitiveStopped: { net: 1, understand: 0 }, corrected: 1, refusedAfterCorrection: 1 });
     expect(report.serverRefusals.other_platform_recommended).toBe(2);
     expect(report.bytesByStage.decide?.count).toBe(1);
+    expect(report).toMatchObject({ tools: { calls: 0, mailsWithTools: 0, decidePasses: { 1: 1 } }, progressHandoffs: 0, withTeamNote: 1 });
     expect(report.costMicroUsd.total).toBeGreaterThan(0);
     expect(JSON.stringify(report)).not.toMatch(/Yonos|résilier/);
   });

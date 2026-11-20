@@ -5,7 +5,9 @@ import { savIntakeExecutions, savMessages, savSyncState } from "@/db/schema";
 import { decryptSavPayload } from "../../crypto";
 import { SAV_RETRIEVAL_EMBEDDING_DIMENSION } from "../../request-retrieval-db";
 import { SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
-import { runSmartTurn, type SmartKnowledgePort, type SmartThreadMessage, type SmartTurnResult } from "./smart-agent";
+import { runSmartTurn, SAV_SMART_MAX_EMBED_CALLS, SAV_SMART_MAX_MODEL_CALLS, type SmartKnowledgePort, type SmartThreadMessage, type SmartTurnResult } from "./smart-agent";
+import { smartMaxExchanges } from "./smart-memory";
+import { getAcademyTools } from "./tools/academy";
 import { SAV_SMART_CONTRACT_REVISION } from "./smart-contract";
 import { smartDbKnowledge } from "./smart-knowledge";
 import { claimSmartItem, readSmartLedger, settleSmartItem, smartContainedErrorCode, smartItemKey, smartLedgerSpent, type SmartItemRow } from "./smart-ledger";
@@ -23,7 +25,7 @@ import { readSmartShadowConfig, SAV_SMART_SHADOW_LOOKBACK_MS } from "./smart-swi
  * case and the agent as owner): no case, no admission, no ticket, no mail, no HubSpot, no Slack, nothing queued. Only the model endpoint is called.
  *
  * Money: the shadow's OWN ledger (`smart-ledger.ts`), capped per UTC day in µUSD (10 EUR by default and at most) and in mails (20 by default),
- * V2's approved prices read only. Each mail is claimed with its WORST case (5 model calls + 1 embedding) before any paid call: two passes on the
+ * V2's approved prices read only. Each mail is claimed with its WORST case (7 model calls + 3 embeddings) before any paid call: two passes on the
  * same mail pay once; a crash keeps the reservation. Time: never started with less than 90 s left in the pass, no mail started with less than
  * 60 s, each call bounded by the time left; out of time, the mail stops as `interrupted` (its spend settled, never retried).
  * Storage: one encrypted row per mail in `sav.sync_state` (no migration), deleted after 30 days by this pass. Logs: closed codes and numbers only.
@@ -32,8 +34,8 @@ import { readSmartShadowConfig, SAV_SMART_SHADOW_LOOKBACK_MS } from "./smart-swi
 type Env = Readonly<Record<string, string | undefined>>;
 export const SAV_SMART_SHADOW_PREFIX = "sav-v2-smart-shadow.v1";
 export const SAV_SMART_SHADOW_RETENTION_MS = 30 * 86_400_000;
-/** Worst case of one mail: understand, decide, verify, correct, reverify, plus one query embedding. */
-export const SAV_SMART_SHADOW_MODEL_CALLS = 5, SAV_SMART_SHADOW_EMBED_CALLS = 1;
+/** Worst case of one mail (v2): understand, 3 decide passes, verify, correct, reverify, plus 3 query embeddings (first search + `chercher_fiches`). */
+export const SAV_SMART_SHADOW_MODEL_CALLS = SAV_SMART_MAX_MODEL_CALLS, SAV_SMART_SHADOW_EMBED_CALLS = SAV_SMART_MAX_EMBED_CALLS;
 const STEP_MIN_MS = 90_000, MAIL_MIN_MS = 60_000, CALL_MAX_MS = 25_000, CALL_MIN_MS = 8_000, CALL_MARGIN_MS = 3_000;
 
 export type SmartShadowStored = Readonly<{
@@ -48,6 +50,8 @@ export type SmartShadowDeps = Readonly<{
   log?: (event: string, fields: unknown) => void;
   /** Tests: the wall clock the deadline is read against (default `Date.now`). */
   clock?: () => number;
+  /** Tests: the Academy tools (default `getAcademyTools()`, empty unless `SAV_V2_SMART_ACADEMY=on`). */
+  academy?: Parameters<typeof runSmartTurn>[1]["academy"];
 }>;
 export type SmartShadowPass =
   | Readonly<{ skipped: "off" | "deadline" | "prompt_unpinned" | "price_unavailable" | "transport_invalid" | "model_invalid" }>
@@ -134,7 +138,7 @@ async function runSmartShadowPassUnsafe(deps: SmartShadowDeps, config: Exclude<R
       if (claim.reason === "already_claimed") { skippedMails.already_claimed = (skippedMails.already_claimed ?? 0) + 1; continue; }
       stoppedBy = claim.reason; break;
     }
-    // From here every call is paid inside the reservation: at most 5 model calls and 1 embedding, each bounded by the time left.
+    // From here every call is paid inside the reservation: at most 7 model calls and 3 embeddings, each bounded by the time left.
     let cost = 0, modelCalls = 0, embedCalls = 0;
     const timeout = () => Math.min(CALL_MAX_MS, left() - CALL_MARGIN_MS);
     const gemini = smartGeminiModel({ env: deps.env, now: deps.now, network: deps.network, callTimeoutMs: timeout });
@@ -162,7 +166,9 @@ async function runSmartShadowPassUnsafe(deps: SmartShadowDeps, config: Exclude<R
     let turn: SmartTurnResult;
     try {
       turn = await runSmartTurn({ subject: mail.subject, body: mail.body, thread: mail.thread },
-        { model: modelPort, knowledge: (deps.knowledge ?? (embed => smartDbKnowledge({ now: deps.now, embed })))(embedPort), maxInputBytes: cap, today: day });
+        { model: modelPort, knowledge: (deps.knowledge ?? (embed => smartDbKnowledge({ now: deps.now, embed })))(embedPort), maxInputBytes: cap, today: day,
+          // Shadow: nothing is sent, so the agent's own questions and trials are never recorded; the memory is seeded from the thread.
+          academy: deps.academy ?? getAcademyTools(), recordOwn: false, maxExchanges: smartMaxExchanges(env) });
     } catch {
       // Unexpected: the reservation is kept as spent (nothing is known of what was sent), the mail never retried.
       await settleSmartItem({ prefix: SAV_SMART_SHADOW_PREFIX, scope: day, item, costMicroUsd: Math.max(cost, worst), status: "failed", now: deps.now(), result: null });
@@ -196,7 +202,8 @@ const bump = (map: Record<string, number>, key: string) => { map[key] = (map[key
 export function aggregateSmartShadow(rows: readonly SmartShadowStored[]) {
   const outcomes: Record<string, number> = {}, refusals: Record<string, number> = {}, verifyRefusals: Record<string, number> = {}, stopReasons: Record<string, number> = {};
   const missingByTheme: Record<string, number> = {}, sensitiveStopped = { net: 0, understand: 0 }, bytes: Record<string, number[]> = {};
-  let corrected = 0, refusedAfterCorrection = 0, serverCaughtWhatVerifyPassed = 0;
+  let corrected = 0, refusedAfterCorrection = 0, serverCaughtWhatVerifyPassed = 0, toolCalls = 0, mailsWithTools = 0, progressHandoffs = 0, withTeamNote = 0;
+  const toolStatus: Record<string, number> = {}, decidePasses: Record<string, number> = {};
   for (const row of rows) {
     const turn = row.turn;
     bump(outcomes, turn.outcome);
@@ -209,6 +216,14 @@ export function aggregateSmartShadow(rows: readonly SmartShadowStored[]) {
     if (turn.reasons.includes("refused_after_correction")) refusedAfterCorrection += 1;
     for (const missing of turn.missing) bump(missingByTheme, missing.theme?.trim().toLowerCase() || "sans_theme");
     for (const call of turn.calls) (bytes[call.kind] ??= []).push(call.inputBytes);
+    // v2 (rows stored before the loop have no steps): tool calls by status, decide passes, handoffs forced by the progress rule, notes.
+    const steps = turn.steps ?? [], tools = steps.filter(step => step.kind === "tool");
+    toolCalls += tools.length; if (tools.length) mailsWithTools += 1;
+    for (const step of tools) bump(toolStatus, `${step.tool}:${step.status}`);
+    const passes = steps.filter(step => step.kind === "decide").length;
+    if (passes) bump(decidePasses, String(passes));
+    if (turn.reasons.some(reason => reason.startsWith("progress:"))) progressHandoffs += 1;
+    if (turn.teamNote) withTeamNote += 1;
   }
   return {
     mails: rows.length, outcomes, sensitiveStopped, stopReasons, serverRefusals: refusals, verifyRefusals, corrected, refusedAfterCorrection, serverCaughtWhatVerifyPassed,
@@ -216,6 +231,7 @@ export function aggregateSmartShadow(rows: readonly SmartShadowStored[]) {
     durationMs: spread(rows.map(row => row.durationMs)),
     bytesByStage: Object.fromEntries(Object.entries(bytes).map(([kind, values]) => [kind, spread(values)])),
     missingByTheme,
+    tools: { calls: toolCalls, mailsWithTools, byToolAndStatus: toolStatus, decidePasses }, progressHandoffs, withTeamNote,
     revisions: [...new Set(rows.map(row => `${row.revision}:${row.promptSha256.slice(0, 16)}:${row.model}:${row.codeSha ?? "?"}`))],
   };
 }
