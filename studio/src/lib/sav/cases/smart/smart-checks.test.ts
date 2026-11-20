@@ -80,6 +80,10 @@ describe("contrôles serveur sans modèle (lot D3)", () => {
       "La résiliation se fait en un clic depuis votre espace.",
       "Vous pouvez arrêter votre abonnement à tout moment.",
       "Pour mettre fin au contrat, écrivez-nous.",
+      // Third review (PORTE_1E): the object BEFORE the verb, in any order within one sentence.
+      "Dans vos paramètres Limova, ouvrez la rubrique Abonnement, cliquez sur “Annuler”, puis confirmez.",
+      "Votre forfait peut être suspendu depuis votre espace.",
+      "Pour votre offre, il suffit de cliquer sur Désactiver.",
     ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toContain("sensitive_commitment");
     for (const sentence of [
       "Vous pouvez annuler la routine depuis vos paramètres.",
@@ -88,6 +92,10 @@ describe("contrôles serveur sans modèle (lot D3)", () => {
       "Vous pouvez annuler une tâche en cours depuis la conversation.",
       "Votre facture est disponible dans votre espace, rubrique Facturation.",
       "Votre abonnement n'est pas en cause : le souci vient de la connexion Gmail.",
+      // Third review (PORTE_1E): « compte » is not a subscription object; « offre » as a verb is not one either.
+      "Vous pouvez arrêter la routine depuis votre compte Limova.",
+      "Limova offre la possibilité d'annuler une tâche en cours.",
+      "Votre abonnement est bien actif. Pour arrêter la routine, ouvrez sa conversation.",
     ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toEqual([]);
   });
   it("N2, enquête : demander l'URL de la conversation, des captures ou le numéro de téléphone du client n'est pas une demande de secret", () => {
