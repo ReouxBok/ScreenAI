@@ -20,6 +20,9 @@
 type Env = Readonly<Record<string, string | undefined>>;
 export const SAV_V2_ENTRY_SMART_ENV = "SAV_V2_ENTRY_SMART";
 export const savV2EntrySmartOn = (env: Env) => env[SAV_V2_ENTRY_SMART_ENV] === "on";
+/** SAV-123 (N8): the smart block may be approved by the rule only with `SAV_V2_SMART_SUPPORT_MODE=auto` (exactly); read by the block switch and at the send fence. */
+export const SAV_V2_SMART_SUPPORT_MODE_ENV = "SAV_V2_SMART_SUPPORT_MODE";
+export const savV2SmartSupportAuto = (env: Env) => env[SAV_V2_SMART_SUPPORT_MODE_ENV] === "auto";
 
 // The label, policy revision and provenance of a smart admission live with the case types (the pure admission rule imports nothing else).
 export {

@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const request = vi.hoisted(() => vi.fn());
 vi.mock("../hubspot-transport", () => ({ requestSavHubspot: request }));
 
-import { qualifyThreadlessTicket, readThreadlessTicket, SAV_THREADLESS_SOURCE_REVISION } from "./threadless-source";
+import { qualifyThreadlessTicket, readThreadlessTicket, SAV_THREADLESS_SOURCE_REVISION, threadlessAccessQualified } from "./threadless-source";
 
 const AT = "2026-11-18T10:00:00.000Z";
 const SITE = "/crm/v3/objects/tickets/987?properties=";
@@ -128,6 +128,14 @@ describe("admission d'un ticket sans fil", () => {
       .resolves.toEqual({ status: "human_wait", reason: "sensitive_request" });
     await expect(qualifyThreadlessTicket({ ...source, description: "", notes: [{ ...notes[0]!, body: TICKET.properties.content }] }, env, new Date(AT)))
       .resolves.toMatchObject({ status: "out_of_scope" });
+  });
+
+  it("PORTE 2A: only a fresh Access qualification lets a first mail leave (smart, gone or changed: no)", async () => {
+    const source = await fixture();
+    expect(threadlessAccessQualified(await qualifyThreadlessTicket(source, env, new Date(AT)))).toBe(true);
+    expect(threadlessAccessQualified(await qualifyThreadlessTicket(source, { ...env, SAV_V2_ENTRY_SMART: "on" }, new Date(AT)))).toBe(false);
+    expect(threadlessAccessQualified(await qualifyThreadlessTicket({ ...source, description: "Comment configurer mon agenda ?" }, env, new Date(AT)))).toBe(false);
+    expect(threadlessAccessQualified({ status: "human_wait", reason: "sensitive_request" })).toBe(false);
   });
 
   it("keeps the existing Gmail qualification scope closed to CRM tickets", async () => {

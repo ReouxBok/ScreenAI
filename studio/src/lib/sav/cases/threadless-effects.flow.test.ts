@@ -407,10 +407,16 @@ describe("SAV-96 new Gmail thread through entry, approval, effect and inbound re
   });
 });
 
-describe("SAV-123 (N8): the central hold before N8 is gone", () => {
-  it("an approved first mail already queued is sent under SAV_V2_ENTRY_SMART=on exactly as with the switch off (a person approved it)", async () => {
+describe("PORTE 2A (P1, risk of PORTE 1F): an Access first mail already queued needs a fresh Access qualification", () => {
+  it("SAV_V2_ENTRY_SMART turned on after the queue: the ticket now qualifies as smart, the Access first mail sends nothing", async () => {
     const s = fixture(), start = await approveAndQueue(s);
     vi.stubEnv("SAV_V2_ENTRY_SMART", "on");
+    expect((await s.run(start.executionId)).supervised).not.toMatchObject([{ state: "confirmed" }]);
+    expect(await effects(start.executionId)).toEqual([]);
+    expect(s.counts).toMatchObject({ gmailPosts: 0, crmPosts: 0 });
+  });
+  it("the same first mail with the switch off still leaves once (control)", async () => {
+    const s = fixture(), start = await approveAndQueue(s);
     expect((await s.run(start.executionId)).supervised).toMatchObject([{ state: "confirmed" }]);
     expect(s.counts).toMatchObject({ gmailPosts: 1, crmPosts: 1 });
   });

@@ -6,7 +6,7 @@ import { readCaseThreadlessSource } from "./case-store";
 import { readPilotReplyProvenance, type PilotProvenanceDeps } from "./pilot-passage-provenance";
 import { savV2NewThreadAutoEnabled, savV2NewThreadEnabled, THREADLESS_ACCESS_DRAFT, threadlessReplyShape, threadlessReplySubject } from "./threadless-config";
 import { threadlessAccessRevision } from "./threadless-guard";
-import { qualifyThreadlessTicket } from "./threadless-source";
+import { qualifyThreadlessTicket, threadlessAccessQualified } from "./threadless-source";
 
 /** The input key of a first mail: the ticket's own stored event (`investigation-runner.ts` `threadlessInput`). */
 export const threadlessInputKey = (eventId: string) => `ticket:${eventId}`;
@@ -22,7 +22,7 @@ export async function readThreadlessReplyProvenance(proposal: CaseReplyProposal,
   const row = await readCaseThreadlessSource(requireDb(), proposal.caseId, proposal.triggerEventId);
   if (!row?.source.contact || row.source.contact.email !== proposal.recipient || proposal.subject !== threadlessReplySubject(row.source.ticketId)
       || caseEffectHash(row.source) !== proposal.ticketSource?.version) return "threadless_source_changed";
-  if ((await qualifyThreadlessTicket(row.source, env)).status !== "admitted" || !await threadlessAccessRevision(env)) return "threadless_access_unproven";
+  if (!threadlessAccessQualified(await qualifyThreadlessTicket(row.source, env)) || !await threadlessAccessRevision(env)) return "threadless_access_unproven";
   // SAV-96 B: decided by the STORED origin of the draft, never by its text. The fixed draft (lot B, no decision, no card): its exact text, or a Studio
   // correction of it, as before. A model draft: proven like a thread reply, a correction skipping the text comparison only.
   if (proposal.ticketSource?.origin !== "model") {

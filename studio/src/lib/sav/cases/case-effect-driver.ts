@@ -32,7 +32,7 @@ import {
 } from "./case-effects";
 import { readCaseReplyFacts } from "./case-reply-facts";
 import { accessSkillSendProblem } from "./access-skill/access-skill-send-fence";
-import { smartSendProblem } from "./smart/smart-send-fence";
+import { smartSendProblem, smartSwitchProblem } from "./smart/smart-send-fence";
 import { caseReplyEditableBody } from "./case-reply-outbound";
 import { caseReplyStoredTextProblem, caseReplyTextProblemForBasis } from "./case-reply-mode";
 import { judgeCurrentTicketOwner, readCaseTicketId, type CaseOwnerRefusal, type CaseTicketOwnerPort } from "./case-ticket-owner";
@@ -234,7 +234,11 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
       // SAV-123 (N8): the smart reply's last look, whoever approved it (person or rule); an unreadable body is judged on the whole text.
       let body = proposal.text;
       try { body = caseReplyEditableBody(proposal.text); } catch { body = proposal.text; }
-      const smart = smartSendProblem({ admission: facts.admissionRecord as Parameters<typeof smartSendProblem>[0]["admission"], body, purpose: proposal.purpose });
+      const admission = facts.admissionRecord as Parameters<typeof smartSendProblem>[0]["admission"];
+      // PORTE 2A: the smart switches read again now (after the queue): entry off, or a rule's approval whose auto switches went off, sends nothing.
+      const switched = smartSwitchProblem({ env: deps.env(), admission, basis: approval?.basis ?? null, approvedBy: approval?.approvedBy ?? null });
+      if (switched) return fault(switched);
+      const smart = smartSendProblem({ admission, body, purpose: proposal.purpose });
       if (smart) return fault(smart);
     }
     // A note describes an interaction that already happened: it is held by the mode, the pauses and the lease, not by what came after (but never by a LOCAL human).
