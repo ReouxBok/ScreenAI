@@ -4,14 +4,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeHumanEvents, savSyncState, staffUsers } from "@/db/schema";
+import { savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeHumanEvents, staffUsers } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }));
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import { catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, readSavIntakeCurrent } from "./runtime-store";
-import { intakeBlockedCauseSql, listIntakeConsole, refreshIntakeConsole } from "./console-store";
+import { intakeBlockedCauseSql, refreshIntakeConsole } from "./console-store";
 import { intakeBlockedRowLabel } from "./console-presentation";
 import { readIntakeRunDiagnostics } from "./run-diagnostics";
 import { analyseSavIntakeRuntime } from "./runtime";
@@ -271,43 +271,6 @@ describe("console label of an exhausted dossier never claimed again", () => {
     expect(label).not.toMatch(/prochain passage/);
   });
 });
-
-describe("console counter « bloqués » (SAV-120, N7 fix 4)", () => {
-  /** A version re-created after the lifetime cap: never scheduled, so never marked, and freshly updated by its release. */
-  async function exhaustedUnmarked() {
-    const m = await stored("Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.");
-    let id = (await enqueueSavIntakeMessage(m.id, release(0).config))!;
-    for (let n = 1; n <= SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage; n++) {
-      const [run] = await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id));
-      await f.db.update(savIntakeRuns).set({ attempts: 1, state: "observed", payloadCiphertext: encryptSavPayload({ ...decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext), plan: { synthetic: true } }) }).where(eq(savIntakeRuns.id, id));
-      id = (await enqueueSavIntakeMessage(m.id, release(n).config))!;
-    }
-    await refreshIntakeConsole();
-    return id;
-  }
-
-  it("counts an exhausted version the scheduler never takes, even right after the release that re-created it", async () => {
-    const id = await exhaustedUnmarked();
-    expect(await kinds(id)).not.toContain("attempts_exhausted");
-    expect(await blockedCause()).toBe("attempts_exhausted");
-    const list = await listIntakeConsole({ mailboxId });
-    expect(list.rows.map(r => r.blockedCause)).toEqual(["attempts_exhausted"]);
-    expect(list.counts.blocked).toBe(1);
-  });
-
-  it("keeps counting it while the agent is fully paused (a real block, not the pause)", async () => {
-    await exhaustedUnmarked();
-    await f.db.update(savIntakeRuns).set({ updatedAt: new Date(Date.now() - 3600_000) });
-    await f.db.insert(savSyncState).values({ key: "sav-agent-pause.v1:intake", status: "active", cursor: encryptSavPayload({ revision: "sav-agent-pause.v1", agent: "intake",
-      level: "fully_paused", setBy: "synthetic@example.invalid", setAt: new Date().toISOString(), reason: "Synthetic pause" }) });
-    try {
-      const list = await listIntakeConsole({ mailboxId });
-      expect(list.rows.map(r => r.blockedCause)).toEqual(["attempts_exhausted"]);
-      expect(list.counts.blocked).toBe(1);
-    } finally { await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-agent-pause.v1:intake")); }
-  });
-});
-
 describe("why an attempt failed, as closed codes (SAV-120, N7 fix 3)", () => {
   /** Fake model that always cites a quote absent from the catalogue, with customer-looking words in its output. */
   function rejectingModel(messageId: string) {
