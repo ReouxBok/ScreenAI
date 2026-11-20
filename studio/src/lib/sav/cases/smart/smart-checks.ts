@@ -97,17 +97,18 @@ const COMMITMENTS: readonly RegExp[] = [
   /\b(?:resiliez|(?:annulez|arretez|stoppez|suspendez|mettez fin a|cloturez|fermez) (?:votre|l'|le) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement))\b/,
 ];
 /*
- * Orchestrator decision after the third review (PORTE_1E): no dependence on word order. A SENTENCE of our reply that carries BOTH a subscription
- * object and a stop verb, in any order (« ouvrez la rubrique Abonnement, cliquez sur “Annuler” »), refuses. « compte » is not an object
- * (« arrêter la routine depuis votre compte Limova » passes); « offre » and « plan » count as nouns only (with a determiner: « Limova offre… »
- * is a verb). A routine, a task, a scheduled send, an invoice or a price carry no object here and pass.
+ * Orchestrator decision after the fourth review (PORTE_1G): the WHOLE reply, not a sentence (splitting « …rubrique Abonnement. Cliquez sur
+ * “Annuler”… » in two sentences must not get through). A reply that carries ANYWHERE a subscription object and ANYWHERE a stop verb refuses.
+ * False positives are accepted: the turn goes to the team, no risk for the customer. « compte » is not an object (« arrêter la routine depuis
+ * votre compte Limova » passes); « offre » and « plan » count as nouns only (with a determiner: « Limova offre… » is a verb). A routine, a task,
+ * a scheduled send, an invoice or a price carry no object here and pass.
  */
 const SUBSCRIPTION_OBJECT = /\b(?:abonnements?|contrats?|forfaits?|souscriptions?|(?:l'|une?|votre|vos|mon|notre|son|cette|cet|ce|d'|des|les|le|la) ?(?:offres?|plans?))\b/;
 const STOP_VERB = /\b(?:annul\w*|arret\w*|mettre fin|mis fin|mettez fin|met fin|mettons fin|stopp?\w*|suspend\w*|interromp\w*|desactiv\w*)/;
 /** True when the reply commits to a sensitive action on the account, or speaks of cancelling the subscription (exported for the tests and the shadow report). */
 export const smartSensitiveCommitment = (reply: string) => {
   const folded = fold(reply);
-  return COMMITMENTS.some(pattern => pattern.test(folded)) || sentencesOf(reply).map(fold).some(sentence => SUBSCRIPTION_OBJECT.test(sentence) && STOP_VERB.test(sentence));
+  return COMMITMENTS.some(pattern => pattern.test(folded)) || (SUBSCRIPTION_OBJECT.test(folded) && STOP_VERB.test(folded));
 };
 
 const URL_RE = /\bhttps?:\/\/[^\s<>"')\]]+/giu;

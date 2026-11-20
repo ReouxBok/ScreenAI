@@ -84,6 +84,10 @@ describe("contrôles serveur sans modèle (lot D3)", () => {
       "Dans vos paramètres Limova, ouvrez la rubrique Abonnement, cliquez sur “Annuler”, puis confirmez.",
       "Votre forfait peut être suspendu depuis votre espace.",
       "Pour votre offre, il suffit de cliquer sur Désactiver.",
+      // Fourth review (PORTE_1G): the whole reply, the same procedure split in two sentences.
+      "Dans vos paramètres Limova, ouvrez la rubrique Abonnement. Cliquez sur “Annuler”, puis confirmez.",
+      // Accepted false positive (orchestrator): a subscription word and a stop verb anywhere in the reply → the team.
+      "Votre abonnement est bien actif. Pour arrêter la routine, ouvrez sa conversation.",
     ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toContain("sensitive_commitment");
     for (const sentence of [
       "Vous pouvez annuler la routine depuis vos paramètres.",
@@ -95,7 +99,6 @@ describe("contrôles serveur sans modèle (lot D3)", () => {
       // Third review (PORTE_1E): « compte » is not a subscription object; « offre » as a verb is not one either.
       "Vous pouvez arrêter la routine depuis votre compte Limova.",
       "Limova offre la possibilité d'annuler une tâche en cours.",
-      "Votre abonnement est bien actif. Pour arrêter la routine, ouvrez sa conversation.",
     ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toEqual([]);
   });
   it("N2, enquête : demander l'URL de la conversation, des captures ou le numéro de téléphone du client n'est pas une demande de secret", () => {
