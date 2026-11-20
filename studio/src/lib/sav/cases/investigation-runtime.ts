@@ -35,6 +35,8 @@ export type CaseInvestigationRuntimeDeps = {
   readTicketOwner?: CaseInvestigationPorts["readTicketOwner"];
   /** Pilot ACCÈS scope of sources (approved policy datum). Absent: closed, so no `access` case is searched or answered. */
   accessScope?: CaseInvestigationPorts["accessScope"];
+  /** SAV-123 (N8): `SAV_V2_ENTRY_SMART=on`, read at each run; absent, no smart case is decided without a scope (unchanged). */
+  smartSupport?: CaseInvestigationPorts["smartSupport"];
   temporaryIncidents?: CaseInvestigationPorts["temporaryIncidents"];
   temporaryKnowledge?: CaseInvestigationPorts["temporaryKnowledge"];
   admissionPolicyRevision?: CaseInvestigationStoreDeps["admissionPolicyRevision"];
@@ -83,6 +85,7 @@ export async function runCaseInvestigationRuntime(caseId: string, deps: CaseInve
     ...(deps.temporaryKnowledge ? { temporaryKnowledge: deps.temporaryKnowledge } : {}),
     ...(deps.customerContext ? { customerContext: deps.customerContext } : {}),
     ...(deps.threadlessInput ? { threadlessInput: deps.threadlessInput } : {}),
+    ...(deps.smartSupport ? { smartSupport: deps.smartSupport } : {}),
     // Scope-first knowledge (11/11): the exact-version read of the block's scope sources, and the transport's own preflight to fit the input.
     ...(readExact ? { readScopeCards: readExact } : {}), ...(deps.model.preflight ? { preflight: deps.model.preflight } : {}) });
 }

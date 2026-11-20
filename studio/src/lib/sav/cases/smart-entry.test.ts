@@ -161,8 +161,10 @@ describe("switch on: every support mail is admitted, whatever its topic", () => 
     expect(await evidence(OFF)).toEqual([]);
     const decision = decide(qualification(rows));
     const snapshot = { owner: "agent" as const, admissionInputVersion: 1, admission: { ...decision, decidedAt: AT, version: 1, inputVersion: 1, qualification: qualification(rows) } };
-    expect(caseAdmissionStatus(snapshot, "policy-syn-r1")).toEqual({ admitted: false, reason: "policy_changed" });
-    // The seam N8 wires: a V2 actor whose current revision is the smart one accepts it.
-    expect(caseAdmissionStatus(snapshot, SAV_SMART_ENTRY_POLICY_REVISION)).toEqual({ admitted: true });
+    expect(caseAdmissionStatus(snapshot, "policy-syn-r1", false)).toEqual({ admitted: false, reason: "policy_changed" });
+    // N8 (SAV-123): switch on, a smart admission is admitted under its own revision, whatever the block policy in force (or none).
+    expect(caseAdmissionStatus(snapshot, "policy-syn-r1", true)).toEqual({ admitted: true });
+    expect(caseAdmissionStatus(snapshot, null, true)).toEqual({ admitted: true });
+    expect(caseAdmissionStatus(snapshot, SAV_SMART_ENTRY_POLICY_REVISION, false)).toEqual({ admitted: true });
   });
 });

@@ -399,16 +399,9 @@ describe("holds: nothing leaves, nothing is lost", () => {
     expect(slack.state.calls).toHaveLength(0);
   });
 
-  it("SAV-123 (PORTE_1H P1): SAV_V2_ENTRY_SMART=on holds the notice pass like every other V2 effect: nothing claimed, no Slack, no HubSpot note; off, the one message goes", async () => {
-    const made = await handedOver("gm-hold-smart-entry");
-    const hubspot = { dispatch: vi.fn(async () => { throw Error("FORBIDDEN"); }), verify: vi.fn(async () => { throw Error("FORBIDDEN"); }) };
+  it("SAV-123 (N8): SAV_V2_ENTRY_SMART=on no longer holds the notice pass (the brain is wired): the one message goes, exactly as with the switch off", async () => {
+    await handedOver("gm-hold-smart-entry");
     environment = { ...environment, SAV_V2_ENTRY_SMART: "on" };
-    expect(await pass({ hubspot })).toEqual({ skipped: "smart_entry_awaiting_n8" });
-    expect((await noticeRows()).find(row => row.id === made.execution!.id)).toMatchObject({ state: "pending", leaseToken: null });
-    expect(await effectsOf(made.execution!.id)).toHaveLength(0);
-    expect(slack.state.calls).toHaveLength(0);
-    expect(hubspot.dispatch).not.toHaveBeenCalled();
-    environment = { ...environment, SAV_V2_ENTRY_SMART: undefined };
     await pass();
     expect(posts()).toHaveLength(1);
   });

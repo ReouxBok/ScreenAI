@@ -300,6 +300,8 @@ export const SAV_SMART_ENTRY_POLICY_REVISION = "smart-entry.v1";
 export const SAV_SMART_ENTRY_RULE_ID = "smart-entry";
 export const SAV_SMART_ENTRY_BLOCK_ID = "smart-support";
 export const SAV_SMART_ENTRY_FAMILY = "other" as const;
+/** SAV-123 (N8): the team wait of a HubSpot ticket the smart entry admitted with no mail thread (the agent does not open the exchange itself). */
+export const SAV_SMART_NO_THREAD_WAIT = "smart_no_thread";
 export const smartSupportProvenance = (at: string) =>
   ({ kind: "qualified_rule" as const, ruleId: SAV_SMART_ENTRY_RULE_ID, revision: SAV_SMART_ENTRY_POLICY_REVISION, at, blockId: SAV_SMART_ENTRY_BLOCK_ID });
 export const isSmartSupportProvenance = (provenance: Readonly<{ kind: string; ruleId?: string; revision?: string; blockId?: string }>) =>

@@ -305,7 +305,7 @@ export async function readIntakeAcknowledgement(messageId: string): Promise<Inta
 
 export type CaseRelayResult =
   | { skipped: "recording_off" | "intake_not_confirmed" | "source_missing" | "no_case_for_thread" | "thread_case_ambiguous" | "before_case" | "customer_return_wait" | "customer_return_not_consumed"
-      | "owner_handover_off" | "owner_handover_out_of_scope" | "owner_handover_smart_pending" | "owner_handover_not_attributed" | "owner_handover_ticket_mismatch" | "owner_handover_no_v1_execution" }
+      | "owner_handover_off" | "owner_handover_out_of_scope" | "owner_handover_not_attributed" | "owner_handover_ticket_mismatch" | "owner_handover_no_v1_execution" }
   | { caseId: string; version: number; created: boolean; appended: boolean; owner: string; relay: CaseRelayProof["kind"] | "v2_customer_return";
       admission: { target: string; reasons: string[] } | null; existingTicket?: SavV2ExistingTicketOwnerRule };
 
@@ -435,14 +435,12 @@ async function relayToCase(input: {
     confirmedTicket: input.confirmedTicket, deps: input.deps, target: relayProof.kind === "owner_handover_mail" ? undefined
       : { ticketId: input.ticketId, executionId: relayProof.kind === "intake_effects_confirmed" ? relayProof.executionId : null, runId: relayProof.intakeRunId, runVersion: relayProof.intakeRunVersion } });
   const handover = input.deps.ownerHandover;
-  // SAV-117 review P1B/1D: under `SAV_V2_ENTRY_SMART=on`, until the smart brain is wired (N8), EVERY handover waits, whatever its reading (the smart entry's, or
-  // a mail it leaves to the team such as support + cancellation). It is neither recorded nor « out of scope »: nothing is handed back to the team, no note, stage or
-  // owner is written in HubSpot; the marker keeps this outcome and the person's assignment stays as it is. Off: the Access check below, exactly as before.
+  // SAV-123 (N8): under `SAV_V2_ENTRY_SMART=on` a handover is the agent's when the smart entry admits it (every request its own, nothing sensitive); any other
+  // reading (support + cancellation, for one) is out of scope and the ticket goes back to the team. Off: the Access check below, exactly as before.
   if (handover && savV2EntrySmartOn(input.deps.env ?? process.env)) {
-    console.info("sav_v2_owner_handover_smart_pending", { messageId: relayProof.messageId, reading: smartQualification(admission.qualification) ? "smart_support" : "team" });
-    return { skipped: "owner_handover_smart_pending" };
-  }
-  if (handover && (!admission.qualification.requests.every(request => request.family === "access"
+    if (!smartQualification(admission.qualification) || decideCaseAdmission({ ...admission, caseSensitivity: caseSensitivityOf(input.decision) }).target !== "agent")
+      return { skipped: "owner_handover_out_of_scope" };
+  } else if (handover && (!admission.qualification.requests.every(request => request.family === "access"
     && (request.provenance.kind === "human" || (request.provenance.kind === "qualified_rule" && (request.provenance.blockId ?? SAV_CASE_ACCESS_BLOCK_ID) === SAV_CASE_ACCESS_BLOCK_ID)))
     || decideCaseAdmission({ ...admission, caseSensitivity: caseSensitivityOf(input.decision) }).target !== "agent")) return { skipped: "owner_handover_out_of_scope" };
   const guardOrdinaryAttribution = !handover && savV2OwnerHandoverEnabled(input.deps.env)

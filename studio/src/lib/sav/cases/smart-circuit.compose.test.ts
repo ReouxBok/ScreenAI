@@ -12,13 +12,16 @@ import {
 import { caseGeminiDecisionPreflight, caseGeminiDecisionProvider } from "./investigation-v2-providers";
 import type { CaseV2ModelTransport } from "./investigation-v2-spend";
 import { smartCaseDecisionProvider } from "./smart/smart-case-provider";
+import { SAV_SMART_SUPPORT_STAMP } from "./smart-support-scope";
 import { SMART_CONFORME, smartGoodDecision, smartReading, smartScriptedModel, type SmartScript } from "./smart/smart-test-doubles";
 import type { SmartTurnResult } from "./smart/smart-agent";
 
 /*
  * SAV-123 (N8): the smart brain in the REAL V2 decision path, end to end on in-memory ports: the production runner (`runCaseInvestigation`), the real
  * provider selection (`caseGeminiDecisionProvider`), the real validator (called by the runner), a scripted brain model and a fake Gemini network.
- * Fictional data only: no database, no key, no network, no effect. Every scenario counts the model calls of one turn (old brain vs smart).
+ * Fictional data only: no database, no key, no network, no effect. Every scenario counts the model calls of one turn (old brain vs smart). The pilot scope
+ * port is wired as in production; a smart case is decided without it while the switch is on (`smart-support-scope.ts`). The passage to the send plan and
+ * the person's approval are proven on PGlite in `smart-circuit.passage.flow.test.ts`.
  */
 
 const ON = { SAV_V2_ENTRY_SMART: "on" } as const;
@@ -58,8 +61,8 @@ type Run = { report: Awaited<ReturnType<typeof runCaseInvestigation>>; records: 
 
 /** One pass of the production runner on in-memory ports, the decision chosen by the REAL provider selection. */
 async function runTurn(options: { env: Record<string, string>; script?: SmartScript; mail: [string, string]; knowledge?: SavRetrievalCandidate[]; snapshot?: CaseSnapshot;
-  policyRevision?: string; geminiOutput?: unknown; pilot?: boolean }): Promise<Run> {
-  const env = { ...GEMINI_ENV, ...options.env }, snap = options.snapshot ?? snapshotOf(), knowledge = options.knowledge ?? [SHEET_CARD];
+  policyRevision?: string; geminiOutput?: unknown; pilot?: false }): Promise<Run> {
+  const env: Record<string, string> = { ...GEMINI_ENV, ...options.env }, snap = options.snapshot ?? snapshotOf(), knowledge = options.knowledge ?? [SHEET_CARD];
   const brain = smartScriptedModel(options.script ?? {}), turns: SmartTurnResult[] = [];
   const smart = smartCaseDecisionProvider({ model: brain.model, env: () => env, now: () => NOW, maxInputBytes: () => 100_000, observe: result => turns.push(result) });
   const network = vi.fn(async () => Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify(options.geminiOutput ?? {}) }] }, finishReason: "STOP" }],
@@ -90,8 +93,10 @@ async function runTurn(options: { env: Record<string, string>; script?: SmartScr
     record: async record => { records.push(record); },
     now: () => NOW,
     readTicketOwner: async () => "v2",
-    // The real runtime always wires the pilot scope port (`investigation-runtime.ts`: `deps.accessScope ?? (async () => null)`).
-    ...(options.pilot ? { accessScope: async () => null } : {}),
+    // The real runtime always wires the pilot scope port (`investigation-runtime.ts`: `deps.accessScope ?? (async () => null)`), and the factory the smart
+    // switch (`investigation-v2-factory.ts`): both are wired here by default, as in production.
+    ...(options.pilot === false ? {} : { accessScope: async () => null }),
+    smartSupport: () => env.SAV_V2_ENTRY_SMART === "on",
   };
   const report = await runCaseInvestigation("case-1", "observe", ports);
   return { report, records, circuitCalls, brainCalls: brain.calls, geminiCalls: network.mock.calls.length, turns };
@@ -179,7 +184,7 @@ describe("SAV-123 (N8) — un seul cerveau par cas", () => {
     nextAction: { kind: "ask", questions: [{ text: "Quel message s'affiche ?", requestId: "r1", reducesUncertainty: "Savoir où cela échoue.", seeks: [{ kind: "observed_result" }] }] } };
 
   it("6. interrupteur éteint → l'ancien fournisseur Gemini répond (1 appel), le cerveau smart n'est jamais appelé", async () => {
-    const run = await runTurn({ env: {}, mail: SHEET_MAIL, geminiOutput: OLD_OUTPUT, policyRevision: SAV_SMART_ENTRY_POLICY_REVISION,
+    const run = await runTurn({ env: {}, mail: SHEET_MAIL, geminiOutput: OLD_OUTPUT, policyRevision: SAV_SMART_ENTRY_POLICY_REVISION, pilot: false,
       script: { understand: { output: sheetReading }, decide: { output: sheetDecision() }, verify: { output: SMART_CONFORME } } });
     expect(run.report).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 1 });
     expect(run.geminiCalls).toBe(1);
@@ -190,7 +195,7 @@ describe("SAV-123 (N8) — un seul cerveau par cas", () => {
   it("interrupteur allumé, cas historique (sans admission smart) → toujours l'ancien fournisseur, jamais les deux", async () => {
     const history = { ...smartAdmission(), admission: undefined, policyRevision: "policy-r1" } as CaseAdmissionRecord;
     delete (history as { admission?: unknown }).admission;
-    const run = await runTurn({ env: ON, mail: SHEET_MAIL, geminiOutput: OLD_OUTPUT, snapshot: snapshotOf(history), policyRevision: "policy-r1",
+    const run = await runTurn({ env: ON, mail: SHEET_MAIL, geminiOutput: OLD_OUTPUT, snapshot: snapshotOf(history), policyRevision: "policy-r1", pilot: false,
       script: { understand: { output: sheetReading }, decide: { output: sheetDecision() }, verify: { output: SMART_CONFORME } } });
     expect(run.report).toMatchObject({ status: "recorded", modelCalls: 1 });
     expect(run.geminiCalls).toBe(1);
@@ -198,18 +203,32 @@ describe("SAV-123 (N8) — un seul cerveau par cas", () => {
   });
 
   it("vitesse : appels modèle d'un tour, ancien contre smart (modèle simulé)", async () => {
-    const old = await runTurn({ env: {}, mail: SHEET_MAIL, geminiOutput: OLD_OUTPUT });
+    const old = await runTurn({ env: {}, mail: SHEET_MAIL, geminiOutput: OLD_OUTPUT, pilot: false });
     const smart = await runTurn({ env: ON, mail: SHEET_MAIL, script: { understand: { output: sheetReading }, decide: { output: sheetDecision() }, verify: { output: SMART_CONFORME } } });
     const measured = { old: { circuit: old.circuitCalls.length, gemini: old.geminiCalls + old.brainCalls.length }, smart: { circuit: smart.circuitCalls.length, gemini: smart.geminiCalls + smart.brainCalls.length } };
     expect(measured).toEqual({ old: { circuit: 1, gemini: 1 }, smart: { circuit: 1, gemini: 3 } });
   });
 });
 
-describe("SAV-123 (N8) — incompatibilité constatée avec le circuit réel (pilote par périmètre)", () => {
-  it("avec le port de périmètre que le runtime branche toujours, un cas smart_support est écarté AVANT tout appel (block_scope_missing)", async () => {
-    const run = await runTurn({ env: ON, mail: SHEET_MAIL, pilot: true, script: { understand: { output: sheetReading }, decide: { output: sheetDecision() }, verify: { output: SMART_CONFORME } } });
+describe("SAV-123 (N8) — sans périmètre pilote pour un cas smart, interrupteur allumé seulement", () => {
+  it("port de périmètre branché (comme en production) + interrupteur allumé : le cas smart est décidé, la décision porte le tampon smart", async () => {
+    const run = await runTurn({ env: ON, mail: SHEET_MAIL, script: { understand: { output: sheetReading }, decide: { output: sheetDecision() }, verify: { output: SMART_CONFORME } } });
+    expect(run.report).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 1 });
+    expect(run.records[0]!.accessScope).toEqual(SAV_SMART_SUPPORT_STAMP);
+    expect(run.records[0]!.blockScopes).toBeUndefined();
+  });
+
+  it("interrupteur éteint, le même cas smart est écarté AVANT tout appel (block_scope_missing), comme avant N8", async () => {
+    const run = await runTurn({ env: {}, mail: SHEET_MAIL, script: { understand: { output: sheetReading }, decide: { output: sheetDecision() }, verify: { output: SMART_CONFORME } } });
     expect(run.report).toMatchObject({ status: "skipped", reason: "block_scope_missing", detail: "smart-support:scope_missing", modelCalls: 0 });
     expect(run.brainCalls).toEqual([]);
     expect(run.geminiCalls).toBe(0);
+  });
+
+  it("un cas smart dont une demande ouverte n'est pas du bloc smart garde les contrôles pilotes (aucun appel)", async () => {
+    const mixed = snapshotOf(smartAdmission(), { openRequests: [request, { ...request, id: "r2", family: "access" }] });
+    const run = await runTurn({ env: ON, mail: SHEET_MAIL, snapshot: mixed, script: { understand: { output: sheetReading } } });
+    expect(run.report).toMatchObject({ status: "skipped", modelCalls: 0 });
+    expect(run.brainCalls).toEqual([]);
   });
 });

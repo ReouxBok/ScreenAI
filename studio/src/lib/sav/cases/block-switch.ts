@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { requireDb } from "@/db";
 import { savSyncState } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
-import { SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_BLOCK_ID } from "./case-types";
+import { SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_BLOCK_ID, SAV_SMART_ENTRY_BLOCK_ID } from "./case-types";
 import { readAccessAutoApprovalConfig } from "./customer-return";
 
 /*
@@ -25,6 +25,12 @@ export type SavBlockMode = typeof SAV_BLOCK_MODES[number];
 export const SAV_BLOCK_SWITCH_DEFAULT = Object.freeze({ mode: "off" as SavBlockMode, paused: false });
 // Temporary compatibility exception. Never add new blocks; remove Access after an explicit setting is saved.
 export const SAV_BLOCK_SWITCH_LEGACY_AUTO_BLOCKS: readonly string[] = Object.freeze([SAV_CASE_ACCESS_BLOCK_ID]);
+/**
+ * SAV-123 (N8, Ugo): the smart block (`smart-support`) is in `draft` with no row, and never more than `draft` even when its row says `auto`: every smart reply
+ * is proposed for a person, never approved by a rule nor sent automatically. Automatic sending is Ugo's go, not this code's. `off` and the pause still apply.
+ */
+export const SAV_BLOCK_SWITCH_DRAFT_ONLY_BLOCKS: readonly string[] = Object.freeze([SAV_SMART_ENTRY_BLOCK_ID]);
+const draftOnly = (blockId: string, mode: SavBlockMode): SavBlockMode => SAV_BLOCK_SWITCH_DRAFT_ONLY_BLOCKS.includes(blockId) && mode === "auto" ? "draft" : mode;
 export const savBlockSwitchKey = (blockId: string) => `${SAV_BLOCK_SWITCH_REVISION}:${blockId}`;
 export const savBlockSwitchSchema = z.object({
   revision: z.literal(SAV_BLOCK_SWITCH_REVISION), blockId: z.string().regex(SAV_CASE_BLOCK_ID), mode: z.enum(SAV_BLOCK_MODES), paused: z.boolean(),
@@ -35,11 +41,11 @@ export type SavBlockSwitchState = Readonly<{ blockId: string; mode: SavBlockMode
 
 export async function readSavBlockSwitch(db: Reader, blockId: string): Promise<SavBlockSwitchState> {
   const [row] = await db.select({ cursor: savSyncState.cursor }).from(savSyncState).where(eq(savSyncState.key, savBlockSwitchKey(blockId)));
-  if (!row) return { blockId, ...SAV_BLOCK_SWITCH_DEFAULT, mode: SAV_BLOCK_SWITCH_LEGACY_AUTO_BLOCKS.includes(blockId) ? "auto" : "off", setting: null, invalid: false };
+  if (!row) return { blockId, ...SAV_BLOCK_SWITCH_DEFAULT, mode: SAV_BLOCK_SWITCH_LEGACY_AUTO_BLOCKS.includes(blockId) ? "auto" : SAV_BLOCK_SWITCH_DRAFT_ONLY_BLOCKS.includes(blockId) ? "draft" : "off", setting: null, invalid: false };
   try {
     const setting = savBlockSwitchSchema.parse(decryptSavPayload(row.cursor!));
     if (setting.blockId !== blockId) throw Error("SAV_BLOCK_SWITCH_KEY_MISMATCH");
-    return { blockId, mode: setting.mode, paused: setting.paused, setting, invalid: false };
+    return { blockId, mode: draftOnly(blockId, setting.mode), paused: setting.paused, setting, invalid: false };
   } catch { return { blockId, mode: "off", paused: false, setting: null, invalid: true }; }
 }
 

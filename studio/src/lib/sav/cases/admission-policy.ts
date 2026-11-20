@@ -117,11 +117,17 @@ export type CaseAdmissionStatus =
   | { admitted: false; reason: "owner_not_agent" | "no_admission" | "not_admitted" | "input_newer" | "policy_missing" | "policy_changed" };
 /** What every V2 actor (decision validator, runner, timers, executor) checks before acting:
  * `owner = agent` alone is not enough. */
-export function caseAdmissionStatus(snapshot: Pick<CaseSnapshot, "owner" | "admission" | "admissionInputVersion">, currentPolicyRevision: string | null): CaseAdmissionStatus {
+export function caseAdmissionStatus(snapshot: Pick<CaseSnapshot, "owner" | "admission" | "admissionInputVersion">, currentPolicyRevision: string | null,
+  /** `SAV_V2_ENTRY_SMART=on` (`smart-entry-switch.ts`), read from the process by default: every actor runs in the process whose switch it obeys. */
+  smartEntryOn: boolean = process.env.SAV_V2_ENTRY_SMART === "on"): CaseAdmissionStatus {
   if (snapshot.owner !== "agent") return { admitted: false, reason: "owner_not_agent" };
   if (!snapshot.admission) return { admitted: false, reason: "no_admission" };
   if (snapshot.admission.target !== "agent") return { admitted: false, reason: "not_admitted" };
   if (snapshot.admissionInputVersion > snapshot.admission.inputVersion) return { admitted: false, reason: "input_newer" };
+  // SAV-123 (N8): a smart admission is decided under the entry's own fixed revision (`smart-entry.v1`), never under `SAV_V2_ADMISSION_POLICY_JSON` (contract
+  // V1 → V2, line 4): it is admitted while `SAV_V2_ENTRY_SMART=on` and that revision is the code's. Switched off, it no longer matches the policy in force
+  // (`policy_changed`), so every actor stops and the policy sweep gives the case back to the team, exactly as for any other policy change.
+  if (smartEntryOn && snapshot.admission.admission === SAV_SMART_ENTRY_ADMISSION && snapshot.admission.policyRevision === SAV_SMART_ENTRY_POLICY_REVISION) return { admitted: true };
   if (currentPolicyRevision === null) return { admitted: false, reason: "policy_missing" };
   if (snapshot.admission.policyRevision !== currentPolicyRevision) return { admitted: false, reason: "policy_changed" };
   return { admitted: true };

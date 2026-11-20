@@ -5,6 +5,7 @@ import { buildCaseDecisionContext, type CaseDecisionContextProblem } from "./dec
 import { caseAccessScopeStamp, caseStampBlockId, readCaseAccessScope, type CaseAccessScopeStamp, type CaseBlockScope } from "./investigation-access-scope";
 import { caseAdmissionStatus } from "./admission-policy";
 import { caseOpenBlockId, caseOpenBlockIds, caseRequestBlockId } from "./case-blocks";
+import { caseSmartSupportOpen, SAV_SMART_SUPPORT_STAMP } from "./smart-support-scope";
 import type { CaseDecisionBlockScopes, CaseDecisionRejection, CaseDecisionValidation } from "./decision-contract";
 import { caseDecisionRefusalKinds, classifyCaseDecisionRefusal, type CaseDecisionRefusal, type CaseDecisionRefusalKind } from "./decision-recovery";
 import { caseModelLoginHistory, validateCaseDecision } from "./decision-validator";
@@ -265,6 +266,12 @@ export type CaseInvestigationPorts = {
    */
   accessScope?(): Promise<unknown>;
   /**
+   * SAV-123 (N8): true while `SAV_V2_ENTRY_SMART=on`. A case admitted by the smart entry whose open requests are all of the smart block
+   * (`caseSmartSupportOpen`) is then decided without a pilot scope (the smart brain has no source list): the validator's general checks apply, and the
+   * decision carries the smart stamp (`smart-support-scope.ts`), in force only while the switch is on. Absent or false: unchanged.
+   */
+  smartSupport?(): boolean;
+  /**
    * Scope-first knowledge (11/11): the block's scope sources the search did not return, read at their exact version (the knowledge base's
    * active version only; the runner keeps a card only if it is that exact version and valid now). Absent: only retrieved scope cards are sent.
    */
@@ -393,7 +400,10 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
   // widened; then no approved scope for the policy in force, no search (the scope is the proof its answers stay low risk).
   let accessScope: CaseBlockScope | undefined;
   let blockScopes: CaseDecisionBlockScopes | undefined;
-  if (ports.accessScope) {
+  const smartCase = ports.smartSupport?.() === true && caseSmartSupportOpen(snapshot);
+  if (smartCase) {
+    if (ports.accessScope && !namesLatest(snapshot, events)) return { status: "skipped", caseId, caseVersion, reason: "admission_not_current_input", modelCalls: 0 };
+  } else if (ports.accessScope) {
     if (!namesLatest(snapshot, events)) return { status: "skipped", caseId, caseVersion, reason: "admission_not_current_input", modelCalls: 0 };
     // Treatment blocks (11/11): a case whose open requests all belong to ONE other block is checked against that block's own scope, of its
     // own family. Anything else (Access, no request, a request without a block) keeps the Access pilot's checks, unchanged.
@@ -745,7 +755,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       revisions: await ports.revisions(), knowledge: knowledge.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId })),
       knowledgeRevision: selection.revision, coverage: (scoped ? caseScopedRecordCoverage(scoped) : coverage)?.map(({ requestId, status, knowledge: refs, limitations }) => ({ requestId, status, knowledge: refs, limitations: [...limitations] })) ?? null, actionsPaused, callSignal,
       ...(temporaryIncidents ? { temporaryIncidents } : {}),
-      ...(accessScope ? { accessScope: caseAccessScopeStamp(accessScope) } : {}),
+      ...(accessScope ? { accessScope: caseAccessScopeStamp(accessScope) } : smartCase ? { accessScope: { ...SAV_SMART_SUPPORT_STAMP } } : {}),
       ...(decisionContext.teamParts?.length ? { teamParts: decisionContext.teamParts.map(row => row.id) } : {}),
       ...(blockScopes ? { blockScopes: Object.values(blockScopes.scopes).map(caseAccessScopeStamp).sort((a, b) => caseStampBlockId(a).localeCompare(caseStampBlockId(b))) } : {}),
       ...(refusalHandoff ? { refusalHandoff } : {}),

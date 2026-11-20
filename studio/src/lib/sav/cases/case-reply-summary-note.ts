@@ -89,6 +89,7 @@ const NOT_TAKEN: Readonly<Record<string, string>> = {
   access_block_closed: "le traitement automatique des demandes d'accès est fermé",
   thread_ambiguous: "le ticket est lié à plusieurs fils de mails, ou son fil à un autre ticket ; l'agent ne choisit pas seul",
   identity_mismatch: "l'expéditeur du mail ne correspond pas au contact du ticket dans HubSpot",
+  smart_no_thread: "aucun fil de mail n'est lié à ce ticket ; l'agent ne commence pas seul l'échange avec le client",
 };
 /** Unknown, absent or technical reasons: the generic label, never the code itself. */
 const NOT_TAKEN_GENERIC = "la demande sort du périmètre actuel de l'agent";

@@ -11,7 +11,6 @@
 //              the notice ends as before and the journal says the note was not granted.
 // Nothing here is called by a route, a cron or an action: the caller injects the clock, the network and the policy. OFF until `SAV_HANDOFF_NOTICE=on` AND the execution
 // policy grants `notify_case_handoff`; `SAV_CASE_EFFECTS` (reply and note effects) is neither read nor needed.
-import { smartEntryEffectsHold } from "./smart-entry-switch";
 import "server-only";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, eq, gt, inArray, isNull, like, lt, lte, notExists, or, sql } from "drizzle-orm";
@@ -430,9 +429,6 @@ export type HandoffNoticePassResult =
  * granted HubSpot handoff note (SAV-92), the existing executor's HubSpot dispatch/verify. No CRM read, no Gmail. */
 export async function runHandoffNoticePass(deps: HandoffNoticeRuntimeDeps): Promise<HandoffNoticePassResult> {
   const env = deps.env();
-  // SAV-123 (PORTE_1H P1): the same central hold as every other V2 effect (`smartEntryEffectsHold`): no Slack post, no HubSpot note, nothing claimed; all stays due.
-  const hold = smartEntryEffectsHold(env);
-  if (hold) return { skipped: hold };
   if (readHandoffNoticeConfig(env).mode !== "on") return { skipped: "notice_off" };
   let config: ReturnType<typeof intakeExecutionConfig>;
   try { config = intakeExecutionConfig(env); } catch (error) { return { skipped: code(error) }; }

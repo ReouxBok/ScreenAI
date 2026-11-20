@@ -407,18 +407,10 @@ describe("SAV-96 new Gmail thread through entry, approval, effect and inbound re
   });
 });
 
-describe("SAV-117 review 1F: the central hold before N8 (`smartEntryEffectsHold`)", () => {
-  it("an approved first mail already queued: SAV_V2_ENTRY_SMART=on sends nothing, writes nothing in HubSpot, claims nothing; switch off, the same entry is sent", async () => {
+describe("SAV-123 (N8): the central hold before N8 is gone", () => {
+  it("an approved first mail already queued is sent under SAV_V2_ENTRY_SMART=on exactly as with the switch off (a person approved it)", async () => {
     const s = fixture(), start = await approveAndQueue(s);
-    const [before] = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.id, start.executionId));
-    const counted = { ...s.counts };
     vi.stubEnv("SAV_V2_ENTRY_SMART", "on");
-    for (const executionId of [start.executionId, undefined]) expect(await s.run(executionId)).toMatchObject({ skipped: "smart_entry_awaiting_n8", supervised: [] });
-    expect(s.counts).toEqual({ ...counted, gmailPosts: 0, crmPosts: 0 }); // not even a read: the hold comes before anything
-    expect(await effects(start.executionId)).toEqual([]);
-    const [held] = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.id, start.executionId));
-    expect(held).toEqual(before);
-    vi.stubEnv("SAV_V2_ENTRY_SMART", "");
     expect((await s.run(start.executionId)).supervised).toMatchObject([{ state: "confirmed" }]);
     expect(s.counts).toMatchObject({ gmailPosts: 1, crmPosts: 1 });
   });

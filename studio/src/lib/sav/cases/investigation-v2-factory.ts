@@ -1,5 +1,6 @@
 import "server-only";
 import { readConfirmedV1Context } from "./admission-context-reader";
+import { savV2EntrySmartOn } from "./smart-entry-switch";
 import { caseInvestigationQualify, type CaseApprovedRulePort } from "./admission-investigation-ports";
 import { caseTicketOwnerPortFromTransport } from "./admission-owner-reader";
 import type { AdmissionPolicyRecord, V1AdmissionAdapterPolicy } from "./admission-runtime";
@@ -106,6 +107,8 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
     ...(temporaryKnowledgeEnabled(env) ? { temporaryKnowledge: runtimeTemporaryKnowledgeLookup(input.env) } : {}),
     mode: "observe", holder: input.holder ?? "sav-v2-investigation", scope, now, leaseSeconds: input.leaseSeconds ?? 90,
     pauseState: casePauseState(caseV2PauseState(), input.env, now, input.caseAllowed), readTicketOwner, accessScope: provenance.accessScope, admissionPolicyRevision: provenance.currentPolicyRevision,
+    // SAV-123 (N8): a smart case is decided without a pilot scope while the smart entry is on (read at each run).
+    smartSupport: () => savV2EntrySmartOn(input.env()),
     // SAV-97: `SAV_V2_ACCESS_SKILL=on` requalifies a return with the Access skill, `shadow` compares it in the logs; `off`: exactly the legacy rule, or none.
     qualify: caseInvestigationReturnAwareQualify(v1Qualify, { readPolicyRecord, now, ...((rules => rules ? { returnRules: rules } : {})(
       caseReturnRulesForAccessSkill(input.env, now, input.returnRule ? caseReturnContentRule(input.returnRule, now) : undefined))) }),

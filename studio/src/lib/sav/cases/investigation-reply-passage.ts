@@ -24,6 +24,7 @@ import { readCaseInvestigationProgress } from "./investigation-record";
 import { caseAdmissionNamesLatestInput, latestInvestigationInput } from "./investigation-runner";
 import { runCaseInvestigationRuntime, type CaseInvestigationRuntimeDeps, type CaseInvestigationRuntimeReport } from "./investigation-runtime";
 import { readPilotReplyProvenance, type PilotProvenanceDeps } from "./pilot-passage-provenance";
+import { isSmartSupportStamp, smartSupportStampInForce } from "./smart-support-scope";
 
 /*
  * B (4/11, LOCAL and OFF): from the investigation of an admitted case to the NORMAL send plan, and nothing else. B proposes the recorded
@@ -66,9 +67,11 @@ async function latestDraft(caseId: string, provenance: PilotProvenanceDeps, env:
   // SAV-92 (multi-block): every block the decision was taken under.
   const blockId = caseStampBlockId(read.record.decision?.accessScope);
   const blockIds = read.record.decision?.blockScopes ? read.record.decision.blockScopes.map(caseStampBlockId) : [blockId];
-  const scope = await readCaseDecisionScopes(provenance.accessScope, await provenance.currentPolicyRevision(), read.record.decision);
-  const draft = caseDecisionDraft(caseId, read.record, events, { accessScope: scope.ok ? caseAccessScopeStamp(scope.scope) : null,
-    ...(read.record.decision?.blockScopes ? { blockScopes: scope.ok && scope.blocks ? scope.blocks.map(caseAccessScopeStamp) : null } : {}) }, env);
+  // SAV-123 (N8): a smart decision has no block scope to read; its stamp is in force only while the smart entry is on.
+  const smart = isSmartSupportStamp(read.record.decision?.accessScope);
+  const scope = smart ? null : await readCaseDecisionScopes(provenance.accessScope, await provenance.currentPolicyRevision(), read.record.decision);
+  const draft = caseDecisionDraft(caseId, read.record, events, { accessScope: !scope ? smartSupportStampInForce(env) : scope.ok ? caseAccessScopeStamp(scope.scope) : null,
+    ...(read.record.decision?.blockScopes ? { blockScopes: scope?.ok && scope.blocks ? scope.blocks.map(caseAccessScopeStamp) : null } : {}) }, env);
   if (!draft) return { draft: null, reason: "decision_not_accepted" } as const;
   const nextAction = read.record.decision?.validation.outcome === "accepted" ? read.record.decision.validation.decision.nextAction.kind : "none";
   return { draft, nextAction, events, blockId, blockIds, reason: draft.reply ? null : (draft.replyLimit ?? "no_reply") } as const;

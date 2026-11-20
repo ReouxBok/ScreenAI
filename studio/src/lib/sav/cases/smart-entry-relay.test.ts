@@ -129,16 +129,17 @@ describe("the smart entry through the real relay and re-evaluation", () => {
     expect((await readCase(mail.caseId))!.admission!.admission).toBeUndefined();
   });
 
-  it("V1's confirmed V2 owner effect does not give a smart admission to the agent: the case stays with the team, no v2_attribution", async () => {
+  it("N8 (SAV-123): V1's confirmed V2 owner effect gives a smart admission to the agent (v2_attribution), admitted while the switch is on", async () => {
     const { deps } = sources();
     const mail = await v1Mail(deps, ["support"], { ownerEffect: true });
     const snapshot = (await readCase(mail.caseId))!;
-    expect([mail.owner, snapshot.owner, snapshot.phase]).toEqual(["human", "human", "handoff_pending"]);
+    expect([mail.owner, snapshot.owner, snapshot.phase]).toEqual(["agent", "agent", "queued"]);
     expect(snapshot.admission).toMatchObject({ target: "agent", admission: "smart_support" });
     const events = await listCaseEvents(mail.caseId);
-    expect(events.filter(event => event.kind === "owner_changed" && (event.detail as { transition?: string } | null)?.transition === "v2_attribution")).toEqual([]);
-    // Before N8, V2 actors keep refusing it (their current revision is the historical policy's, never smart-entry.v1).
-    expect(caseAdmissionStatus({ ...snapshot, owner: "agent" }, "syn-policy-r1").admitted).toBe(false);
+    expect(events.filter(event => event.kind === "owner_changed" && (event.detail as { transition?: string } | null)?.transition === "v2_attribution")).toHaveLength(1);
+    // V2 actors accept it under its own revision while the switch is on, whatever the block policy; off, it no longer matches (the sweep gives it back).
+    expect(caseAdmissionStatus(snapshot, "syn-policy-r1", true).admitted).toBe(true);
+    expect(caseAdmissionStatus(snapshot, "syn-policy-r1", false)).toEqual({ admitted: false, reason: "policy_changed" });
   });
 
   it("the re-evaluation reads the mail again through the entry and never reads the unreadable policy", async () => {
