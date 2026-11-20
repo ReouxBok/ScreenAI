@@ -140,29 +140,38 @@ export function intakeBlockedPause(state: SavAgentPauseState): IntakeBlockedPaus
 /** A scheduled automatic retry (waiting, no lease token, future leaseUntil) is a next action, not an incident, until its due time passes. */
 /** SAV-92 (A): a run whose mail already has a confirmed execution (ticket and actions done) is not an incident even if it
  * was left waiting: no code moves a run after its execution is confirmed. Its follow-up is shown on its own. */
+/** SAV-88: a version re-created (deployment) after the message already used its one rescue is never claimed again: "à traiter à la main". */
+function intakeRescueUsedSql(threadId: ReturnType<typeof sql>) {
+  return sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and br.state in ('pending', 'waiting')
+    and ${intakeRescueConsumedSql(sql`br.message_id`)} and not ${intakeRescueConsumedSql(sql`br.message_id`, sql`br.id`)}
+    and ${intakeCountedAttemptsSql(sql`br.message_id`)} >= ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage})`;
+}
+/** A version re-created after the attempt caps is never scheduled, so it never gets its marker: it is exhausted, not
+ * "waiting for the next pass". Same lifetime total as the scheduler's bound; an open rescue lifts it. */
+function intakeExhaustedUnmarkedSql(threadId: ReturnType<typeof sql>) {
+  return sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and br.state in ('pending', 'waiting')
+    and ${intakeCountedAttemptsSql(sql`br.message_id`)} >= ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage}
+    and not ${intakeRescueOpenSql(sql`br.id`, sql`br.message_id`)} and ${noReadRecoverySql(sql`br.id`)})`;
+}
+/** SAV-120 (N7 fix 4): the counter, the list cause and the monitor share this predicate. The two unmarked lifetime blocks
+ * above (no journal marker because the scheduler never takes them) are blocks too, paused or not and whatever their age:
+ * without them the counter showed 6 while the list named at least 14 blocked dossiers. */
 export function intakeBlockedRunSql(threadId: ReturnType<typeof sql>, pause: IntakeBlockedPause = INTAKE_NOT_PAUSED) {
   // An analysis stuck from before the pause stays an incident; waiting for a claim does not.
   const states = pause.analysisPaused ? sql`('analysing')` : sql`('pending', 'waiting', 'analysing')`;
   const since = pause.resumedAt ? sql`greatest(br.updated_at, ${pause.resumedAt}::timestamptz)` : sql`br.updated_at`;
-  return sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and (
+  return sql`(exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and (
     ${intakeActiveBlockSql(sql`br.id`)}
     or (br.state in ${states} and ${since} < now() - make_interval(mins => ${SAV_INTAKE_BLOCKED_AFTER_MINUTES})
       and not coalesce(br.state = 'waiting' and br.lease_token is null and br.lease_until > now(), false)
-      and not exists(select 1 from sav.intake_executions be where be.message_id = br.message_id and be.state = 'confirmed'))))`;
+      and not exists(select 1 from sav.intake_executions be where be.message_id = br.message_id and be.state = 'confirmed'))))
+    or ${intakeRescueUsedSql(threadId)} or ${intakeExhaustedUnmarkedSql(threadId)})`;
 }
 export function intakeBlockedCauseSql(threadId: ReturnType<typeof sql>, pause: IntakeBlockedPause = INTAKE_NOT_PAUSED) {
   // SAV-88: an attempts_exhausted lifted by the rescue claimed on the same run no longer blocks (see attempt-policy.ts).
   const marker = (kind: string) => sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and ${intakeActiveBlockSql(sql`br.id`, [kind])})`;
   const paused = pause.analysisPaused ? sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and br.state in ('pending', 'waiting'))` : sql`false`;
-  // SAV-88: a version re-created (deployment) after the message already used its one rescue is never claimed again: "à traiter à la main".
-  const rescueUsed = sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and br.state in ('pending', 'waiting')
-    and ${intakeRescueConsumedSql(sql`br.message_id`)} and not ${intakeRescueConsumedSql(sql`br.message_id`, sql`br.id`)}
-    and ${intakeCountedAttemptsSql(sql`br.message_id`)} >= ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage})`;
-  // A version re-created after the attempt caps is never scheduled, so it never gets its marker: it is exhausted, not
-  // "waiting for the next pass". Same lifetime total as the scheduler's bound; an open rescue lifts it.
-  const exhaustedUnmarked = sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and br.state in ('pending', 'waiting')
-    and ${intakeCountedAttemptsSql(sql`br.message_id`)} >= ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage}
-    and not ${intakeRescueOpenSql(sql`br.id`, sql`br.message_id`)} and ${noReadRecoverySql(sql`br.id`)})`;
+  const rescueUsed = intakeRescueUsedSql(threadId), exhaustedUnmarked = intakeExhaustedUnmarkedSql(threadId);
   return sql<string | null>`case when ${marker("rescue_failed")} or ${rescueUsed} then 'manual_required' when ${marker("private_resource_unavailable")} then 'private_resource_unavailable'
     when ${marker("other_evidence_unavailable")} then 'other_evidence_unavailable' when ${marker("forwarded_origin_unverified")} then 'forwarded_origin_unverified' when ${marker("attempts_exhausted")} or ${exhaustedUnmarked} then 'attempts_exhausted' when ${marker("deterministic_block")} then 'input_invalid'
     when ${marker("source_invalid")} then 'source_invalid' when ${intakeBlockedRunSql(threadId, pause)} then 'technical_wait' when ${paused} then 'agent_paused' else null end`;
