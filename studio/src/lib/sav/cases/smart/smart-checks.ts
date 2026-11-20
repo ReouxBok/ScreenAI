@@ -91,16 +91,24 @@ const COMMITMENTS: readonly RegExp[] = [
   /\b(?:un|le|votre) (?:remboursement|avoir|geste commercial|dedommagement) (?:vous )?(?:sera|va etre|a ete) (?:effectue|fait|emis|verse|vire|lance|accorde|applique)/,
   // Astra, N2 review (P1): the PROCEDURE given to the customer to cancel their Limova subscription or contract (« vous pouvez résilier votre
   // abonnement depuis vos paramètres », « résiliez depuis… », « pour mettre fin à votre contrat, … »). Cancelling a routine stays allowed.
-  new RegExp(String.raw`\b(?:vous pouvez|vous pourrez|vous pourriez|il (?:vous )?suffit d[e']|pour|afin d[e']|vous devez|il faut|merci d[e']|n'hesitez pas a)\s*(?:\w+ ){0,2}(?:resilier\b|(?:annuler|arreter|stopper|suspendre|interrompre|mettre fin a|ne pas renouveler|desactiver|clore|cloturer|fermer) (?:le renouvellement (?:de |d')?)?(?:votre|l'|le|ce|cet|son) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement|compte limova)\b)`),
-  // Orchestrator decision after the second review (Ugo: cancellation is never handled by the agent on its own): on OUR reply only, any word of
-  // cancellation (« résilier », « résiliation », « Résilier mon abonnement »…) or « mettre fin à / arrêter / annuler / stopper / suspendre » +
-  // abonnement, contrat or compte Limova refuses, whatever the wording. Cancelling a routine, a task or a scheduled send still passes.
+  new RegExp(String.raw`\b(?:vous pouvez|vous pourrez|vous pourriez|il (?:vous )?suffit d[e']|pour|afin d[e']|vous devez|il faut|merci d[e']|n'hesitez pas a)\s*(?:\w+ ){0,2}(?:resilier\b|(?:annuler|arreter|stopper|suspendre|interrompre|mettre fin a|ne pas renouveler|desactiver|clore|cloturer|fermer) (?:le renouvellement (?:de |d')?)?(?:votre|l'|le|ce|cet|son) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement)\b)`),
+  // Orchestrator decision (Ugo: cancellation is never handled by the agent on its own): any word of cancellation in OUR reply, always.
   /\bresili\w*/,
-  /\b(?:mettre fin|mis fin|mettez fin|met fin|arret\w*|annul\w*|stopp?\w*|suspend\w*|interromp\w*)\b(?: \w+){0,3} (?:a |au |a l')?(?:votre |mon |notre |son |l'|le |ce |cet )?(?:abonnement|contrat|compte limova)\b/,
-  /\b(?:resiliez|(?:annulez|arretez|stoppez|suspendez|mettez fin a|cloturez|fermez) (?:votre|l'|le) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement|compte limova))\b/,
+  /\b(?:resiliez|(?:annulez|arretez|stoppez|suspendez|mettez fin a|cloturez|fermez) (?:votre|l'|le) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement))\b/,
 ];
-/** True when the reply commits to a sensitive action on the account (exported for the tests and the shadow report). */
-export const smartSensitiveCommitment = (reply: string) => { const folded = fold(reply); return COMMITMENTS.some(pattern => pattern.test(folded)); };
+/*
+ * Orchestrator decision after the third review (PORTE_1E): no dependence on word order. A SENTENCE of our reply that carries BOTH a subscription
+ * object and a stop verb, in any order (« ouvrez la rubrique Abonnement, cliquez sur “Annuler” »), refuses. « compte » is not an object
+ * (« arrêter la routine depuis votre compte Limova » passes); « offre » and « plan » count as nouns only (with a determiner: « Limova offre… »
+ * is a verb). A routine, a task, a scheduled send, an invoice or a price carry no object here and pass.
+ */
+const SUBSCRIPTION_OBJECT = /\b(?:abonnements?|contrats?|forfaits?|souscriptions?|(?:l'|une?|votre|vos|mon|notre|son|cette|cet|ce|d'|des|les|le|la) ?(?:offres?|plans?))\b/;
+const STOP_VERB = /\b(?:annul\w*|arret\w*|mettre fin|mis fin|mettez fin|met fin|mettons fin|stopp?\w*|suspend\w*|interromp\w*|desactiv\w*)/;
+/** True when the reply commits to a sensitive action on the account, or speaks of cancelling the subscription (exported for the tests and the shadow report). */
+export const smartSensitiveCommitment = (reply: string) => {
+  const folded = fold(reply);
+  return COMMITMENTS.some(pattern => pattern.test(folded)) || sentencesOf(reply).map(fold).some(sentence => SUBSCRIPTION_OBJECT.test(sentence) && STOP_VERB.test(sentence));
+};
 
 const URL_RE = /\bhttps?:\/\/[^\s<>"')\]]+/giu;
 const DOMAIN = /(?<![\p{L}\p{N}@./-])(?:www\.)?[a-z0-9][a-z0-9-]{1,62}(?:\.[a-z0-9-]{1,62})*\.(?:com|fr|io|ai|net|org|co|app|eu|be|ch|ca|me|so|dev)(?![\p{L}\p{N}-])/giu;
