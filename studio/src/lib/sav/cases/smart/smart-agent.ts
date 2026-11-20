@@ -264,7 +264,9 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     const verdict = parseSmartOutput(smartVerdictSchema, read.output);
     return { codes: [...server.codes], verdict: verdict.ok ? verdict.value : null, failed: verdict.ok ? null : `${kind}:output_invalid` };
   };
-  const refused = (result: Awaited<ReturnType<typeof review>>) => result.codes.length > 0 || result.verdict?.verdict === "non_conforme";
+  // A counter-read that lists a problem refuses the reply, whatever its verdict says ("conforme" with problems is a reservation, not an approval).
+  const refused = (result: Awaited<ReturnType<typeof review>>) =>
+    result.codes.length > 0 || result.verdict?.verdict === "non_conforme" || (result.verdict?.problems.length ?? 0) > 0;
   const accepted = (current: SmartDecision) => {
     const text = current.reply?.trim() ? `${current.reply.trim()}\n\n${savReplyFooter("fr", "automated")}` : null;
     return end(current.outcome, reasons, { replyWithFooter: text, note: current.outcome === "handoff" || current.coverage.some(row => row.status === "handed") ? current.teamNote : null });

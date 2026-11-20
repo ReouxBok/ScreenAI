@@ -113,6 +113,42 @@ describe("contrôles serveur, relecture et une correction", () => {
     expect(result.outcome).toBe("handoff");
     expect(result.reasons).toEqual(expect.arrayContaining(["refused_after_correction", "verify:unlisted_claim"]));
   });
+  it("P1 Astra, premier passage : « conforme » avec un problème (code hors liste) est un refus, la réponse est corrigée puis acceptée", async () => {
+    const reserved = { verdict: "conforme", problems: [{ code: "tone", sentence: "Belle journée." }] };
+    const { result, calls } = await run({ understand: { output: smartReading() }, decide: { output: smartGoodDecision() }, verify: { output: reserved },
+      correct: { output: smartGoodDecision() }, reverify: { output: SMART_CONFORME } });
+    expect(result.checks.first).toEqual([]);
+    expect(result.verdicts.first).toMatchObject({ verdict: "conforme", problems: [{ code: "unlisted_claim" }] });
+    expect(calls.map(call => call.kind)).toEqual(["understand", "decide", "verify", "correct", "reverify"]);
+    expect(result).toMatchObject({ outcome: "reply", corrected: true });
+    const correction = calls.find(call => call.kind === "correct")!.payload as { problems: Array<{ code: string }> };
+    expect(correction.problems.map(problem => problem.code)).toEqual(["unlisted_claim"]);
+  });
+  it("P1 Astra, premier passage : « conforme » avec un problème, la correction échoue : équipe, jamais « reply »", async () => {
+    const reserved = { verdict: "conforme", problems: [{ code: "tone", sentence: "Belle journée." }] };
+    const { result } = await run({ understand: { output: smartReading() }, decide: { output: smartGoodDecision() }, verify: { output: reserved }, correct: { fail: "http_500" } });
+    expect(result.outcome).toBe("handoff");
+    expect(result.replyWithFooter).toBeNull();
+  });
+  it("P1 Astra, second passage : après une correction, « conforme » avec un problème mène à l'équipe", async () => {
+    const invented = smartGoodDecision({ facts: [{ ...smartGoodDecision().facts[0], excerpt: "la connexion se fait par SMS uniquement" }] });
+    const reserved = { verdict: "conforme", problems: [{ code: "tone", sentence: "Belle journée." }] };
+    const { result, calls } = await run({ understand: { output: smartReading() }, decide: { output: invented }, verify: { output: SMART_CONFORME },
+      correct: { output: smartGoodDecision() }, reverify: { output: reserved } });
+    expect(result.checks.first).toEqual(["excerpt_not_found"]);
+    expect(result.checks.second).toEqual([]);
+    expect(calls.map(call => call.kind)).toEqual(["understand", "decide", "verify", "correct", "reverify"]);
+    expect(result.outcome).toBe("handoff");
+    expect(result.reasons).toEqual(expect.arrayContaining(["refused_after_correction", "verify:unlisted_claim"]));
+    expect(result.replyWithFooter).toBeNull();
+  });
+  it("témoin : « conforme » avec une liste de problèmes vide (ou absente) reste une réponse, sans correction", async () => {
+    for (const verdict of [{ verdict: "conforme", problems: [] }, { verdict: "conforme" }, { verdict: "conforme", problems: null }]) {
+      const { result, calls } = await run({ understand: { output: smartReading() }, decide: { output: smartGoodDecision() }, verify: { output: verdict } });
+      expect(result).toMatchObject({ outcome: "reply", corrected: false });
+      expect(calls.map(call => call.kind)).toEqual(["understand", "decide", "verify"]);
+    }
+  });
   it("promesse de délai, lien hors liste, fiche d'un autre besoin : refusés", async () => {
     const reply = `${SMART_GOOD_REPLY}\n\nNous allons corriger cela sous 48 heures. Voir https://exemple-tiers.invalid/guide ou yonos.com.`;
     const other = smartGoodDecision({ reply, facts: [{ ...smartGoodDecision().facts[0], needId: "n2" }] });
