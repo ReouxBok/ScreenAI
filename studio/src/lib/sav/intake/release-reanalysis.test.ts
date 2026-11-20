@@ -307,3 +307,58 @@ describe("console counter « bloqués » (SAV-120, N7 fix 4)", () => {
     } finally { await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-agent-pause.v1:intake")); }
   });
 });
+
+describe("why an attempt failed, as closed codes (SAV-120, N7 fix 3)", () => {
+  /** Fake model that always cites a quote absent from the catalogue, with customer-looking words in its output. */
+  function rejectingModel(messageId: string) {
+    return vi.fn(async (url: Parameters<typeof fetch>[0]) => {
+      if (String(url).startsWith("https://generativelanguage.googleapis.com/")) {
+        const answer = { messageId, requests: [{ id: "r1", kind: "support", currentMessageId: messageId, quoteId: "Q-CLIENT-SECRET-TEXT" }] };
+        return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } });
+      }
+      if (String(url).startsWith("https://api.hubapi.com/")) return Response.json({ total: 0, results: [] });
+      throw Error("EXTERNAL_NETWORK_FORBIDDEN");
+    });
+  }
+
+  it("journals a small attempt outcome the diagnostic can read, with codes only and no customer text", async () => {
+    const m = await stored("Bonjour, mon numéro client est 123456 et la synchronisation échoue.");
+    const { config, env: e } = release(0), id = (await enqueueSavIntakeMessage(m.id, config))!;
+    await analyseSavIntakeRuntime(id, config, { env: () => e, network: rejectingModel(m.id) });
+    const rows = await f.db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, id));
+    const outcome = rows.find(r => r.kind === "attempt_outcome");
+    expect(outcome, rows.map(r => r.kind).join(",")).toBeTruthy();
+    const value = decryptSavPayload<{ reason: string | null; traces: Array<Record<string, unknown>> }>(outcome!.payloadCiphertext);
+    expect(value.traces.length).toBeGreaterThan(0);
+    expect(value.traces.some(t => t.errorCode || t.validationFailure)).toBe(true);
+    const text = JSON.stringify(value);
+    for (const leaked of ["123456", "synchronisation", "CLIENT-SECRET", "client@example.invalid", "Bonjour"]) expect(text).not.toContain(leaked);
+    expect(outcome!.payloadCiphertext.length).toBeLessThan(4096);
+    const diagnostics = await readIntakeRunDiagnostics(threadId);
+    const event = diagnostics!.runs.find(r => r.runId === id)!.events.find(ev => ev.kind === "attempt_outcome");
+    expect(event?.diagnostic.readable).toBe(true);
+    expect(event?.diagnostic.traces.some(t => t.errorCode || t.validationReason)).toBe(true);
+  });
+});
+
+describe("attempt outcome allow-list (SAV-120, N7 fix 3)", () => {
+  it("keeps closed codes, enums and byte counts only; free text and unknown values are dropped", async () => {
+    const { intakeAttemptOutcome } = await import("./attempt-outcome");
+    const outcome = intakeAttemptOutcome({ reason: "Le client dit: rembourse-moi", traces: [
+      { phase: "understanding", accepted: true, errorCode: null },
+      { method: "analyseMessage", phase: "understanding", accepted: false, errorCode: "SAV_INTAKE_MODEL_OUTPUT_REJECTED",
+        validationFailure: { reason: "excerpt_not_in_source", stage: "evidence", path: "requests.0.quote", excerpt: "mon mot de passe est hunter2" },
+        contextLimit: { stage: "wire", bytes: 900_000, limitBytes: 800_000, breakdown: { text: "corps du mail" } } },
+      { operation: "ticket_history", status: "failed", reason: "history_body_unavailable", detail: "jean@example.invalid" },
+      { phase: "understanding", accepted: false, errorCode: "erreur libre avec texte client" },
+    ] });
+    expect(outcome.reason).toBeNull();
+    expect(outcome.traces).toHaveLength(3);
+    expect(outcome.traces[0]).toMatchObject({ method: "analyseMessage", errorCode: "SAV_INTAKE_MODEL_OUTPUT_REJECTED",
+      validationFailure: { reason: "excerpt_not_in_source", stage: "evidence" }, contextLimit: { stage: "wire", bytes: 900_000, limitBytes: 800_000 } });
+    expect(outcome.traces[1]).toMatchObject({ operation: "ticket_history", status: "failed", reason: "history_body_unavailable" });
+    expect(outcome.traces[2].errorCode).toBeNull();
+    const text = JSON.stringify(outcome);
+    for (const leaked of ["rembourse", "hunter2", "requests.0", "corps du mail", "jean@", "texte client"]) expect(text).not.toContain(leaked);
+  });
+});

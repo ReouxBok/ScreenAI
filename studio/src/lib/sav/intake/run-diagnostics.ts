@@ -25,7 +25,9 @@ const publicCodes = new Set<string>([...Object.keys(intakeContextReasonLabels), 
   "aliases_unavailable", "batch_limit", "partial_batch", "conflicting_contact", "contact_limit", "cancelled", "read_unavailable",
   "ticket_limit", "ticket_membership_conflict", "ticket_content_unavailable", "history_limit", "history_date_unknown", "read_retry_scheduled", "read_retry_stopped", "read_retry_claimed", "resume_held", "resume_progress",
   // SAV-92 (stuck dossiers): read faults that were missing (diagnostic showed them as no code) and the bounded hand-over to the team.
-  "history_body_unavailable", "wrong_contact", "resume_team_required"]);
+  "history_body_unavailable", "wrong_contact", "resume_team_required",
+  // SAV-120 (N7): the compact, closed-code outcome journalled after each attempt without a decision (attempt-outcome.ts).
+  "attempt_outcome"]);
 /** Exported for the exhaustiveness test of CRM read faults (closed codes only). */
 export const SAV_INTAKE_PUBLIC_DIAGNOSTIC_CODES: ReadonlySet<string> = publicCodes;
 const outputStages = new Set(["sanitize_wire", "visual_normalize", "decode", "final_schema", "evidence"]);
