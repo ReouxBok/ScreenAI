@@ -1,6 +1,4 @@
 import { isSmartSupportProvenance } from "../case-types";
-import { ACCESS_AUTO_APPROVAL_BASIS, readAccessAutoApprovalConfig } from "../customer-return";
-import { savV2EntrySmartOn, savV2SmartSupportAuto } from "../smart-entry-switch";
 import { smartOtherPlatformInvite, smartSensitiveCommitment } from "./smart-checks";
 
 /*
@@ -11,12 +9,10 @@ import { smartOtherPlatformInvite, smartSensitiveCommitment } from "./smart-chec
  * another platform. A neutral mention (« pour la question de remboursement, notre équipe vous répondra ») passes: the Access kernel is not applied here
  * (PORTE 2A, P2). A hand-over or closing notice is the team's path: never judged here.
  */
-type Env = Readonly<Record<string, string | undefined>>;
-type Admission = { qualification?: { requests?: ReadonlyArray<{ provenance?: { kind?: string; ruleId?: string; revision?: string; blockId?: string } }> } } | null | undefined;
+export type Admission = { qualification?: { requests?: ReadonlyArray<{ provenance?: { kind?: string; ruleId?: string; revision?: string; blockId?: string } }> } } | null | undefined;
 export type SmartSendProblem = "CANCELLED_REPLY_SENSITIVE_WORDING" | "CANCELLED_REPLY_OTHER_PLATFORM";
-export type SmartSwitchProblem = "CANCELLED_SMART_ENTRY_OFF" | "CANCELLED_SMART_AUTO_OFF";
 
-const smartAdmission = (admission: Admission) =>
+export const smartAdmission = (admission: Admission) =>
   (admission?.qualification?.requests ?? []).some(row => row.provenance && isSmartSupportProvenance({ kind: row.provenance.kind ?? "", ...row.provenance }));
 
 export function smartSendProblem(input: Readonly<{ admission: Admission; body: string; purpose: string }>): SmartSendProblem | null {
@@ -24,20 +20,5 @@ export function smartSendProblem(input: Readonly<{ admission: Admission; body: s
   if (!smartAdmission(input.admission)) return null;
   if (smartSensitiveCommitment(input.body)) return "CANCELLED_REPLY_SENSITIVE_WORDING";
   if (smartOtherPlatformInvite(input.body)) return "CANCELLED_REPLY_OTHER_PLATFORM";
-  return null;
-}
-
-/*
- * PORTE 2A (P1): the switches, read again at every look before a smart reply's plan, marker or send (after it was queued). `SAV_V2_ENTRY_SMART=on` is
- * required for any smart reply (the smart stamp depends on it). A reply the RULE approved (basis `auto_access.v1`) also needs, now, the smart block's
- * `SAV_V2_SMART_SUPPORT_MODE=auto` and the global automatic reply (`SAV_V2_AUTO_REPLY=access` with the same approver). A person's explicit approval
- * needs neither. Switched off after the queue: cancelled, nothing leaves.
- */
-export function smartSwitchProblem(input: Readonly<{ env: Env; admission: Admission; basis?: string | null; approvedBy?: string | null }>): SmartSwitchProblem | null {
-  if (!smartAdmission(input.admission)) return null;
-  if (!savV2EntrySmartOn(input.env)) return "CANCELLED_SMART_ENTRY_OFF";
-  if (input.basis !== ACCESS_AUTO_APPROVAL_BASIS) return null;
-  const auto = readAccessAutoApprovalConfig(input.env);
-  if (!savV2SmartSupportAuto(input.env) || auto.mode !== "on" || auto.approverId !== (input.approvedBy ?? "").toLowerCase()) return "CANCELLED_SMART_AUTO_OFF";
   return null;
 }

@@ -1,7 +1,9 @@
 import { caseRequestBlockId } from "./case-blocks";
 import { SAV_SMART_ENTRY_ADMISSION, SAV_SMART_ENTRY_BLOCK_ID, SAV_SMART_ENTRY_POLICY_REVISION, type CaseSnapshot } from "./case-types";
 import { caseStampBlockId, type CaseAccessScopeStamp } from "./investigation-access-scope";
-import { savV2EntrySmartOn } from "./smart-entry-switch";
+import { ACCESS_AUTO_APPROVAL_BASIS, readAccessAutoApprovalConfig } from "./customer-return";
+import { savV2EntrySmartOn, savV2SmartSupportAuto } from "./smart-entry-switch";
+import { smartAdmission, type Admission } from "./smart/smart-send-fence";
 
 /*
  * SAV-123 (N8): what replaces the approved block scope for a smart case. Pure: reads only the values given.
@@ -31,4 +33,20 @@ export function caseSmartSupportOpen(snapshot: Pick<CaseSnapshot, "admission" | 
   if (snapshot.admission?.admission !== SAV_SMART_ENTRY_ADMISSION || snapshot.admission.policyRevision !== SAV_SMART_ENTRY_POLICY_REVISION) return false;
   const open = snapshot.body.openRequests.filter(row => row.status === "open");
   return open.length > 0 && open.every(row => caseRequestBlockId(snapshot, row) === SAV_SMART_ENTRY_BLOCK_ID);
+}
+
+export type SmartSwitchProblem = "CANCELLED_SMART_ENTRY_OFF" | "CANCELLED_SMART_AUTO_OFF";
+/*
+ * PORTE 2A (P1): the switches, read again at every look before a smart reply's plan, marker or send (after it was queued). `SAV_V2_ENTRY_SMART=on` is
+ * required for any smart reply (the smart stamp depends on it). A reply the RULE approved (basis `auto_access.v1`) also needs, now, the smart block's
+ * `SAV_V2_SMART_SUPPORT_MODE=auto` and the global automatic reply (`SAV_V2_AUTO_REPLY=access` with the same approver). A person's explicit approval
+ * needs neither. Switched off after the queue: cancelled, nothing leaves.
+ */
+export function smartSwitchProblem(input: Readonly<{ env: Env; admission: Admission; basis?: string | null; approvedBy?: string | null }>): SmartSwitchProblem | null {
+  if (!smartAdmission(input.admission)) return null;
+  if (!savV2EntrySmartOn(input.env)) return "CANCELLED_SMART_ENTRY_OFF";
+  if (input.basis !== ACCESS_AUTO_APPROVAL_BASIS) return null;
+  const auto = readAccessAutoApprovalConfig(input.env);
+  if (!savV2SmartSupportAuto(input.env) || auto.mode !== "on" || auto.approverId !== (input.approvedBy ?? "").toLowerCase()) return "CANCELLED_SMART_AUTO_OFF";
+  return null;
 }

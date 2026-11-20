@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { smartSendProblem, smartSwitchProblem } from "./smart-send-fence";
+import { smartSendProblem } from "./smart-send-fence";
+import { smartSwitchProblem } from "../smart-support-scope";
 
 // PORTE 2A: the smart send fence and the switches read again before a queued smart reply leaves (pure).
 const SMART = { qualification: { requests: [{ provenance: { kind: "qualified_rule", ruleId: "smart-entry", revision: "smart-entry.v1", blockId: "smart-support" } }] } };
@@ -22,6 +23,18 @@ describe("PORTE 2A (P2) : le filet smart refuse seulement ce que prévoit le CAP
     expect(smartSendProblem({ admission: ACCESS, body: "Pour résilier, écrivez-nous.", purpose: "answer" })).toBeNull();
     expect(smartSendProblem({ admission: SMART, body: "Pour résilier, écrivez-nous.", purpose: "handoff" })).toBeNull();
   });
+});
+
+describe("PORTE 2A (P1) : le filet « autre plateforme » suit la règle partagée (other-platform.ts)", () => {
+  it.each(["HubSpot", "Google Sheets", "Zapier"])("« Dans les intégrations de Limova, optez pour %s » passe", tool =>
+    expect(judge(`Dans les intégrations de Limova, optez pour ${tool}.`)).toBeNull());
+  it("« Pour remplacer Limova, inscrivez-vous sur Wix » est refusé", () =>
+    expect(judge("Pour remplacer Limova, inscrivez-vous sur Wix.")).toBe("CANCELLED_REPLY_OTHER_PLATFORM"));
+  it.each([
+    "Je vous recommande d'utiliser Zapier pour remplir votre tableau.",
+    "Si cette option manque dans Limova, essayez Wix pour créer votre site.",
+  ])("« %s » est refusé", body => expect(judge(body)).toBe("CANCELLED_REPLY_OTHER_PLATFORM"));
+  it("« Inscrivez-vous au webinaire Limova » passe", () => expect(judge("Inscrivez-vous au webinaire Limova de jeudi.")).toBeNull());
 });
 
 describe("PORTE 2A (P1) : interrupteurs smart relus avant l'envoi", () => {

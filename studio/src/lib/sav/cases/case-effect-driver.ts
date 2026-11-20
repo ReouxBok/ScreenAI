@@ -32,7 +32,8 @@ import {
 } from "./case-effects";
 import { readCaseReplyFacts } from "./case-reply-facts";
 import { accessSkillSendProblem } from "./access-skill/access-skill-send-fence";
-import { smartSendProblem, smartSwitchProblem } from "./smart/smart-send-fence";
+import { smartSendProblem } from "./smart/smart-send-fence";
+import { smartSwitchProblem } from "./smart-support-scope";
 import { caseReplyEditableBody } from "./case-reply-outbound";
 import { caseReplyStoredTextProblem, caseReplyTextProblemForBasis } from "./case-reply-mode";
 import { judgeCurrentTicketOwner, readCaseTicketId, type CaseOwnerRefusal, type CaseTicketOwnerPort } from "./case-ticket-owner";

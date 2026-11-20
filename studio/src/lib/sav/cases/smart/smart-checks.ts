@@ -128,10 +128,17 @@ export const smartSensitiveCommitment = (reply: string) => {
   return COMMITMENTS.some(pattern => pattern.test(folded)) || (SUBSCRIPTION_OBJECT.test(folded) && STOP_VERB.test(folded));
 };
 
-/** SAV-123 (N8): an invitation to use, switch to or praise another platform, sentence by sentence (the same rules as `other_platform_recommended` below). */
+/*
+ * SAV-123 (N8), PORTE 2A: the send fence's other-platform rule is the shared one (`../../other-platform.ts`), no list of its own: per sentence, advice to
+ * leave Limova or go to another tool (`savOtherPlatformRedirect`, « pour remplacer Limova… » included), a named third party compared favourably
+ * (`savOtherPlatformEndorses`), or a clause orienting to a named third party (`savOtherPlatformOrients`). A sentence set in Limova's Intégrations menu
+ * (« Dans les intégrations de Limova, optez pour HubSpot ») places the tool inside Limova: its orientation is not a redirection.
+ */
+const INTEGRATIONS_MENU = /\b(?:dans|depuis|via) (?:le |vos |les )?(?:menu |onglet |rubrique )?integrations?\b|\bintegrations >/;
 export const smartOtherPlatformInvite = (reply: string) => sentencesOf(reply).some(sentence => {
-  const folded = fold(sentence), limova = /\b(?:limova|webinaire|academy|charly)\b/.test(folded), named = [...folded.matchAll(THIRD_PARTY)].length > 0;
-  return (SIGNUP.test(folded) && !limova) || SWITCH.test(folded) || (named && PRAISE.test(folded) && !limova);
+  const folded = fold(sentence);
+  if (savOtherPlatformRedirect(folded) || savOtherPlatformEndorses(folded, SAV_OTHER_PLATFORM_THIRD_PARTIES)) return true;
+  return !INTEGRATIONS_MENU.test(folded) && savOtherPlatformOrients(folded, SAV_OTHER_PLATFORM_THIRD_PARTIES);
 });
 
 const URL_RE = /\bhttps?:\/\/[^\s<>"')\]]+/giu;
