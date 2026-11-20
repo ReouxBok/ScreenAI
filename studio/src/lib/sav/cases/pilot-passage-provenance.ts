@@ -18,6 +18,7 @@ import { latestInvestigationInput } from "./investigation-runner";
 import { parseIncidentContext, revalidateIncidentContext } from "./investigation-incidents";
 import type { IncidentReader } from "./investigation-incidents-contract";
 import { unprovenFixClaim } from "@/lib/knowledge/temporary-incident-schema";
+import { temporaryKnowledgePromise } from "./temporary-knowledge-promise";
 import { readThreadlessReplyProvenance } from "./threadless-provenance";
 import { CASE_REPLY_STUDIO_CORRECTION_BASIS } from "./case-reply-validation";
 
@@ -97,6 +98,8 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
     if (!await revalidateIncidentContext(incidents, deps.readTemporaryIncidents, deps.now())) return unproven("temporary_incident_unproven");
     if (incidents.entries.length) {
       if (incidents.entries.some(entry => unprovenFixClaim(draft.reply!.text, entry.fixLevel) || (options.humanCorrection === true && unprovenFixClaim(proposal.text, entry.fixLevel)))) return unproven("temporary_incident_claim_unproven");
+      if (incidents.entries.some(entry => entry.priority)
+        && (temporaryKnowledgePromise(draft.reply.text) || (options.humanCorrection === true && temporaryKnowledgePromise(proposal.text)))) return unproven("temporary_incident_claim_unproven");
     }
   }
   // The type decides, never an empty list: only a real question may rest on no source; an answer must show what supports it.

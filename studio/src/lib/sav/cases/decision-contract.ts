@@ -141,6 +141,7 @@ export type CaseDecisionValidationContext = {
   /** `order` null: known only by its date (body handoff), so it cannot be placed safely against a message. */
   handoffs: Array<{ at: string; order: number | null }>;
   knowledge: SavRetrievalCandidate[];
+  usesTemporaryKnowledge?: true;
   /**
    * Per-request retrieval of the cards (`selectCaseKnowledge`), when the knowledge came from it: a card may then only
    * support the requests it was retrieved for. Absent or null (cards given as a plain list): no link is checked.
@@ -209,6 +210,7 @@ export const caseDecisionRejectionLabels = {
   account_advice_forbidden: "Conseiller une nouvelle souscription ou un nouveau compte est interdit.",
   // SAV-97 (switch `on` only): our own reply may never carry a request Ugo keeps with the team (cancel, refund, delete the account...).
   reply_sensitive_wording: "La réponse contient une formulation réservée à l'équipe (résiliation, remboursement, suppression du compte...).",
+  reply_temporary_promise: "Une information temporaire ne permet aucune promesse de délai, de prix ou de fonctionnalité.",
   access_link_missing: `Parcours d'accès : la réponse doit rappeler le lien ${SAV_CASE_ACCESS_URL}.`,
   access_link_invalid: `Parcours d'accès : seul le lien ${SAV_CASE_ACCESS_URL} est permis pour se connecter.`,
   login_procedure_redundant: "Le client a déjà fait ce que demande la fiche de connexion et dit ce qui s'affiche : ni recommencer la procédure, ni redemander. Transférer à l'équipe avec ce qui est connu, sans inventer de cause.",
