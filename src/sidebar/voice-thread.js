@@ -2,10 +2,13 @@
 // instead of appending a message whenever the other speaker emits a fragment.
 (() => {
   const utterances = new Map();
-  window.addEventListener('limova-gpt-transcript', ({ detail }) => {
-    const { utteranceId, role, text, final } = detail || {};
+  window.addEventListener('limova-gpt-transcript', event => {
+    if (event.voiceSession && typeof voiceSession !== 'undefined' && event.voiceSession !== voiceSession) return;
+    const { detail } = event;
+    const { utteranceId, role, text, final, persist } = detail || {};
     if (!utteranceId || !['user', 'assistant'].includes(role)) return;
-    const value = String(text || '');
+    const value = String(text || '').replace(/\uFFFD/g, '');
+    if (!/[\p{L}\p{N}]/u.test(value)) return;
     let item = utterances.get(utteranceId);
     if (!item) {
       if (utterances.size > 400) utterances.delete(utterances.keys().next().value);
@@ -20,9 +23,10 @@
       if (item.node) item.node.parentElement.dataset.voiceUtteranceId = utteranceId;
     }
     if (item.node?.isConnected) item.node.textContent = value.trim();
-    if (final && value.trim() && item.saved !== value.trim()) {
+    if (final && value.trim() && (item.saved !== value.trim() || (persist !== false && !item.persisted))) {
+      if (persist !== false) item.persisted = true;
       item.saved = value.trim();
-      chrome.runtime.sendMessage({ type: 'LOCAL_VOICE_TRANSCRIPT', role, text: value, utteranceId }).catch(() => {});
+      chrome.runtime.sendMessage({ type: 'VOICE_TRANSCRIPT', role, text: value, utteranceId, final: persist !== false }).catch(() => {});
     }
     scrollToBottom();
   });

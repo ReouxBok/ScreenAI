@@ -10,6 +10,7 @@ describe('background privacy boundaries', () => {
 
   beforeAll(async () => {
     chromeMock = installFullChromeMock();
+    chromeMock.tabs.query.mockImplementation(async query => query?.active ? [{ id: 17, windowId: 1, url: 'https://new.limova.ai/home', active: true }] : []);
     globalThis.fetch = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}) }));
     vi.resetModules();
     background = await import('../../../src/background.js');
@@ -32,6 +33,24 @@ describe('background privacy boundaries', () => {
     HTMLElement.prototype.getBoundingClientRect = originalRect;
     uninstallFullChromeMock();
     delete globalThis.fetch;
+  });
+
+  it('diagnoses the external page being used without requiring a Limova tab', async () => {
+    chromeMock.tabs.query.mockResolvedValueOnce([{ id: 19, windowId: 1, active: true, url: 'https://calendar.google.com/calendar/' }]);
+    chromeMock.tabs.sendMessage.mockResolvedValueOnce({ ok: true, documentReadyState: 'complete' });
+    const result = await background.runDiagnostics();
+    expect(result.checks.find(check => check.name === 'activePage')).toMatchObject({ status: 'ok' });
+    expect(result.checks.find(check => check.name === 'contentScript')).toMatchObject({ status: 'ok' });
+    expect(result.probableCause || '').not.toContain('onglet Limova');
+  });
+
+  it('keeps fields and selection controls beyond 150 links and 12000 voice characters', async () => {
+    document.body.innerHTML = '<main>' + Array.from({ length: 180 }, (_, i) => `<a href="/item-${i}">Section navigation ${i}</a>`).join('') + '<label for="dense">Votre message</label><textarea id="dense"></textarea><label for="calendar">Agenda Anthony</label><input id="calendar" type="checkbox"></main>';
+    const result = await background.getFreshVoiceContext();
+    expect(result.elementCount).toBeGreaterThan(150);
+    expect(result.pageContext.length).toBeGreaterThan(12000);
+    expect(result.pageContext).toContain('Votre message');
+    expect(result.pageContext).toContain('Agenda Anthony');
   });
 
   it('maps native and ARIA selection controls once with their state', async () => {

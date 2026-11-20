@@ -158,7 +158,7 @@ describe('background.js — onMessage router', () => {
 
   it('GET_SETTINGS returns hasApiKey: true (keys are server-side)', async () => {
     const result = await dispatch({ type: 'GET_SETTINGS' });
-    expect(result).toEqual({ hasApiKey: true });
+    expect(result).toEqual({ hasApiKey: true, autonomyMode: 'balanced' });
   });
 
   it('SAVE_SETTINGS returns ok: true (keys managed server-side)', async () => {

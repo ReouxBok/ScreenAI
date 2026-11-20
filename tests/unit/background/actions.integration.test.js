@@ -11,6 +11,7 @@ describe('controlled page actions', () => {
 
   beforeAll(async () => {
     chromeMock = installFullChromeMock();
+    chromeMock.tabs.query.mockImplementation(async query => query?.active ? [{ id: 17, windowId: 1, url: 'https://new.limova.ai/home', active: true }] : []);
     globalThis.fetch = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}) }));
     vi.resetModules();
     background = await import('../../../src/background.js');
@@ -45,6 +46,7 @@ describe('controlled page actions', () => {
 
   beforeEach(async () => {
     background.handleResetSession();
+    await background.handleMessage({ type: 'SET_AUTONOMY_MODE', mode: 'full' });
     sidebarMessages.length = 0;
     chromeMock.tabs.sendMessage.mockReset();
     chromeMock.tabs.sendMessage.mockResolvedValue({ ok: true });
@@ -135,7 +137,8 @@ describe('controlled page actions', () => {
     try {
       const result = await background.proposeOrExecuteAction(1, 'Clique sur Documents');
       expect(result.ok).toBe(false);
-      expect(track).toHaveBeenCalledWith('content_script', 'CONTENT_SCRIPT_REPAIR_FAILED', {
+      if (reason === 'navigation_race') expect(track).not.toHaveBeenCalledWith('content_script', 'CONTENT_SCRIPT_REPAIR_FAILED', expect.anything());
+      else expect(track).toHaveBeenCalledWith('content_script', 'CONTENT_SCRIPT_REPAIR_FAILED', {
         errorType: 'Error', failureReason: reason
       });
       expect(JSON.stringify(track.mock.calls)).not.toContain('private.example');
@@ -163,10 +166,17 @@ describe('controlled page actions', () => {
     }));
   });
 
+  async function cancelApproval(operation) {
+    await vi.waitFor(() => expect(sidebarMessages.some(message => message.type === 'ACTION_PROPOSAL')).toBe(true));
+    const proposal = sidebarMessages.find(message => message.type === 'ACTION_PROPOSAL');
+    await background.handleMessage({ type: 'CANCEL_ACTION', actionId: proposal.actionId });
+    return operation;
+  }
+
   it('keeps a link to another site blocked when the user did not ask for it', async () => {
     await showOnlyExternalLink();
-    const result = await background.proposeOrExecuteAction(1, 'Que contient cette page ?');
-    expect(result).toMatchObject({ ok: false, status: 'blocked' });
+    const result = await cancelApproval(background.proposeOrExecuteAction(1, 'Que contient cette page ?'));
+    expect(result).toMatchObject({ ok: false, cancelled: true });
     expect(chromeMock.tabs.sendMessage).not.toHaveBeenCalledWith(17, expect.objectContaining({
       type: 'EXECUTE_ELEMENT_ACTION'
     }));
@@ -249,26 +259,113 @@ describe('controlled page actions', () => {
 
   it('never sends a form the user did not ask to send', async () => {
     const idOf = await showPage('<form><textarea aria-label="Message"></textarea><button type="submit">Envoyer</button></form>');
-    const result = await background.proposeOrExecuteAction(idOf('Envoyer'), 'Que contient cette page ?');
-    expect(result).toMatchObject({ ok: false, status: 'blocked' });
+    const result = await cancelApproval(background.proposeOrExecuteAction(idOf('Envoyer'), 'Que contient cette page ?'));
+    expect(result).toMatchObject({ ok: false, cancelled: true });
     notClicked();
   });
 
   it('does not treat a bare "clique" as explicit for a consequential button', async () => {
     const idOf = await showPage('<button type="button">Supprimer le brouillon</button>');
-    const vague = await background.proposeOrExecuteAction(idOf('Supprimer le brouillon'), 'Clique');
-    expect(vague).toMatchObject({ ok: false, status: 'blocked' });
+    const vague = await cancelApproval(background.proposeOrExecuteAction(idOf('Supprimer le brouillon'), 'Clique'));
+    expect(vague).toMatchObject({ ok: false, cancelled: true });
     notClicked();
     const named = await background.proposeOrExecuteAction(idOf('Supprimer le brouillon'), 'Clique sur Supprimer le brouillon');
     expect(named.ok).toBe(true);
   });
 
+  it('persists the selected autonomy mode and requires approval for a safe click in ask mode', async () => {
+    await background.handleMessage({ type: 'SET_AUTONOMY_MODE', mode: 'ask' });
+    expect((await background.handleMessage({ type: 'GET_SETTINGS' })).autonomyMode).toBe('ask');
+    expect((await chromeMock.storage.local.get('charly_autonomy_mode_v1')).charly_autonomy_mode_v1).toBe('ask');
+    const pending = background.proposeOrExecuteAction(1, 'Clique sur Documents');
+    await vi.waitFor(() => expect(sidebarMessages.some(message => message.type === 'ACTION_PROPOSAL')).toBe(true));
+    notClicked();
+    const { actionId } = sidebarMessages.find(message => message.type === 'ACTION_PROPOSAL');
+    await background.handleMessage({ type: 'CONFIRM_ACTION', actionId });
+    const approved = await pending;
+    expect(approved.ok, JSON.stringify(approved)).toBe(true);
+    clicked(1);
+    const clicks = chromeMock.tabs.sendMessage.mock.calls.filter(([, msg]) => msg.type === 'EXECUTE_ELEMENT_ACTION').length;
+    await background.handleMessage({ type: 'CONFIRM_ACTION', actionId });
+    expect(chromeMock.tabs.sendMessage.mock.calls.filter(([, msg]) => msg.type === 'EXECUTE_ELEMENT_ACTION')).toHaveLength(clicks);
+  });
+
+  it('cancels an approval if its target page changes', async () => {
+    await background.handleMessage({ type: 'SET_AUTONOMY_MODE', mode: 'ask' });
+    const pending = background.proposeOrExecuteAction(1, 'Clique sur Documents');
+    await vi.waitFor(() => expect(sidebarMessages.some(message => message.type === 'ACTION_PROPOSAL')).toBe(true));
+    const { actionId } = sidebarMessages.find(message => message.type === 'ACTION_PROPOSAL');
+    chromeMock.tabs.get.mockResolvedValueOnce({ id: 17, url: 'https://different.example/', windowId: 1 });
+    await background.handleMessage({ type: 'CONFIRM_ACTION', actionId });
+    expect(await pending).toMatchObject({ cancelled: true });
+    notClicked();
+  });
+
+  it('waits for approval before writing text in ask mode and resumes after confirmation', async () => {
+    await background.handleMessage({ type: 'SET_AUTONOMY_MODE', mode: 'ask' });
+    const pending = background.typeVoiceText(5, 'Texte approuvé', undefined, 'Instructions');
+    await vi.waitFor(() => expect(sidebarMessages.some(message => message.type === 'ACTION_PROPOSAL')).toBe(true));
+    expect(chromeMock.tabs.sendMessage.mock.calls.some(([, msg]) => msg.type === 'TYPE_ELEMENT_TEXT')).toBe(false);
+    const proposal = sidebarMessages.find(message => message.type === 'ACTION_PROPOSAL');
+    expect(proposal.detail).toBe('Texte approuvé');
+    await background.handleMessage({ type: 'CONFIRM_ACTION', actionId: proposal.actionId });
+    const approved = await pending;
+    expect(approved.ok, JSON.stringify(approved)).toBe(true);
+  });
+
+  it.each([
+    'Crée un rendez-vous demain de 15h à 16h',
+    'Ajoute une réunion à mon agenda',
+    'Modifie ce rendez-vous pour demain à 10h',
+    'Schedule a meeting tomorrow at 3pm',
+    'Enregistre les modifications'
+  ])('saves the requested calendar task through a div role=button: %s', async request => {
+    await background.handleMessage({ type: 'SET_AUTONOMY_MODE', mode: 'balanced' });
+    const idOf = await showPage('<main><h1>Calendrier — Nouvel événement</h1><div role="dialog"><h2>Nouvel événement</h2><input aria-label="Titre"><div role="button" tabindex="0">Enregistrer</div></div></main>');
+    const result = await background.proposeOrExecuteAction(idOf('Enregistrer'), request, {
+      toolExplicitRequest: true, targetLabel: 'Enregistrer'
+    });
+    expect(result.ok).toBe(true);
+    clicked(idOf('Enregistrer'));
+  });
+
+  it.each([
+    'Analyse cet événement',
+    'Comment créer un rendez-vous ?',
+    'Explique comment cliquer sur Enregistrer',
+    'Crée un rendez-vous mais ne l’enregistre pas',
+    'Crée un rendez-vous mais ne pas enregistrer',
+    'Crée un rendez-vous sans l’enregistrer',
+    'Crée un rendez-vous mais attends avant d’enregistrer',
+    'Ne crée pas de rendez-vous',
+    "Don't create an event"
+  ])('does not infer permission to save from an information request or a withheld save: %s', async request => {
+    const idOf = await showPage('<main><h1>Calendrier — Nouvel événement</h1><div role="dialog"><div role="button" tabindex="0">Enregistrer</div></div></main>');
+    const pending = background.proposeOrExecuteAction(idOf('Enregistrer'), request, {
+      toolExplicitRequest: true, targetLabel: 'Enregistrer'
+    });
+    const result = /sans|ne |attends|don.t/i.test(request) ? await pending : await cancelApproval(pending);
+    expect(result).toMatchObject({ ok: false, cancelled: true });
+    notClicked();
+  });
+
+  it('does not use a calendar request to authorize a different resource or a payment save', async () => {
+    const idOf = await showPage('<main><h1>Facturation</h1><button type="submit">Enregistrer</button></main>');
+    expect((await cancelApproval(background.proposeOrExecuteAction(idOf('Enregistrer'), 'Crée un rendez-vous demain', {
+      toolExplicitRequest: true, targetLabel: 'Enregistrer'
+    }))).cancelled).toBe(true);
+    notClicked();
+    expect(background.classifyActionRisk({ type: 'clickable', text: 'Enregistrer', section: 'Paiement par carte bancaire' }, {
+      userMessage: 'Crée un rendez-vous', pageContext: 'Calendrier'
+    }).level).toBe('sensitive');
+  });
+
   it('accepts a voice tool click on a consequential button only after a real request', async () => {
     const idOf = await showPage('<button type="button">Payer maintenant</button>');
-    const question = await background.proposeOrExecuteAction(idOf('Payer maintenant'), 'C’est quoi ce bouton ?', {
+    const question = await cancelApproval(background.proposeOrExecuteAction(idOf('Payer maintenant'), 'C’est quoi ce bouton ?', {
       toolExplicitRequest: true, targetLabel: 'Payer maintenant'
-    });
-    expect(question).toMatchObject({ ok: false, status: 'blocked' });
+    }));
+    expect(question).toMatchObject({ ok: false, cancelled: true });
     notClicked();
     const confirmation = await background.proposeOrExecuteAction(idOf('Payer maintenant'), 'Oui vas-y', {
       toolExplicitRequest: true, targetLabel: 'Payer maintenant'
@@ -789,10 +886,16 @@ describe('controlled page actions', () => {
     expect(chromeMock.tabs.sendMessage).not.toHaveBeenCalledWith(17, expect.objectContaining({ type: 'TYPE_ELEMENT_TEXT' }));
   });
 
-  it('never creates a pending confirmation for a sensitive action', async () => {
-    const result = await background.proposeOrExecuteAction(2, 'Sauvegarde');
-    expect(result.status).toBe('blocked');
-    expect(sidebarMessages.some(message => message.type === 'ACTION_PROPOSAL')).toBe(false);
+  it('asks for approval for a sensitive action instead of refusing it', async () => {
+    await background.handleMessage({ type: 'SET_AUTONOMY_MODE', mode: 'balanced' });
+    const idOf = await showPage('<button type="button">Payer maintenant</button>');
+    const pending = background.proposeOrExecuteAction(idOf('Payer maintenant'), 'Clique sur Payer maintenant');
+    await vi.waitFor(() => expect(sidebarMessages.some(message => message.type === 'ACTION_PROPOSAL')).toBe(true));
+    const proposal = sidebarMessages.find(message => message.type === 'ACTION_PROPOSAL');
+    expect(sidebarMessages.some(message => message.code === 'ACTION_SENSITIVE_BLOCKED')).toBe(false);
+    await background.handleMessage({ type: 'CONFIRM_ACTION', actionId: proposal.actionId });
+    const approved = await pending;
+    expect(approved.ok, JSON.stringify(approved)).toBe(true);
   });
 
   it('does not claim success when no Limova tab is locked', async () => {

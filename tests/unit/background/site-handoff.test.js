@@ -67,6 +67,16 @@ describe('Charly on other sites and Limova handoff', () => {
     expect(chromeMock.tabs.create).not.toHaveBeenCalled();
   });
 
+  it('creates in the current Limova chat instead of rejecting an internal source page', async () => {
+    await chromeMock.storage.local.set({ limova_ai_processing_consent_v1: true });
+    chromeMock.tabs.query.mockResolvedValueOnce([{ id: 4, windowId: 1, active: true, url: 'https://new.limova.ai/chat/current' }]);
+    chromeMock.tabs.sendMessage.mockImplementation(async (_tabId, message) => message.type === 'LIMOVA_COMPOSE_AND_SEND' ? { ok: true, sent: true } : { ok: true });
+    const result = await background.handoffToLimova('Rédige un post LinkedIn');
+    expect(result).toMatchObject({ ok: true, sent: true, limovaTabId: 4 });
+    expect(chromeMock.tabs.create).not.toHaveBeenCalled();
+    expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(4, expect.objectContaining({ type: 'LIMOVA_COMPOSE_AND_SEND', prompt: 'Rédige un post LinkedIn' }));
+  });
+
   it('opens only web addresses the user names', () => {
     expect(background.normalizeRequestedPageUrl('lemonde.fr')).toBe('https://lemonde.fr/');
     expect(background.normalizeRequestedPageUrl('https://www.lefigaro.fr/actualite-france')).toBe('https://www.lefigaro.fr/actualite-france');

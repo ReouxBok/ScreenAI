@@ -92,11 +92,29 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateLangSwitcher();
   renderAnnouncements();
   initEventListeners();
+  loadAutonomyMode();
   await loadInitialState();
   document.documentElement.dataset.sidebarReady = 'true';
 });
 
+function applyAutonomyMode(mode) {
+  for (const input of document.querySelectorAll('input[name="autonomyMode"]')) input.checked = input.value === mode;
+}
+
+async function loadAutonomyMode() {
+  const settings = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }).catch(() => ({}));
+  applyAutonomyMode(settings?.autonomyMode || 'balanced');
+}
+
 function initEventListeners() {
+  for (const input of document.querySelectorAll('input[name="autonomyMode"]')) {
+    input.addEventListener('change', async () => {
+      if (!input.checked) return;
+      const result = await chrome.runtime.sendMessage({ type: 'SET_AUTONOMY_MODE', mode: input.value }).catch(() => null);
+      document.getElementById('autonomyStatus').textContent = t(result?.ok ? 'autonomySaved' : 'autonomySaveFailed');
+      if (!result?.ok) await loadAutonomyMode();
+    });
+  }
   elements.userInput.addEventListener('input', handleInputChange);
   elements.userInput.addEventListener('keydown', handleInputKeydown);
   elements.sendBtn.addEventListener('click', sendMessage);
@@ -828,8 +846,18 @@ function handleBackgroundMessage(message) {
       addMessage('system', t('agentStopped'));
       break;
 
+    case 'AUTONOMY_MODE_CHANGED':
+      applyAutonomyMode(message.mode);
+      voiceSession?.setAutonomyMode?.(message.mode);
+      break;
+    case 'ACTION_APPROVAL_RESOLVED':
+      elements.chatContainer.querySelector(`[data-pending-action="${CSS.escape(message.actionId)}"]`)?.remove();
+      if (voiceSession?.pendingApproval?.actionId === message.actionId) voiceSession.pendingApproval = null;
+      break;
     case 'ACTION_PROPOSAL':
       renderActionProposal(message);
+      voiceSession?.requestApproval?.(message);
+      updateStatus('voice', t('approvalWaiting'));
       break;
 
     case 'ACTION_RESULT':
@@ -850,6 +878,7 @@ function handleBackgroundMessage(message) {
 }
 
 function renderActionProposal(action) {
+  if (elements.chatContainer.querySelector(`[data-pending-action="${CSS.escape(action.actionId)}"]`)) return;
   const card = document.createElement('div');
   card.className = 'action-card';
   card.dataset.pendingAction = action.actionId;
@@ -868,8 +897,16 @@ function renderActionProposal(action) {
   cancel.dataset.decision = 'cancel';
   cancel.textContent = t('actionCancel');
   actions.append(confirm, cancel);
-  card.append(text, actions);
+  card.append(text);
+  if (action.detail) {
+    const detail = document.createElement('p'); detail.className = 'action-card-detail'; detail.textContent = action.detail; card.append(detail);
+  }
+  card.append(actions);
   elements.chatContainer.appendChild(card);
+  const keepAlive = setInterval(() => {
+    if (!card.isConnected) return clearInterval(keepAlive);
+    chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }).catch(() => {});
+  }, 15_000);
   scrollToBottom();
 }
 
@@ -878,7 +915,7 @@ async function handleActionDecision(actionId, confirmed) {
   card?.querySelectorAll('button').forEach(button => { button.disabled = true; });
   const result = await chrome.runtime.sendMessage({ type: confirmed ? 'CONFIRM_ACTION' : 'CANCEL_ACTION', actionId });
   card?.remove();
-  if (!result?.ok && result?.error) addMessage('error', result.error);
+  if (!result?.ok && !result?.cancelled && result?.error) addMessage('error', result.error);
 }
 
 // ============================================================================

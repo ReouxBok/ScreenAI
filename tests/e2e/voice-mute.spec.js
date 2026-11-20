@@ -32,7 +32,7 @@ async function setup(context,id,{deferMicrophone=false}={}) {
       if(msg.type==='GET_LIVE_TOKEN')return {ok:true,token:'synthetic-only',model:'test-model'};
       return realSendMessage(msg);
     };
-    const RealVoice=window.LimovaVoiceSession;
+    const RealVoice=Object.getPrototypeOf(window.LimovaVoiceSession); // Legacy Gemini AudioWorklet transport.
     window.LimovaVoiceSession=class extends RealVoice {constructor(...args){super(...args);window.__voice=this;}};
   },deferMicrophone);
   await page.locator('#voiceBtn').click();

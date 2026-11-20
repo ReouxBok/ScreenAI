@@ -93,7 +93,7 @@ class LimovaVoiceSession {
   updatePageContext(pageContext, contextVersion, source = 'navigation', visualCapture = null) {
     if (this.trainingMode) return false;
     const version = Number(contextVersion || 0);
-    const context = String(pageContext || '').slice(0, 12_000);
+    const context = String(pageContext || '');
     if (!context || version <= this.lastContextVersion) return false;
     this.pendingPageContext = { context, version, source };
     this.queueVisualCapture(visualCapture, version, source);
@@ -330,9 +330,12 @@ class LimovaVoiceSession {
       chrome.tabs.onRemoved?.addListener(onRemoved);
       chrome.tabs.create({
         url: chrome.runtime.getURL('src/sidebar/microphone-permission.html'),
+        ...(Number.isInteger(this.contextWindowId) ? { windowId: this.contextWindowId } : {}),
         active: true
-      }).then(tab => {
+      }).then(async tab => {
         permissionTabId = tab?.id ?? null;
+        this.microphonePermissionTabId = permissionTabId;
+        if (permissionTabId != null) await chrome.runtime.sendMessage({ type: 'VOICE_PERMISSION_TAB_OPENED', tabId: permissionTabId }).catch(() => {});
         this.diagnostic('VOICE_PERMISSION_TAB_OPENED', { opened: permissionTabId !== null });
       }).catch(() => finish(false, 'voiceMicUnavailable'));
     });
@@ -891,7 +894,7 @@ class LimovaVoiceSession {
         this.flushVisualCapture();
       }
       const response = {
-        status: result?.status === 'unexpected' || result?.verificationRequired
+        status: result?.cancelled ? 'cancelled' : result?.status === 'unexpected' || result?.verificationRequired
             ? 'unexpected'
             : result?.ok
               ? 'ok'

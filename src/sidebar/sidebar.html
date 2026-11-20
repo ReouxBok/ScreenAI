@@ -45,6 +45,14 @@
             </svg>
           </button>
           <div class="header-menu" id="headerMenu" hidden>
+            <fieldset class="autonomy-picker" aria-describedby="autonomyStatus">
+              <legend data-i18n="autonomyTitle">Autonomie</legend>
+              <label class="autonomy-option"><input type="radio" name="autonomyMode" value="ask"><span><strong data-i18n="autonomyAsk">Demander une approbation</strong><small data-i18n="autonomyAskDescription">Demande avant modifications et commandes</small></span></label>
+              <label class="autonomy-option"><input type="radio" name="autonomyMode" value="balanced" checked><span><strong data-i18n="autonomyBalanced">Approuver pour moi</strong><small data-i18n="autonomyBalancedDescription">Demande seulement si c’est risqué</small></span></label>
+              <label class="autonomy-option"><input type="radio" name="autonomyMode" value="full"><span><strong data-i18n="autonomyFull">Accès complet</strong><small data-i18n="autonomyFullDescription">Demande rarement avant d’agir</small></span></label>
+              <p class="autonomy-status" id="autonomyStatus" role="status" aria-live="polite"></p>
+            </fieldset>
+            <div class="menu-divider"></div>
             <button class="menu-item" id="trainingBtn">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 10 12 5 2 10l10 5 10-5Z"/><path d="M6 12v5c3 2 9 2 12 0v-5"/></svg>
               Entraîner Charly
@@ -136,7 +144,7 @@
     <section class="ai-consent-panel" id="aiConsentPanel" hidden aria-labelledby="aiConsentTitle">
       <div class="ai-consent-icon" aria-hidden="true">✦</div>
       <h2 id="aiConsentTitle" data-i18n="aiConsentTitle">Activer l’intelligence de Charly</h2>
-      <p data-i18n="aiConsentText">Avec ton accord, Charly utilise Google Gemini pour traiter le contexte Limova et peut conserver tes conversations jusqu’à 12 mois pour reprendre tes objectifs. Les captures et valeurs de formulaires ne sont jamais mémorisées. Tu gardes le contrôle dans le menu.</p>
+      <p data-i18n="aiConsentText">Avec ton accord, Charly utilise Google Gemini pour le texte et OpenAI GPT Live pour la voix afin de traiter le contexte de la page et peut conserver tes conversations jusqu’à 12 mois pour reprendre tes objectifs. Les captures et valeurs de formulaires ne sont jamais mémorisées. Tu gardes le contrôle dans le menu.</p>
       <a href="https://www.limova.ai/legal/politique-de-confidentialite" target="_blank" rel="noopener noreferrer" data-i18n="privacyLink">Politique de confidentialité</a>
       <div class="ai-consent-actions">
         <button class="consent-btn consent-accept" id="aiConsentAccept" data-i18n="aiConsentAccept">Activer Charly</button>
@@ -249,9 +257,11 @@
   <script src="i18n.js"></script>
   <script src="announcements.js"></script>
   <script src="voice.js"></script>
+  <script src="voice-openai.js"></script>
   <script src="training-recording-upload.js"></script>
   <script src="training-recorder.js"></script>
   <script src="site-access.js"></script>
   <script src="sidebar.js"></script>
+  <script src="voice-thread.js"></script>
 </body>
 </html>

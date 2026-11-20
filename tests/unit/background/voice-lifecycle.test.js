@@ -14,6 +14,7 @@ const mutationCalls = () => chromeMock.tabs.sendMessage.mock.calls.filter(([, re
 
 beforeEach(async () => {
   chromeMock = installFullChromeMock();
+    chromeMock.tabs.query.mockImplementation(async query => query?.active ? [{ id: 17, windowId: 1, url: 'https://new.limova.ai/home', active: true }] : []);
   await chromeMock.storage.local.set({ [consentKey]: true });
   globalThis.fetch = vi.fn(async () => ({ ok: true, json: async () => ({}) }));
   vi.resetModules();
@@ -45,6 +46,50 @@ async function stopOrReset(reset) {
     await message({ type: 'VOICE_SESSION_STATE', active: true });
   } else await message({ type: 'VOICE_SESSION_STATE', active: false });
 }
+
+describe('voice page binding', () => {
+  it('keeps the panel window and restores its page while the microphone helper has focus', async () => {
+    await message({ type: 'VOICE_SESSION_STATE', active: false });
+    await message({ type: 'GET_VOICE_PAGE_CONTEXT', windowId: 1, initialTabId: 17 });
+    await message({ type: 'VOICE_SESSION_STATE', active: true });
+    await message({ type: 'VOICE_PERMISSION_TAB_OPENED', tabId: 99 });
+    chromeMock.tabs.query.mockImplementation(async query => query.windowId === 1
+      ? [{ id: 99, windowId: 1, active: true }]
+      : [{ id: 88, windowId: 2, active: true, url: 'https://other.example' }]);
+    const result = await background.getFreshVoiceContext();
+    expect(result.ok).toBe(true);
+    expect(chromeMock.tabs.query).toHaveBeenLastCalledWith({ active: true, windowId: 1 });
+    expect(chromeMock.scripting.executeScript).toHaveBeenLastCalledWith(expect.objectContaining({ target: { tabId: 17 } }));
+  });
+
+  it('does not restore a voice page binding after stop during tab validation', async () => {
+    let release;
+    chromeMock.tabs.get.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const pending = message({ type: 'GET_VOICE_PAGE_CONTEXT', windowId: 1, initialTabId: 17 });
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    await message({ type: 'VOICE_SESSION_STATE', active: false });
+    release({ id: 17, windowId: 1, active: true, url: 'https://new.limova.ai/home' });
+    expect(await pending).toMatchObject({ cancelled: true });
+    await background.getFreshVoiceContext();
+    expect(chromeMock.tabs.query).toHaveBeenLastCalledWith({ active: true, lastFocusedWindow: true });
+  });
+
+  it('does not substitute a hidden Limova tab for a restricted Chrome page', async () => {
+    await message({ type: 'GET_VOICE_PAGE_CONTEXT', windowId: 1, initialTabId: 17 });
+    chromeMock.tabs.query.mockResolvedValue([{ id: 99, windowId: 1, active: true, url: 'chrome://extensions/' }]);
+    await expect(background.getFreshVoiceContext()).rejects.toMatchObject({ code: 'VOICE_CONTEXT_TAB_MISSING' });
+  });
+
+  it('upserts overlapping transcript fragments without duplicating turns', async () => {
+    await message({ type: 'VOICE_TRANSCRIPT', role: 'user', text: 'Ouvre', utteranceId: 'session:user:1', final: false });
+    await message({ type: 'VOICE_TRANSCRIPT', role: 'assistant', text: 'Je regarde', utteranceId: 'session:assistant:2', final: false });
+    await message({ type: 'VOICE_TRANSCRIPT', role: 'user', text: 'Ouvre mon agenda', utteranceId: 'session:user:1', final: false });
+    const { conversationHistory } = await message({ type: 'GET_STATE' });
+    expect(conversationHistory.map(({ role, content }) => ({ role, content }))).toEqual([
+      { role: 'user', content: 'Ouvre mon agenda' }, { role: 'assistant', content: 'Je regarde' }
+    ]);
+  });
+});
 
 describe('already dispatched voice commands', () => {
   it('does not report an old task as successful merely because its click opened a followed tab', async () => {
