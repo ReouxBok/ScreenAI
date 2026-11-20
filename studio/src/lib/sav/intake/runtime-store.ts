@@ -25,6 +25,7 @@ import { decryptSavPayload, encryptSavPayload, savContentHash } from "../crypto"
 import { savAttachmentInventorySchema } from "../attachment-contract";
 import { prepareSavIntakeMessage, intakeForwardNeedsOriginal } from "./message";
 import { invalidIntakeAddressMetadata, SAV_INTAKE_INVALID_SOURCE } from "./source-validation";
+import { intakeAttemptOutcome, SAV_INTAKE_ATTEMPT_OUTCOME_KIND } from "./attempt-outcome";
 import { unbilledProviderStatus } from "./model-usage";
 import { intakeMaxCallReservation, intakeRequestReservation, storedIntakeReservation, type IntakeRequestSize } from "./request-reservation";
 import type { SavGeminiMetadata } from "../gemini-response";
@@ -518,6 +519,8 @@ export async function saveSavIntakeResult(lease: IntakeLease, config: IntakeRunt
       leaseToken: null, leaseUntil: null, updatedAt: now }).where(eq(savIntakeRuns.id, lease.run.id));
     await tx.update(savMessages).set({ analysisStatus: state === "observed" ? "intake_observed" : "intake_waiting" }).where(eq(savMessages.id, lease.run.messageId));
     await journal(tx, lease.run.id, state, payload);
+    // SAV-120: a compact, always readable trace of why this attempt ended without a decision (closed codes only).
+    if (state === "waiting") await journal(tx, lease.run.id, SAV_INTAKE_ATTEMPT_OUTCOME_KIND, intakeAttemptOutcome(payload));
     // SAV-88: the rescue had to conclude. "observed" is a V1 decision taken (ticket, identification, no ticket, or a
     // human choice for the team's queue); any other end (collect_context without a human choice, stale sources,
     // rejected output, recorded provider error) is a dead end: "à traiter à la main", unless a read retry is scheduled.
@@ -554,7 +557,7 @@ export async function failSavIntakeRun(lease: IntakeLease, payload: IntakeRuntim
       // The last allowed attempt failed: mark it now so the console shows the cause instead of a silent wait.
       const budget = intakeAttemptBudget(lease.run.id, await attemptRows(tx, lease.run.messageId));
       if (budget.exhausted && !await blockedRun(tx, lease.run.id)) await journal(tx, lease.run.id, await exhaustionKind(tx, lease.run.id),
-        { cause: budget.exhausted, failed: budget.failed, total: budget.total, policy: SAV_INTAKE_ATTEMPT_POLICY });
+        { cause: budget.exhausted, failed: budget.failed, total: budget.total, policy: SAV_INTAKE_ATTEMPT_POLICY, ...intakeAttemptOutcome(payload) });
     }
     // SAV-88: a rescue that ends here without a scheduled read retry did not conclude: terminal, whatever the error (a pause excepted, above).
     if (rows.length && !uncertain && !paused && payload.readRecovery?.state !== "scheduled" && await rescueConsumed(tx, lease.run.id, true)
@@ -563,6 +566,7 @@ export async function failSavIntakeRun(lease: IntakeLease, payload: IntakeRuntim
       if(payload.readRecovery)await writeReadRecoveryMarker(tx,lease.run.id,payload.readRecovery);
       await tx.update(savMessages).set({ analysisStatus: uncertain ? "intake_uncertain" : "intake_waiting" }).where(eq(savMessages.id, lease.run.messageId));
       await journal(tx, lease.run.id, "interrupted", payload);
+      await journal(tx, lease.run.id, SAV_INTAKE_ATTEMPT_OUTCOME_KIND, intakeAttemptOutcome(payload));
     } else {
       const [existing] = await tx.select({ id: savIntakeRuns.id }).from(savIntakeRuns).where(eq(savIntakeRuns.id, lease.run.id));
       if (existing) await journal(tx, lease.run.id, "obsolete_partial_result", { sourceHash: lease.sourceHash, payload });

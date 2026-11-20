@@ -215,6 +215,43 @@ describe("a dossier still re-analysed after a release (decision waiting for its 
   });
 });
 
+describe("a new customer mail on a dossier whose attempts are exhausted (SAV-120, N7 fix 1)", () => {
+  it("gets its own attempt counter and is analysed; the exhausted version stays exhausted, its counter untouched", async () => {
+    const m = await stored("Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.");
+    // Pre-fix history: eight counted attempts on the first mail, then a version never scheduled again.
+    let id = (await enqueueSavIntakeMessage(m.id, release(0).config))!, exhaustedConfig = release(0).config;
+    for (let n = 1; n <= SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage; n++) {
+      const [run] = await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id));
+      await f.db.update(savIntakeRuns).set({ attempts: 1, state: "observed", payloadCiphertext: encryptSavPayload({ ...decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext), plan: { synthetic: true } }) }).where(eq(savIntakeRuns.id, id));
+      exhaustedConfig = release(n).config;
+      id = (await enqueueSavIntakeMessage(m.id, exhaustedConfig))!;
+    }
+    // The lifetime total is reached: the version is never scheduled (the exact claim refusal is covered above).
+    await f.db.update(savIntakeRuns).set({ updatedAt: new Date(Date.now() - 3600_000) }).where(eq(savIntakeRuns.id, id));
+    await refreshIntakeConsole();
+    expect(await blockedCause()).toBe("attempts_exhausted");
+    const exhaustedKinds = await kinds(id);
+    const before = (await runsOf(m.id)).map(r => ({ id: r.id, attempts: r.attempts })).sort((a, b) => a.id.localeCompare(b.id));
+    // No new mail: nothing restarts (no replay), whatever the passes.
+    expect(await catchupSavIntake(exhaustedConfig)).toBe(0);
+    expect((await runsOf(m.id)).find(r => r.isCurrent)?.id).toBe(id);
+    // The customer writes again: a new entry version, bound to the new mail.
+    const reply = await stored("Toujours la même erreur 500 ce matin, pouvez-vous regarder ?");
+    expect(await catchupSavIntake(exhaustedConfig)).toBe(1);
+    const [next] = await runsOf(reply.id);
+    expect(next).toMatchObject({ isCurrent: true, attempts: 0, state: "pending" });
+    expect(await kinds(next.id)).not.toContain("attempts_exhausted");
+    const lease = await claimSavIntakeRun(next.id, exhaustedConfig);
+    expect(lease).toBeTruthy();
+    expect((await runsOf(reply.id))[0].attempts).toBe(1);
+    // Never a reset: the first mail keeps every counter and its marker.
+    expect((await runsOf(m.id)).map(r => ({ id: r.id, attempts: r.attempts })).sort((a, b) => a.id.localeCompare(b.id))).toEqual(before);
+    expect(await kinds(id)).toEqual(expect.arrayContaining(exhaustedKinds));
+    expect((await runsOf(m.id)).find(r => r.id === id)?.state).not.toBe("observed");
+    expect((await readIntakeRunDiagnostics(threadId))?.attemptBudget).toMatchObject({ runAttempts: 1, total: 1, exhausted: null });
+  });
+});
+
 describe("console label of an exhausted dossier never claimed again", () => {
   it("says the attempts are exhausted, not that the next pass will take it", async () => {
     const m = await stored("Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.");
@@ -232,5 +269,59 @@ describe("console label of an exhausted dossier never claimed again", () => {
     const label = intakeBlockedRowLabel({ blockedCause: await blockedCause(), status: "pending", reason: null });
     expect(label).toMatch(/tentatives d’analyse épuisées/);
     expect(label).not.toMatch(/prochain passage/);
+  });
+});
+describe("why an attempt failed, as closed codes (SAV-120, N7 fix 3)", () => {
+  /** Fake model that always cites a quote absent from the catalogue, with customer-looking words in its output. */
+  function rejectingModel(messageId: string) {
+    return vi.fn(async (url: Parameters<typeof fetch>[0]) => {
+      if (String(url).startsWith("https://generativelanguage.googleapis.com/")) {
+        const answer = { messageId, requests: [{ id: "r1", kind: "support", currentMessageId: messageId, quoteId: "Q-CLIENT-SECRET-TEXT" }] };
+        return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } });
+      }
+      if (String(url).startsWith("https://api.hubapi.com/")) return Response.json({ total: 0, results: [] });
+      throw Error("EXTERNAL_NETWORK_FORBIDDEN");
+    });
+  }
+
+  it("journals a small attempt outcome the diagnostic can read, with codes only and no customer text", async () => {
+    const m = await stored("Bonjour, mon numéro client est 123456 et la synchronisation échoue.");
+    const { config, env: e } = release(0), id = (await enqueueSavIntakeMessage(m.id, config))!;
+    await analyseSavIntakeRuntime(id, config, { env: () => e, network: rejectingModel(m.id) });
+    const rows = await f.db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, id));
+    const outcome = rows.find(r => r.kind === "attempt_outcome");
+    expect(outcome, rows.map(r => r.kind).join(",")).toBeTruthy();
+    const value = decryptSavPayload<{ reason: string | null; traces: Array<Record<string, unknown>> }>(outcome!.payloadCiphertext);
+    expect(value.traces.length).toBeGreaterThan(0);
+    expect(value.traces.some(t => t.errorCode || t.validationFailure)).toBe(true);
+    const text = JSON.stringify(value);
+    for (const leaked of ["123456", "synchronisation", "CLIENT-SECRET", "client@example.invalid", "Bonjour"]) expect(text).not.toContain(leaked);
+    expect(outcome!.payloadCiphertext.length).toBeLessThan(4096);
+    const diagnostics = await readIntakeRunDiagnostics(threadId);
+    const event = diagnostics!.runs.find(r => r.runId === id)!.events.find(ev => ev.kind === "attempt_outcome");
+    expect(event?.diagnostic.readable).toBe(true);
+    expect(event?.diagnostic.traces.some(t => t.errorCode || t.validationReason)).toBe(true);
+  });
+});
+
+describe("attempt outcome allow-list (SAV-120, N7 fix 3)", () => {
+  it("keeps closed codes, enums and byte counts only; free text and unknown values are dropped", async () => {
+    const { intakeAttemptOutcome } = await import("./attempt-outcome");
+    const outcome = intakeAttemptOutcome({ reason: "Le client dit: rembourse-moi", traces: [
+      { phase: "understanding", accepted: true, errorCode: null },
+      { method: "analyseMessage", phase: "understanding", accepted: false, errorCode: "SAV_INTAKE_MODEL_OUTPUT_REJECTED",
+        validationFailure: { reason: "excerpt_not_in_source", stage: "evidence", path: "requests.0.quote", excerpt: "mon mot de passe est hunter2" },
+        contextLimit: { stage: "wire", bytes: 900_000, limitBytes: 800_000, breakdown: { text: "corps du mail" } } },
+      { operation: "ticket_history", status: "failed", reason: "history_body_unavailable", detail: "jean@example.invalid" },
+      { phase: "understanding", accepted: false, errorCode: "erreur libre avec texte client" },
+    ] });
+    expect(outcome.reason).toBeNull();
+    expect(outcome.traces).toHaveLength(3);
+    expect(outcome.traces[0]).toMatchObject({ method: "analyseMessage", errorCode: "SAV_INTAKE_MODEL_OUTPUT_REJECTED",
+      validationFailure: { reason: "excerpt_not_in_source", stage: "evidence" }, contextLimit: { stage: "wire", bytes: 900_000, limitBytes: 800_000 } });
+    expect(outcome.traces[1]).toMatchObject({ operation: "ticket_history", status: "failed", reason: "history_body_unavailable" });
+    expect(outcome.traces[2].errorCode).toBeNull();
+    const text = JSON.stringify(outcome);
+    for (const leaked of ["rembourse", "hunter2", "requests.0", "corps du mail", "jean@", "texte client"]) expect(text).not.toContain(leaked);
   });
 });
