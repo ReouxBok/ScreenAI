@@ -17,7 +17,7 @@ import { accessSkillWireAnswer } from "../access-skill/access-skill-wire";
 import { createSavBenchAgent, smartBenchTurn } from "./smart-bench-agent";
 import { smartEmptyMemory } from "./smart-memory";
 import {
-  readSmartBenchSelfTestConfig, readSmartBenchSelfTestReport, readSmartBenchSelfTestRows, runSmartBenchSelfTestPass, smartBenchItem, smartBenchReportLine, smartBenchRisky, smartBenchRunPattern, smartBenchSelfTestSet,
+  readSmartBenchSelfTestConcurrency, readSmartBenchSelfTestConfig, readSmartBenchSelfTestReport, readSmartBenchSelfTestRows, runSmartBenchSelfTestPass, smartBenchItem, smartBenchReportLine, smartBenchRisky, smartBenchRunPattern, smartBenchSelfTestSet,
   aggregateSmartBenchSelfTest, SAV_SMART_BENCH_NEW_CALLS, SAV_SMART_BENCH_SELFTEST_CORPUS, SAV_SMART_BENCH_SELFTEST_PREFIX, SAV_SMART_BENCH_SELFTEST_VARIANTS, type SmartBenchSelfTestDeps,
 } from "./smart-bench-selftest";
 import { readSmartLedger, smartItemKey } from "./smart-ledger";
@@ -347,3 +347,150 @@ describe("rapport d'un run", () => {
     expect((await readSmartBenchSelfTestRows("lotA1")).map(row => row.runId)).toEqual(["lotA1"]);
   });
 });
+
+describe("concurrence (21/11) : N conversations en parallèle dans une passe", () => {
+  const RESERVE = 1_000, CALLS_PER_TURN = SAV_SMART_BENCH_NEW_CALLS + 1;
+  const POLICY_ENV = (extra: Record<string, string> = {}) => ENV({ SAV_V2_SMART_BENCH_SELFTEST_AGENT: "new", SAV_V2_SMART_BENCH_SELFTEST_BATCH: "20",
+    SAV_V2_SPEND_POLICY_JSON: JSON.stringify({ ...ACCESS_SKILL_TEST_POLICY, model: { ...ACCESS_SKILL_TEST_POLICY.model, reserveMicroUsdPerCall: RESERVE } }), ...extra });
+  /** Eight one-turn conversations: the same worst case each (CALLS_PER_TURN × RESERVE). */
+  const ONE_TURN = SAV_BENCH_CORPUS.filter(row => !row.risky && row.turns.length === 1).slice(0, 8);
+  const WORST = CALLS_PER_TURN * RESERVE;
+  /** The slow model: each call waits `delayMs`, counts the calls in flight, optionally advances a fake clock; usage unreadable → costs the reservation. */
+  const slow = (delayMs: number, onCall: () => void = () => undefined) => {
+    const state = { inFlight: 0, maxInFlight: 0, sent: 0 };
+    const fn = async () => {
+      onCall();
+      state.sent += 1; state.inFlight += 1; state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+      state.inFlight -= 1;
+      return Response.json({ candidates: [{ content: { parts: [{ text: "{}" }] } }] });
+    };
+    return { state, fn };
+  };
+  /** A scripted agent making `perTurn` calls per turn through the meter; counts the turns played per conversation. */
+  const scripted = (played: Map<string, number>, perTurn = 1) => (_name: string, meter: (url: string, init: RequestInit) => Promise<Response>): SavBenchAgent => ({ name: "scripted", revision: "x",
+    respond: async input => {
+      played.set(input.conversationId, (played.get(input.conversationId) ?? 0) + 1);
+      for (let call = 0; call < perTurn; call += 1)
+        await meter("https://generativelanguage.googleapis.com/v1beta/models/synthetic-model:generateContent", { method: "POST", body: "x" });
+      return { outcome: "passer_la_main", reply: null, citations: [], codes: [] };
+    } });
+
+  it("réglage : absent → 1 (comportement d'avant) ; 1 à 8 ; sinon refusé avant toute lecture", async () => {
+    expect(ONE_TURN).toHaveLength(8);
+    expect(readSmartBenchSelfTestConcurrency(ENV())).toBe(1);
+    for (const value of ["1", "4", "8"]) expect(readSmartBenchSelfTestConcurrency(ENV({ SAV_V2_SMART_BENCH_SELFTEST_CONCURRENCY: value }))).toBe(Number(value));
+    for (const value of ["0", "9", "", "quatre", "2.5", "-1"]) {
+      expect(readSmartBenchSelfTestConcurrency(ENV({ SAV_V2_SMART_BENCH_SELFTEST_CONCURRENCY: value }))).toBeNull();
+      expect(readSmartBenchSelfTestConfig(ENV({ SAV_V2_SMART_BENCH_SELFTEST_CONCURRENCY: value }))).toEqual({ mode: "refused", reason: "concurrency_invalid" });
+    }
+    state.db = null;
+    expect(await runSmartBenchSelfTestPass(deps(ENV({ SAV_V2_SMART_BENCH_SELFTEST_CONCURRENCY: "9" }), network()))).toEqual({ skipped: "refused", reason: "concurrency_invalid" });
+  });
+
+  it("concurrence 4, modèle lent : 4 conversations en même temps, chacune jouée, réservée, réglée et journalisée une fois", async () => {
+    const net = slow(30), played = new Map<string, number>(), logs: [string, Record<string, unknown>][] = [];
+    const result = await runSmartBenchSelfTestPass(deps(POLICY_ENV({ SAV_V2_SMART_BENCH_SELFTEST_ID: "par-4", SAV_V2_SMART_BENCH_SELFTEST_CONCURRENCY: "4" }), network(),
+      { network: net.fn, corpus: ONE_TURN, agents: scripted(played), log: (event, fields) => logs.push([event, fields]) }));
+    expect(net.state.maxInFlight).toBe(4);
+    expect(result).toMatchObject({ ran: 8, stoppedBy: "done", remaining: 0, spentMicroUsd: RESERVE * net.state.sent });
+    expect([...played.values()]).toEqual(Array(8).fill(1));
+    expect(await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, "par-4")).toMatchObject({ items: 8, open: {}, settledMicroUsd: RESERVE * net.state.sent });
+    const lines = logs.filter(([event]) => event === "sav_smart_bench_conversation").map(([, fields]) => fields.conversationId);
+    expect([...lines].sort()).toEqual(ONE_TURN.map(row => row.id).sort());
+    expect(logs.filter(([event]) => event === "sav_smart_bench_selftest")).toHaveLength(1);
+  });
+
+  it("concurrence 4 et lot de 6 : jamais plus de 6 conversations commencées", async () => {
+    const net = slow(20), played = new Map<string, number>();
+    const result = await runSmartBenchSelfTestPass(deps(POLICY_ENV({ SAV_V2_SMART_BENCH_SELFTEST_ID: "par-batch", SAV_V2_SMART_BENCH_SELFTEST_CONCURRENCY: "4", SAV_V2_SMART_BENCH_SELFTEST_BATCH: "6" }), network(),
+      { network: net.fn, corpus: ONE_TURN, agents: scripted(played) }));
+    expect(result).toMatchObject({ ran: 6, stoppedBy: "batch", remaining: 2 });
+    expect(played.size).toBe(6);
+    expect((await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, "par-batch")).items).toBe(6);
+  });
+
+  it("concurrence 4, plafond de 2,5 conversations : les réservations en vol comptent, arrêt net sans dépassement", async () => {
+    const net = slow(30), played = new Map<string, number>();
+    const cap = Math.floor(2.5 * WORST);
+    const result = await runSmartBenchSelfTestPass(deps(POLICY_ENV({ SAV_V2_SMART_BENCH_SELFTEST_ID: "par-cap", SAV_V2_SMART_BENCH_SELFTEST_CONCURRENCY: "4", SAV_V2_SMART_BENCH_SELFTEST_MAX_MICRO_USD: String(cap) }), network(),
+      { network: net.fn, corpus: ONE_TURN, agents: scripted(played) }));
+    // Two worst cases fit, the third claim (made while the first two are still in flight) is refused: 2 played, money cap.
+    expect(result).toMatchObject({ ran: 2, stoppedBy: "money_cap", remaining: 6 });
+    expect(played.size).toBe(2);
+    expect(net.state.maxInFlight).toBeLessThanOrEqual(2);
+    const ledger = await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, "par-cap");
+    expect(ledger).toMatchObject({ items: 2, open: {} });
+    expect(ledger.settledMicroUsd).toBe(RESERVE * net.state.sent);
+    expect(ledger.settledMicroUsd).toBeLessThanOrEqual(cap);
+    expect((result as { spentMicroUsd: number }).spentMicroUsd).toBeLessThanOrEqual(cap);
+  });
+
+  it("concurrence 4, un appel mesuré au-dessus de la réservation : les autres conversations en vol n'envoient plus d'appel", async () => {
+    let sent = 0;
+    const fn = async () => {
+      sent += 1;
+      const first = sent === 1;
+      await new Promise(resolve => setTimeout(resolve, first ? 5 : 40));
+      return Response.json({ candidates: [{ content: { parts: [{ text: "{}" }] } }], usageMetadata: { promptTokenCount: first ? 10_000_000_000_000 : 1_000, candidatesTokenCount: 0 } });
+    };
+    const played = new Map<string, number>();
+    const result = await runSmartBenchSelfTestPass(deps(POLICY_ENV({ SAV_V2_SMART_BENCH_SELFTEST_ID: "par-over", SAV_V2_SMART_BENCH_SELFTEST_CONCURRENCY: "4" }), network(),
+      { network: fn, corpus: ONE_TURN, agents: scripted(played, 3) }));
+    // The 4 first calls were already in flight; after the overrun no call is sent and no conversation starts.
+    expect(sent).toBe(4);
+    expect(result).toMatchObject({ ran: 4, stoppedBy: "money_cap", remaining: 4 });
+    expect((await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, "par-over")).open).toEqual({});
+  });
+
+  it("concurrence 4, deadline : aucune conversation commencée sous 150 s, aucun appel envoyé sous la limite par appel", async () => {
+    const t0 = 1_000_000, deadlineMs = t0 + 170_000;
+    let t = t0;
+    const leftAtSend: number[] = [], leftAtStart: number[] = [];
+    const net = slow(10, () => { leftAtSend.push(deadlineMs - t); t += 20_000; });
+    const played = new Map<string, number>();
+    const agents = (name: SmartBenchAgentNameForTest, meter: (url: string, init: RequestInit) => Promise<Response>) => {
+      const inner = scripted(played, 3)(name, meter);
+      return { ...inner, respond: async (input: Parameters<SavBenchAgent["respond"]>[0]) => { if (input.turn === 1) leftAtStart.push(deadlineMs - t); return inner.respond(input); } };
+    };
+    const result = await runSmartBenchSelfTestPass(deps(POLICY_ENV({ SAV_V2_SMART_BENCH_SELFTEST_ID: "par-deadline", SAV_V2_SMART_BENCH_SELFTEST_CONCURRENCY: "4" }), network(),
+      { network: net.fn, corpus: ONE_TURN, agents, clock: () => t, deadlineMs }));
+    expect(result).toMatchObject({ ran: 4, stoppedBy: "deadline", remaining: 4 });
+    // The four starts are decided at t0 (170 s left), before the claim, as in the serial loop; once the in-flight calls brought the time left
+    // under 150 s, no fifth conversation starts although four remain.
+    expect(leftAtStart).toHaveLength(4);
+    expect(Math.max(...leftAtSend)).toBe(170_000);
+    expect(deadlineMs - t).toBeLessThan(150_000);
+    expect(leftAtSend.length).toBeGreaterThan(0);
+    expect(leftAtSend.every(left => left >= 8_000 + 3_000)).toBe(true);
+    const rows = await readSmartBenchSelfTestRows("par-deadline");
+    expect(rows.some(row => row.stopped === "deadline")).toBe(true);
+    expect((await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, "par-deadline")).open).toEqual({});
+  });
+
+  it("deux passes de concurrence 4 qui se chevauchent : `already_claimed` jamais joué deux fois", async () => {
+    const net = slow(15), played = new Map<string, number>(), logs: string[] = [];
+    const run = () => runSmartBenchSelfTestPass(deps(POLICY_ENV({ SAV_V2_SMART_BENCH_SELFTEST_ID: "par-overlap", SAV_V2_SMART_BENCH_SELFTEST_CONCURRENCY: "4" }), network(),
+      { network: net.fn, corpus: ONE_TURN, agents: scripted(played), log: (event, fields) => { if (event === "sav_smart_bench_conversation") logs.push(String(fields.conversationId)); } }));
+    const [a, b] = await Promise.all([run(), run()]);
+    expect([...played.values()]).toEqual(Array(8).fill(1));
+    expect(played.size).toBe(8);
+    expect([...logs].sort()).toEqual(ONE_TURN.map(row => row.id).sort());
+    expect((a as { ran: number }).ran + (b as { ran: number }).ran).toBe(8);
+    expect(await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, "par-overlap")).toMatchObject({ items: 8, open: {} });
+    expect(await readSmartBenchSelfTestRows("par-overlap")).toHaveLength(8);
+  });
+
+  it("concurrence 4, erreur SQL à la réservation : résultat codé, rien n'est levé, 0 appel", async () => {
+    const net = slow(5);
+    state.db = new Proxy(f.db as unknown as Record<string | symbol, unknown>, { get(target, prop) {
+      if (prop === "transaction") return async () => { throw Object.assign(new Error("synthetic"), { code: "XX000" }); };
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    expect(await runSmartBenchSelfTestPass(deps(POLICY_ENV({ SAV_V2_SMART_BENCH_SELFTEST_CONCURRENCY: "4" }), network(), { network: net.fn, corpus: ONE_TURN, agents: scripted(new Map()) })))
+      .toEqual({ skipped: "error_contained", code: "sql_XX000" });
+    expect(net.state.sent).toBe(0);
+  });
+});
+type SmartBenchAgentNameForTest = Parameters<NonNullable<SmartBenchSelfTestDeps["agents"]>>[0];

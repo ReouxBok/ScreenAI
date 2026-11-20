@@ -47,6 +47,9 @@ export const SAV_SMART_BENCH_SELFTEST_BATCH_ENV = "SAV_V2_SMART_BENCH_SELFTEST_B
 export const SAV_SMART_BENCH_SELFTEST_CAP_ENV = "SAV_V2_SMART_BENCH_SELFTEST_MAX_MICRO_USD";
 export const SAV_SMART_BENCH_SELFTEST_SET_ENV = "SAV_V2_SMART_BENCH_SELFTEST_SET";
 export const SAV_SMART_BENCH_SELFTEST_PASSES_ENV = "SAV_V2_SMART_BENCH_SELFTEST_PASSES";
+export const SAV_SMART_BENCH_SELFTEST_CONCURRENCY_ENV = "SAV_V2_SMART_BENCH_SELFTEST_CONCURRENCY";
+/** Conversations played at the same time in one pass (21/11): default 1 (one by one, as before), at most 8. */
+export const SAV_SMART_BENCH_SELFTEST_DEFAULT_CONCURRENCY = 1, SAV_SMART_BENCH_SELFTEST_MAX_CONCURRENCY = 8;
 export const SAV_SMART_BENCH_SELFTEST_PREFIX = "sav-v2-smart-bench-selftest.v1";
 /** Ceiling of the run's cap (Ugo 20/11: 15 USD per run); without the env the cap stays at the default 10 000 000 µUSD. */
 export const SAV_SMART_BENCH_SELFTEST_MAX_CAP_MICRO_USD = 15_000_000, SAV_SMART_BENCH_SELFTEST_DEFAULT_CAP_MICRO_USD = 10_000_000;
@@ -82,8 +85,16 @@ export const smartBenchSelfTestCorpusRevision = (set: SmartBenchSelfTestSet) =>
 
 export type SmartBenchSelfTestConfig =
   | Readonly<{ mode: "off" }>
-  | Readonly<{ mode: "refused"; reason: "id_invalid" | "agent_invalid" | "batch_invalid" | "cap_invalid" | "set_invalid" | "passes_invalid" }>
+  | Readonly<{ mode: "refused"; reason: "id_invalid" | "agent_invalid" | "batch_invalid" | "cap_invalid" | "set_invalid" | "passes_invalid" | "concurrency_invalid" }>
   | Readonly<{ mode: "run"; runId: string; agents: readonly SmartBenchAgentName[]; batch: number; capMicroUsd: number; set: SmartBenchSelfTestSet; passes: SmartBenchPass }>;
+
+/** The pass's concurrency: absent → 1; an integer from 1 to 8; anything else → null (the config is then refused, `concurrency_invalid`). */
+export function readSmartBenchSelfTestConcurrency(env: Env): number | null {
+  const raw = env[SAV_SMART_BENCH_SELFTEST_CONCURRENCY_ENV];
+  if (raw === undefined) return SAV_SMART_BENCH_SELFTEST_DEFAULT_CONCURRENCY;
+  const value = INTEGER.test(raw) ? Number(raw) : NaN;
+  return value >= 1 && value <= SAV_SMART_BENCH_SELFTEST_MAX_CONCURRENCY ? value : null;
+}
 
 export function readSmartBenchSelfTestConfig(env: Env): SmartBenchSelfTestConfig {
   if (env[SAV_SMART_BENCH_SELFTEST_ENV] !== "run") return { mode: "off" };
@@ -105,6 +116,7 @@ export function readSmartBenchSelfTestConfig(env: Env): SmartBenchSelfTestConfig
   if (!(SAV_SMART_BENCH_SELFTEST_SETS as readonly string[]).includes(set)) return { mode: "refused", reason: "set_invalid" };
   const passes = integer(SAV_SMART_BENCH_SELFTEST_PASSES_ENV, 1, 2);
   if (passes === null) return { mode: "refused", reason: "passes_invalid" };
+  if (readSmartBenchSelfTestConcurrency(env) === null) return { mode: "refused", reason: "concurrency_invalid" };
   return { mode: "run", runId, agents: agent === "both" ? ["current", "new"] : [agent], batch, capMicroUsd, set: set as SmartBenchSelfTestSet, passes: passes as SmartBenchPass };
 }
 
@@ -180,14 +192,26 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
     .where(like(savSyncState.key, smartBenchRunPattern(config.runId)))).map(row => row.key));
   const todo = passes.flatMap(pass => config.agents.flatMap(agent => corpus.map(conversation => ({ pass, agent, conversation }))))
     .filter(({ pass, agent, conversation }) => !claimed.has(smartItemKey(SAV_SMART_BENCH_SELFTEST_PREFIX, smartBenchItem(config.runId, agent, conversation.id, pass))));
-  let ran = 0, stoppedBy: Extract<SmartBenchSelfTestPass, { ran: number }>["stoppedBy"] = todo.length ? "batch" : "done";
-  for (const { pass, agent: agentName, conversation } of todo) {
-    if (ran >= config.batch) { stoppedBy = "batch"; break; }
-    if (left() < CONVERSATION_MIN_MS) { stoppedBy = "deadline"; break; }
+  // Concurrency (21/11): N workers share the to-do list, each takes the next conversation. Concurrency 1 = the historical loop, unchanged.
+  // - Batch: a slot is taken (`started`) BEFORE the claim and given back when the claim is refused, so N workers never start more than `_BATCH`.
+  // - Money: the claim is atomic (the ledger row locked FOR UPDATE, the item checked in the same transaction) and counts every reservation still
+  //   open, so the in-flight conversations' worst cases are counted: N parallel claims never pass the cap; the first refusal stops new starts.
+  // - Time: no new conversation below 150 s left; each in-flight call still bounded by the time left (the meter, per conversation).
+  // - Stop: the FIRST reason (batch, deadline, money cap, an error) wins; in-flight conversations finish, are settled and logged.
+  const concurrency = readSmartBenchSelfTestConcurrency(env) ?? SAV_SMART_BENCH_SELFTEST_DEFAULT_CONCURRENCY;
+  let ran = 0, started = 0, next = 0, stopped = false, overrun = false, stoppedBy: Extract<SmartBenchSelfTestPass, { ran: number }>["stoppedBy"] = todo.length ? "batch" : "done";
+  const stop = (reason: typeof stoppedBy) => { if (!stopped) { stopped = true; stoppedBy = reason; } };
+  const worker = async () => { while (!stopped && next < todo.length) {
+    if (started >= config.batch) { stop("batch"); break; }
+    if (left() < CONVERSATION_MIN_MS) { stop("deadline"); break; }
+    const { pass, agent: agentName, conversation } = todo[next++]!;
+    started += 1;
     const item = smartBenchItem(config.runId, agentName, conversation.id, pass), maxCalls = conversation.turns.length * smartBenchCallsPerTurn(agentName);
     const worst = maxCalls * prices.modelReserve;
-    const claim = await claimSmartItem({ prefix: SAV_SMART_BENCH_SELFTEST_PREFIX, scope: config.runId, item, worstMicroUsd: worst, capMicroUsd: config.capMicroUsd, maxItems: null, now: deps.now() });
-    if (claim.status === "refused") { if (claim.reason === "already_claimed") continue; stoppedBy = "money_cap"; break; }
+    let claim: Awaited<ReturnType<typeof claimSmartItem>>;
+    try { claim = await claimSmartItem({ prefix: SAV_SMART_BENCH_SELFTEST_PREFIX, scope: config.runId, item, worstMicroUsd: worst, capMicroUsd: config.capMicroUsd, maxItems: null, now: deps.now() }); }
+    catch (error) { started -= 1; throw error; }
+    if (claim.status === "refused") { started -= 1; if (claim.reason === "already_claimed") continue; stop("money_cap"); break; }
 
     // The meter: every call of this conversation (agent and judge), refused BEFORE sending when its body exceeds the input bound, when the
     // conversation's spend plus one more reservation would pass its own reservation, or beyond the call count or the time left. Costed at
@@ -196,6 +220,8 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
     const send = deps.network ?? ((url, init) => fetch(url, init));
     const meter: CaseV2Network = async (url, init) => {
       const timeout = Math.min(CALL_MAX_MS, left() - CALL_MARGIN_MS);
+      // A measured cost above a conversation's reservation (in parallel): no other in-flight conversation sends another call either.
+      if (overrun) { meterStop ??= "money_budget"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_MONEY_BUDGET" }); }
       if (calls >= maxCalls) { meterStop ??= "call_budget"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_CALL_BUDGET" }); }
       if (timeout < CALL_MIN_MS) { meterStop ??= "deadline"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_DEADLINE" }); }
       if (cost + prices.modelReserve > worst) { meterStop ??= "money_budget"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_MONEY_BUDGET" }); }
@@ -208,6 +234,7 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
       if (!response.ok) { cost += response.status >= 500 || response.status === 408 || response.status === 429 ? prices.modelReserve : 0; return response; }
       const json = await response.json().catch(() => null) as { usageMetadata?: unknown } | null;
       cost += prices.modelCost(smartUsageOf(json?.usageMetadata));
+      if (cost > worst) { overrun = true; stop("money_cap"); }
       return json === null ? new Response("not json", { status: 200 }) : Response.json(json);
     };
     const agent = deps.agents?.(agentName, meter) ?? (agentName === "new"
@@ -233,8 +260,14 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
     // One line per conversation, codes and numbers only (fictional corpus ids, no reply text): the judge's verdict readable from the logs.
     try { log("sav_smart_bench_conversation", smartBenchConversationLine(stored)); } catch { /* the log never fails the pass */ }
     ran += 1;
-    if (meterStop === "deadline") { stoppedBy = "deadline"; break; }
-  }
+    if (meterStop === "deadline") { stop("deadline"); break; }
+  } };
+  // Every worker runs to its end (none left spending in the background); the first error, if any, is then contained by the caller.
+  const outcomes = await Promise.allSettled(Array.from({ length: Math.min(concurrency, Math.max(1, todo.length)) }, async () => {
+    try { await worker(); } catch (error) { stopped = true; throw error; }
+  }));
+  const failed = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+  if (failed) throw failed.reason;
   const spentMicroUsd = smartLedgerSpent(await readSmartLedger(SAV_SMART_BENCH_SELFTEST_PREFIX, config.runId));
   const remaining = Math.max(0, todo.length - ran);
   const result = { ran, stoppedBy: ran === todo.length && stoppedBy === "batch" ? "done" as const : stoppedBy, spentMicroUsd, remaining };
