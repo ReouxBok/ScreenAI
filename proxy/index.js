@@ -15,7 +15,7 @@ const GEMINI_API_KEY = process.env.EXTENSION_GEMINI_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const ALLOWED_EXTENSION_ID = process.env.ALLOWED_EXTENSION_ID;
 const GEMINI_MODEL = 'gemini-3.6-flash';
-const LIVE_MODEL = 'gpt-live-1';
+const LIVE_MODEL = 'gpt-live-1.1';
 // Legacy Chrome extensions use Gemini Live tokens rather than WebRTC offers.
 const GEMINI_LIVE_MODEL = 'gemini-3.1-flash-live-preview';
 const LIVE_BACKEND_MODEL = process.env.OPENAI_LIVE_BACKEND_MODEL || 'gpt-6-luna';
