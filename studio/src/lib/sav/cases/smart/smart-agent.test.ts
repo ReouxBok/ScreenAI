@@ -116,6 +116,16 @@ describe("contrôles serveur, relecture et une correction", () => {
     expect(kept.result).toMatchObject({ outcome: "reply", corrected: false });
     expect(kept.result.checks.first).toEqual([]);
   });
+  it("quatrième revue N2 (PORTE_1G) : la procédure coupée en deux phrases → équipe ; routine, tâche et envoi programmé sans mot d'abonnement → réponse", async () => {
+    const split = smartGoodDecision({ reply: `${SMART_GOOD_REPLY}\n\nDans vos paramètres Limova, ouvrez la rubrique Abonnement. Cliquez sur “Annuler”, puis confirmez.` });
+    const refused = await run({ understand: { output: smartReading() }, decide: { output: split }, verify: { output: SMART_CONFORME }, correct: { output: split }, reverify: { output: SMART_CONFORME } });
+    expect(refused.result).toMatchObject({ outcome: "handoff", replyWithFooter: null });
+    expect(refused.result.reasons).toEqual(expect.arrayContaining(["refused_after_correction", "check:sensitive_commitment"]));
+    for (const sentence of ["Vous pouvez arrêter la routine depuis vos paramètres.", "Vous pouvez annuler une tâche en cours depuis la conversation.", "Vous pouvez annuler l'envoi programmé avant 8 h."]) {
+      const kept = await run({ understand: { output: smartReading() }, decide: { output: smartGoodDecision({ reply: `${SMART_GOOD_REPLY}\n\n${sentence}` }) }, verify: { output: SMART_CONFORME } });
+      expect(kept.result, sentence).toMatchObject({ outcome: "reply", corrected: false });
+    }
+  });
   it("revue N2, témoin : « vous pouvez annuler la routine depuis vos paramètres » reste une réponse", async () => {
     const routine = smartGoodDecision({ reply: `${SMART_GOOD_REPLY}\n\nVous pouvez annuler la routine depuis vos paramètres.` });
     const { result } = await run({ understand: { output: smartReading() }, decide: { output: routine }, verify: { output: SMART_CONFORME } });
