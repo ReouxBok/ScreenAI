@@ -248,14 +248,13 @@ export async function qualifyThreadlessTicket(source: ThreadlessTicketSource, en
 /**
  * SAV-118 (N5), `SAV_V2_ENTRY_SMART=on` only: a ticket a person gave the agent takes the same door as a mail (contract V1→V2, `smart-entry-switch.ts`).
  * Sorting: no extra model call here; the smart brain's own reading classifies the request and hands over what is sensitive (fallback of the ticket, see N5's
- * report). Kept: the CRM billing and cancellation categories (they only ever exclude, never admit), the prompt-injection check, the identified contact (no
+ * report). Kept: the prompt-injection check (the CRM category is never a gate, Ugo 19/11), the identified contact (no
  * contact at all: `crm_missing_primary`, set by the read). Not read: the Access block, its skill and rule, the word list on the description or the notes,
  * the approved policy. One request, the ticket's, `other` like a mail's smart request; `decideCaseAdmission` decides it as it decides a mail's.
  */
 function qualifySmartThreadlessTicket(source: ThreadlessTicketSource): ThreadlessTicketQualification {
-  const categories = source.categories.split(";").map(category => category.trim());
-  if (categories.includes(SAV_HUBSPOT_SUPPORT.categories.billing) || categories.includes(SAV_HUBSPOT_SUPPORT.categories.cancellation))
-    return { status: "human_wait", reason: "sensitive_request" };
+  // Ugo 19/11: never gate on hs_ticket_category; the content decides (the smart brain reads the ticket and hands a sensitive one to the team, N8).
+  // The prompt-injection check stays: a technical security control, not a topic filter (orchestrator decision, as N2's net).
   if (containsPromptInjection(`${source.subject}\n${threadlessTicketPlainDescription(source)}`)) return { status: "human_wait", reason: "untrusted_source" };
   if (!source.contact) return { status: "human_wait", reason: "identity_unconfirmed" };
   const request = { id: threadlessRequestId(source), summary: "Demande support signalée dans HubSpot" };

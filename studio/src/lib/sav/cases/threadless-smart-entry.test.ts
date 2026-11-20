@@ -14,7 +14,7 @@ import { qualifyThreadlessTicket, readThreadlessTicket, threadlessRequestId, typ
 /*
  * SAV-118 (N5), SYNTHETIC only: a ticket a person gave the Agent SAV in HubSpot takes the same door as a mail under `SAV_V2_ENTRY_SMART=on`. Same simulated
  * HubSpot reads as `threadless-source.test.ts` (reads only). Proven: a support ticket outside Access is admitted (no word list, no Access rule or skill, no
- * policy), a CRM billing or cancellation category keeps it with the team, a ticket with no contact goes to the team with `crm_missing_primary`, a ticket without
+ * policy), the CRM category is never a gate (the content decides), a ticket with no contact goes to the team with `crm_missing_primary`, a ticket without
  * any mail thread is admitted, and before N8 an admitted ticket opens no case (nothing written). Switch off: exactly the historical answers.
  */
 
@@ -65,10 +65,11 @@ describe("switch on: a HubSpot ticket handed to the agent takes the same door as
     expect(await qualifyThreadlessTicket(read.source, SMART, new Date(AT))).toMatchObject({ status: "admitted" });
   });
 
-  it("« je veux résilier » with the CRM cancellation (or billing) category: the team, as before", async () => {
-    for (const category of [SAV_HUBSPOT_SUPPORT.categories.cancellation, SAV_HUBSPOT_SUPPORT.categories.billing]) {
-      const read = await ticket(SMART, { content: "Bonjour, je veux résilier.", category });
-      expect(await qualifyThreadlessTicket(read.source, SMART, new Date(AT))).toEqual({ status: "human_wait", reason: "sensitive_request" });
+  it("never gated on hs_ticket_category (Ugo 19/11): a Finance (or Cancellation) category whose content is support is admitted; switch off, still the team", async () => {
+    for (const category of [SAV_HUBSPOT_SUPPORT.categories.billing, SAV_HUBSPOT_SUPPORT.categories.cancellation]) {
+      const read = await ticket(SMART, { content: "Bonjour, ma synchronisation Google Sheet ne se met plus à jour.", category });
+      expect(await qualifyThreadlessTicket(read.source, SMART, new Date(AT))).toMatchObject({ status: "admitted" });
+      expect(await qualifyThreadlessTicket(read.source, BASE, new Date(AT))).toEqual({ status: "human_wait", reason: "sensitive_request" });
     }
   });
 
