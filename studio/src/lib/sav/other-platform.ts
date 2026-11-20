@@ -19,28 +19,26 @@ export const SAV_OTHER_PLATFORM_THIRD_PARTIES = Object.freeze([
 /** Limova's own words: a sentence that names them is about Limova (« inscrivez-vous au webinaire Limova », « créez votre compte sur l'Academy »). */
 export const SAV_OTHER_PLATFORM_LIMOVA = /\b(?:limova|webinaires?|academy|charly)\b/;
 
-/*
- * PORTE 1I (Astra): the exception is the action's DESTINATION, never a mere « Limova » somewhere in the sentence. « Pour remplacer Limova,
- * inscrivez-vous sur Wix » is refused; « inscrivez-vous au prochain webinaire Limova » and « choisissez HubSpot dans le menu Intégrations de
- * Limova » pass.
- */
-/** The sentence tells the customer to leave or replace Limova: always a redirection. */
+/** The sentence tells the customer to leave or replace Limova: always a redirection, with or without a name. */
 export const SAV_OTHER_PLATFORM_LEAVES = /\b(?:remplac\w* limova|a la place de limova|au lieu de limova|plutot que limova|quitt\w* limova|sans limova)\b/;
-/** A sentence about Limova itself (a Limova word, and nothing that leaves Limova). */
-export const savOtherPlatformAboutLimova = (foldedSentence: string) => SAV_OTHER_PLATFORM_LIMOVA.test(foldedSentence) && !SAV_OTHER_PLATFORM_LEAVES.test(foldedSentence);
-const LIMOVA_DESTINATION = /^.{0,40}?\b(?:limova|webinaires?|academy|charly)\b/;
-/** True when one match of `pattern` (a sign-up) leads somewhere else than Limova's own pages (its destination, the next words, is not Limova). */
-export function savOtherPlatformSignupElsewhere(foldedSentence: string, pattern: RegExp): boolean {
-  if (SAV_OTHER_PLATFORM_LEAVES.test(foldedSentence)) return pattern.test(foldedSentence);
-  for (const match of foldedSentence.matchAll(new RegExp(pattern.source, "g"))) if (!LIMOVA_DESTINATION.test(foldedSentence.slice(match.index! + match[0].length))) return true;
-  return false;
-}
-const SIGNUP = SAV_OTHER_PLATFORM_SIGNUP.map(source => new RegExp(source));
-/** A sentence that invites to sign up elsewhere (the bench's patterns), a sign-up whose destination is Limova's excepted. */
-export const savOtherPlatformSignup = (foldedSentence: string) => SIGNUP.some(pattern => savOtherPlatformSignupElsewhere(foldedSentence, pattern));
 
-/** The sentence configures or connects the tool INSIDE Limova (« dans le menu Intégrations », « Paramètres > », « relier X à Limova »). */
-const INSIDE_LIMOVA = /\b(?:dans|depuis|via|sur|de) (?:le menu |l'onglet |la page |la rubrique |vos |les )?(?:integrations?|parametres|limova)\b|\b(?:parametres|integrations) >|\b(?:connect|reli|branch|synchronis|integr|associ)\w*\b.{0,60}\b(?:a|avec|sur|dans|de) limova\b/;
+/*
+ * PORTE 1J (orchestrator): ONE principle, read per CLAUSE (cut on commas, « si », « mais », « ou », « puis »): the third-party tool NAMED in the
+ * clause decides. A clause is refused when it carries an orientation verb AND a named third party (known list or written by the customer),
+ * unless that same clause configures, connects, links or uses the tool in / with Limova, or picks it in the Intégrations menu. A clause without a
+ * named third party is never refused for a sign-up (« Sur Limova, créez votre compte » passes); leaving Limova is refused above.
+ */
+export const savOtherPlatformClauses = (foldedSentence: string) => foldedSentence.split(/[,;()]|:\s|\b(?:si|mais|ou|puis)\b/).map(row => row.trim()).filter(Boolean);
+const ORIENT = new RegExp(String.raw`\b(?:(?:d'|de |vous pouvez |vous pourriez |je vous invite a |mieux vaut |il vaut mieux )(?:utiliser|passer (?:par|chez|sur)|essayer|tester|opter pour|vous tourner vers)|utilisez|passez (?:par|chez|sur)|essayez|testez|optez pour|tournez-vous vers|rendez-vous sur|allez sur|activez|prenez|recommande|conseille|suggere|souscri\w*|ouvrez un compte|creez (?:un|votre) compte|${SAV_OTHER_PLATFORM_SIGNUP.join("|")})`);
+const INSIDE_LIMOVA = /\b(?:configur|connect|reli|branch|synchronis|integr|associ)\w*\b.{0,60}\b(?:dans|a|avec|sur|de) limova\b|\b(?:avec|dans|a|depuis) limova\b|\b(?:dans|depuis|via) (?:le |vos |les )?(?:menu |onglet |rubrique )?(?:integrations?|parametres)\b|\b(?:parametres|integrations) >/;
+const escapeName = (name: string) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const namesPattern = (names: readonly string[]) => new RegExp(String.raw`(?<![\p{L}\p{N}])(?:${names.map(escapeName).join("|")})(?![\p{L}\p{N}])`, "u");
+/** True when one clause orients the customer to a NAMED third party, outside configuring it in Limova. */
+export function savOtherPlatformOrients(foldedSentence: string, names: readonly string[]): boolean {
+  if (!names.length) return false;
+  const named = namesPattern(names);
+  return savOtherPlatformClauses(foldedSentence).some(clause => ORIENT.test(clause) && named.test(clause) && !INSIDE_LIMOVA.test(clause));
+}
 
 /*
  * Advice to go and use another tool, with no name needed: « vous pourriez passer par un autre outil », « changez de créateur de site »,
@@ -56,19 +54,15 @@ const REDIRECT: readonly RegExp[] = [
 /** True when the folded sentence advises using another tool or platform to do what Limova does (no name needed). */
 export const savOtherPlatformRedirect = (foldedSentence: string) => REDIRECT.some(pattern => pattern.test(foldedSentence));
 
-const escape = (name: string) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 /*
- * A NAMED third party praised, compared favourably or recommended (the shape of the bench's per-conversation patterns
- * `<name>.{0,60}(mieux|meilleur|plus simple|plus adapte|recommand|conseill|essayez|activez|prenez|vaut)`), without the words that also describe
- * the right answer (« Assistant téléphonique », « agent », « lien »): « Botario est plus simple », « je vous conseille Waalaxy »,
- * « activez le chatbot de Webly », « Yonos Voice vaut le coup ». Naming the customer's tool to connect it to Limova passes.
+ * A NAMED third party compared favourably (the shape of the bench's patterns `<name>.{0,60}(mieux|meilleur|plus simple|plus adapte|vaut)`):
+ * « Botario est plus simple », « Yonos Voice vaut le coup ». Recommending it is `savOtherPlatformOrients`.
  */
 export function savOtherPlatformEndorses(foldedSentence: string, names: readonly string[]): boolean {
   if (!names.length) return false;
-  const name = `(?:${names.map(escape).join("|")})(?![\\p{L}\\p{N}])`;
+  const name = `(?:${names.map(escapeName).join("|")})(?![\\p{L}\\p{N}])`;
   return [
     new RegExp(String.raw`(?<![\p{L}\p{N}])${name}.{0,60}?\b(?:est|serait|semble|sera|reste|sont|seraient|parait|c'est)\s(?:\S+\s){0,2}?(?:mieux|meilleure?s?|plus (?:simple|adapte|facile|complet|performant|pratique|interessant)|ideale?|une bonne (?:option|solution|alternative|idee))`, "u"),
-    ...(INSIDE_LIMOVA.test(foldedSentence) && !SAV_OTHER_PLATFORM_LEAVES.test(foldedSentence) ? [] : [new RegExp(String.raw`\b(?:recommande|conseille|suggere|essayez|testez|optez pour|prenez|activez|choisissez|utilisez|passez par|inscrivez-vous (?:sur|chez)|rendez-vous sur|tournez-vous vers|allez sur)\s(?:(?:vous|plutot|aussi|donc|d'utiliser|d'essayer|de passer par|de prendre|de tester|de choisir|de vous tourner vers|d'opter pour|de vous inscrire (?:sur|chez|a))\s)*(?:(?:le|la|l'|les|son|sa|leur|ses)\s?(?!integration|connexion|connecteur|synchronisation|compte)[\p{L}-]+(?: [\p{L}-]+)? (?:de |d'|chez ))?${name}`, "u")]),
     new RegExp(String.raw`(?<![\p{L}\p{N}])${name}.{0,60}?\bvaut (?:le coup|la peine|mieux)`, "u"),
   ].some(pattern => pattern.test(foldedSentence));
 }

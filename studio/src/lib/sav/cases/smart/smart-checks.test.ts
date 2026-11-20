@@ -22,7 +22,9 @@ describe("contrôles serveur sans modèle (lot D3)", () => {
     const customer = "Je veux relier Limova à mon site Wix.";
     expect(check(`${SMART_GOOD_REPLY} Je vous recommande d'utiliser Wix pour cela.`, { customer })).toContain("other_platform_recommended");
     expect(check(`${SMART_GOOD_REPLY} Wix propose déjà un assistant vocal.`, { customer })).toContain("other_platform_recommended");
-    expect(check(`${SMART_GOOD_REPLY} Créez un compte chez eux.`, { customer })).toContain("other_platform_recommended");
+    // PORTE 1J (orchestrator): a clause WITHOUT a named third party is never refused for a sign-up (« chez eux » names no tool): left to the counter-read.
+    expect(check(`${SMART_GOOD_REPLY} Créez un compte chez eux.`, { customer })).not.toContain("other_platform_recommended");
+    expect(check(`${SMART_GOOD_REPLY} Créez un compte chez Wix.`, { customer })).toContain("other_platform_recommended");
     expect(check(`${SMART_GOOD_REPLY} Utilisez plutôt un outil comme celui-ci.`)).toContain("other_platform_recommended");
     expect(check(`${SMART_GOOD_REPLY} Pour votre site Wix, je transmets la question à l'équipe.`, { customer })).toEqual([]);
     expect(check(`${SMART_GOOD_REPLY} Inscrivez-vous au prochain webinaire Limova.`)).toEqual([]);

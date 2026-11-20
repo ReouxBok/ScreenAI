@@ -1,7 +1,7 @@
 import { normalizeSavEvidenceText, savEvidenceContains } from "../../evidence-text";
 import {
-  SAV_OTHER_PLATFORM_THIRD_PARTIES, savOtherPlatformAboutLimova, savOtherPlatformCustomerTools, savOtherPlatformEndorses, savOtherPlatformRedirect, savOtherPlatformSignup,
-  savOtherPlatformSignupElsewhere,
+  SAV_OTHER_PLATFORM_LIMOVA, SAV_OTHER_PLATFORM_THIRD_PARTIES, savOtherPlatformClauses, savOtherPlatformCustomerTools, savOtherPlatformEndorses, savOtherPlatformOrients,
+  savOtherPlatformRedirect,
 } from "../../other-platform";
 import { requestsCredential } from "../decision-validator";
 import type { SmartCheckCode, SmartDecision, SmartReading } from "./smart-contract";
@@ -57,9 +57,8 @@ const cardText = (source: SmartSource) => [source.title, source.content, ...sour
 export const SAV_SMART_THIRD_PARTIES = SAV_OTHER_PLATFORM_THIRD_PARTIES;
 const THIRD_PARTY = new RegExp(String.raw`(?<![\p{L}\p{N}])(${SAV_SMART_THIRD_PARTIES.map(name => name.replace(/[.]/g, "\\.")).join("|")})(?![\p{L}\p{N}])`, "gu");
 
-// A sentence that invites to sign up, subscribe, switch or use another product. « inscrivez-vous au webinaire Limova » stays allowed (Limova named).
-const SIGNUP = /\b(?:inscri(?:vez|re|ption|s|t)|creez(?:-vous)? (?:un|votre) compte|creer un compte|ouvr(?:ez|ir) un compte|abonnez-vous|souscri(?:vez|re))\b/;
-const SWITCH = /\b(?:je vous (?:recommande|conseille|suggere|propose) (?:d'utiliser|de passer (?:par|chez|sur)|de vous tourner vers|de vous inscrire|l'outil|la plateforme|le service|l'application|le logiciel|un autre|une autre|plutot)|utilisez plutot|tournez-vous vers|optez pour|passez (?:plutot )?(?:par|chez) (?:un|une) (?:autre|outil|service|prestataire|plateforme)|(?:un|une) (?:autre )?(?:outil|service|prestataire|logiciel|plateforme|solution|application) (?:externe |tierce? )?(?:comme|tel(?:le)? que|du type)|(?:outil|plateforme|solution|logiciel|service) (?:alternati(?:f|ve)|concurrente?))\b/;
+// A sentence that invites to switch or use another product, no name needed (a sign-up is judged per clause by the named tool: PORTE 1J).
+const SWITCH = /\b(?:je vous (?:recommande|conseille|suggere|propose) (?:d'utiliser|de passer (?:par|chez|sur)|de vous tourner vers|l'outil|la plateforme|le service|l'application|le logiciel|un autre|une autre|plutot)|utilisez plutot|tournez-vous vers|optez pour|passez (?:plutot )?(?:par|chez) (?:un|une) (?:autre|outil|service|prestataire|plateforme)|(?:un|une) (?:autre )?(?:outil|service|prestataire|logiciel|plateforme|solution|application) (?:externe |tierce? )?(?:comme|tel(?:le)? que|du type)|(?:outil|plateforme|solution|logiciel|service) (?:alternati(?:f|ve)|concurrente?))\b/;
 // SAV-122: « fait » alone is no praise (« votre site fait avec Yonos » describes the customer's tool); « Yonos fait des agents » still is.
 const PRAISE = /\b(?:(?:propose(?:nt)?|offre(?:nt)?|permet(?:tent)?|dispose(?:nt)?|gere(?:nt)?|integre(?:nt)?|fournit|fournissent)\b|(?:fait|font) (?:aussi |egalement |deja |tres bien |mieux |des |du |de l'|de la |ca |cela ))/;
 
@@ -73,10 +72,10 @@ export function smartOtherPlatformSentences(reply: string, customerText: string)
   const names = [...new Set([...SAV_OTHER_PLATFORM_THIRD_PARTIES, ...savOtherPlatformCustomerTools(customerText, fold)])];
   const known = new RegExp(String.raw`(?<![\p{L}\p{N}])(${names.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})(?![\p{L}\p{N}])`, "u");
   return sentencesOf(reply).filter(sentence => {
-    // PORTE 1I: a « Limova » word exempts only a sentence about Limova itself; a sign-up is judged by its destination.
-    const folded = fold(sentence), limova = savOtherPlatformAboutLimova(folded);
-    return savOtherPlatformSignupElsewhere(folded, SIGNUP) || savOtherPlatformSignup(folded) || SWITCH.test(folded) || savOtherPlatformRedirect(folded)
-      || savOtherPlatformEndorses(folded, names) || (known.test(folded) && PRAISE.test(folded) && !limova);
+    // PORTE 1J: per clause, the named third party decides; a « Limova » word elsewhere in the sentence exempts nothing.
+    const folded = fold(sentence);
+    return SWITCH.test(folded) || savOtherPlatformRedirect(folded) || savOtherPlatformOrients(folded, names) || savOtherPlatformEndorses(folded, names)
+      || savOtherPlatformClauses(folded).some(clause => known.test(clause) && PRAISE.test(clause) && !SAV_OTHER_PLATFORM_LIMOVA.test(clause));
   });
 }
 

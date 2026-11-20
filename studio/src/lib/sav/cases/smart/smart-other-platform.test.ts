@@ -94,6 +94,24 @@ describe("PORTE 1I (Astra, 2 P1) : l'exception porte sur la DESTINATION de l'act
   });
 });
 
+describe("PORTE 1J (dernier tour) : par proposition, l'outil tiers NOMMÉ décide", () => {
+  it("« utilisez Wix si cette option manque dans Limova » et 2 variantes : refusées (« dans Limova » ailleurs dans la phrase n'exempte rien)", () => {
+    const customer = "Je veux relier mon site Wix à Limova.";
+    for (const sentence of [
+      "Pour créer votre site, utilisez Wix si cette option manque dans Limova.",
+      "Si cette option manque dans Limova, essayez Wix pour créer votre site.",
+      "Limova ne le fait pas, mais vous pouvez vous inscrire sur Wix.",
+    ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`, customer), sentence).toContain("other_platform_recommended");
+  });
+  it("« Sur Limova, créez votre compte avec votre adresse professionnelle » et 2 variantes : passent (aucun outil tiers nommé)", () => {
+    for (const sentence of [
+      "Sur Limova, créez votre compte avec votre adresse professionnelle.",
+      "Créez votre compte sur Limova avec votre adresse professionnelle.",
+      "Pour commencer, créez votre compte sur l'Academy puis connectez-vous.",
+    ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`, "Je n'arrive pas à me connecter."), sentence).toEqual([]);
+  });
+});
+
 describe("SAV-122 : même source de vérité que le banc, mesure gratuite sur les 528 conversations", () => {
   const origins = [...SAV_BENCH_CORPUS, ...SAV_SMART_BENCH_MULTITURN];
   const all = [...origins, ...buildSavBenchVariants(origins)];
