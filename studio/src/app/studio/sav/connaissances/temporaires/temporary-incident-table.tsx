@@ -4,15 +4,12 @@ import styles from "../workspace.module.css";
 
 const fixLabels = { none: "Incident connu, aucun correctif annoncé", fix_announced: "Correctif annoncé (déploiement non prouvé)", deploy_proven: "Déploiement prouvé", client_verified: "Résultat client vérifié" } as const;
 
-/**
- * Describes the INCIDENT, never the knowledge item: the carrying revision may be approved, published or active,
- * but the incident itself is never projected, published, indexed or used by the agent (SAV-79, runtime not wired).
- */
+/** Shows the incident's review and lifecycle. The library shows the state of the published card. */
 export function incidentStateLabel(row: TemporaryIncidentPreviewRow) {
   if (!row.incident) return "Incident invalide : ignoré, à corriger";
   const approval = row.incidentApproved ? "approuvé avec la révision" : row.revisionApproved ? "révision approuvée sans relecteur SAV reconnu" : `en attente de revue de la révision (${row.reviewState})`;
   const lifecycle = row.incident.status === "revoked" ? "révoqué" : row.expired ? "expiré" : "déclaré actif";
-  return `Incident ${lifecycle}, ${approval}. Jamais projeté dans la fiche ni publié ; non utilisé par l’agent SAV (branchement non réalisé).`;
+  return `Incident ${lifecycle}, ${approval}. Message conservé dans la révision canonique.`;
 }
 
 export function TemporaryIncidentTable({ rows, formatDate }: { rows: TemporaryIncidentPreviewRow[]; formatDate: (value: string) => string }) {

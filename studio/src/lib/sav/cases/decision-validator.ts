@@ -12,6 +12,7 @@ import { caseAccessSourceProblem } from "./investigation-access-scope";
 import { caseAskBeforeHandoffEnabled, caseReaskBeforeHandoff } from "./ask-before-handoff";
 import { accessSkillKernelHits } from "./access-skill/access-skill-kernel";
 import { readAccessSkillMode } from "./access-skill/access-skill-mode";
+import { temporaryKnowledgePromise } from "./temporary-knowledge-promise";
 
 /*
  * Pure and deterministic: no model, network, database, clock or effect. `now` is an argument.
@@ -865,6 +866,7 @@ Il vous suffira ensuite de saisir ce code sur la page pour accéder à votre esp
     });
     if (reply.accountAdvice === "new_subscription" || reply.accountAdvice === "new_account") reject("account_advice_forbidden", "reply.accountAdvice", reply.accountAdvice);
     if (requestsCredential(reply.text)) reject("credential_request_pattern", "reply.text");
+    if (context.usesTemporaryKnowledge && temporaryKnowledgePromise(reply.text)) reject("reply_temporary_promise", "reply.text");
     // SAV-97 (`SAV_V2_ACCESS_SKILL=on` only): the exclude-only kernel on OUR outgoing text; a hit is refused, so the case goes to the team, never to the customer.
     if ((action.kind === "answer" || action.kind === "ask") && readAccessSkillMode(process.env) === "on") {
       const kernel = accessSkillKernelHits(reply.text);

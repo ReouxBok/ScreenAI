@@ -33,6 +33,7 @@ export const caseDecisionRefusalKinds: Record<CaseDecisionRejectionCode, CaseDec
   credential_request_pattern: "forbidden_action",
   account_advice_forbidden: "forbidden_action",
   reply_sensitive_wording: "forbidden_action",
+  reply_temporary_promise: "forbidden_action",
   access_link_invalid: "forbidden_action",
   // Pilot ACCÈS: the scope forbids answering from this source; asking or handing off stays possible.
   access_scope_missing: "forbidden_action",

@@ -1,5 +1,6 @@
 import { canReviewKnowledgeCandidate } from "./contracts";
 import { fixStatement, temporaryIncidentDocumentSchema, type TemporaryIncident } from "./temporary-incident-schema";
+import { temporaryKnowledgeState } from "./temporary-knowledge";
 
 export { TEMPORARY_FIX_LEVELS, TEMPORARY_INCIDENT_MAX_DAYS, fixStatement, temporaryIncidentDocumentSchema, unprovenFixClaim } from "./temporary-incident-schema";
 export type { TemporaryFixLevel, TemporaryIncident } from "./temporary-incident-schema";
@@ -42,7 +43,6 @@ export function selectTemporaryIncident(records: TemporaryIncidentRecord[], cont
   }
   // A malformed record could be the one covering this case: never silently ignore it.
   if (errors.length) return { kind: "invalid", route: "human", errors: [...new Set(errors)] };
-  const now = context.now.getTime();
   const area = normalizeArea(context.productArea);
   const inScope = parsed.filter(({ incident }) => incident.scope.families.includes(context.family as never) && normalizeArea(incident.scope.productArea) === area);
   if (!inScope.length) return { kind: "none", reason: "no_match" };
@@ -60,8 +60,7 @@ export function selectTemporaryIncident(records: TemporaryIncidentRecord[], cont
       || entry.approved === previous.approved && previous.incident.revision < entry.incident.revision) latest.set(entry.incident.id, entry);
   }
   const candidates = [...latest.values()];
-  const live = candidates.filter(({ incident, approved }) => approved && incident.status === "active" && !supersededIds.has(incident.id)
-    && Date.parse(incident.knownSince) <= now && now < Date.parse(incident.validUntil));
+  const live = candidates.filter(({ incident, approved }) => approved && temporaryKnowledgeState(incident, context.now) === "active" && !supersededIds.has(incident.id));
   if (live.length > 1) return { kind: "ambiguous", incidentIds: live.map(({ incident }) => incident.id).sort(), route: "human" };
   if (live.length === 1) {
     const { incident } = live[0];

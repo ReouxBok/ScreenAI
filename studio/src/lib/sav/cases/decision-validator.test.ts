@@ -660,7 +660,8 @@ describe("SAV-6 purity", () => {
     const imports = (file: string) => [...readFileSync(path.join(dir, file), "utf8").matchAll(/from "([^"]+)"/g)].map(match => match[1]).sort();
     // `../message-context`: the shared, pure split of a mail into the customer's own words and what they quote (nothing behind it but the schema library).
     // SAV-97: the exclude-only kernel (pure phrases on OUR reply text) and the switch (pure env read), nothing else behind them but the sensitive word list.
-    expect(imports("decision-validator.ts")).toEqual(["../message-context", "../request-retrieval", "./access-skill/access-skill-kernel", "./access-skill/access-skill-mode", "./ask-before-handoff", "./decision-contract", "./investigation-access-scope", "./restored-access"]);
+    expect(imports("decision-validator.ts")).toEqual(["../message-context", "../request-retrieval", "./access-skill/access-skill-kernel", "./access-skill/access-skill-mode", "./ask-before-handoff", "./decision-contract", "./investigation-access-scope", "./restored-access", "./temporary-knowledge-promise"]);
+    expect(imports("temporary-knowledge-promise.ts")).toEqual([]);
     expect(imports("access-skill/access-skill-kernel.ts")).toEqual(["../sensitive-words"]);
     expect(imports("access-skill/access-skill-mode.ts")).toEqual([]);
     expect(imports("sensitive-words.ts")).toEqual(["./case-types"]);
