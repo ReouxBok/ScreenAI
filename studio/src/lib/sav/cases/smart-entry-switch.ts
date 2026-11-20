@@ -36,6 +36,10 @@ export const SAV_SMART_ENTRY_MISSING_PRIMARY = "crm_missing_primary";
  * journal, summary note) nor of the ticket stage executor (`runCaseTicketStagePass`). Each executor stops BEFORE claiming or marking anything, with this
  * reason: nothing is consumed, nothing irreversible is written, the work stays due. It is a guard against an accidental switch-on, not a filter.
  * Off: null, every executor exactly as before.
+ * SAV-123 (N8, PORTE_1H): also the Slack/HubSpot hand-over notice pass (`runHandoffNoticePass`) and the owner hand-over BEFORE its claim (`runSavOwnerHandover`:
+ * no attempt consumed, the marker never marked complete). KEPT by N8: the brain is wired as the decision provider (`smart/smart-case-provider.ts`), but the
+ * circuit's runner, draft and provenance still require an approved block scope that `smart-support` has none of (RAPPORT_N8): removing the hold now would
+ * leave agent-owned smart cases skipped without a wait. Remove it (and its 5 call sites) together with that scope change.
  */
 export const SAV_SMART_ENTRY_EFFECTS_HOLD = "smart_entry_awaiting_n8";
 export const smartEntryEffectsHold = (env: Env): typeof SAV_SMART_ENTRY_EFFECTS_HOLD | null => savV2EntrySmartOn(env) ? SAV_SMART_ENTRY_EFFECTS_HOLD : null;

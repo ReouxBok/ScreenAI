@@ -215,6 +215,9 @@ async function processOwnerHandover(input: OwnerHandoverTransition, claim: Claim
 export async function runSavOwnerHandover(input: OwnerHandoverTransition, options: Options) {
   const env = options.env ?? process.env, now = options.now ?? (() => new Date());
   if (!savV2OwnerHandoverEnabled(env)) return { status: "off" };
+  // SAV-123 (PORTE_1H P1): the central hold BEFORE the claim: no attempt consumed, the marker neither run nor marked `complete`; switched off, the hand-over is due again.
+  const hold = smartEntryEffectsHold(env);
+  if (hold) { console.info("sav_v2_owner_handover_held", { hold, reason: "before_claim" }); return { status: hold }; }
   const claim = await claimOwnerHandover(input, now());
   if (!claim) return { status: "not_due_or_claimed" };
   let status: string;

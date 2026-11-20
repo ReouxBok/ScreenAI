@@ -24,6 +24,10 @@ import { appendCaseAttachmentParts, caseAttachmentPartsOf, fitCaseCustomerAttach
 import type { CaseEmbeddingTransport, CaseKnowledgeVectorSearch } from "./investigation-budgeted-retrieval";
 import type { CaseInvestigationModelRequest, CaseInvestigationPauseLevel } from "./investigation-runner";
 import type { CaseV2ModelTransport } from "./investigation-v2-spend";
+import { isSmartCaseRequest, smartCaseDecisionProvider } from "./smart/smart-case-provider";
+import { smartGeminiModel, smartInputCap } from "./smart/smart-model";
+import { smartMaxExchanges } from "./smart/smart-memory";
+import type { SmartTurnPorts } from "./smart/smart-agent";
 
 /*
  * B (4/11, LOCAL and OFF): the real adapters of the V2 investigation. Each talks to its provider through an injected `network` (`fetch` by
@@ -309,6 +313,8 @@ export function prepareCaseGeminiDecisionRequest(original: CaseInvestigationMode
 /** Runs before money and dispatch; ledger-known/uncertain calls retain their precedence. */
 export function caseGeminiDecisionPreflight(env: () => Env) {
   return (request: CaseInvestigationModelRequest): CaseModelTransportDiagnostic | null => {
+    // SAV-123 (N8): a smart case's call is not a Gemini decision body; the brain bounds each of its own calls (`smartInputCap`).
+    if (isSmartCaseRequest(request, env())) return null;
     const prepared = prepareCaseGeminiDecisionRequest(request, env());
     if (prepared.ok) return null;
     // K1: structured log of the breakdown (ids and byte counts only); the returned diagnostic is the one the record may store, unchanged.
@@ -319,9 +325,23 @@ export function caseGeminiDecisionPreflight(env: () => Env) {
   };
 }
 
-export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number }>): CaseV2ModelTransport {
+/**
+ * SAV-123 (N8): the ONE place the decision brain is chosen, per call. `SAV_V2_ENTRY_SMART=on` and a case admitted `smart_support`: the smart brain
+ * (`smartCaseDecisionProvider`, on V2's key, model and bounds through `smartGeminiModel`). Anything else: the Gemini decision below, unchanged.
+ * A call never reaches both. Same port, so the ledger, the V2 money gate and the validator are the same for both.
+ */
+/** Academy tools are injected by the caller (`getAcademyTools()`), never imported here: the bench reaches this module and must not reach the Academy client. */
+export function caseSmartDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; now?: () => Date; academy?: SmartTurnPorts["academy"] }>): CaseV2ModelTransport {
+  const now = input.now ?? (() => new Date());
+  return smartCaseDecisionProvider({ env: input.env, now, maxInputBytes: () => smartInputCap(input.env(), now()), maxExchanges: smartMaxExchanges(input.env()), ...(input.academy ? { academy: input.academy } : {}),
+    model: smartGeminiModel({ env: input.env, now, ...(input.network ? { network: input.network } : {}), ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}) }) });
+}
+
+export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; smart?: CaseV2ModelTransport }>): CaseV2ModelTransport {
   const network = input.network ?? ((url, init) => fetch(url, init));
+  let smart = input.smart;
   return async request => {
+    if (isSmartCaseRequest(request, input.env())) return (smart ??= caseSmartDecisionProvider(input))(request);
     const failed = (diagnostic: CaseModelTransportDiagnostic, uncertain: boolean, usage: { inputTokens?: number; outputTokens?: number } | null, breakdown?: CaseDecisionBodyBreakdown) => {
       // Structured, closed metadata is useful even if the later journal write fails. No raw error/provider response.
       // K1: the breakdown is logged here only; the returned (and stored) diagnostic keeps main's exact shape.
