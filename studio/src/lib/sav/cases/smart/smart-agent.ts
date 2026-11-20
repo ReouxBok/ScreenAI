@@ -19,9 +19,11 @@ import type { AcademyTool } from "./tools/academy";
  * Agent SAV intelligent (20/11, v2 the same day: HARNAIS_BOUCLE): ONE turn of the new agent on one customer mail, with its ports injected
  * (model, knowledge, tools, memory). No database, no clock of its own, no effect: it returns what it would do. The shadow stores it; the bench scores it.
  *
- *   0. filet      `smartSafetyNet` on the INTEGRAL raw texts: a real sensitive request (or an odd mail), the whole mail to the team, 0 call;
- *   1. comprendre one call: the needs (PS included), what the customer already did, and `sensible {famille, preuve}` (barrier 2): unless
+ *   0. filet      `smartSafetyNet` on the INTEGRAL raw texts: TECHNICAL stops only (empty, too long, an instruction aimed at the model), the
+ *                 whole mail to the team, 0 call. No stop on a word since N2 (Ugo, 20/11: « smart mais pas restrictif »);
+ *   1. comprendre one call: the needs (PS included), what the customer already did, and `sensible {famille, preuve}`: unless
  *                 `sensitive`, `sensitiveFamilies` and `sensible` ALL say « nothing sensitive », the whole mail to the team (doubt = team);
+ *                 a customer the reading says very upset or threatening (`upset`) is handed over with a note;
  *   2. chercher   the existing search, through the knowledge port, at most 3 needs;
  *   3. décider    the BOUNDED LOOP: at most 3 passes. Each pass returns one step: « thinking », then read-only tool calls (`chercher_fiches`, Academy
  *                 when its switch is on; at most 4 calls per mail, 3 per pass, in parallel) or the final decision. Tool results come back as
@@ -152,7 +154,8 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
 
   // 0. The net, on the integral raw texts.
   const net = smartSafetyNet({ subject: input.subject, body: input.body });
-  if (net.stop) return end("team_sensitive", net.reasons, { sensitiveStop: "net", note: null, noteText: smartSensitiveNote(net.reasons) });
+  if (net.stop) return end("team_sensitive", net.reasons, { sensitiveStop: "net", note: null,
+    noteText: `Mail transmis tel quel à l'équipe, sans lecture par l'assistant (${net.reasons.join(", ")}).` });
   const hints = net.hints;
 
   // 1. Understand.
@@ -161,9 +164,9 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const parsedReading = parseSmartOutput(smartReadingSchema, understood.output);
   if (!parsedReading.ok) return end("failed", ["understand:output_invalid"]);
   reading = parsedReading.value;
-  // Barrier 2, imposed by the server (Astra, 20/11, simplified after the third review): the three fields must ALL say « nothing sensitive »
-  // (`sensitive: "no"`, no `sensitiveFamilies`, `sensible.famille: "aucune"`). Any contradiction, an absent or unreadable field: doubt = the team.
-  // The model never lifts a hint of the net: a sensitive word left in the new request already stopped the mail at step 0.
+  // The sensitive barrier, imposed by the server (Astra, 20/11, simplified after the third review): the three fields must ALL say « nothing
+  // sensitive » (`sensitive: "no"`, no `sensitiveFamilies`, `sensible.famille: "aucune"`). Any contradiction, an absent or unreadable field:
+  // doubt = the team. Since N2 it is the first barrier on the mail's subject: the net no longer reads words.
   const sensible = reading.sensible;
   const families = [...new Set([...(sensible && sensible.famille !== "aucune" ? [sensible.famille] : []), ...reading.sensitiveFamilies])];
   if (!sensible || sensible.famille !== "aucune" || reading.sensitive !== "no" || reading.sensitiveFamilies.length) {
@@ -172,6 +175,8 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   }
   if (reading.instructionInMail) return handoff([...hints, "understand:instruction_in_mail"], "other");
   if (reading.wantsHuman) return handoff([...hints, "understand:wants_human"], "wants_human");
+  // N2 (Ugo, 20/11): a very upset or threatening customer (cancel, bad review, lawyer) goes to the team, judged by the model, never by a word list.
+  if (reading.upset) return handoff([...hints, "understand:upset"], "upset");
   if (!reading.needs.length) return handoff([...hints, "understand:no_need"], "unsure");
 
   // 2. Search: the existing search, through the port; expired temporary cards are never given.

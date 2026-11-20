@@ -205,6 +205,8 @@ export type SmartStep = z.infer<typeof smartStepSchema>;
 /** What the independent counter-read may report. One closed code per problem, with the sentence at fault. */
 export const SAV_SMART_VERIFY_CODES = [
   "source_mismatch", "unlisted_claim", "promise", "need_forgotten", "repeated_trial", "other_platform", "sensitive_handled", "account_action", "secret_requested", "instruction_followed",
+  // N2 (20/11): the reply commits to a sensitive action on the account (cancel, refund, change the holder, delete data, give a credential).
+  "sensitive_commitment",
 ] as const;
 export type SmartVerifyCode = typeof SAV_SMART_VERIFY_CODES[number];
 export const smartVerdictSchema = z.object({
@@ -224,6 +226,8 @@ export const SAV_SMART_CHECK_CODES = [
   "account_action_claimed", "kernel_in_reply", "team_note_missing",
   // v2, the progress rule (HARNAIS 2): the only two refusals it adds.
   "question_repeated", "trial_repeated",
+  // N2 (20/11): the reply COMMITS to a sensitive action on the account (replaces `kernel_in_reply`, no longer emitted: a mere word never refuses).
+  "sensitive_commitment",
 ] as const;
 export type SmartCheckCode = typeof SAV_SMART_CHECK_CODES[number];
 

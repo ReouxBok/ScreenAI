@@ -47,20 +47,20 @@ describe("parcours nominal", () => {
 });
 
 describe("sensible : tout le mail à l'équipe", () => {
-  it("PS de résiliation APRÈS la signature : le filet lit le texte intégral, 0 appel payé", async () => {
+  it("PS de résiliation APRÈS la signature (N2) : le modèle lit le texte intégral et le dit sensible → équipe, aucune recherche ni décision", async () => {
     const body = "Bonjour,\nJe n'arrive pas à me connecter à mon espace.\nCordialement,\nJean Fictif\nGérant\n\nPS : je veux résilier mon abonnement.";
-    const { result, calls, knowledge } = await run({}, { ...MAIL, body });
-    expect(result).toMatchObject({ outcome: "team_sensitive", sensitiveStop: "net" });
-    expect(result.reasons).toContain("kernel:resilier");
-    expect(calls).toEqual([]);
+    const { result, calls, knowledge } = await run({ understand: { output: smartReading({ sensitive: "yes", sensitiveFamilies: ["cancellation"] }) } }, { ...MAIL, body });
+    expect(result).toMatchObject({ outcome: "team_sensitive", sensitiveStop: "understand", replyWithFooter: null });
+    expect(JSON.stringify(calls[0]!.payload)).toContain("je veux résilier mon abonnement");
+    expect(calls.map(call => call.kind)).toEqual(["understand"]);
     expect(knowledge.calls).toBe(0);
   });
-  it("« problème de connexion » puis, après la signature, « je conteste cette facture » : équipe, 0 appel (cas d'Astra)", async () => {
+  it("« je conteste cette facture » après la signature (cas d'Astra, N2) : la lecture le voit (sensible « facturation ») → équipe", async () => {
     const body = "Bonjour,\nproblème de connexion depuis ce matin.\n--\nJean Fictif\nSociété Fictive\nje conteste cette facture";
-    const { result, calls } = await run({}, { ...MAIL, body });
-    expect(result.outcome).toBe("team_sensitive");
-    expect(result.reasons).toContain("sensitive:finance");
-    expect(calls).toEqual([]);
+    const { result, calls } = await run({ understand: { output: smartReading({ sensible: { famille: "facturation", preuve: "je conteste cette facture" } }) } }, { ...MAIL, body });
+    expect(result).toMatchObject({ outcome: "team_sensitive", sensitiveStop: "understand" });
+    expect(result.reasons).toContain("understand:sensible_facturation");
+    expect(calls.map(call => call.kind)).toEqual(["understand"]);
   });
   it("la lecture dit sensible ou doute : équipe, aucune recherche ni décision", async () => {
     for (const sensitive of ["yes", "doubt"]) {

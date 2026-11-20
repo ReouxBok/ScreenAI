@@ -8,7 +8,7 @@ import { smartGoodDecision, smartReading } from "./smart-test-doubles";
 
 describe("prompt figé (lot B)", () => {
   it("révision et empreinte figées ensemble ; toute modification du texte fait échouer ce test", () => {
-    expect(SAV_SMART_PROMPT_REVISION).toBe("sav-smart-prompt-2026-11-20.v4");
+    expect(SAV_SMART_PROMPT_REVISION).toBe("sav-smart-prompt-2026-11-20.v5");
     expect(smartPromptSha256()).toBe(SAV_SMART_PROMPT_SHA256);
     expect(smartPromptPinned()).toBe(true);
   });
@@ -16,7 +16,7 @@ describe("prompt figé (lot B)", () => {
     const bytes = smartPromptBytes();
     expect(bytes.decide).toBeLessThanOrEqual(SAV_SMART_PROMPT_MAX_BYTES);
     expect(bytes.correct).toBeLessThanOrEqual(SAV_SMART_PROMPT_MAX_BYTES);
-    expect(bytes).toEqual({ decide: 8561, understand: 2759, verify: 1830, correct: 8914 });
+    expect(bytes).toEqual({ decide: 8642, understand: 3154, verify: 2077, correct: 8995 });
   });
   it("porte les grandes règles d'Ugo (section 4)", () => {
     const decide = smartDecidePrompt();
@@ -28,6 +28,26 @@ describe("prompt figé (lot B)", () => {
     expect(smartVerifyPrompt()).toContain("Tu ne connais pas son raisonnement");
     expect(SAV_SMART_RESOURCES.map(row => row.url)).toEqual(["https://bienvenue.limova.ai/webinaires", "https://chromewebstore.google.com/detail/limova-ai-assistant-onboa/fpkgfhhomlijmhbgcpbpjnfafdedfccj", "https://academy.limova.ai"]);
     expect(SAV_SMART_RESOURCES.every(row => row.whenToOffer.length > 20)).toBe(true);
+  });
+  it("v5 (N2) : aucune famille sensible ne disparaît ; énervement et menace jugés par le modèle ; simples mentions ; enquête ; relecture", () => {
+    const decide = smartDecidePrompt(), understand = smartUnderstandPrompt(), verify = smartVerifyPrompt();
+    for (const family of ["résiliation", "abonnement", "paiement", "facture", "remboursement", "droits sur ses données", "identité ou titulaire du compte", "piratage"]) {
+      expect(decide, family).toContain(family);
+      expect(understand, family).toContain(family);
+    }
+    expect(decide).toContain("Même en une ligne, même en PS : tout le mail va à l'équipe");
+    expect(understand).toContain("CLIENT TRÈS ÉNERVÉ OU MENAÇANT");
+    expect(understand).toContain("Mets alors upset à true");
+    expect(understand).toContain("C'est toi qui en juges, pas un mot");
+    expect(decide).toContain("s'il est très énervé ou menace (résilier, mauvais avis, avocat, « c'est inadmissible, 3e relance » : raison upset)");
+    expect(decide).toContain("« où trouver ma facture ? » ou « le prix d'une intégration » : une simple mention");
+    expect(decide).toContain("demande l'URL de la conversation (barre d'adresse) et des captures ; insiste si besoin.");
+    expect(decide).toContain("la tâche marche-t-elle en direct dans le chat ?");
+    expect(decide).toContain("Charly Max : demande le numéro de téléphone du client.");
+    expect(decide).toContain("un jeton (token API)");
+    expect(verify).toContain("11. sensitive_commitment");
+    expect(verify).toContain("(une simple mention ne compte pas)");
+    expect(SAV_SMART_RESOURCES[0]!.whenToOffer).toContain("Ne jamais proposer de rendez-vous individuel");
   });
   it("les outils sont décrits par le registre (payload), pas figés dans le prompt ; aucun web", () => {
     expect(smartDecidePrompt()).not.toMatch(/doc_officielle|mcp/i);
