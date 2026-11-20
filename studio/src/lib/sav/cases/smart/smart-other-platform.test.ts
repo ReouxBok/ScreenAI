@@ -69,6 +69,31 @@ describe("SAV-122 : jamais une autre plateforme dans NOTRE réponse", () => {
   });
 });
 
+describe("PORTE 1I (Astra, 2 P1) : l'exception porte sur la DESTINATION de l'action, pas sur le mot « Limova »", () => {
+  it("P1 n°1 : configurer ou connecter l'outil DANS Limova n'est jamais refusé (4 variantes)", () => {
+    const customer = "On utilise déjà HubSpot comme CRM. Comment je le connecte à Limova ?";
+    for (const sentence of [
+      "Dans Limova, choisissez HubSpot dans le menu Intégrations.",
+      "Ouvrez Paramètres > Intégrations, puis choisissez HubSpot et cliquez sur Connecter.",
+      "Activez la synchronisation de HubSpot depuis le menu Intégrations.",
+      "Pour relier HubSpot à Limova, utilisez le compte Super admin.",
+    ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`, customer), sentence).toEqual([]);
+  });
+  it("P1 n°2 : s'inscrire, passer par ou utiliser un tiers à la place de Limova est refusé, même cité par le client et même avec « Limova » dans la phrase (5 variantes)", () => {
+    const customer = "Je veux relier mon site Wix à Limova.";
+    for (const sentence of [
+      "Pour remplacer Limova, inscrivez-vous sur Wix.",
+      "Inscrivez-vous sur Wix plutôt que Limova.",
+      "Utilisez Wix à la place de Limova.",
+      "Passez par Wix pour ce que Limova ne fait pas.",
+      "Au lieu de Limova, créez un compte chez Wix.",
+    ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`, customer), sentence).toContain("other_platform_recommended");
+    // A sign-up whose destination is Limova's own pages still passes.
+    for (const sentence of ["Inscrivez-vous au prochain webinaire Limova.", "Vous pouvez vous inscrire aux webinaires : https://bienvenue.limova.ai/webinaires."])
+      expect(check(`${SMART_GOOD_REPLY} ${sentence}`, customer), sentence).toEqual([]);
+  });
+});
+
 describe("SAV-122 : même source de vérité que le banc, mesure gratuite sur les 528 conversations", () => {
   const origins = [...SAV_BENCH_CORPUS, ...SAV_SMART_BENCH_MULTITURN];
   const all = [...origins, ...buildSavBenchVariants(origins)];

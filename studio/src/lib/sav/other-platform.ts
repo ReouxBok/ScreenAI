@@ -19,9 +19,28 @@ export const SAV_OTHER_PLATFORM_THIRD_PARTIES = Object.freeze([
 /** Limova's own words: a sentence that names them is about Limova (« inscrivez-vous au webinaire Limova », « créez votre compte sur l'Academy »). */
 export const SAV_OTHER_PLATFORM_LIMOVA = /\b(?:limova|webinaires?|academy|charly)\b/;
 
+/*
+ * PORTE 1I (Astra): the exception is the action's DESTINATION, never a mere « Limova » somewhere in the sentence. « Pour remplacer Limova,
+ * inscrivez-vous sur Wix » is refused; « inscrivez-vous au prochain webinaire Limova » and « choisissez HubSpot dans le menu Intégrations de
+ * Limova » pass.
+ */
+/** The sentence tells the customer to leave or replace Limova: always a redirection. */
+export const SAV_OTHER_PLATFORM_LEAVES = /\b(?:remplac\w* limova|a la place de limova|au lieu de limova|plutot que limova|quitt\w* limova|sans limova)\b/;
+/** A sentence about Limova itself (a Limova word, and nothing that leaves Limova). */
+export const savOtherPlatformAboutLimova = (foldedSentence: string) => SAV_OTHER_PLATFORM_LIMOVA.test(foldedSentence) && !SAV_OTHER_PLATFORM_LEAVES.test(foldedSentence);
+const LIMOVA_DESTINATION = /^.{0,40}?\b(?:limova|webinaires?|academy|charly)\b/;
+/** True when one match of `pattern` (a sign-up) leads somewhere else than Limova's own pages (its destination, the next words, is not Limova). */
+export function savOtherPlatformSignupElsewhere(foldedSentence: string, pattern: RegExp): boolean {
+  if (SAV_OTHER_PLATFORM_LEAVES.test(foldedSentence)) return pattern.test(foldedSentence);
+  for (const match of foldedSentence.matchAll(new RegExp(pattern.source, "g"))) if (!LIMOVA_DESTINATION.test(foldedSentence.slice(match.index! + match[0].length))) return true;
+  return false;
+}
 const SIGNUP = SAV_OTHER_PLATFORM_SIGNUP.map(source => new RegExp(source));
-/** A sentence that invites to sign up elsewhere (the bench's patterns), Limova's own sign-ups excepted. */
-export const savOtherPlatformSignup = (foldedSentence: string) => !SAV_OTHER_PLATFORM_LIMOVA.test(foldedSentence) && SIGNUP.some(pattern => pattern.test(foldedSentence));
+/** A sentence that invites to sign up elsewhere (the bench's patterns), a sign-up whose destination is Limova's excepted. */
+export const savOtherPlatformSignup = (foldedSentence: string) => SIGNUP.some(pattern => savOtherPlatformSignupElsewhere(foldedSentence, pattern));
+
+/** The sentence configures or connects the tool INSIDE Limova (« dans le menu Intégrations », « Paramètres > », « relier X à Limova »). */
+const INSIDE_LIMOVA = /\b(?:dans|depuis|via|sur|de) (?:le menu |l'onglet |la page |la rubrique |vos |les )?(?:integrations?|parametres|limova)\b|\b(?:parametres|integrations) >|\b(?:connect|reli|branch|synchronis|integr|associ)\w*\b.{0,60}\b(?:a|avec|sur|dans|de) limova\b/;
 
 /*
  * Advice to go and use another tool, with no name needed: « vous pourriez passer par un autre outil », « changez de créateur de site »,
@@ -32,6 +51,7 @@ const REDIRECT: readonly RegExp[] = [
   new RegExp(String.raw`\b(?:vous pouvez|vous pourriez|il vous suffit d[e']|je vous invite a|n'hesitez pas a|le plus simple (?:est|serait) d[e']|mieux vaut|il vaut mieux|il faudrait|vous devriez|je vous (?:recommande|conseille|suggere) d[e'])\s*(?:aussi |plutot |egalement |donc |peut-etre |alors )?(?:passer (?:par|chez|sur|a)|utiliser|essayer|tester|opter pour|vous tourner vers|migrer vers|changer d[e']|souscrire(?: a)?|prendre|activer|choisir)\s*(?:un |une |le |la |l'|leur |son |sa |cet |cette |ce )?${TOOL_NOUN}\b`),
   new RegExp(String.raw`\b(?:changez|changer|passez|passer|migrez|migrer) (?:de |d'|chez |vers |pour )(?:site|createur|outil|plateforme|hebergeur|logiciel|prestataire|solution|fournisseur|editeur|un autre|une autre)\b`),
   new RegExp(String.raw`\b(?:passez|passer) (?:a|chez|pour) (?:un |une |la |l'|leur |son |sa )?(?:autre|formule|offre|version (?:payante|superieure|pro))\b`),
+  SAV_OTHER_PLATFORM_LEAVES,
 ];
 /** True when the folded sentence advises using another tool or platform to do what Limova does (no name needed). */
 export const savOtherPlatformRedirect = (foldedSentence: string) => REDIRECT.some(pattern => pattern.test(foldedSentence));
@@ -48,7 +68,7 @@ export function savOtherPlatformEndorses(foldedSentence: string, names: readonly
   const name = `(?:${names.map(escape).join("|")})(?![\\p{L}\\p{N}])`;
   return [
     new RegExp(String.raw`(?<![\p{L}\p{N}])${name}.{0,60}?\b(?:est|serait|semble|sera|reste|sont|seraient|parait|c'est)\s(?:\S+\s){0,2}?(?:mieux|meilleure?s?|plus (?:simple|adapte|facile|complet|performant|pratique|interessant)|ideale?|une bonne (?:option|solution|alternative|idee))`, "u"),
-    new RegExp(String.raw`\b(?:recommande|conseille|suggere|essayez|testez|optez pour|prenez|activez|choisissez|tournez-vous vers|allez sur)\s(?:(?:vous|plutot|aussi|donc|d'utiliser|d'essayer|de passer par|de prendre|de tester|de choisir|de vous tourner vers|d'opter pour|de vous inscrire (?:sur|chez|a))\s)*(?:(?:le|la|l'|les|son|sa|leur|ses)\s?(?!integration|connexion|connecteur|synchronisation|compte)[\p{L}-]+(?: [\p{L}-]+)? (?:de |d'|chez ))?${name}`, "u"),
+    ...(INSIDE_LIMOVA.test(foldedSentence) && !SAV_OTHER_PLATFORM_LEAVES.test(foldedSentence) ? [] : [new RegExp(String.raw`\b(?:recommande|conseille|suggere|essayez|testez|optez pour|prenez|activez|choisissez|utilisez|passez par|inscrivez-vous (?:sur|chez)|rendez-vous sur|tournez-vous vers|allez sur)\s(?:(?:vous|plutot|aussi|donc|d'utiliser|d'essayer|de passer par|de prendre|de tester|de choisir|de vous tourner vers|d'opter pour|de vous inscrire (?:sur|chez|a))\s)*(?:(?:le|la|l'|les|son|sa|leur|ses)\s?(?!integration|connexion|connecteur|synchronisation|compte)[\p{L}-]+(?: [\p{L}-]+)? (?:de |d'|chez ))?${name}`, "u")]),
     new RegExp(String.raw`(?<![\p{L}\p{N}])${name}.{0,60}?\bvaut (?:le coup|la peine|mieux)`, "u"),
   ].some(pattern => pattern.test(foldedSentence));
 }

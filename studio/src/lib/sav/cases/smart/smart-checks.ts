@@ -1,6 +1,7 @@
 import { normalizeSavEvidenceText, savEvidenceContains } from "../../evidence-text";
 import {
-  SAV_OTHER_PLATFORM_LIMOVA, SAV_OTHER_PLATFORM_THIRD_PARTIES, savOtherPlatformCustomerTools, savOtherPlatformEndorses, savOtherPlatformRedirect, savOtherPlatformSignup,
+  SAV_OTHER_PLATFORM_THIRD_PARTIES, savOtherPlatformAboutLimova, savOtherPlatformCustomerTools, savOtherPlatformEndorses, savOtherPlatformRedirect, savOtherPlatformSignup,
+  savOtherPlatformSignupElsewhere,
 } from "../../other-platform";
 import { requestsCredential } from "../decision-validator";
 import type { SmartCheckCode, SmartDecision, SmartReading } from "./smart-contract";
@@ -72,8 +73,9 @@ export function smartOtherPlatformSentences(reply: string, customerText: string)
   const names = [...new Set([...SAV_OTHER_PLATFORM_THIRD_PARTIES, ...savOtherPlatformCustomerTools(customerText, fold)])];
   const known = new RegExp(String.raw`(?<![\p{L}\p{N}])(${names.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})(?![\p{L}\p{N}])`, "u");
   return sentencesOf(reply).filter(sentence => {
-    const folded = fold(sentence), limova = SAV_OTHER_PLATFORM_LIMOVA.test(folded);
-    return (SIGNUP.test(folded) && !limova) || savOtherPlatformSignup(folded) || SWITCH.test(folded) || savOtherPlatformRedirect(folded)
+    // PORTE 1I: a « Limova » word exempts only a sentence about Limova itself; a sign-up is judged by its destination.
+    const folded = fold(sentence), limova = savOtherPlatformAboutLimova(folded);
+    return savOtherPlatformSignupElsewhere(folded, SIGNUP) || savOtherPlatformSignup(folded) || SWITCH.test(folded) || savOtherPlatformRedirect(folded)
       || savOtherPlatformEndorses(folded, names) || (known.test(folded) && PRAISE.test(folded) && !limova);
   });
 }
