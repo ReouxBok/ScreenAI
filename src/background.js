@@ -1081,6 +1081,9 @@ async function handleMessage(request, sender) {
         typeVoiceText(request.elementId, request.text, request.contextVersion, request.targetLabel)
       );
 
+    case 'VOICE_DISMISS_POPUP_REQUEST':
+      return runEvaluatedVoiceTool('dismiss_popup', '', () => dismissVoicePopup(request.contextVersion));
+
     case 'VOICE_SCROLL_REQUEST':
       return runEvaluatedVoiceTool('scroll_page', '', () =>
         scrollVoicePage(request.direction, request.amount, request.elementId, request.contextVersion)
@@ -4039,7 +4042,7 @@ async function getLiveToken(context) {
         trainingMode,
         // Tells the proxy this extension follows every site and handles
         // open_page and create_in_limova.
-        capabilities: ['any_site', 'limova_handoff', 'browser_tasks', 'structured_verification', 'batch_fields'],
+        capabilities: ['any_site', 'limova_handoff', 'browser_tasks', 'structured_verification', 'batch_fields', 'dismiss_popup'],
         ...(sessionState.resetContext ? { resetContext: true } : {}),
         ...(trainingMode || evaluationMode ? {} : await userFirstNameField()),
         ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
@@ -4456,6 +4459,20 @@ async function proposeVoiceAction(elementId, requestedContextVersion, toolIntent
     requestedContextVersion,
     operation
   });
+}
+
+async function dismissVoicePopup(contextVersion, operation = captureVoiceOperation()) {
+  if (trainingState.active || !(await hasAIProcessingConsent()) || !isCurrentOperation(operation) || !operation.tabId) return { ok: false };
+  if (contextVersion !== pageContextVersion) return { ok: false, status: 'unexpected', retryWithFreshContext: true, error: 'La carte DOM a changé.' };
+  const result = await sendContentMessage(operation.tabId, {
+    type: 'DISMISS_TRANSIENT_POPUP', contextVersion, taskRevision: operation.taskRevision
+  }, true, operation).catch(() => ({ ok: false, failureCode: 'content_script_unavailable' }));
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  const fresh = await getFreshVoiceContext(null, { capture: true, operation });
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  Logger.event('action', 'POPUP_DISMISS_COMPLETED', { ok: result?.ok === true, dismissed: result?.dismissed === true,
+    method: ['escape', 'outside_pointer'].includes(result?.dismissalMethod) ? result.dismissalMethod : null });
+  return { ...fresh, ...result };
 }
 
 async function setVoiceControlState(elementId, checked, contextVersion, targetLabel) {

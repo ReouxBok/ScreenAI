@@ -151,6 +151,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  if (request.type === 'DISMISS_TRANSIENT_POPUP') {
+    dismissTransientPopup(request).then(sendResponse)
+      .catch(() => sendResponse({ ok: false, failureCode: 'popup_not_dismissed', error: 'Le sélecteur n’a pas pu être fermé.' }));
+    return true;
+  }
+
   if (request.type === 'VOICE_TASK_REVISION') {
     if (Number.isSafeInteger(request.revision)) voiceTaskRevision = Math.max(voiceTaskRevision, request.revision);
     sendResponse({ ok: true });
@@ -980,6 +986,81 @@ function waitForPointerFrame() {
 
 function waitForPointerDelay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function transientPopupCandidate() {
+  const layered = element => {
+    for (let node = element; node && node !== document.body; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (style.position === 'fixed' || (style.position === 'absolute' && Number.parseInt(style.zIndex, 10) >= 10)) return true;
+    }
+    return false;
+  };
+  const expanded = [...document.querySelectorAll('[aria-expanded="true"][aria-controls]')];
+  const owned = new Map();
+  for (const trigger of expanded) {
+    for (const id of trigger.getAttribute('aria-controls').split(/\s+/)) {
+      const popup = document.getElementById(id);
+      if (popup && isVisiblyRendered(trigger)) owned.set(popup, trigger);
+    }
+  }
+  const candidates = new Set([...owned.keys()]);
+  for (const node of document.querySelectorAll('[role="menu"], [role="listbox"], [role="tree"], [role="grid"], [popover]')) {
+    const popup = node.closest('[role="dialog"], [role="menu"], [role="listbox"], [popover]') || node;
+    if (layered(popup) && !popup.querySelector('form, textarea, [contenteditable="true"], input:not([type="hidden"]):not([type="button"]):not([type="submit"])')) candidates.add(popup);
+  }
+  return [...candidates].filter(popup => isVisiblyRendered(popup))
+    .filter(popup => !popup.querySelector('form, textarea, [contenteditable="true"]'))
+    .sort((a, b) => { const x = a.getBoundingClientRect(), y = b.getBoundingClientRect(); return x.width * x.height - y.width * y.height; })
+    .map(popup => ({ popup, trigger: owned.get(popup) }))[0] || null;
+}
+
+async function dismissTransientPopup(request = {}) {
+  const current = () => request.taskRevision === undefined || request.taskRevision === voiceTaskRevision;
+  if (!current()) return { ok: false, cancelled: true };
+  if (document.documentElement.dataset.limovaContextVersion !== String(request.contextVersion)) {
+    return { ok: false, failureCode: 'stale_context', error: 'La page a changé.' };
+  }
+  const candidate = transientPopupCandidate();
+  // Never press Escape blindly: it could discard the main editor instead.
+  if (!candidate) return { ok: true, unchanged: true, dismissed: false };
+  const { popup, trigger } = candidate;
+  const gone = () => !popup.isConnected || !isVisiblyRendered(popup)
+    || (trigger?.isConnected && trigger.getAttribute('aria-expanded') === 'false');
+  const target = popup.contains(document.activeElement) || document.activeElement === trigger
+    ? document.activeElement : popup;
+  for (const type of ['keydown', 'keyup']) target.dispatchEvent(new KeyboardEvent(type, {
+    key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true, composed: true
+  }));
+  await waitForPointerFrame();
+  await waitForPointerDelay(120);
+  if (!current()) return { ok: false, cancelled: true };
+  if (gone()) return { ok: true, dismissed: true, dismissalMethod: 'escape' };
+
+  // Some widgets listen only for outside pointer events. Click neutral space
+  // within the enclosing editor, never a Save button or its backdrop.
+  const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open]')]
+    .filter(node => node !== popup && !popup.contains(node) && isVisiblyRendered(node));
+  const editor = trigger?.closest('[role="dialog"], [aria-modal="true"], dialog[open]')
+    || popup.parentElement?.closest('[role="dialog"], [aria-modal="true"], dialog[open]')
+    || dialogs.find(node => node.querySelector('input,textarea,[contenteditable="true"]'));
+  const scope = editor || document.body;
+  const rect = editor?.getBoundingClientRect() || { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+  const interactive = 'button,a,input,textarea,select,label,[contenteditable="true"],[role="button"],[role="option"],[role="menuitem"],[onclick]';
+  for (const fx of [0.1, 0.5, 0.9]) {
+    for (const fy of [0.1, 0.5, 0.9]) {
+      const x = Math.round(rect.left + rect.width * fx), y = Math.round(rect.top + rect.height * fy);
+      const hit = document.elementFromPoint?.(x, y);
+      if (!(hit instanceof HTMLElement) || !scope.contains(hit) || popup.contains(hit) || hit.closest(interactive)) continue;
+      if (!current()) return { ok: false, cancelled: true };
+      dispatchCompletePointerClick(hit, x, y);
+      await waitForPointerFrame();
+      await waitForPointerDelay(120);
+      return gone() ? { ok: true, dismissed: true, dismissalMethod: 'outside_pointer' }
+        : { ok: false, failureCode: 'popup_not_dismissed', error: 'Le sélecteur est encore ouvert ; son état doit être relu.' };
+    }
+  }
+  return { ok: false, failureCode: 'popup_not_dismissed', error: 'Aucune surface neutre ne permet de fermer ce sélecteur.' };
 }
 
 function dispatchCompletePointerClick(element, clientX, clientY) {

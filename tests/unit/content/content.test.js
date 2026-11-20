@@ -225,6 +225,35 @@ describe('content.js — DOM helpers', () => {
   });
 
   describe('executeElementAction', () => {
+    it.each(['escape', 'outside_pointer'])('dismisses a transient calendar with %s while preserving the event editor', async method => {
+      vi.useFakeTimers();
+      window.requestAnimationFrame = callback => setTimeout(callback, 0);
+      document.documentElement.dataset.limovaContextVersion = '10';
+      document.body.innerHTML = '<section role="dialog" id="editor"><input value="Brouillon privé"><div id="space"></div><div role="dialog" id="calendar" style="position:absolute;z-index:20"><div role="grid"><button>21</button></div></div><button id="save">Enregistrer</button></section>';
+      for (const el of document.querySelectorAll('section,div,button,input')) el.getBoundingClientRect = () => ({ left:0,top:0,right:600,bottom:400,width:600,height:400 });
+      const popup = document.querySelector('#calendar'), save = vi.fn();
+      document.querySelector('#save').onclick = save;
+      if (method === 'escape') popup.addEventListener('keydown', event => { if (event.key === 'Escape') popup.remove(); });
+      else document.querySelector('#space').addEventListener('mousedown', () => popup.remove());
+      document.elementFromPoint = vi.fn(() => document.querySelector('#space'));
+      const result = content.dismissTransientPopup({ contextVersion: 10 });
+      await vi.advanceTimersByTimeAsync(1000);
+      await expect(result).resolves.toMatchObject({ ok: true, dismissed: true, dismissalMethod: method });
+      expect(document.querySelector('#editor input').value).toBe('Brouillon privé');
+      expect(document.querySelector('#editor')).toBeTruthy();
+      expect(save).not.toHaveBeenCalled();
+      delete document.elementFromPoint;
+      vi.useRealTimers();
+    });
+
+    it('does not press Escape on the main event editor when no transient popup exists', async () => {
+      document.documentElement.dataset.limovaContextVersion = '10';
+      document.body.innerHTML = '<section role="dialog"><input value="Sport"><button>Enregistrer</button></section>';
+      const escape = vi.fn(); document.addEventListener('keydown', escape);
+      await expect(content.dismissTransientPopup({ contextVersion: 10 })).resolves.toMatchObject({ ok:true, unchanged:true, dismissed:false });
+      expect(escape).not.toHaveBeenCalled(); document.removeEventListener('keydown', escape);
+    });
+
     it('clicks only a current, visible element identified by data-lid', () => {
       document.documentElement.dataset.limovaContextVersion = '7';
       document.body.innerHTML = '<button data-lid="4">Open</button>';

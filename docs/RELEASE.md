@@ -6,7 +6,7 @@ Les champs texte, date, heure, les zones de texte et les éditeurs peuvent recev
 
 Les rejets de clic remontent un code précis (cible masquée, désactivée, absente ou contexte périmé) dans le résultat de l’outil et les diagnostics, sans journaliser le texte de la page. GPT Live, Marin en français, les permissions et les niveaux d’autonomie sont conservés.
 
-Correctif limité à l’extension : le proxy v81 est compatible et ne nécessite aucun redéploiement. Soumettre `dist/limova-ai-extension-2.2.63.zip` après validation ; remplacer l’examen en attente de la 2.2.62 si nécessaire.
+L’outil `dismiss_popup` ferme les sélecteurs, menus et listes temporaires par Échap ou un clic dans une zone neutre, puis renvoie la page fraîche. Il préserve le formulaire principal et vérifie la fermeture. Le proxy propose cet outil uniquement aux extensions qui annoncent cette capacité. Déployer ce proxy avant la nouvelle extension. Soumettre `dist/limova-ai-extension-2.2.63.zip` après validation ; remplacer l’examen en attente de la 2.2.62 si nécessaire.
 
 ## Extension 2.2.62 — autonomie, accord vocal et formulaires rapides
 
