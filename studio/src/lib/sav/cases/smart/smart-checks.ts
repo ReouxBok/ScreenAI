@@ -18,7 +18,8 @@ import type { SmartAcademyEvidence } from "./smart-tools";
  *   secret     the existing V2 tripwire (`requestsCredential`) on the reply;
  *   promise    a delay, a price, a gift or a future feature that no cited card carries;
  *   account    a claim that an action was done on the account;
- *   commitment the reply COMMITS to a sensitive action on the account (N2, 20/11): « nous allons annuler / rembourser / supprimer », « je vous
+ *   commitment the reply COMMITS to a sensitive action on the account, or gives the customer the procedure to cancel their subscription or
+ *              contract (N2, 20/11, and its review): « nous allons annuler / rembourser / supprimer », « je vous
  *              rembourse », « votre abonnement sera résilié », « je vous envoie votre mot de passe »... A word alone (« votre facture est
  *              disponible dans… », « vous pouvez annuler la routine ») never refuses: since N2 the old `kernel_in_reply` is no longer emitted;
  *   coverage   every need of the reading is answered, asked or handed; a reply or a question has a text; a handoff has a team note.
@@ -88,6 +89,10 @@ const COMMITMENTS: readonly RegExp[] = [
   /\b(?:votre|vos|le|l'|ce|cet|son) ?(?:abonnement|compte|contrat|commande|offre|donnees|paiement|prelevement|acces)s? (?:sera|seront|va etre|vont etre|a ete|ont ete) (?:bien |immediatement |automatiquement |definitivement |integralement )?(?:annule|resilie|rembourse|supprime|efface|ferme|clos|cloture|desactive|transfere|suspendu|recredite)e?s?\b/,
   /\bvous (?:serez|allez etre|avez ete) (?:bien |integralement |entierement |rapidement )?(?:rembourse|recredite|dedommage)e?s?\b/,
   /\b(?:un|le|votre) (?:remboursement|avoir|geste commercial|dedommagement) (?:vous )?(?:sera|va etre|a ete) (?:effectue|fait|emis|verse|vire|lance|accorde|applique)/,
+  // Astra, N2 review (P1): the PROCEDURE given to the customer to cancel their Limova subscription or contract (« vous pouvez résilier votre
+  // abonnement depuis vos paramètres », « résiliez depuis… », « pour mettre fin à votre contrat, … »). Cancelling a routine stays allowed.
+  new RegExp(String.raw`\b(?:vous pouvez|vous pourrez|vous pourriez|il (?:vous )?suffit d[e']|pour|afin d[e']|vous devez|il faut|merci d[e']|n'hesitez pas a)\s*(?:\w+ ){0,2}(?:resilier\b|(?:annuler|arreter|stopper|suspendre|interrompre|mettre fin a|ne pas renouveler|desactiver|clore|cloturer|fermer) (?:le renouvellement (?:de |d')?)?(?:votre|l'|le|ce|cet|son) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement|compte limova)\b)`),
+  /\b(?:resiliez|(?:annulez|arretez|stoppez|suspendez|mettez fin a|cloturez|fermez) (?:votre|l'|le) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement|compte limova))\b/,
 ];
 /** True when the reply commits to a sensitive action on the account (exported for the tests and the shadow report). */
 export const smartSensitiveCommitment = (reply: string) => { const folded = fold(reply); return COMMITMENTS.some(pattern => pattern.test(folded)); };

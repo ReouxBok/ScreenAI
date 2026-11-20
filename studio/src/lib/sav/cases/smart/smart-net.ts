@@ -9,7 +9,9 @@ import { normalizeSensitiveText } from "../sensitive-words";
  * It no longer stops a mail on its WORDS (calibrated word lists stopped 8 ordinary mails out of 10 in the shadow: invoices, prices,
  * subscriptions are part of the customers' own business). What is left before the model is TECHNICAL only:
  *   - an empty mail, or a mail too long to be read whole (never given to the model in part);
- *   - an instruction aimed at the model (`containsPromptInjection`): a security stop, not a judgment of the subject;
+ *   - an instruction aimed at the model (`smartInstructionToModel`): a security stop, not a judgment of the subject. Since the N2 review it
+ *     is the shared detector, except that its bare words (« system prompt ») need an order addressed to the assistant: a customer who
+ *     reports the LABEL « system prompt » shown by their Assistant is not stopped;
  *   - the cleaning of quoted history (`smartFreshText`) and the masking of personal data (`smartMask`).
  * Sensitivity and anger are the MODEL's judgment (the reading: `sensible`, `sensitiveFamilies`, `upset`), with zero tolerance: any doubt
  * goes to the team. After the model, the server reads only OUR reply (`smart-checks.ts`, `sensitive_commitment`), then the counter-read.
@@ -65,11 +67,30 @@ export function smartFreshText(body: string): string {
   return kept.join("\n");
 }
 
+/**
+ * Astra, N2 review (P2): the shared detector (`containsPromptInjection`) also stops on the BARE words « system prompt », « developer message »
+ * or « jailbreak », so a customer who reports that label shown by their Assistant went to the team. Here those bare words count only with an
+ * order addressed to the assistant (normalized text). The other patterns of the shared detector are kept as they are: never broader than it.
+ */
+const BARE_LABELS = /system prompt|developer message|jailbreak/gi;
+const ORDER_TO_MODEL: readonly RegExp[] = [
+  /\b(?:revele[sz]?|devoile[sz]?|montre[sz]?-moi|affiche[sz]?-moi|donne[sz]?-moi|repete[sz]?|recopie[sz]?|ecris-moi)\b(?: \w+){0,2} (?:ton|tes|votre|vos) (?:prompt|system prompt|consignes|instructions|regles)\b/,
+  /\b(?:reveal|show me|print|repeat|output|dump|leak|disclose|tell me|ignore|forget|disregard)\b(?: \w+){0,2} (?:your|the) (?:system prompt|hidden prompt|developer message|instructions|initial prompt|rules)\b/,
+  /\bjailbreak(?:ed|ing)? (?:mode|prompt|yourself|toi)\b|\b(?:tu es|you are) (?:maintenant|now) (?:en mode|in) (?:dan|developpeur|developer|jailbreak)\b/,
+];
+/** True when a customer text gives the assistant an order about its own rules (exported for the tests). */
+export function smartInstructionToModel(value: string): boolean {
+  if (!containsPromptInjection(value)) return false;
+  if (containsPromptInjection(value.replace(BARE_LABELS, " "))) return true;
+  const text = norm(value);
+  return ORDER_TO_MODEL.some(pattern => pattern.test(text));
+}
+
 /** Step 0 on the integral raw texts (never truncated before reading). Technical stops only; `reasons` and `hints`: closed codes only. */
 export function smartSafetyNet(input: Readonly<{ subject: string; body: string }>): SmartNetResult {
   const subject = String(input.subject ?? ""), body = String(input.body ?? "");
   const reasons: string[] = [];
-  if (containsPromptInjection(`${subject}\n${body}`)) reasons.push("instruction_in_mail");
+  if (smartInstructionToModel(`${subject}\n${body}`)) reasons.push("instruction_in_mail");
   if (!body.trim() && !subject.trim()) reasons.push("empty");
   if (smartMask(body).length > SAV_SMART_MAIL_MAX_CHARS || smartMask(subject).length > SAV_SMART_SUBJECT_MAX_CHARS) reasons.push("too_long");
   if (reasons.length) return { stop: true, reasons };

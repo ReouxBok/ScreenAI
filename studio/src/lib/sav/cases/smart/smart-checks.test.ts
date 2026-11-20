@@ -63,7 +63,22 @@ describe("contrôles serveur sans modèle (lot D3)", () => {
     }
     expect(smartSensitiveCommitment("Nous ne pouvons pas annuler votre abonnement nous-mêmes.")).toBe(false);
     expect(smartSensitiveCommitment("Je vous suggère de supprimer le fichier puis de le réimporter.")).toBe(false);
-    expect(check(`${SMART_GOOD_REPLY} Vous pouvez résilier depuis vos paramètres.`)).not.toContain("kernel_in_reply");
+    expect(check(`${SMART_GOOD_REPLY} Pour toute question de résiliation, je transmets votre message à l'équipe.`)).toEqual([]);
+  });
+  it("revue N2 (P1 Astra) : la procédure donnée au client pour résilier ou annuler son abonnement ou son contrat est refusée ; annuler une routine passe", () => {
+    for (const sentence of [
+      "Vous pouvez résilier votre abonnement depuis vos paramètres.",
+      "Vous pouvez résilier depuis vos paramètres.",
+      "Résiliez votre abonnement depuis l'onglet Facturation.",
+      "Pour annuler votre abonnement, ouvrez vos paramètres.",
+      "Il vous suffit de mettre fin à votre contrat depuis votre espace.",
+      "Annulez le renouvellement depuis votre compte.",
+    ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toContain("sensitive_commitment");
+    for (const sentence of [
+      "Vous pouvez annuler la routine depuis vos paramètres.",
+      "Pour arrêter la routine, supprimez-la depuis sa conversation.",
+      "Vous pouvez annuler l'envoi programmé avant 8 h.",
+    ]) expect(check(`${SMART_GOOD_REPLY} ${sentence}`), sentence).toEqual([]);
   });
   it("N2, enquête : demander l'URL de la conversation, des captures ou le numéro de téléphone du client n'est pas une demande de secret", () => {
     expect(check(`${SMART_GOOD_REPLY} Pouvez-vous nous envoyer l'URL de la conversation, visible dans la barre d'adresse, et une capture d'écran ?`)).toEqual([]);

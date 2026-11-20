@@ -89,6 +89,21 @@ describe("contrôles serveur, relecture et une correction", () => {
     expect(result.replyWithFooter).toBeNull();
     expect(calls.map(call => call.kind)).toEqual(["understand", "decide", "verify", "correct", "reverify"]);
   });
+  it("revue N2 (P1 Astra) : lecture « ordinaire » et relecture « conforme » fautives, procédure de résiliation deux fois : équipe, aucun texte client", async () => {
+    const cancel = smartGoodDecision({ reply: `${SMART_GOOD_REPLY}\n\nVous pouvez résilier votre abonnement depuis vos paramètres.` });
+    const { result, calls } = await run({ understand: { output: smartReading() }, decide: { output: cancel }, verify: { output: SMART_CONFORME }, correct: { output: cancel }, reverify: { output: SMART_CONFORME } });
+    expect(result.checks.first).toContain("sensitive_commitment");
+    expect(result.checks.second).toContain("sensitive_commitment");
+    expect(result).toMatchObject({ outcome: "handoff", replyWithFooter: null });
+    expect(result.reasons).toEqual(expect.arrayContaining(["refused_after_correction", "check:sensitive_commitment"]));
+    expect(calls.map(call => call.kind)).toEqual(["understand", "decide", "verify", "correct", "reverify"]);
+  });
+  it("revue N2, témoin : « vous pouvez annuler la routine depuis vos paramètres » reste une réponse", async () => {
+    const routine = smartGoodDecision({ reply: `${SMART_GOOD_REPLY}\n\nVous pouvez annuler la routine depuis vos paramètres.` });
+    const { result } = await run({ understand: { output: smartReading() }, decide: { output: routine }, verify: { output: SMART_CONFORME } });
+    expect(result).toMatchObject({ outcome: "reply", corrected: false });
+    expect(result.checks.first).toEqual([]);
+  });
   it("une demande de mot de passe est refusée", async () => {
     const reply = `${SMART_GOOD_REPLY}\n\nPouvez-vous nous envoyer votre mot de passe ?`;
     const bad = smartGoodDecision({ reply });
