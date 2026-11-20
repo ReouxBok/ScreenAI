@@ -15,13 +15,33 @@ const NEAR_FUTURE_ACTION = /\b(?:(?:je|nous|on) (?:vais|allons|va) (?:te |vous |
 const COMMITTED_OUTCOME = /\b(?:sera|seront|will be|va etre) (?:pret\w*|disponible\w*|corrige\w*|resolu\w*|retabli\w*|livre\w*|ajoute\w*|integre\w*|gratuit\w*|ready|available|fixed|resolved|delivered|added|free)\b/;
 const COMMITTED_PRICE = /\b(?:prix|tarif|price) (?:sera de|will be) \d/;
 
+const isPromise = (clause: string, outcomeUncertain: boolean) =>
+  COMMITTED_ACTION.test(clause) || NEAR_FUTURE_ACTION.test(clause) || (!outcomeUncertain && COMMITTED_OUTCOME.test(clause)) || COMMITTED_PRICE.test(clause);
+
+/* The uncertainty covers only the proposition it governs: what comes before it (« sera disponible vendredi, même si nous ignorons quand… ») is still examined.
+ * After an « ignorons quand » of the same sentence, a stated outcome is part of what is unknown; a committed action is not. */
+function clauseIsPromise(clause: string, outcomeUncertain: boolean) {
+  if (EXPLICIT_COMMITMENT.test(clause)) return true;
+  if (NON_COMMITTAL_OUTCOME.test(clause)) return false;
+  const unknown = UNKNOWN_DATE.exec(clause);
+  return isPromise(unknown ? clause.slice(0, unknown.index) : clause, outcomeUncertain);
+}
+
+/* The uncertainty ends where a contrast (« mais », « cependant », « toutefois », « en revanche », « néanmoins ») introduces an independent statement. */
+const CONTRAST = /\b(?:mais|but|cependant|toutefois|en revanche|neanmoins|however)\b/;
+
 export function temporaryKnowledgePromise(text: string) {
   return sentencesOf(text).some(sentence => {
-    const normalized = normalize(sentence).replace(/[^\p{L}\p{N}]+/gu, " ");
-    return normalized.split(/\b(?:mais|but)\b/).some(clause => {
-      if (EXPLICIT_COMMITMENT.test(clause)) return true;
-      if (NON_COMMITTAL_OUTCOME.test(clause) || UNKNOWN_DATE.test(clause)) return false;
-      return COMMITTED_ACTION.test(clause) || NEAR_FUTURE_ACTION.test(clause) || COMMITTED_OUTCOME.test(clause) || COMMITTED_PRICE.test(clause);
+    let outcomeUncertain = false;
+    return sentence.split(",").some(part => {
+      const clauses = normalize(part).replace(/[^\p{L}\p{N}]+/gu, " ").split(CONTRAST);
+      let promise = false;
+      clauses.forEach((clause, index) => {
+        if (index > 0) outcomeUncertain = false;
+        if (clauseIsPromise(clause, outcomeUncertain)) promise = true;
+        if (UNKNOWN_DATE.test(clause)) outcomeUncertain = true;
+      });
+      return promise;
     });
   });
 }
