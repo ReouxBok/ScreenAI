@@ -16,7 +16,7 @@ import { accessSkillWireAnswer } from "../access-skill/access-skill-wire";
 import type { SmartKnowledgePort } from "./smart-agent";
 import { readSmartLedger } from "./smart-ledger";
 import type { SmartEmbedPort } from "./smart-model";
-import { aggregateSmartShadow, readSmartShadowRows, runSmartShadowPass, SAV_SMART_SHADOW_PREFIX } from "./smart-shadow";
+import { aggregateSmartShadow, readSmartShadowGates, readSmartShadowRows, runSmartShadowPass, SAV_SMART_SHADOW_PREFIX, smartShadowItem, smartV1Gate, type SmartShadowStored } from "./smart-shadow";
 import { SMART_CONFORME, SMART_TEST_CARD, smartGoodDecision, smartReading } from "./smart-test-doubles";
 
 /*
@@ -54,7 +54,7 @@ const knowledge = (embed: SmartEmbedPort): SmartKnowledgePort => async () => {
 const pass = (env: Record<string, string>, net: ReturnType<typeof network>, extra: Partial<Parameters<typeof runSmartShadowPass>[0]> = {}) =>
   runSmartShadowPass({ env: () => env, now: () => AT, network: net.fn, knowledge, log: () => undefined, ...extra });
 
-async function v1Mail(options: { body?: string; executionThread?: "same" | "other"; receivedAt?: Date } = {}) {
+async function v1Mail(options: { body?: string; executionThread?: "same" | "other"; receivedAt?: Date; kinds?: string[]; classification?: string; payload?: unknown } = {}) {
   const threadId = randomUUID(), messageId = randomUUID(), receivedAt = options.receivedAt ?? new Date(AT.getTime() - 3_600_000);
   await f.db.insert(savThreads).values({ id: threadId, mailboxId, gmailThreadId: `t-${threadId}`, subject: "Connexion", customerEmail: "client@exemple.invalid" });
   const message = (direction: "inbound" | "outbound", text: string, at: Date, id = randomUUID()) => f.db.insert(savMessages).values({ id, threadId, mailboxId, direction,
@@ -68,7 +68,7 @@ async function v1Mail(options: { body?: string; executionThread?: "same" | "othe
     await f.db.insert(savThreads).values({ id: executionThread, mailboxId, gmailThreadId: `t-${executionThread}`, subject: "Autre", customerEmail: "autre@exemple.invalid" });
   }
   await f.db.insert(savIntakeExecutions).values({ messageId, threadId: executionThread, runVersion: 1, policyId, policyHash: "fixture", state: "confirmed", ticketId: String(Math.floor(Math.random() * 1e9)),
-    payloadCiphertext: encryptSavPayload({}) });
+    payloadCiphertext: encryptSavPayload(options.payload ?? { plan: { decision: { classification: options.classification ?? options.kinds?.[0] ?? "support", requests: (options.kinds ?? ["support"]).map((kind, index) => ({ id: `r${index}`, kind })) } } }) });
   return messageId;
 }
 async function effects() {
@@ -171,6 +171,78 @@ describe("allumé : 0 effet, un seul paiement par mail", () => {
   });
 });
 
+describe("porte V1 (SAV-116) : seul le « support » de V1 va au modèle", () => {
+  it("porte pure : support seul passe ; finance et résiliation l'emportent ; sinon la raison est le premier type non support ; illisible = unknown", () => {
+    const gate = (classification: string, ...kinds: string[]) => smartV1Gate({ classification, requests: kinds.map(kind => ({ kind })) });
+    expect(gate("support", "support")).toEqual({ gate: "support" });
+    expect(gate("mixed", "support", "other")).toEqual({ gate: "support" });
+    expect(gate("mixed", "support", "cancellation")).toEqual({ gate: "team", reason: "cancellation" });
+    expect(gate("mixed", "finance", "cancellation")).toEqual({ gate: "team", reason: "cancellation" });
+    expect(gate("finance", "support")).toEqual({ gate: "team", reason: "finance" });
+    expect(gate("finance", "finance")).toEqual({ gate: "team", reason: "finance" });
+    for (const reason of ["partnership", "commercial", "investor", "other", "unknown"]) expect(gate(reason, reason)).toEqual({ gate: "team", reason });
+    expect(gate("acknowledgement", "acknowledgement")).toEqual({ gate: "team", reason: "acknowledgement" });
+    expect(gate("support")).toEqual({ gate: "support" });
+    expect(gate("mixed")).toEqual({ gate: "team", reason: "unknown" });
+    expect(smartV1Gate({})).toEqual({ gate: "team", reason: "unknown" });
+    expect(smartV1Gate(null)).toEqual({ gate: "team", reason: "unknown" });
+    expect(gate("support", "n'importe quoi")).toEqual({ gate: "team", reason: "unknown" });
+  });
+  it("mail support : le modèle est appelé, la ligne porte v1Gate « support » et le temps d'un tour", async () => {
+    await v1Mail({ kinds: ["support"] });
+    const net = network(), result = await pass(ENV(), net);
+    expect(result).toMatchObject({ ran: 1, discardedByV1: {} });
+    expect(net.calls.length).toBeGreaterThan(0);
+    const [row] = await readSmartShadowRows();
+    expect(row).toMatchObject({ v1Gate: "support" });
+    expect(typeof row!.durationMs).toBe("number");
+  });
+  it("résiliation + support : team/cancellation, aucun appel, ni quota ni argent ; compté une seule fois sur deux passes", async () => {
+    await v1Mail({ kinds: ["support", "cancellation"], classification: "mixed" });
+    const net = network(), first = await pass(ENV(), net);
+    expect(first).toMatchObject({ ran: 0, discardedByV1: { cancellation: 1 } });
+    expect(await pass(ENV(), net)).toMatchObject({ ran: 0, stoppedBy: "no_mail", discardedByV1: {} });
+    expect(net.calls).toEqual([]);
+    expect(await readSmartLedger(SAV_SMART_SHADOW_PREFIX, DAY)).toMatchObject({ items: 0, settledMicroUsd: 0, open: {} });
+    expect(await readSmartShadowRows()).toEqual([]);
+    expect(await readSmartShadowGates()).toMatchObject([{ gate: "team", reason: "cancellation" }]);
+  });
+  it("finance seule : team/finance ; décision illisible : team/unknown", async () => {
+    await v1Mail({ kinds: ["finance"] });
+    await v1Mail({ payload: {} });
+    const net = network();
+    expect(await pass(ENV(), net)).toMatchObject({ ran: 0, discardedByV1: { finance: 1, unknown: 1 } });
+    expect(net.calls).toEqual([]);
+  });
+  it("le quota de mails par jour ne compte que les mails envoyés au modèle : 3 mails écartés ne le consomment pas", async () => {
+    await v1Mail({ kinds: ["finance"] }); await v1Mail({ kinds: ["partnership"] }); await v1Mail({ kinds: ["commercial"] }); await v1Mail({ kinds: ["support"] });
+    const net = network(), result = await pass(ENV({ SAV_V2_SMART_SHADOW_MAX_MAILS_PER_DAY: "1" }), net);
+    expect(result).toMatchObject({ ran: 1, discardedByV1: { finance: 1, partnership: 1, commercial: 1 } });
+    expect((await readSmartLedger(SAV_SMART_SHADOW_PREFIX, DAY)).items).toBe(1);
+  });
+  it("une ligne ancienne (sans v1Gate) reste lisible : lue comme « unknown », comptée à part, sans casser l'agrégat", async () => {
+    await v1Mail({ kinds: ["support"] });
+    await pass(ENV(), network());
+    const [recent] = await readSmartShadowRows();
+    const old: Omit<SmartShadowStored, "v1Gate"> = Object.fromEntries(Object.entries(recent!).filter(([key]) => key !== "v1Gate")) as Omit<SmartShadowStored, "v1Gate">;
+    const report = aggregateSmartShadow([old, recent!]);
+    expect(report.unknownGate).toEqual({ mails: 1 });
+    expect(report.support.mails).toBe(1);
+    expect(aggregateSmartShadow([old])).toMatchObject({ support: { mails: 0 }, unknownGate: { mails: 1 } });
+  });
+  it("agrégat en deux blocs : support (réponses, transferts, coût, p50/p95) et écartés par V1 (nombre par raison)", async () => {
+    await v1Mail({ kinds: ["support"] }); await v1Mail({ kinds: ["support"] });
+    await v1Mail({ kinds: ["finance"] }); await v1Mail({ kinds: ["finance"] }); await v1Mail({ kinds: ["partnership"] });
+    await pass(ENV(), network());
+    const report = aggregateSmartShadow(await readSmartShadowRows(), await readSmartShadowGates());
+    expect(report).toMatchObject({ support: { mails: 2, outcomes: { reply: 2 } }, discardedByV1: { mails: 3, byReason: { finance: 2, partnership: 1 } }, unknownGate: { mails: 0 } });
+    expect(report.support.durationMs).toMatchObject({ count: 2 });
+    expect(report.support.durationMs).toHaveProperty("p95");
+    expect(report.support.costMicroUsd).toMatchObject({ count: 2, median: expect.any(Number) });
+    expect(JSON.stringify(report)).not.toContain(smartShadowItem(""));
+  });
+});
+
 describe("plafonds et temps", () => {
   it("plafond d'argent : le pire cas d'un mail ne tient pas, arrêt avant tout appel", async () => {
     await v1Mail();
@@ -204,7 +276,7 @@ describe("rapport", () => {
   it("agrégats : décisions, refus par motif, sensibles arrêtés, coût, durée, octets, fiches manquantes", async () => {
     await v1Mail(); await v1Mail({ body: "Bonjour, je veux résilier." });
     await pass(ENV(), network({ decide: smartGoodDecision({ reply: "Bonjour,\n\nInscrivez-vous chez Yonos.\n\nBelle journée.", facts: [] }) }));
-    const report = aggregateSmartShadow(await readSmartShadowRows());
+    const report = aggregateSmartShadow(await readSmartShadowRows()).support;
     expect(report).toMatchObject({ mails: 2, outcomes: { handoff: 1, team_sensitive: 1 }, sensitiveStopped: { net: 1, understand: 0 }, corrected: 1, refusedAfterCorrection: 1 });
     expect(report.serverRefusals.other_platform_recommended).toBe(2);
     expect(report.bytesByStage.decide?.count).toBe(1);
