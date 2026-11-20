@@ -289,7 +289,23 @@ export type CaseAdmissionDecision = {
   families: (CaseRequestFamily | "unknown")[];
   sensitivity: CaseSensitivity;
   policyRevision: string | null;
+  /** SAV-117: present only on a decision of the smart entry (`smart-entry-switch.ts`); absent on every block-entry decision, exactly as before. */
+  admission?: typeof SAV_SMART_ENTRY_ADMISSION;
 };
+/** SAV-117 (N4, `smart-entry-switch.ts`): the label and policy revision of a smart-entry admission, and the provenance of a request it admits: a `qualified_rule`
+ * of this id, revision and block. No detector of the block registry carries this block, so no configured rule produces it on the block entry. Family `other`:
+ * V1 gives no topic, the smart brain reads the mail. Kept here so the pure admission rule keeps importing nothing but this file. */
+export const SAV_SMART_ENTRY_ADMISSION = "smart_support" as const;
+export const SAV_SMART_ENTRY_POLICY_REVISION = "smart-entry.v1";
+export const SAV_SMART_ENTRY_RULE_ID = "smart-entry";
+export const SAV_SMART_ENTRY_BLOCK_ID = "smart-support";
+export const SAV_SMART_ENTRY_FAMILY = "other" as const;
+export const smartSupportProvenance = (at: string) =>
+  ({ kind: "qualified_rule" as const, ruleId: SAV_SMART_ENTRY_RULE_ID, revision: SAV_SMART_ENTRY_POLICY_REVISION, at, blockId: SAV_SMART_ENTRY_BLOCK_ID });
+export const isSmartSupportProvenance = (provenance: Readonly<{ kind: string; ruleId?: string; revision?: string; blockId?: string }>) =>
+  provenance.kind === "qualified_rule" && provenance.ruleId === SAV_SMART_ENTRY_RULE_ID && provenance.revision === SAV_SMART_ENTRY_POLICY_REVISION
+  && provenance.blockId === SAV_SMART_ENTRY_BLOCK_ID;
+
 export type CaseAdmissionRecord = CaseAdmissionDecision & {
   decidedAt: string;
   /** Case version right after this admission was recorded. */

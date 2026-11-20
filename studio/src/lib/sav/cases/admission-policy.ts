@@ -1,6 +1,6 @@
 import {
   SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_ADMISSION_REASONS, SAV_CASE_ADMISSION_REVISION, SAV_CASE_ADMISSION_TEAM_REASONS, SAV_CASE_SENSITIVE_FAMILIES,
-  caseAdmissionPolicySchema, caseAdmissionQualificationSchema, caseSensitivityForFamily,
+  SAV_SMART_ENTRY_ADMISSION, SAV_SMART_ENTRY_POLICY_REVISION, caseAdmissionPolicySchema, caseAdmissionQualificationSchema, caseSensitivityForFamily, isSmartSupportProvenance,
   type CaseAdmissionDecision, type CaseAdmissionPolicy, type CaseAdmissionQualification, type CaseAdmissionReason,
   type CaseRequestFamily, type CaseSensitivity, type CaseSnapshot,
 } from "./case-types";
@@ -39,6 +39,7 @@ export function decideCaseAdmission(input: CaseAdmissionInput & { caseSensitivit
   const parsed = caseAdmissionQualificationSchema.safeParse(input.qualification);
   if (!parsed.success) throw Error("SAV_CASE_ADMISSION_INPUT_INVALID");
   const qualification = parsed.data;
+  if (qualification.requests.some(request => isSmartSupportProvenance(request.provenance))) return decideSmartCaseAdmission(qualification, input.caseSensitivity);
   const policy = input.policy === null || input.policy === undefined ? null : caseAdmissionPolicySchema.safeParse(input.policy);
   const families = qualification.requests.map(request => request.family);
   const sensitivity = families.reduce<CaseSensitivity>((current, family) =>
@@ -75,6 +76,39 @@ export function decideCaseAdmission(input: CaseAdmissionInput & { caseSensitivit
     nextStep: target === "agent" ? "none" : target === "team" ? "team_takeover" : "qualify",
     families: [...new Set(families)] as (CaseRequestFamily | "unknown")[], sensitivity,
     policyRevision: policy?.success ? policy.data.revision : null,
+  };
+}
+
+/**
+ * SAV-117 (N4): the admission of a mail the smart entry read (`SAV_V2_ENTRY_SMART=on`), recognised by its provenance only, so every re-evaluation of the stored
+ * qualification decides the same. Kept from V1→V2: sensitivity of the case and of every family (finance, cancellation... and mixed mails: the team), team
+ * signals, at least one request, identity confirmed, CRM complete. Not read: the block, the word list, the approved policy (recorded as `smart-entry.v1`).
+ * A request that is neither the smart entry's nor a team part makes the whole decision `qualification_unproven`: the two entries are never mixed.
+ */
+function decideSmartCaseAdmission(qualification: CaseAdmissionQualification, caseSensitivity: CaseSensitivity): CaseAdmissionDecision {
+  const families = qualification.requests.map(request => request.family);
+  const sensitivity = families.reduce<CaseSensitivity>((current, family) =>
+    family === "unknown" ? current : maxCaseSensitivity(current, caseSensitivityForFamily(family) ?? "none"), caseSensitivity);
+  const reasons = new Set<CaseAdmissionReason>();
+  if (caseSensitivity !== "none") reasons.add("case_sensitive");
+  if (families.some(isSensitive)) {
+    reasons.add("sensitive_family");
+    if (families.some(family => !isSensitive(family))) reasons.add("mixed_sensitive");
+  }
+  for (const signal of qualification.teamSignals) reasons.add(signal.kind);
+  const handled = qualification.requests.filter(request => request.provenance.kind !== "team_part");
+  if (!handled.length) reasons.add("no_request");
+  if (handled.some(request => !isSmartSupportProvenance(request.provenance))) reasons.add("qualification_unproven");
+  if (qualification.identity.status !== "confirmed") reasons.add("identity_unconfirmed");
+  if (qualification.crmContext !== "complete") reasons.add("context_incomplete");
+  if (!reasons.size) reasons.add("admitted");
+  const ordered = SAV_CASE_ADMISSION_REASONS.filter(reason => reasons.has(reason));
+  const target = SAV_CASE_ADMISSION_TEAM_REASONS.includes(ordered[0]!) ? "team" : ordered[0] === "admitted" ? "agent" : "qualification";
+  return {
+    revision: SAV_CASE_ADMISSION_REVISION, target, reasons: ordered,
+    nextStep: target === "agent" ? "none" : target === "team" ? "team_takeover" : "qualify",
+    families: [...new Set(families)] as (CaseRequestFamily | "unknown")[], sensitivity,
+    policyRevision: SAV_SMART_ENTRY_POLICY_REVISION, admission: SAV_SMART_ENTRY_ADMISSION,
   };
 }
 
