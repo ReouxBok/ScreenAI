@@ -21,7 +21,8 @@ import { pilotProvenanceGate, type PilotProvenanceDeps } from "./pilot-passage-p
 import { readSavV2QualificationScope } from "./qualification-scope";
 import { caseAttachmentMediaMode } from "./investigation-customer-attachments-reader";
 import { caseCustomerContextReader } from "./investigation-customer-context-reader";
-import { readRuntimeTemporaryIncidents } from "@/lib/knowledge/temporary-incidents-runtime";
+import { runtimeTemporaryKnowledgeLookup } from "@/lib/knowledge/temporary-incidents-runtime";
+import { temporaryKnowledgeEnabled } from "@/lib/knowledge/temporary-knowledge";
 
 /*
  * B (4/11, LOCAL and OFF): the concrete factory of the V2 investigation, for A's trigger and the wake. One real adapter per port, nothing
@@ -101,7 +102,8 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
   const v1Qualify = caseInvestigationQualify({ readConfirmedContext: readConfirmedV1Context, adapterPolicy: input.adapterPolicy ?? (async () => null), readPolicyRecord, now,
     ...(input.approvedRules ? { approvedRules: input.approvedRules } : {}) });
   const deps: CaseInvestigationRuntimeDeps = {
-    temporaryIncidents: readRuntimeTemporaryIncidents,
+    temporaryIncidents: provenance.readTemporaryIncidents,
+    ...(temporaryKnowledgeEnabled(env) ? { temporaryKnowledge: runtimeTemporaryKnowledgeLookup(input.env) } : {}),
     mode: "observe", holder: input.holder ?? "sav-v2-investigation", scope, now, leaseSeconds: input.leaseSeconds ?? 90,
     pauseState: casePauseState(caseV2PauseState(), input.env, now, input.caseAllowed), readTicketOwner, accessScope: provenance.accessScope, admissionPolicyRevision: provenance.currentPolicyRevision,
     // SAV-97: `SAV_V2_ACCESS_SKILL=on` requalifies a return with the Access skill, `shadow` compares it in the logs; `off`: exactly the legacy rule, or none.

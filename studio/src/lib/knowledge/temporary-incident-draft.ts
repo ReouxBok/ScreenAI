@@ -4,10 +4,11 @@ import { temporaryIncidentSchema } from "./temporary-incidents";
 /** Only prepares data for the existing NEW proposal draft. No approval, projection or runtime binding. */
 export function prepareTemporaryIncidentDraft(input: {
   id: string; title: string; family: string; productArea: string; knownSince: string; validUntil: string;
-  reply: string; source: string;
+  reply: string; source: string; keywords?: string[];
 }, now: Date = new Date()) {
   const incident = temporaryIncidentSchema.parse({ schemaVersion: 1, id: input.id, revision: 1, title: input.title,
     scope: { families: [input.family], productArea: input.productArea }, status: "active",
+    ...(input.keywords ? { keywords: input.keywords } : {}),
     knownSince: input.knownSince, validUntil: input.validUntil, infoToCollect: [], approvedReply: input.reply,
     fix: { level: "none", evidence: "" }, provenance: { source: input.source, recordedAt: now.toISOString() } });
   const document = canonicalKnowledgeSchema.parse({ schemaVersion: 1, objective: input.title, applicability: "sav_only", locale: "fr-FR",

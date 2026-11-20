@@ -1,6 +1,7 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
 import { recordSavWorkerPulse } from "@/lib/sav/monitor";
+import { temporaryKnowledgeEnabled } from "@/lib/knowledge/temporary-knowledge";
 
 export type SavV2EffectsTrigger = "vercel_cron" | "gmail_webhook" | "heartbeat_workflow";
 export type SavV2EffectsPassOptions = { trigger: SavV2EffectsTrigger; pulseId?: string; budgetMs?: number };
@@ -23,6 +24,11 @@ export async function runSavV2EffectsPass(options: SavV2EffectsPassOptions): Pro
     if (process.env.SAV_V2_ENTRY !== "on" || process.env.SAV_CASE_RECORDING !== "on") {
       await recordSavWorkerPulse(pulseId, pulseStartedAt, false, "sav-v2-effects");
       return { payload: { caseEffects: { status: "ok", durationMs: 0, data: { skipped: "v2_off" } } }, hasStepFailure: false, pulseId };
+    }
+    if (temporaryKnowledgeEnabled()) {
+      await import("@/lib/sav/temporary-knowledge-reminder")
+        .then(({ prepareDailyTemporaryKnowledgeReminder }) => prepareDailyTemporaryKnowledgeReminder(new Date(startedAt)))
+        .catch(() => console.error("sav_temporary_knowledge_reminder_failed"));
     }
     const { reconcileCaseV2Effects } = await import("@/lib/sav/cases/v2-effects-binding");
     const data = await reconcileCaseV2Effects({ env: process.env, deadlineMs });

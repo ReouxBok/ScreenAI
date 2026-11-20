@@ -5,16 +5,18 @@ import { createSavTestDb } from "../../../../test/sav-db";
 import { finalReplyText } from "../../../../test/sav-case-reply-text";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
-import { contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeProjections } from "@/db/schema";
+import { contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeProjections, savSyncState } from "@/db/schema";
 import { canonicalKnowledgeSchema } from "@/lib/knowledge/contracts";
-import { createTemporaryIncidentReader, readRuntimeTemporaryIncidents, type IncidentProjection } from "@/lib/knowledge/temporary-incidents-runtime";
+import { activeTemporaryKnowledge } from "@/lib/knowledge/temporary-incidents-read";
+import { createTemporaryIncidentReader, readRuntimeTemporaryIncidents, runtimeTemporaryKnowledgeLookup, type IncidentProjection } from "@/lib/knowledge/temporary-incidents-runtime";
 import { temporaryIncidentSchema } from "@/lib/knowledge/temporary-incidents";
+import { prepareDailyTemporaryKnowledgeReminder, temporaryKnowledgeReminderText } from "../temporary-knowledge-reminder";
 import { readSavAgentPause } from "../intake/agent-pause";
 import type { SavRetrievalBackend, SavRetrievalCandidate } from "../request-retrieval";
 import { listCaseEvents, openCaseEvent } from "./case-store";
 import { caseDedupeKey, caseRequestId, type CaseSnapshot, type KnowledgeRef } from "./case-types";
 import { SAV_CASE_ACCESS_SCOPE_REVISION, type CaseAccessScope } from "./investigation-access-scope";
-import { caseIncidentBindings, revalidateIncidentContext } from "./investigation-incidents";
+import { caseIncidentBindings, caseTemporaryKnowledgeRequestTexts, revalidateIncidentContext } from "./investigation-incidents";
 import { incidentContext, type IncidentBinding, type IncidentContext } from "./investigation-incidents-contract";
 import { caseGeminiDecisionProvider, caseInvestigationPrompt, prepareCaseGeminiDecisionRequest } from "./investigation-v2-providers";
 import { expandInvestigationContext } from "./investigation-context-view";
@@ -42,25 +44,28 @@ async function seed(value: unknown = incident(), reviewState = "approved") {
   await f.db.insert(contentItems).values({ id: itemId, slug: `syn-${itemId}`, title: "Connexion SYN", type: "article", ownerEmail: "reviewer@example.invalid" });
   await f.db.insert(contentVersions).values({ id: versionId, itemId, version: 1, bodyMarkdown: "Connexion SYN", metadata: { intents: [], limovaPaths: [], prerequisites: [], expectedResult: "Connexion", troubleshooting: "" }, changeNote: "SYN", authorEmail: "reviewer@example.invalid" });
   await f.db.insert(knowledgeFamilies).values({ id: familyId, canonicalKey: `syn-${familyId}`, title: "Connexion SYN", createdBy: "reviewer@example.invalid", approvedRevisionId: revisionId });
-  await f.db.insert(knowledgeFamilyRevisions).values({ id: revisionId, familyId, revision: 1, canonicalHash: `syn-hash-${revisionId}`, document: { ...document, ...(value === undefined ? {} : { temporaryIncident: value }) } as never, reviewState, reviewedBy: "ugo@limova.ai", reviewedAt: new Date(clock.getTime() - 60000) });
+  await f.db.insert(knowledgeFamilyRevisions).values({ id: revisionId, familyId, revision: 1, canonicalHash: `syn-hash-${revisionId}`, document: { ...document, ...(value === null ? {} : { temporaryIncident: value }) } as never, reviewState, reviewedBy: "ugo@limova.ai", reviewedAt: new Date(clock.getTime() - 60000) });
   await f.db.insert(knowledgeProjections).values({ familyId, revisionId, surface: "sav", itemId, versionId });
   const card: SavRetrievalCandidate = { id: itemId, contentVersionId: versionId, title: "Connexion SYN", content: "Ouvrir la page de connexion.", source: "fixture", verifiedAt: new Date(clock.getTime() - 86400000).toISOString(), semanticScore: null, resolution: { steps: ["Ouvrir la connexion"] }, availability: { active: true, published: true, indexed: true, archived: false, aiEnabled: true, locale: "fr-FR", audience: "support" } };
   return { itemId, versionId, familyId, revisionId, card, binding: { requestId: "syn-request", family: "access" as const, knowledgeId: itemId, contentVersionId: versionId } };
 }
 const scopeFor = (s: Seed): CaseAccessScope => ({ schema: SAV_CASE_ACCESS_SCOPE_REVISION, policyRevision: POLICY.revision, revision: "syn-scope-r1", family: "access", sources: [{ knowledgeId: s.itemId, contentVersionId: s.versionId, use: "answer" }] });
 async function context(bindings: IncidentBinding[]) { const result = await readRuntimeTemporaryIncidents(bindings, clock); if (!result.ok) throw Error(result.problem); return result.context; }
-async function accessCase() {
+async function accessCase(text = "Connexion impossible à la plateforme") {
   const gmail = `syn-${randomUUID()}`, requestId = caseRequestId(gmail, "r1");
-  return (await openCaseEvent({ ticketId: String(++seq), threadId: randomUUID(), admission: { policy: POLICY, qualification: qualified([requestId]) }, opens: [{ id: requestId, summary: "Connexion impossible", subject: { status: "available", text: "Connexion impossible à la plateforme", provenance: { source: "v1_accepted_analysis", field: "ticketSummary", runId: randomUUID(), runVersion: 1, resultHash: "syn-hash", validatorRevision: "syn-r1", acceptedAt: POLICY.approvedAt } } }], kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(gmail), sourceRef: { type: "email", id: gmail }, occurredAt: new Date().toISOString() })).case;
+  return (await openCaseEvent({ ticketId: String(++seq), threadId: randomUUID(), admission: { policy: POLICY, qualification: qualified([requestId]) }, opens: [{ id: requestId, summary: "Connexion impossible", subject: { status: "available", text, provenance: { source: "v1_accepted_analysis", field: "ticketSummary", runId: randomUUID(), runVersion: 1, resultHash: "syn-hash", validatorRevision: "syn-r1", acceptedAt: POLICY.approvedAt } } }], kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(gmail), sourceRef: { type: "email", id: gmail }, occurredAt: new Date().toISOString() })).case;
 }
-async function run(c: CaseSnapshot, s: Seed, options: { duringModel?: () => Promise<void>; owner?: "v2" | "human"; pause?: "fully_paused"; failed?: boolean; reply?: string; ledger?: { money: { count: number }; crashAfterSettle?: boolean; legacy?: boolean } } = {}) {
-  const calls: CaseInvestigationModelRequest[] = [], scope = scopeFor(s);
-  const backend: SavRetrievalBackend = { readRevision: async () => "syn-kb-r1", search: async queries => queries.map(() => [s.card]) };
+async function run(c: CaseSnapshot, s: Seed, options: { duringModel?: () => Promise<void>; owner?: "v2" | "human"; pause?: "fully_paused"; failed?: boolean; reply?: string; ledger?: { money: { count: number }; crashAfterSettle?: boolean; legacy?: boolean }; ordinary?: Seed; discoverTemporary?: boolean; answerWithOrdinary?: boolean } = {}) {
+  const calls: CaseInvestigationModelRequest[] = [], scope = scopeFor(s), ordinary = options.ordinary;
+  if (ordinary) scope.sources.unshift(...scopeFor(ordinary).sources);
+  const cards = ordinary ? [{ ...ordinary.card, semanticScore: 0.95 }, { ...s.card, semanticScore: 0.91 }] : [s.card];
+  const backend: SavRetrievalBackend = { readRevision: async () => "syn-kb-r1", search: async queries => queries.map(() => options.discoverTemporary ? cards.filter(card => card.id !== s.card.id) : cards) };
   const ports = caseInvestigationStorePorts({ readTicketOwner: async () => options.owner ?? "v2", holder: "sav-v2-investigation", scope: { locale: "fr-FR", audience: "support" }, now: () => clock,
     pauseState: async () => options.pause ?? (await readSavAgentPause(f.db as never, "v2")).level,
     knowledge: snapshot => selectCaseKnowledge(snapshot, backend, { locale: "fr-FR", audience: "support", now: clock }), customerTexts: async (_caseId, refs) => Object.fromEntries(refs.map(ref => [`${ref.type}:${ref.id}`, "Bonjour, connexion impossible à mon compte."])), revisions: async () => ({ rules: "syn-r1", playbookId: "syn-p1", model: "syn-model", prompt: "syn-prompt" }),
     callModel: async request => { calls.push(structuredClone(request)); await options.duringModel?.(); if (options.failed) return { status: "failed", uncertain: true };
-      const ref: KnowledgeRef = { knowledgeId: s.itemId, contentVersionId: s.versionId }, open = request.snapshot.body.openRequests.filter(row => row.status === "open");
+      const answer = options.answerWithOrdinary && ordinary ? ordinary : s;
+      const ref: KnowledgeRef = { knowledgeId: answer.itemId, contentVersionId: answer.versionId }, open = request.snapshot.body.openRequests.filter(row => row.status === "open");
       return { status: "ok", output: { caseVersion: request.snapshot.version, understanding: { requests: open.map(row => ({ id: row.id, summary: "Connexion impossible", family: "access", status: "open" })), newFacts: [] }, nextAction: { kind: "answer", requestIds: [open[0]!.id], steps: [{ text: "Ouvrir la page de connexion.", knowledge: ref }], expectedResult: "Le client se connecte." }, reply: { text: options.reply ?? "Bonjour, depuis https://new.limova.ai : un délai est connu ; l’équipe suit le sujet.", citations: [ref], impossibilityClaims: [], accountAdvice: "none" } } } satisfies CaseInvestigationModelResult;
     }, admissionPolicyRevision: async () => POLICY.revision, qualify: async (snapshot, events) => { const latest = events.filter(event => event.kind === "inbound_confirmed").at(-1); return latest ? { admission: { policy: POLICY, qualification: qualified(snapshot.body.openRequests.filter(row => row.status === "open").map(row => row.id)) }, sourceRef: latest.sourceRef } : null; } });
   const ledger = options.ledger;
@@ -70,7 +75,9 @@ async function run(c: CaseSnapshot, s: Seed, options: { duringModel?: () => Prom
     money: async () => { ledger.money.count++; return { status: "allowed" }; }, provider: async request => {
       const result = await ports.callModel(request); if (result.status !== "ok" && result.status !== "failed") throw Error("SYN_PROVIDER_RESULT"); return result;
     }, holder: "syn-incidents", leaseSeconds: 60, maxPerSubject: 3 }) : ports.callModel;
-  return { report: await runCaseInvestigation(c.caseId, "observe", { ...ports, callModel, accessScope: async () => scope, temporaryIncidents: readRuntimeTemporaryIncidents }), calls };
+  return { report: await runCaseInvestigation(c.caseId, "observe", { ...ports, callModel, accessScope: async () => scope, temporaryIncidents: readRuntimeTemporaryIncidents,
+    ...(options.discoverTemporary ? { temporaryKnowledge: runtimeTemporaryKnowledgeLookup(), readScopeCards: async refs =>
+      cards.filter(card => refs.some(ref => ref.knowledgeId === card.id && ref.contentVersionId === card.contentVersionId)) } : {}) }), calls };
 }
 async function draftOf(c: CaseSnapshot, s: Seed) {
   const events = await listCaseEvents(c.caseId), read = readCaseInvestigationProgress(events, latestInvestigationInput(events)!);
@@ -85,6 +92,158 @@ beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 60000);
 afterAll(async () => { state.db = null; await f.client.close(); });
 beforeEach(() => { clock = new Date(Date.now() + 360000); vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "synthetic-incident-runtime-test-key"); vi.stubEnv("SAV_CASE_RECORDING", "on"); vi.stubGlobal("fetch", vi.fn(() => { throw Error("NETWORK_FORBIDDEN"); })); });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
+
+describe("SAV-105 temporary knowledge", () => {
+  const env = { SAV_V2_TEMPORARY_KNOWLEDGE: "on" };
+  const knowledge = () => ({ ...incident(), keywords: ["connexion impossible"] });
+
+  it.each([false, true])("promotes approved knowledge with a UTC expiry and the same byte limit (absent from vector results: %s)", async discoverTemporary => {
+    vi.stubEnv("SAV_V2_TEMPORARY_KNOWLEDGE", "on");
+    const temporary = await seed(knowledge()), ordinary = await seed(null), c = await accessCase();
+    await seed({ ...knowledge(), id: "syn-unscoped" });
+    const { calls, report } = await run(c, temporary, { ordinary, discoverTemporary });
+    expect(report).toMatchObject({ status: "recorded", outcome: "accepted" });
+    expect(calls[0]!.knowledge.map(card => card.id)).toEqual([temporary.itemId, ordinary.itemId]);
+    expect(calls[0]!.coverage?.[0]?.knowledge.map(ref => ref.knowledgeId)).toEqual([temporary.itemId, ordinary.itemId]);
+    const prompt = caseInvestigationPrompt(calls[0]!);
+    expect(Object.keys(prompt.payload).indexOf("temporaryKnowledge")).toBeLessThan(Object.keys(prompt.payload).indexOf("knowledge"));
+    expect(prompt.payload.temporaryKnowledge).toEqual([{ requestId: c.body.openRequests[0]!.id, knowledgeId: temporary.itemId,
+      contentVersionId: temporary.versionId, title: knowledge().title, content: knowledge().approvedReply,
+      notice: `Information temporaire, valable jusqu’au ${knowledge().validUntil}.` }]);
+    expect(prompt.instruction).toContain("Aucune promesse");
+    const wire = prepareCaseGeminiDecisionRequest(calls[0]!, { ...TRANSPORT_ENV, ...env });
+    expect(wire).toMatchObject({ ok: true, metadata: { maxInputBytes: 26000 } });
+    if (!wire.ok) throw Error("PREPARE_FAILED");
+    expect(Buffer.byteLength(wire.body)).toBeLessThanOrEqual(26000);
+    expect(wire.body).not.toContain("requestText");
+    const { proposal } = await draftOf(c, temporary);
+    expect(await readPilotReplyProvenance(proposal, depsFor(temporary))).toMatchObject({ status: "proven" });
+    vi.stubEnv("SAV_V2_TEMPORARY_KNOWLEDGE", "off");
+    expect(await readPilotReplyProvenance(proposal, depsFor(temporary))).toMatchObject({ status: "unproven", reasons: ["temporary_incident_unproven"] });
+    expect(prepareCaseGeminiDecisionRequest(calls[0]!, TRANSPORT_ENV)).toMatchObject({ ok: false, diagnostic: { networkAttempted: false } });
+  });
+
+  it.each(["unrelated", "expired", "retired", "off"] as const)("does not promote %s knowledge in V2 or return it from the scoped catalog", async state => {
+    vi.stubEnv("SAV_V2_TEMPORARY_KNOWLEDGE", state === "off" ? undefined : "on");
+    const value = knowledge();
+    if (state === "unrelated") { value.keywords = ["écran de routines"]; value.scope.productArea = "Routines"; }
+    if (state === "expired") value.validUntil = clock.toISOString();
+    if (state === "retired") { value.status = "revoked"; value.revocation = { at: clock.toISOString(), reason: "Retrait SYN" }; }
+    const temporary = await seed(value), ordinary = await seed(null), c = await accessCase();
+    const { calls } = await run(c, temporary, { ordinary });
+    expect(calls[0]!.knowledge.map(card => card.id)).toEqual([ordinary.itemId, temporary.itemId]);
+    expect(caseInvestigationPrompt(calls[0]!).payload).not.toHaveProperty("temporaryKnowledge");
+    const matches = await activeTemporaryKnowledge(clock, "Connexion impossible", { env: state === "off" ? {} : env });
+    expect(matches.map(row => row.familyId)).not.toContain(temporary.familyId);
+  });
+
+  it.each([false, true])("requires a symptom before promoting either Gmail incident (independent lookup: %s)", async discoverTemporary => {
+    vi.stubEnv("SAV_V2_TEMPORARY_KNOWLEDGE", "on");
+    const scope = { ...incident().scope, productArea: "Gmail" };
+    const attachments = await seed({ ...knowledge(), scope, keywords: ["Gmail", "pièces jointes manquantes"] });
+    const drafts = await seed({ ...knowledge(), scope, id: "syn-gmail-drafts", keywords: ["brouillons bloqués"] });
+    const connectionText = "Comment connecter Gmail ?";
+    expect(await activeTemporaryKnowledge(clock, connectionText, { env })).toEqual([]);
+    const connection = await run(await accessCase(connectionText), drafts, { ordinary: attachments, discoverTemporary, answerWithOrdinary: true });
+    expect(connection.report).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 1 });
+    expect(connection.calls[0]?.knowledge[0]?.id).toBe(attachments.itemId);
+    expect(caseInvestigationPrompt(connection.calls[0]!).payload).not.toHaveProperty("temporaryKnowledge");
+
+    const symptomText = "Dans Gmail, j’ai des pièces jointes manquantes.";
+    const symptom = await run(await accessCase(symptomText), attachments, { ordinary: drafts, discoverTemporary });
+    expect(symptom.report).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 1 });
+    expect(symptom.calls[0]?.knowledge[0]?.id).toBe(attachments.itemId);
+    expect(caseInvestigationPrompt(symptom.calls[0]!).payload.temporaryKnowledge).toEqual([
+      expect.objectContaining({ knowledgeId: attachments.itemId }),
+    ]);
+  });
+
+  it("matches normalized words or the exact theme and returns UTC dates and the owner", async () => {
+    const temporary = await seed({ ...knowledge(), knownSince: "2034-01-20T07:15:00+01:00", validUntil: "2034-01-23T07:15:00+01:00" });
+    // The approved revision precedes this synthetic lookup time.
+    const now = new Date("2034-01-20T06:15:00Z");
+    const cards = await activeTemporaryKnowledge(now, ["Sans rapport", "CONNEXION DOCUMENTAIRE SYN"], { env });
+    expect(cards).toContainEqual(expect.objectContaining({ familyId: temporary.familyId, responsible: "reviewer@example.invalid", state: "active",
+      knownSince: now.toISOString(), validUntil: "2034-01-23T06:15:00.000Z" }));
+    expect(await activeTemporaryKnowledge(now, "Une CONNEXION IMPOSSIBLE est affichée.", { env })).toEqual(cards);
+    expect(await activeTemporaryKnowledge(now, "reconnexion impossible", { env })).not.toContainEqual(expect.objectContaining({ familyId: temporary.familyId }));
+    expect(await activeTemporaryKnowledge(new Date("2034-01-23T06:15:00Z"), "Connexion impossible", { env })).not.toContainEqual(expect.objectContaining({ familyId: temporary.familyId }));
+  });
+
+  it("withholds temporary search terms for the entire sensitive case and rejects sensitive scopes", async () => {
+    vi.stubEnv("SAV_V2_TEMPORARY_KNOWLEDGE", "on");
+    const value = knowledge(), s = await seed(value), c = await accessCase();
+    const open = c.body.openRequests[0]!;
+    c.body.openRequests.push({ ...open, id: "syn-finance", family: "finance" });
+    const terms = caseTemporaryKnowledgeRequestTexts(c);
+    expect(terms.size).toBe(0);
+    expect(await readRuntimeTemporaryIncidents([{ ...s.binding, requestId: open.id }], clock, terms)).toMatchObject({ context: { entries: [] } });
+    expect(temporaryIncidentSchema.safeParse({ ...value, scope: { ...value.scope, families: ["finance"] } }).success).toBe(false);
+  });
+
+  it.each([
+    ["À bientôt.", false],
+    ["Nous ne pouvons pas garantir de délai.", false],
+    ["Nous ne pouvons pas garantir que la fonctionnalité sera disponible demain.", false],
+    ["Nous livrerons cette fonctionnalité vendredi.", true],
+    ["Nous ne pouvons pas garantir de délai, mais nous livrerons cette fonctionnalité vendredi.", true],
+    ["La fonctionnalité sera disponible demain.", true],
+    ["Le prix sera de 20 €.", true],
+    ["La fonctionnalité ne sera pas disponible demain.", false],
+  ] as const)("checks affirmative commitments at entry and in a model reply: %s", async (wording, promised) => {
+    vi.stubEnv("SAV_V2_TEMPORARY_KNOWLEDGE", "on");
+    const value = knowledge(), s = await seed(value), c = await accessCase();
+    const parsed = temporaryIncidentSchema.safeParse({ ...value, approvedReply: wording });
+    if (promised) expect(parsed).toMatchObject({ success: false, error: { issues: [expect.objectContaining({ message: "TEMPORARY_KNOWLEDGE_PROMISE" })] } });
+    else expect(parsed.success).toBe(true);
+
+    const result = await run(c, s, { reply: `Bonjour, ouvrez la page https://new.limova.ai. ${wording}` });
+    expect(result.calls.some(call => call.feedback.some(row => row.code === "reply_temporary_promise"))).toBe(promised);
+    if (promised) expect(result.report).not.toMatchObject({ status: "recorded", outcome: "accepted" });
+    else {
+      expect(result.report).toMatchObject({ status: "recorded", outcome: "accepted" });
+      const { proposal } = await draftOf(c, s);
+      expect(await readPilotReplyProvenance(proposal, depsFor(s))).toMatchObject({ status: "proven" });
+      const corrected = { ...proposal, text: finalReplyText("Bonjour, nous livrerons cette fonctionnalité vendredi.") };
+      expect(await readPilotReplyProvenance(corrected, depsFor(s), { humanCorrection: true })).toMatchObject({
+        status: "unproven", reasons: ["temporary_incident_claim_unproven"],
+      });
+    }
+  });
+
+  it("formats the reminder and prepares it once per Paris day with the summer and winter offsets", async () => {
+    clock = new Date("2033-07-20T05:00:00Z");
+    await seed(knowledge());
+    const key = eq(savSyncState.key, "sav-temporary-knowledge:v1:reminder");
+    expect(temporaryKnowledgeReminderText([])).toBe("Aucune information temporaire active.");
+    expect(temporaryKnowledgeReminderText([{ title: "SYN un", validUntil: "2033-07-21T05:00:00Z" },
+      { title: "SYN deux", validUntil: "2033-07-22T05:00:00Z" }])).toBe("2 informations temporaires actives :\n- SYN un (fin le 21/07/2033 07:00)\n- SYN deux (fin le 22/07/2033 07:00)\nGarder ou retirer ?");
+    expect(await prepareDailyTemporaryKnowledgeReminder(clock, {})).toBe("off");
+    expect(await prepareDailyTemporaryKnowledgeReminder(new Date("2033-07-20T04:59:59Z"), env)).toBe("not_due");
+    expect(await f.db.select().from(savSyncState).where(key)).toEqual([]);
+    expect((await Promise.all([prepareDailyTemporaryKnowledgeReminder(clock, env), prepareDailyTemporaryKnowledgeReminder(clock, env)])).sort()).toEqual(["already_prepared", "prepared"]);
+    const [row] = await f.db.select().from(savSyncState).where(key);
+    expect(JSON.parse(row!.cursor!)).toMatchObject({ day: "2033-07-20", text: "1 information temporaire active :\n- SYN délai de connexion (fin le 21/07/2033 07:00)\nGarder ou retirer ?" });
+    expect(await prepareDailyTemporaryKnowledgeReminder(new Date("2033-12-20T05:59:59Z"), env)).toBe("not_due");
+    vi.stubEnv("SAV_V2_TEMPORARY_KNOWLEDGE", "on");
+    vi.stubEnv("SAV_V2_ENTRY", "on");
+    vi.stubEnv("SAV_CASE_EFFECTS", "off");
+    vi.stubEnv("SAV_HANDOFF_NOTICE", "off");
+    vi.stubEnv("SAV_V2_TICKET_STAGES", "off");
+    const { runSavV2EffectsPass } = await import("../v2-effects-pass");
+    vi.setSystemTime(new Date("2033-12-20T06:00:00Z"));
+    try {
+      const pass = await runSavV2EffectsPass({ trigger: "vercel_cron" });
+      expect(pass.payload.caseEffects).toMatchObject({ status: "ok", data: { skipped: "effects_off" } });
+      const [winter] = await f.db.select().from(savSyncState).where(key);
+      expect(JSON.parse(winter!.cursor!)).toMatchObject({ day: "2033-12-20", text: "Aucune information temporaire active." });
+      expect(JSON.stringify(pass.payload)).not.toContain("information temporaire");
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("SAV-79 exact approved projection reader", () => {
   it("joins the exact selected SAV version and carries distinct canonical, approval and incident proofs", async () => {

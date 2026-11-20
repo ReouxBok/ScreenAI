@@ -1,3 +1,4 @@
+import { temporaryKnowledgeEnabled } from "@/lib/knowledge/temporary-knowledge";
 import { caseAskBeforeHandoffEnabled, SAV_CASE_ASK_BEFORE_HANDOFF_INSTRUCTION } from "./ask-before-handoff";
 import { firstMailSkillInstruction } from "./first-mail/first-mail-skill";
 import { casePromptCompactOn, compactCaseKnowledgeContent, selectCaseKnowledgePassages } from "./investigation-prompt-compact";
@@ -139,7 +140,8 @@ export function caseDecisionProviderSchema(purpose: "decision" | "resolution_che
 export function caseInvestigationPromptRevision(attachmentsOn: boolean, env: Env = {}) {
   const base = attachmentsOn ? SAV_CASE_INVESTIGATION_PROMPT_REVISION : SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS;
   return caseDecisionPromptRevision(base, readCaseDecisionGeneration(env, env[SAV_V2_MODEL_ENV] ?? "")) + (casePromptCompactOn(env) ? "+compact2" : "")
-    + (readAccessSkillMode(env) === "on" ? SAV_CASE_ACCESS_SKILL_DECISION_REVISION_SUFFIX : "");
+    + (readAccessSkillMode(env) === "on" ? SAV_CASE_ACCESS_SKILL_DECISION_REVISION_SUFFIX : "")
+    + (temporaryKnowledgeEnabled(env) ? "+tempknow1" : "");
 }
 
 /**
@@ -192,11 +194,20 @@ export function caseInvestigationPrompt(request: CaseInvestigationModelRequest, 
   const passageQuery = options.compact ? [request.customerContext?.latestMessage?.text, ...body.openRequests.filter(row => row.status === "open").map(caseRequestSearchText)].filter(Boolean).join(" ") : "";
   const cards = request.knowledge.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId, title: card.title, ...(options.compact ? { source: card.source } : {}),
     content: options.compact ? (selectCaseKnowledgePassages(card.content, card.resolution, passageQuery, options.knowledgeBytes ?? 6_000) ?? compactCaseKnowledgeContent(card.content, card.resolution)) : card.content.slice(0, 6_000), resolution: card.resolution }));
+  const incidents = request.temporaryIncidents;
+  const legacyIncidents = incidents?.entries.filter(entry => !entry.priority) ?? [];
+  const temporaryKnowledge = request.purpose === "decision" ? (incidents?.entries ?? []).flatMap(({ priority, proof, title, reply, validUntil }) => {
+    const { requestId, knowledgeId, contentVersionId } = proof;
+    if (!priority || !request.coverage?.some(row => row.requestId === requestId
+      && row.knowledge.some(ref => ref.knowledgeId === knowledgeId && ref.contentVersionId === contentVersionId))) return [];
+    return [{ requestId, knowledgeId, contentVersionId, title, content: reply, notice: `Information temporaire, valable jusqu’au ${validUntil}.` }];
+  }) : [];
   const instruction = [
     "Tu es l'agent SAV V2 de Limova. Tu proposes UNE décision pour ce dossier, en JSON strictement conforme au schéma fourni.",
     "Réponds en français, uniquement à partir des fiches fournies (citer knowledgeId et contentVersionId exacts) et des faits du dossier.",
     "Pour ask, pose une à cinq questions dans un seul mail, chacune avec ses propres seeks/factKey. Préserve les faits déjà répondus ; ne repose pas les questions answeredBy. Une réponse partielle conserve les autres questions ouvertes. Pour chaque réponse identifiée, enregistre dans understanding.newFacts la factKey exacte de la question stockée, avec la source du mail client.",
     "N'invente ni lien, ni état de compte, ni paiement, ni droit. Ne demande jamais de mot de passe ni de code. Si les fiches ne suffisent pas, pose une question ciblée ou transmets à l'équipe.",
+    ...(temporaryKnowledge.length ? ["Lis temporaryKnowledge pour la demande indiquée par requestId. Donne la priorité à l’incident sur la fiche permanente si le client décrit le même symptôme et que les deux sources se contredisent. Garde les règles d'admission, de citation et de passation intégrale des sujets sensibles. Aucune promesse de délai, de prix ou de fonctionnalité, ni action sur le compte. La date de validité est interne."] : []),
     ...(request.customerReportedLogin ? ["customerReportedLogin résume les déclarations du client sur la connexion. Un indicateur false signifie non établi. Tiens compte des contrôles confirmés sans les redemander. restoredAccessReported contient la citation et sa source si le dernier mail confirme explicitement le rétablissement. Cite-les pour proposer confirm_resolution si la chronologie le permet. stillBlockedReported demande de poursuivre le diagnostic. Une seconde lecture distincte doit confirmer toute clôture."] : []),
     ...(request.customerContext ? [SAV_CASE_CUSTOMER_CONTEXT_INSTRUCTION] : []),
     ...(body.openRequests.filter(row => row.status === "open").length >= 2 ? [SAV_CASE_COVER_EVERY_REQUEST_INSTRUCTION] : []),
@@ -215,7 +226,9 @@ export function caseInvestigationPrompt(request: CaseInvestigationModelRequest, 
   const payload = { caseVersion: request.snapshot.version, purpose: request.purpose,
     openRequests: body.openRequests.filter(row => row.status === "open").map(asData), facts: body.facts, questions: body.questions, trials: body.trials,
     ...(request.customerReportedLogin ? { customerReportedLogin: request.customerReportedLogin } : {}),
-    ...(request.temporaryIncidents?.entries.length ? { temporaryIncidents: request.temporaryIncidents } : {}),
+    ...(temporaryKnowledge.length ? { temporaryKnowledge } : {}),
+    ...(incidents && legacyIncidents.length ? { temporaryIncidents: { ...incidents, entries: legacyIncidents,
+      bindings: incidents.bindings.map(({ requestId, family, knowledgeId, contentVersionId }) => ({ requestId, family, knowledgeId, contentVersionId })) } } : {}),
     knowledge: cards, coverage: request.coverage, previousRejections: request.feedback, closure: request.closure,
     ...(request.customerContext ? { customerContext: requestWords.length ? { ...request.customerContext, requestWords } : request.customerContext } : {}),
     ...(requestWords.length && !request.customerContext ? { customerRequestWords: requestWords } : {}),
@@ -239,6 +252,8 @@ const generateResponse = z.object({
 export function prepareCaseGeminiDecisionRequest(original: CaseInvestigationModelRequest, env: Env):
   | { ok: true; key: string; model: string; body: string; metadata: Pick<CaseModelTransportDiagnostic, "inputBytes" | "maxInputBytes" | "knowledgeCards">; compacted: boolean; generation: CaseDecisionGenerationConfig }
   | { ok: false; diagnostic: CaseModelTransportDiagnostic; breakdown?: CaseDecisionBodyBreakdown; problem?: CaseDecisionGenerationProblem } {
+  if (original.temporaryIncidents?.entries.some(entry => entry.priority) && !temporaryKnowledgeEnabled(env))
+    return { ok: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false } };
   const resolved = resolveCaseV2GeminiKey(env), model = env[SAV_V2_MODEL_ENV] ?? "";
   if (!resolved.ok) return { ok: false, diagnostic: { stage: "preflight", code: "key_unavailable", networkAttempted: false } };
   if (!MODEL_ID.test(model)) return { ok: false, diagnostic: { stage: "preflight", code: "model_invalid", networkAttempted: false } };

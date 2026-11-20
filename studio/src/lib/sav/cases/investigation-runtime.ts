@@ -36,6 +36,7 @@ export type CaseInvestigationRuntimeDeps = {
   /** Pilot ACCÈS scope of sources (approved policy datum). Absent: closed, so no `access` case is searched or answered. */
   accessScope?: CaseInvestigationPorts["accessScope"];
   temporaryIncidents?: CaseInvestigationPorts["temporaryIncidents"];
+  temporaryKnowledge?: CaseInvestigationPorts["temporaryKnowledge"];
   admissionPolicyRevision?: CaseInvestigationStoreDeps["admissionPolicyRevision"];
   qualify?: CaseInvestigationStoreDeps["qualify"];
   customerTexts?: CaseInvestigationPorts["customerTexts"];
@@ -79,6 +80,7 @@ export async function runCaseInvestigationRuntime(caseId: string, deps: CaseInve
   const readExact = deps.knowledge.vectors!.readExact?.bind(deps.knowledge.vectors);
   return runCaseInvestigation(caseId, "observe", { ...ports, accessScope: deps.accessScope ?? (async () => null),
     ...(deps.temporaryIncidents ? { temporaryIncidents: deps.temporaryIncidents } : {}),
+    ...(deps.temporaryKnowledge ? { temporaryKnowledge: deps.temporaryKnowledge } : {}),
     ...(deps.customerContext ? { customerContext: deps.customerContext } : {}),
     ...(deps.threadlessInput ? { threadlessInput: deps.threadlessInput } : {}),
     // Scope-first knowledge (11/11): the exact-version read of the block's scope sources, and the transport's own preflight to fit the input.

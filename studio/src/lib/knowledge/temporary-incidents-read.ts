@@ -2,8 +2,38 @@ import { and, desc, eq, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { knowledgeFamilies, knowledgeFamilyRevisions, knowledgeProjections } from "@/db/schema";
 import { isTemporaryIncidentApproved, temporaryIncidentSchema, type TemporaryIncident } from "./temporary-incidents";
+import { temporaryKnowledgeEnabled, temporaryKnowledgeMatches, temporaryKnowledgeState } from "./temporary-knowledge";
 
 type Reader = Pick<ReturnType<typeof requireDb>, "select" | "selectDistinct">;
+
+/** The staff creator of the canonical family owns this knowledge, independently of its reviewer. */
+export type ActiveTemporaryKnowledge = TemporaryIncident & { familyId: string; revisionId: string; responsible: string; state: "active" };
+
+/** An empty list of themes reads all active cards for the internal reminder. */
+export async function activeTemporaryKnowledge(now: Date, themesOrText: string | readonly string[], options: {
+  env?: Readonly<Record<string, string | undefined>>;
+  db?: Pick<Reader, "select">;
+} = {}): Promise<ActiveTemporaryKnowledge[]> {
+  if (!temporaryKnowledgeEnabled(options.env) || !Number.isFinite(now.getTime())) return [];
+  const rows = await (options.db ?? requireDb()).select({
+    familyId: knowledgeFamilies.id, revisionId: knowledgeFamilyRevisions.id, responsible: knowledgeFamilies.createdBy, document: knowledgeFamilyRevisions.document,
+    reviewState: knowledgeFamilyRevisions.reviewState, reviewedBy: knowledgeFamilyRevisions.reviewedBy,
+  }).from(knowledgeFamilies).innerJoin(knowledgeFamilyRevisions, and(
+    eq(knowledgeFamilyRevisions.id, knowledgeFamilies.approvedRevisionId), eq(knowledgeFamilyRevisions.familyId, knowledgeFamilies.id),
+  )).where(and(eq(knowledgeFamilyRevisions.reviewState, "approved"), sql`${knowledgeFamilyRevisions.reviewedAt} <= ${now.toISOString()}::timestamptz`,
+    sql`(${knowledgeFamilyRevisions.document} -> 'temporaryIncident') ? 'keywords'`));
+  const active: ActiveTemporaryKnowledge[] = [];
+  for (const row of rows) {
+    if (!isTemporaryIncidentApproved({ approved: true, reviewState: row.reviewState, reviewedBy: row.reviewedBy })) continue;
+    const parsed = temporaryIncidentSchema.safeParse(row.document.temporaryIncident);
+    if (!parsed.success || !parsed.data.keywords || temporaryKnowledgeState(parsed.data, now) !== "active") continue;
+    const { familyId, revisionId, responsible } = row;
+    active.push({ ...parsed.data, familyId, revisionId, responsible, state: "active" });
+  }
+  const allThemes = typeof themesOrText !== "string" && themesOrText.length === 0;
+  return active.filter(row => allThemes || temporaryKnowledgeMatches(row, themesOrText))
+    .sort((a, b) => a.validUntil.localeCompare(b.validUntil) || a.id.localeCompare(b.id));
+}
 
 /** Read-only admin preview (SAV-79). States are reported as observed; nothing here publishes or activates. */
 export type TemporaryIncidentPreviewRow = {
