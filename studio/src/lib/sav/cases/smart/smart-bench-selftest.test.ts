@@ -117,6 +117,25 @@ describe("allumé : un paiement par conversation, 0 effet", () => {
     for (const table of [savCases, savCaseEffectExecutions, savIntakeEffects, savMessages]) expect(await f.db.select().from(table)).toEqual([]);
     expect(fetches).not.toHaveBeenCalled();
   });
+  it("journal : une ligne par conversation et le rapport final, codes et nombres seulement (jamais le texte d'une réponse)", async () => {
+    const net = network(), env = ENV({ SAV_V2_SMART_BENCH_SELFTEST_AGENT: "new", SAV_V2_SMART_BENCH_SELFTEST_ID: "run-log" }), logs: [string, Record<string, unknown>][] = [];
+    await runSmartBenchSelfTestPass(deps(env, net, { log: (event, fields) => logs.push([event, fields]) }));
+    const lines = logs.filter(([event]) => event === "sav_smart_bench_conversation").map(([, fields]) => fields);
+    expect(lines).toHaveLength(3);
+    for (const line of lines) {
+      expect(line).toMatchObject({ runId: "run-log", agent: "new", passed: expect.any(Boolean), costMicroUsd: expect.any(Number) });
+      expect(Object.keys(line).sort()).toEqual(["agent", "calls", "conversationId", "costMicroUsd", "endedBy", "failedTurns", "family", "passed", "runId", "stopped", "turnsPlayed"]);
+    }
+    const reports = logs.filter(([event]) => event === "sav_smart_bench_report").map(([, fields]) => fields);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({ runId: "run-log", new: { conversationsStored: 3, metrics: { conversations: 3 } }, current: { conversationsStored: 0 } });
+    expect(JSON.stringify(logs)).not.toContain("teamNote");
+    expect(JSON.stringify(logs)).not.toMatch(/"reply":/);
+    // A pass with nothing left to run logs the report again, and no conversation line.
+    logs.length = 0;
+    await runSmartBenchSelfTestPass(deps(env, net, { log: (event, fields) => logs.push([event, fields]) }));
+    expect(logs.map(([event]) => event)).toEqual(["sav_smart_bench_selftest", "sav_smart_bench_report"]);
+  });
   it("deux passes qui se chevauchent : chaque conversation n'est payée qu'une fois", async () => {
     const net = network(), env = ENV({ SAV_V2_SMART_BENCH_SELFTEST_AGENT: "new", SAV_V2_SMART_BENCH_SELFTEST_ID: "run-2" });
     await Promise.all([runSmartBenchSelfTestPass(deps(env, net)), runSmartBenchSelfTestPass(deps(env, net))]);

@@ -193,6 +193,8 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
     }
     // The measured cost, never clipped to the reservation: above it, the ledger sees the real spend and refuses the next claim at the cap.
     await settleSmartItem({ prefix: SAV_SMART_BENCH_SELFTEST_PREFIX, scope: config.runId, item, costMicroUsd: cost, status: "done", now: deps.now(), result: stored });
+    // One line per conversation, codes and numbers only (fictional corpus ids, no reply text): the judge's verdict readable from the logs.
+    try { log("sav_smart_bench_conversation", smartBenchConversationLine(stored)); } catch { /* the log never fails the pass */ }
     ran += 1;
     if (meterStop === "deadline") { stoppedBy = "deadline"; break; }
   }
@@ -200,6 +202,11 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
   const remaining = Math.max(0, todo.length - ran);
   const pass = { ran, stoppedBy: ran === todo.length && stoppedBy === "batch" ? "done" as const : stoppedBy, spentMicroUsd, remaining };
   log("sav_smart_bench_selftest", { ...pass, runId: config.runId, agents: config.agents, model, revision: SAV_SMART_PROMPT_REVISION, promptSha256: smartPromptSha256().slice(0, 16) });
+  // Run complete: the aggregated report (the same as `readSmartBenchSelfTestReport`), codes and numbers only, on every pass until switched off.
+  if (remaining === 0) {
+    try { log("sav_smart_bench_report", smartBenchReportLine(config.runId, aggregateSmartBenchSelfTest(await readSmartBenchSelfTestRows(config.runId)))); }
+    catch { /* the report never fails the pass */ }
+  }
   return pass;
 }
 
@@ -228,6 +235,23 @@ export function aggregateSmartBenchSelfTest(rows: readonly SmartBenchStored[]) {
       onlyNewPasses: paired.filter(id => newPassed.has(id) && !currentPassed.has(id)), onlyCurrentPasses: paired.filter(id => currentPassed.has(id) && !newPassed.has(id)),
       bothFail: paired.filter(id => !currentPassed.has(id) && !newPassed.has(id)).length },
   };
+}
+
+const SMART_BENCH_REPORT_MAX_FAILURES = 150;
+const turnFailure = (row: SavBenchTurnRow) => ({ turn: row.turn, expected: row.expected, outcome: row.outcome,
+  failed: Object.entries(row.verdict.criteria).filter(([, value]) => value.final === "echec").map(([criterion]) => criterion), checks: row.checks.map(hit => hit.code), failure: row.failure });
+/** The per-conversation log line: verdict, failed turns with their failed criteria and check codes, cost. Never a reply or a judge's text. */
+export function smartBenchConversationLine(stored: SmartBenchStored) {
+  return { runId: stored.runId, agent: stored.agent, conversationId: stored.conversationId, family: stored.conversation?.family ?? null,
+    passed: stored.conversation?.passed ?? false, endedBy: stored.conversation?.endedBy ?? null, turnsPlayed: stored.conversation?.turnsPlayed ?? 0,
+    failedTurns: stored.turns.filter(row => !row.verdict.passed).map(turnFailure), stopped: stored.stopped, costMicroUsd: stored.costMicroUsd, calls: stored.calls };
+}
+/** The run's report as one log line: metrics per agent, the comparison, and at most 150 failed turns per agent (the count says if cut). */
+export function smartBenchReportLine(runId: string, report: ReturnType<typeof aggregateSmartBenchSelfTest>) {
+  const side = (agent: ReturnType<typeof aggregateSmartBenchSelfTest>["current"]) => ({
+    conversationsStored: agent.conversationsStored, costMicroUsd: agent.costMicroUsd, calls: agent.calls, revisions: agent.revisions, stopped: agent.stopped,
+    metrics: agent.metrics, failuresCount: agent.failures.length, failures: agent.failures.slice(0, SMART_BENCH_REPORT_MAX_FAILURES) });
+  return { runId, current: side(report.current), new: side(report.new), comparison: report.comparison };
 }
 
 export async function readSmartBenchSelfTestRows(runId: string): Promise<SmartBenchStored[]> {
