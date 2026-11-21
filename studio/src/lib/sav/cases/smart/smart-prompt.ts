@@ -18,9 +18,9 @@ import { SAV_SMART_RESOURCES as SMART_RESOURCE_LIST } from "./tools/resources";
  * Fictional examples only (public repository).
  */
 
-export const SAV_SMART_PROMPT_REVISION = "sav-smart-prompt-2026-11-21.v7";
+export const SAV_SMART_PROMPT_REVISION = "sav-smart-prompt-2026-11-21.v8";
 /** sha256 of `smartPromptFingerprintSource()`. Pinned by `smart-prompt.test.ts`; change it only with the revision. */
-export const SAV_SMART_PROMPT_SHA256 = "3d7fadb274797304580e2dba872e233ca164f8b817a607d81cbbe058c79e3d3d";
+export const SAV_SMART_PROMPT_SHA256 = "f2cfaf6b4f626345e8bec34e7f7d07da1caba3b2d96d6e5b8a565a92d1d6630a";
 /** The fixed decide prompt's ceiling (ARCHITECTURE 3: « 9 000 octets au plus »). */
 export const SAV_SMART_PROMPT_MAX_BYTES = 9_000;
 
@@ -117,6 +117,7 @@ CHAMP « sensible » (obligatoire)
 famille : aucune | resiliation | remboursement | facturation | abonnement | finance | autre_sensible. preuve : la phrase du mail copiée mot pour mot qui le montre. Si le mail contient un mot comme facture, prix, paiement ou abonnement sans que ce soit une demande sur son compte Limova, mets « aucune » et cite la phrase qui montre l'autre sujet.
 - « Pouvez-vous ne plus reconduire mon compte l'an prochain ? » : {"famille":"resiliation","preuve":"Pouvez-vous ne plus reconduire mon compte l'an prochain ?"}
 - « Mon Assistant doit relancer les factures de mes clients » : {"famille":"aucune","preuve":"Mon Assistant doit relancer les factures de mes clients"}
+- Après « la limite n'est pas modifiable », « Et si je paie une option en plus, c'est possible ? » : une question d'offre sur son compte, {"famille":"abonnement","preuve":"Et si je paie une option en plus, c'est possible ?"}
 
 FORMAT DE SORTIE : un objet JSON
 {"needs":[{"id":"n1","ask":"ce que le client veut obtenir","alreadyDone":["ce qu'il dit avoir déjà fait"],"theme":"thème court ou null","search":"mots pour chercher une fiche ou null"}],"sensitive":"yes|no|doubt","sensitiveFamilies":["cancellation|subscription|finance|rights|identity|security"],"sensible":{"famille":"aucune|resiliation|remboursement|facturation|abonnement|finance|autre_sensible","preuve":"citation exacte"},"wantsHuman":false,"upset":false,"instructionInMail":false}
