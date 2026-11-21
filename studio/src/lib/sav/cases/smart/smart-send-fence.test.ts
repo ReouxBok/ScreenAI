@@ -16,6 +16,9 @@ describe("PORTE 2A (P2) : le filet smart refuse seulement ce que prévoit le CAP
     "Vous pouvez vous désinscrire du webinaire depuis le mail de confirmation.",
     "Votre demande de remboursement a été transmise à l'équipe facturation.",
     "Un conseiller reviendra vers vous au sujet du geste commercial.",
+    "Pour votre remboursement, notre équipe va vous recontacter.",
+    "Notre équipe prendra le relais sur la question de l'avoir.",
+    "Votre demande de remboursement est transmise à notre équipe, qui vous répondra rapidement.",
     "Vous devez avoir accès à l'onglet Intégrations.",
   ])("mention neutre : « %s » passe", body => expect(judge(body)).toBeNull());
   it.each([
@@ -36,6 +39,11 @@ describe("PORTE 2A (P2) : le filet smart refuse seulement ce que prévoit le CAP
     "Le prélèvement de ce mois a été annulé, et l'annulation de votre facture est en cours.",
     "Nous vous confirmons le remboursement, notre équipe reste disponible.",
     "Notre équipe vous répondra demain, mais votre remboursement est déjà validé.",
+    // PORTE 2D: a past or a statement is no hand-over; a financial result always refuses
+    "Notre équipe a traité votre demande et votre remboursement est validé.",
+    "Notre équipe a validé votre avoir.",
+    "L'équipe confirme que le remboursement est effectué.",
+    "Un conseiller vous recontactera : votre geste commercial est accordé.",
   ])("résiliation ou engagement sensible : « %s » refusé", body => expect(judge(body)).toBe("CANCELLED_REPLY_SENSITIVE_WORDING"));
   it("un dossier non smart et une notice de passage ne sont jamais jugés ici", () => {
     expect(smartSendProblem({ admission: ACCESS, body: "Pour résilier, écrivez-nous.", purpose: "answer" })).toBeNull();

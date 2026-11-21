@@ -130,13 +130,19 @@ const STOP_VERB = /\b(?:annul\w*|arret\w*|mettre fin|mis fin|mettez fin|met fin|
  * hands it to the team (« notre équipe vous répondra », « un conseiller », « transmis à l'équipe »). A bare « notre équipe reste disponible » is no hand-over.
  */
 const MONEY = /\brembours\w*|\b(?:un|d'un|l'|votre|cet|son|vos|des) ?avoirs?\b|\bgeste commercial|\bdedommag\w*|\brecredit\w*|\bannul\w* (?:(?:de|du|d'|le|la|les|des|votre|vos|ce|cette|l')\s*){0,2}(?:prelevement|facture)s?\b|\b(?:prelevement|facture)s? (?:\S+ ){0,4}annul\w*/;
-const TO_TEAM = /\b(?:notre equipe|nos equipes|l'equipe|un conseiller|nos conseillers|le service (?:client|facturation|comptabilite))\b.{0,40}\b(?:repond\w*|recontact\w*|revien\w*|traite\w*|trait\w*|examin\w*|etudi\w*|prend\w* en charge|occup\w*|charg\w*|contact\w*|verifi\w*)|\btransmis\w* (?:a|au) (?:notre |l'|un |nos )?(?:equipe|conseiller|service)/;
+// PORTE 2D: only a hand-over to COME or a transmission counts (« vous répondra », « reviendra vers vous », « va vous recontacter », « prendra le relais »,
+// « transmis à l'équipe »); a past or a statement (« a traité », « a validé ») does not.
+const TO_TEAM = /\b(?:notre equipe|nos equipes|l'equipe|un conseiller|nos conseillers|le service (?:client|facturation|comptabilite))\b.{0,40}\b(?:(?:vous )?(?:repondr|reviendr|recontacter|contacter|examiner|etudier|traiter|verifier)(?:a|ont)\b|(?:va|vont) vous (?:repondre|recontacter|contacter)|(?:va|vont) (?:revenir vers vous|examiner|etudier|traiter)|prendr(?:a|ont) (?:le relais|en charge)|s'en occupera)|\btransmis\w* (?:a|au) (?:notre |l'|un |nos )?(?:equipe|conseiller|service)/;
+// PORTE 2D: a financial RESULT announced (remboursement / avoir / geste / dédommagement + validé, effectué, confirmé, accordé, en cours, versé, crédité) refuses always.
+const MONEY_NOUN = String.raw`(?:rembours\w*|(?:un|d'un|l'|votre|cet|son|vos|des) ?avoirs?\b|geste commercial|dedommag\w*)`;
+const MONEY_RESULT_WORD = String.raw`(?:valid\w*|effectu\w*|confirm\w*|accord\w*|en cours|vers[ee]s?\b|verse\w*|credit\w*|recredit\w*|appliqu\w*|vire\w*)`;
+const MONEY_RESULT = new RegExp(String.raw`\b${MONEY_NOUN}.{0,40}\b${MONEY_RESULT_WORD}|\b${MONEY_RESULT_WORD}.{0,40}\b${MONEY_NOUN}`);
 const moneyParts = (reply: string) => sentencesOf(reply).flatMap(sentence => fold(sentence).split(/;|\bmais\b/)).map(row => row.trim()).filter(Boolean);
 /** True when the reply commits to a sensitive action on the account, speaks of cancelling the subscription, or of money outside a hand-over to the team. */
 export const smartSensitiveCommitment = (reply: string) => {
   const folded = fold(reply);
   return COMMITMENTS.some(pattern => pattern.test(folded)) || (SUBSCRIPTION_OBJECT.test(folded) && STOP_VERB.test(folded))
-    || moneyParts(reply).some(part => MONEY.test(part) && !TO_TEAM.test(part));
+    || moneyParts(reply).some(part => MONEY_RESULT.test(part) || (MONEY.test(part) && !TO_TEAM.test(part)));
 };
 
 /*
