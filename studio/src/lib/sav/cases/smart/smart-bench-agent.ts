@@ -59,7 +59,7 @@ export function smartBenchTurn(result: SmartTurnResult): SavBenchAgentTurn {
 /** Dry-run model: deterministic, free; the body is still measured by the wire. */
 function dryRunModel(network: Network, env: Env): SmartModelPort {
   return async ({ kind, system, payload, temperature }) => {
-    const body = smartWireBody(system, payload, 8_192, temperature), inputBytes = Buffer.byteLength(body, "utf8");
+    const body = smartWireBody(system, payload, 8_192, temperature, env.SAV_V2_MODEL ?? ""), inputBytes = Buffer.byteLength(body, "utf8");
     await network(`https://dry-run.invalid/${env.SAV_V2_MODEL ?? "model"}:generateContent`, { method: "POST", body }).catch(() => null);
     const needs = [{ id: "n1", ask: "demande du client", alreadyDone: [], theme: null, search: "aide" }];
     const decision = { outcome: "handoff", reply: null, teamNote: { raison: "no_source", besoin: "Banc à blanc : pas de modèle." }, handoffReason: "no_source",

@@ -189,6 +189,17 @@ export function smartFactSentenceInReply(reply: string, sentence: string): boole
   return key.length > 0 && normalizeSavEvidenceText(reply).toLocaleLowerCase("fr").includes(key);
 }
 /** The facts whose sentence is not in the reply: given to the correction one by one, so it knows WHICH sentence to copy or to remove. */
+/**
+ * SAV-122 (bench v7, pareil-02, plateforme-04-v2: `excerpt_not_found`): the same comparison defect as the fact sentence. A card's steps are
+ * joined by line breaks without final punctuation and start with a capital, so an excerpt copied as « épingler l'extension via l'icône
+ * puzzle. » or « 2. Recharger la page » was refused. The excerpt must STILL be in the source: only its list number, its final punctuation and
+ * its case are ignored, with the word boundaries of `savEvidenceContains` (no fuzzy match, no accent removal, no word dropped).
+ */
+export function smartExcerptInSource(source: string, excerpt: string): boolean {
+  if (savEvidenceContains(source, excerpt)) return true;
+  const key = sentenceKey(excerpt);
+  return key.length > 0 && savEvidenceContains(normalizeSavEvidenceText(source).toLocaleLowerCase("fr"), key);
+}
 export const smartMissingFactSentences = (reply: string, facts: SmartDecision["facts"]) => facts.filter(fact => !smartFactSentenceInReply(reply, fact.sentence)).map(fact => fact.sentence);
 
 /** The server's checks on one decision. Empty `codes`: nothing refused (the counter-read may still refuse). */
@@ -214,7 +225,7 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
       if (!fact.toolCallId || !fact.excerpt?.trim()) { codes.add("fact_source_invalid"); continue; }
       if (!evidence || evidence.needId !== fact.needId) { codes.add("card_not_retrieved_for_need"); continue; }
       citedAcademy.set(evidence.callId, evidence);
-      if (!savEvidenceContains(evidence.text, fact.excerpt)) codes.add("excerpt_not_found");
+      if (!smartExcerptInSource(evidence.text, fact.excerpt)) codes.add("excerpt_not_found");
       continue;
     }
     if (fact.type === "fait_limova" || fact.type === "fait_temporaire") {
@@ -222,12 +233,12 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
       const source = input.sources.find(row => row.cardId === fact.cardId && row.version === fact.version);
       if (!source || !source.needIds.includes(fact.needId)) { codes.add("card_not_retrieved_for_need"); continue; }
       cited.set(`${source.cardId}:${source.version}`, source);
-      if (!savEvidenceContains(cardText(source), fact.excerpt)) codes.add("excerpt_not_found");
+      if (!smartExcerptInSource(cardText(source), fact.excerpt)) codes.add("excerpt_not_found");
       continue;
     }
     if (fact.type === "dit_par_le_client") {
       if (fact.sourceKind !== "client" || !fact.excerpt?.trim()) { codes.add("fact_source_invalid"); continue; }
-      if (!savEvidenceContains(input.customerText, fact.excerpt)) codes.add("excerpt_not_found");
+      if (!smartExcerptInSource(input.customerText, fact.excerpt)) codes.add("excerpt_not_found");
       continue;
     }
     // conseil: no source by definition; a source given to advice is ignored.

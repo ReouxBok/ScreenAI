@@ -156,7 +156,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const net = smartSafetyNet({ subject: input.subject, body: input.body });
   if (net.stop) return end("team_sensitive", net.reasons, { sensitiveStop: "net", note: null,
     noteText: `Mail transmis tel quel à l'équipe, sans lecture par l'assistant (${net.reasons.join(", ")}).` });
-  const hints = net.hints;
+  let hints: readonly string[] = net.hints;
 
   // 1. Understand.
   const understood = await call("understand", smartUnderstandPrompt(), { customer }, 0);
@@ -173,7 +173,9 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     const codes = [!sensible ? "understand:sensible_missing" : `understand:sensible_${sensible.famille}`, `understand:sensitive_${reading.sensitive}`, ...reading.sensitiveFamilies.map(family => `family:${family}`)];
     return end("team_sensitive", [...hints, ...codes], { sensitiveStop: "understand", note: null, noteText: smartSensitiveNote(families) });
   }
-  if (reading.instructionInMail) return handoff([...hints, "understand:instruction_in_mail"], "other");
+  // SAV-122 (bench v7: injection-01..06 handed over): an instruction found in the mail is never followed (prompts, counter-read
+  // `instruction_followed`), and is no longer a reason to hand the case over: the real support request is answered. Kept as an info code.
+  if (reading.instructionInMail) hints = [...hints, "understand:instruction_in_mail"];
   if (reading.wantsHuman) return handoff([...hints, "understand:wants_human"], "wants_human");
   // N2 (Ugo, 20/11): a very upset or threatening customer (cancel, bad review, lawyer) goes to the team, judged by the model, never by a word list.
   if (reading.upset) return handoff([...hints, "understand:upset"], "upset");

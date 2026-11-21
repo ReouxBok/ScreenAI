@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { prepareV2SkillCall, type AccessSkillDeps } from "../access-skill/access-skill-judge";
 import { SAV_ACCESS_SKILL_GEMINI_URL, type AccessSkillUsage } from "../access-skill/access-skill-wire";
-import { resolveCaseV2GeminiKey, SAV_V2_EMBEDDING_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
+import { resolveCaseV2GeminiKey, SAV_V2_EMBEDDING_MODEL_ENV, SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
 import { readCaseV2SpendPolicy, readCaseV2TransportPolicy } from "../investigation-v2-spend";
 import type { SmartCallKind } from "./smart-contract";
 
@@ -23,12 +23,20 @@ export type SmartCallResult =
 export type SmartModelPort = (call: Readonly<{ kind: Exclude<SmartCallKind, "embed">; system: string; payload: unknown; temperature: number }>) => Promise<SmartCallResult>;
 export type SmartEmbedPort = (texts: readonly string[]) => Promise<Readonly<{ status: "ok"; vectors: number[][] }> | Readonly<{ status: "failed"; problem: string; sent: boolean }>>;
 
+/*
+ * SAV-122 (bench 21/11 v7: ~12 turns `correct:finish_not_stop`, one `decide:finish_not_stop`): the body set NO thinking level, so a Gemini 3
+ * model thought at its default (dynamic, high) level, and its thoughts count against the SAME `maxOutputTokens` (the policy's, never raised
+ * here) as the JSON decision: the long decide / correct answers were cut (`MAX_TOKENS`). Like V1 (`savGeminiGenerationConfig`) and V2's
+ * `SAV_V2_THINKING_DECISION`, a Gemini 3 model now thinks at the « low » level on every call of the new agent. Other models: unchanged body.
+ */
+export const SAV_SMART_THINKING_LEVEL = "low";
+const GEMINI_3 = /^gemini-3(?:[.-])/;
 /** The exact body of one call: system instruction, the data as ONE JSON user part (data, never instructions), JSON output. */
-export function smartWireBody(system: string, payload: unknown, maxOutputTokens: number, temperature: number): string {
+export function smartWireBody(system: string, payload: unknown, maxOutputTokens: number, temperature: number, model = ""): string {
   return JSON.stringify({
     systemInstruction: { parts: [{ text: system }] },
     contents: [{ role: "user", parts: [{ text: JSON.stringify(payload) }] }],
-    generationConfig: { responseMimeType: "application/json", temperature, maxOutputTokens },
+    generationConfig: { responseMimeType: "application/json", temperature, maxOutputTokens, ...(GEMINI_3.test(model) ? { thinkingConfig: { thinkingLevel: SAV_SMART_THINKING_LEVEL } } : {}) },
   });
 }
 export const smartWireBytes = (system: string, payload: unknown, maxOutputTokens = 8192, temperature = 0) => Buffer.byteLength(smartWireBody(system, payload, maxOutputTokens, temperature), "utf8");
@@ -80,7 +88,7 @@ export function smartGeminiModel(deps: AccessSkillDeps & Readonly<{ callTimeoutM
     const env = deps.env(), cap = smartInputCap(env, deps.now());
     let inputBytes = 0;
     const prepared = prepareV2SkillCall({ env: deps.env, now: deps.now, network: deps.network, timeoutMs: deps.callTimeoutMs?.() ?? deps.timeoutMs }, maxOutputTokens => {
-      const body = smartWireBody(system, payload, maxOutputTokens, temperature);
+      const body = smartWireBody(system, payload, maxOutputTokens, temperature, env[SAV_V2_MODEL_ENV] ?? "");
       inputBytes = Buffer.byteLength(body, "utf8");
       return body;
     });
