@@ -18,11 +18,25 @@ L’extension se connecte à Limova Team comme un appareil, à côté de Limova 
 | `team-panel.js/.css` | Section « Connexions » du panneau latéral, bandeau d’activité. |
 | `team-service.js` | Assemblage dans le service worker, badge, alarme de reconnexion. |
 
+## `browser.v2` (TEAM-726)
+
+- Annoncé dans le `hello` à côté de `browser.v1`.
+- Écran d’accueil : « Limova » (Charly, inchangé) ou « Limova Team » (un seul bouton « Se connecter »). Une personne déjà connectée à Charly ne voit pas ce choix ; « Changer de produit » y revient.
+- Aucune fenêtre d’accord, à aucun niveau d’autonomie, sauf pour payer. Champs sensibles, sites bloqués, pause, prise de main et « Tout arrêter » restent appliqués. `set_autonomy` s’applique tout de suite ; une nouvelle connexion démarre en « Accès complet ».
+- `include_page: true` sur `open_tab`, `navigate`, `scroll`, `click`, `fill`, `select`, `submit`, `download` et `batch` renvoie `data.page` (4000 caractères et 200 éléments par défaut).
+- `browser.batch` : 1 à 20 étapes `fill` / `select` / `check` / `click` sur un même instantané, toutes vérifiées avant la première, arrêt à la première erreur, et une navigation termine le lot (`stale_snapshot` pour la suite).
+
+## Environnements
+
+- Version publique (`npm run build`) : production uniquement, aucun choix affiché.
+- Version de test pour la préproduction : `LIMOVA_TEAM_ENV=staging npm run build` réécrit `src/team/build-config.js` dans `build/` seulement et nomme l’archive `limova-ai-extension-<version>-team-staging.zip`.
+- Réglage développeur : `chrome.storage.local.set({ limova_team_developer_v1: true })` dans la console du service worker affiche le choix d’environnement dans le panneau, sur n’importe quelle version.
+
 ## Essayer en local
 
-1. `npm ci`, puis `npm run build` ; ou utiliser le dossier non empaqueté fourni avec la PR.
+1. `npm ci`, puis `npm run build` (ou `LIMOVA_TEAM_ENV=staging npm run build`) ; ou utiliser le dossier non empaqueté fourni avec la PR.
 2. `chrome://extensions` → « Mode développeur » → « Charger l’extension non empaquetée » → choisir le dossier.
-3. Ouvrir le panneau, menu ⋮ → « Connexions » (ou « Connexions Limova Team » sur l’écran de connexion de Charly), choisir l’environnement, « Connecter », puis approuver sur le tableau de bord.
+3. Ouvrir le panneau, choisir « Limova Team », « Se connecter », puis se connecter sur le tableau de bord.
 
 La clé du manifeste donne toujours l’identifiant `fpkgfhhomlijmhbgcpbpjnfafdedfccj`, celui que le tableau de bord reçoit dans `extension_id`.
 
