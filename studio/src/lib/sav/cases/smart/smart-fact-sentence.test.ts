@@ -44,7 +44,8 @@ describe("fact_sentence_missing : la phrase du fait est dans la réponse, quelle
     const bad = smartGoodDecision({ facts: [...smartGoodDecision().facts, { sentence: absent, needId: "n1", type: "conseil", sourceKind: "aucune", cardId: null, version: null, excerpt: null }] });
     const { calls } = await run({ understand: { output: smartReading() }, decide: { output: bad }, verify: { output: SMART_CONFORME }, correct: { output: smartGoodDecision() }, reverify: { output: SMART_CONFORME } }, MAIL);
     const correction = calls.find(call => call.kind === "correct")!.payload as { problems: Array<{ code: string; sentence: string }> };
-    expect(correction.problems).toEqual(expect.arrayContaining([{ code: "fact_sentence_missing", sentence: absent }]));
+    // SAV-122 (bench v11): an absent sentence also carries the fix « drop this fact ».
+    expect(correction.problems).toEqual(expect.arrayContaining([{ code: "fact_sentence_missing", sentence: absent, fix: "retire ce fait de facts : il n'est pas dans la réponse" }]));
   });
   it("mesure gratuite sur les 1 334 keyFacts (528 conversations) : refus avant → après, par forme", () => {
     const origins = [...SAV_BENCH_CORPUS, ...SAV_SMART_BENCH_MULTITURN], all = [...origins, ...buildSavBenchVariants(origins)];

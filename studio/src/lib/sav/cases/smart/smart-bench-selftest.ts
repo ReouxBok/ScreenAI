@@ -326,7 +326,7 @@ const SMART_BENCH_REPORT_MAX_FAILURES = 150;
 const turnFailure = (row: SavBenchTurnRow) => ({ turn: row.turn, expected: row.expected, outcome: row.outcome,
   failed: Object.entries(row.verdict.criteria).filter(([, value]) => value.final === "echec").map(([criterion]) => criterion), checks: row.checks.map(hit => hit.code), failure: row.failure,
   // SAV-122 diagnostic: the agent's closed codes (reasons, refusing check and counter-read codes, calls), never a text.
-  codes: row.codes.filter(code => /^[a-z0-9_:.>-]{1,80}$/.test(code)) });
+  codes: [...row.codes, ...row.checks.flatMap(hit => hit.label ? [`bench:${hit.label}`] : [])].filter(code => /^[a-z0-9_:.>-]{1,80}$/.test(code)) });
 /** The per-conversation log line: verdict, failed turns with their failed criteria and check codes, cost. Never a reply or a judge's text. */
 export function smartBenchConversationLine(stored: SmartBenchStored) {
   return { runId: stored.runId, pass: stored.pass ?? 1, agent: stored.agent, conversationId: stored.conversationId, family: stored.conversation?.family ?? null,

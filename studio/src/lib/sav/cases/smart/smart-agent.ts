@@ -1,5 +1,5 @@
 import { savReplyFooter } from "../../reply-format";
-import { smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
+import { smartBindFactSentences, smartFactSentenceForm, smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
 import {
   parseSmartOutput, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchema,
   type SmartCallKind, type SmartCheckCode, type SmartDecision, type SmartReading, type SmartTeamNote, type SmartTurnOutcome, type SmartVerdict,
@@ -253,6 +253,9 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     coverage: reading!.needs.map(need => ({ needId: need.id, status: "handed" as const })),
     teamNote: smartFallbackNote({ reason, reading, memory: memoryBefore, modelNote: current.teamNote }), facts: [],
   });
+  // SAV-122 (bench v11): a fact sentence that rewords a sentence of the reply is bound to the real one (smartBindFactSentences), then checked.
+  const bind = (current: SmartDecision) => { const done = smartBindFactSentences(current); if (done.bound) reasons.push("facts:bound"); return done.decision; };
+  decision = bind(decision);
   if (gate.mustHandOff && decision.outcome !== "handoff") decision = forceHandoff(decision, "trop_d_echanges");
   const tentative = smartMergeMemory({ memory: memoryBefore, decision, reading, latestCustomerText, recordOwn: false });
   if (decision.outcome !== "handoff" && smartNoProgressTwice(memoryBefore, tentative.progressed)) {
@@ -292,7 +295,10 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   // SAV-122: a fact-level problem (missing sentence, invalid source, excerpt not found, card not retrieved, third-party fact) is named, one
   // problem per fact sentence, so the correction knows WHICH fact to fix or drop (bench v8: fact_source_invalid came back at the second pass).
   const named = (code: SmartCheckCode) => [...new Set(first.factProblems.filter(row => row.code === code && row.sentence.trim()).map(row => row.sentence))].slice(0, 10);
-  const problems = [...first.codes.flatMap(code => named(code).length ? named(code).map(sentence => ({ code, sentence })) : [{ code, sentence: "" }]),
+  // A declared sentence with no equivalent in the reply (form « absent »): the fix is to drop that fact, not to rewrite the reply.
+  const fix = (code: SmartCheckCode, sentence: string) => code === "fact_sentence_missing" && smartFactSentenceForm(decision!.reply?.trim() ?? "", sentence) === "absent"
+    ? { fix: "retire ce fait de facts : il n'est pas dans la réponse" } : {};
+  const problems = [...first.codes.flatMap(code => named(code).length ? named(code).map(sentence => ({ code, sentence, ...fix(code, sentence) })) : [{ code, sentence: "" }]),
     ...(first.verdict?.problems ?? [])];
   corrected = true;
   const fixed = await call("correct", smartCorrectionPrompt(), { ...lastPayload, tools: [], lastStep: true, previousDecision: decision, problems }, 0.3);
@@ -300,7 +306,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const output = smartUnwrapOutput(fixed.output) as { decision?: unknown } | null;
   const parsedFix = parseSmartOutput(smartDecisionSchema, output && typeof output === "object" && "decision" in output ? output.decision : output);
   if (!parsedFix.ok) return handoff([...reasons, "correct:output_invalid", "refused_once"], "panne");
-  decision = gate.mustHandOff && parsedFix.value.outcome !== "handoff" ? forceHandoff(parsedFix.value, "trop_d_echanges") : parsedFix.value;
+  decision = gate.mustHandOff && parsedFix.value.outcome !== "handoff" ? forceHandoff(parsedFix.value, "trop_d_echanges") : bind(parsedFix.value);
   const second = await review(decision, "reverify");
   checks.second = second.codes; verdicts.second = second.verdict;
   if (second.failed === "deadline") return end("interrupted", [...reasons, "reverify:deadline"]);

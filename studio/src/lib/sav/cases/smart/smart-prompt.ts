@@ -18,9 +18,9 @@ import { SAV_SMART_RESOURCES as SMART_RESOURCE_LIST } from "./tools/resources";
  * Fictional examples only (public repository).
  */
 
-export const SAV_SMART_PROMPT_REVISION = "sav-smart-prompt-2026-11-21.v11";
+export const SAV_SMART_PROMPT_REVISION = "sav-smart-prompt-2026-11-21.v12";
 /** sha256 of `smartPromptFingerprintSource()`. Pinned by `smart-prompt.test.ts`; change it only with the revision. */
-export const SAV_SMART_PROMPT_SHA256 = "dd45f86fd9fb3ae4ec504c1d7dbd0a732c7fd148524433d8905153c9f3d14a00";
+export const SAV_SMART_PROMPT_SHA256 = "a11477e7aa53c59cdab5600a373d30bdae47f465ce0e44b944d3a442b358b206";
 /** The fixed decide prompt's ceiling (ARCHITECTURE 3: « 9 000 octets au plus »). */
 export const SAV_SMART_PROMPT_MAX_BYTES = 9_000;
 
@@ -149,7 +149,7 @@ FORMAT DE SORTIE : un objet JSON
 non_conforme exige au moins un problème. Sans problème réel : conforme et problems vide.`;
 
 /** The instruction appended to the decide call for its ONE correction. */
-export const SAV_SMART_CORRECTION_INSTRUCTION = "CORRECTION : ta décision précédente (previousDecision) a été refusée pour les problèmes listés (problems). Tu n'as plus d'outil. Rends un objet JSON avec action \"final\", calls vide et une nouvelle decision complète qui corrige chaque phrase en cause. Sinon, pose une question au client si elle suffit, ou passe la main (handoff) avec ta meilleure note.";
+export const SAV_SMART_CORRECTION_INSTRUCTION = "CORRECTION : ta décision précédente (previousDecision) a été refusée pour les problèmes listés (problems). Tu n'as plus d'outil. Rends action \"final\", calls vide et une decision complète qui corrige chaque phrase en cause (un problème avec fix : applique-le). Sinon, pose une question au client si elle suffit, ou passe la main (handoff) avec ta meilleure note.";
 
 export const smartDecidePrompt = () => DECIDE;
 export const smartUnderstandPrompt = () => UNDERSTAND;
