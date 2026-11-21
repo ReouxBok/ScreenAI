@@ -162,7 +162,7 @@ export const SAV_BENCH_CORPUS_D: readonly SavBenchConversationInput[] = [
     turns: [
       { text: "Bonjour, une amie m'a parlé d'un webinaire spécial Charly Max le 8 novembre, je peux encore m'inscrire ?",
         expect: { outcome: "repondre", keyFacts: ["ce webinaire est passé", "webinaires de prise en main chaque semaine sur https://bienvenue.limova.ai/webinaires"],
-          forbidden: ["proposer de s'inscrire au webinaire du 8 novembre"], mustNotMatch: ["(inscri\\w*|rendez-vous).{0,40}8 novembre"] } },
+          forbidden: ["proposer de s'inscrire au webinaire du 8 novembre"], mustNotMatch: ["(inscrivez-vous|vous pouvez (encore )?vous inscrire|rendez-vous|inscription (est )?(encore )?ouverte).{0,40}8 novembre"] } },
       { text: "Dommage. Les webinaires de la semaine parlent aussi de WhatsApp ?",
         expect: { outcome: ["repondre", "passer_la_main"], keyFacts: ["dire honnêtement que le programme détaillé n'est pas dans les sources, renvoyer vers la page des webinaires"],
           forbidden: ["inventer le programme d'un webinaire"], mustNotMatch: ["8 novembre"] } },

@@ -47,7 +47,9 @@ const hostOf = (url: string) => { try { return new globalThis.URL(url).hostname.
 const under = (host: string, domain: string) => host === domain || host.endsWith(`.${domain}`);
 /** Every link of the reply outside Limova's pages and the conversation's allowed official docs: a sign-up elsewhere, another platform. */
 export function savBenchForeignLinks(reply: string, allowedDomains: readonly string[]): string[] {
-  return (reply.match(URL) ?? []).filter(url => {
+  // SAV-122 (bench v8, mdp-01): « sur https://new.limova.ai. » kept the sentence's final dot in the host (« new.limova.ai. »): a Limova link
+  // counted as foreign. Trailing punctuation and Markdown marks are not part of a link.
+  return (reply.match(URL) ?? []).map(url => url.replace(/[.,;:!?*_~\]]+$/, "")).filter(url => {
     const host = hostOf(url);
     if (!host) return true;
     if (host === "chromewebstore.google.com") return !url.includes(LIMOVA_STORE_PATH);
