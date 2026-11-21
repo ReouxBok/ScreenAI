@@ -14,15 +14,16 @@ import { createSavBenchGeminiJudge } from "../../bench/bench-judge";
 import { savBenchGeminiEnvelope } from "../../bench/bench-wire";
 import type { SavBenchAgent } from "../../bench/bench-types";
 import { accessSkillWireAnswer } from "../access-skill/access-skill-wire";
-import { createSavBenchAgent, smartBenchTurn } from "./smart-bench-agent";
+import { createSavBenchAgent, smartBenchTurn, smartBenchTurnCodes } from "./smart-bench-agent";
+import { runSmartTurn } from "./smart-agent";
 import { smartEmptyMemory } from "./smart-memory";
 import {
-  readSmartBenchSelfTestConcurrency, readSmartBenchSelfTestConfig, readSmartBenchSelfTestReport, readSmartBenchSelfTestRows, runSmartBenchSelfTestPass, smartBenchItem, smartBenchReportLine, smartBenchRisky, smartBenchRunPattern, smartBenchSelfTestSet,
+  readSmartBenchSelfTestConcurrency, readSmartBenchSelfTestConfig, readSmartBenchSelfTestReport, readSmartBenchSelfTestRows, runSmartBenchSelfTestPass, smartBenchConversationLine, smartBenchItem, smartBenchReportLine, smartBenchRisky, smartBenchRunPattern, smartBenchSelfTestSet,
   aggregateSmartBenchSelfTest, SAV_SMART_BENCH_NEW_CALLS, SAV_SMART_BENCH_SELFTEST_CORPUS, SAV_SMART_BENCH_SELFTEST_PREFIX, SAV_SMART_BENCH_SELFTEST_VARIANTS, type SmartBenchSelfTestDeps,
 } from "./smart-bench-selftest";
 import { readSmartLedger, smartItemKey } from "./smart-ledger";
 import { SAV_SMART_SHADOW_MODEL_CALLS } from "./smart-shadow";
-import { SMART_CONFORME, smartGoodDecision, smartReading } from "./smart-test-doubles";
+import { SMART_CONFORME, smartGoodDecision, smartReading, smartScriptedModel, smartStaticKnowledge } from "./smart-test-doubles";
 
 /*
  * Lot F' (20/11): the bench self-test on PGlite with the FICTIONAL corpus, the model doubled at the network (no key, no money).
@@ -254,6 +255,31 @@ describe("adaptateur du banc (--agent=new)", () => {
     expect(smartBenchTurn({ ...base, outcome: "team_sensitive" })).toMatchObject({ outcome: "equipe_sensible", reply: null });
     expect(smartBenchTurn({ ...base, outcome: "failed" })).toMatchObject({ outcome: "passer_la_main", reply: null, failure: "failed:x" });
     expect(smartBenchTurn({ ...base, outcome: "reply", replyWithFooter: "Bonjour\n—\nCharly", decision: smartGoodDecision() as never })).toMatchObject({ outcome: "repondre", citations: ["fiche-connexion"] });
+  });
+});
+
+describe("diagnostic SAV-122 : pourquoi le cerveau a transféré, en codes fermés seulement", () => {
+  it("tour à 4 appels (relecture refuse, la correction transfère) : codes du premier contrôle, de la relecture, correction et séquence d'appels ; aucun texte", async () => {
+    const secret = "PHRASE-CLIENT-SECRETE";
+    const scripted = smartScriptedModel({ understand: { output: smartReading() }, decide: { output: smartGoodDecision() },
+      verify: { output: { verdict: "non_conforme", problems: [{ code: "other_platform", sentence: secret }] } },
+      correct: { output: smartGoodDecision({ outcome: "handoff", reply: null, handoffReason: "unsure", coverage: [{ needId: "n1", status: "handed" }], facts: [],
+        teamNote: { raison: "unsure", besoin: secret, compris: secret, verifie: [], essaye: [], hypotheses: [], prochaineVerification: secret, ditAuClient: null } }) } });
+    const result = await runSmartTurn({ subject: "Connexion", body: `Bonjour ${secret}`, thread: [] },
+      { model: scripted.model, knowledge: smartStaticKnowledge(), maxInputBytes: 100_000, today: "2026-11-21" });
+    expect(result.outcome).toBe("handoff");
+    const codes = smartBenchTurnCodes(result);
+    expect(codes).toEqual(expect.arrayContaining(["first:verdict:non_conforme", "first:verify:other_platform", "corrected", "handoff_reason:unsure", "note:unsure", "calls:understand>decide>verify>correct"]));
+    expect(smartBenchTurn(result).codes).toEqual(codes);
+    expect(JSON.stringify(codes)).not.toContain(secret);
+    expect(codes.every(code => /^[a-z0-9_:.>-]{1,80}$/.test(code))).toBe(true);
+  });
+  it("la ligne de journal porte ces codes dans failedTurns[].codes, filtrés (un texte libre n'y passe jamais)", () => {
+    const turn = { turn: 1, expected: ["repondre"], outcome: "passer_la_main", reply: "texte de réponse", codes: ["first:check:sensitive_commitment", "Texte libre du client !"], failure: null,
+      checks: [{ code: "outcome_mismatch", criterion: "issue", detail: "x" }], judge: null, verdict: { passed: false, criteria: { issue: { final: "echec" } } } };
+    const line = smartBenchConversationLine({ runId: "r", agent: "new", conversationId: "mdp-01", conversation: null, turns: [turn], stopped: null, costMicroUsd: 0, calls: 4 } as never);
+    expect(line.failedTurns[0]).toMatchObject({ codes: ["first:check:sensitive_commitment"], checks: ["outcome_mismatch"], failed: ["issue"] });
+    expect(JSON.stringify(line)).not.toMatch(/texte de réponse|Texte libre/);
   });
 });
 

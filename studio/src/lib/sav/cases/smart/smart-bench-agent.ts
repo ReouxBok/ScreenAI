@@ -25,9 +25,28 @@ export function smartBenchSource(card: SavBenchCard, needIds: readonly string[])
     validUntil: card.validUntil ?? null };
 }
 
+/*
+ * SAV-122 diagnostic (bench 21/11, v6: 9 handoffs at 4-5 calls): WHY the brain handed over, as closed codes only (never a customer's text, a
+ * reply or a judge's words): the turn's reasons, the server codes and the counter-read's problem codes of each review (`first:check:<code>`,
+ * `first:verify:<code>`, then `second:`), whether a correction ran, the decision's handoff reason and the call sequence.
+ */
+const CLOSED_CODE = /^[a-z0-9_:.>-]{1,80}$/;
+export function smartBenchTurnCodes(result: SmartTurnResult): string[] {
+  const review = (pass: "first" | "second") => [
+    ...(result.checks[pass] ?? []).map(code => `${pass}:check:${code}`),
+    ...(result.verdicts[pass] ? [`${pass}:verdict:${result.verdicts[pass]!.verdict}`, ...result.verdicts[pass]!.problems.map(problem => `${pass}:verify:${problem.code}`)] : []),
+  ];
+  const codes = [
+    ...result.reasons, ...review("first"), ...review("second"), ...(result.corrected ? ["corrected"] : []),
+    ...(result.decision?.handoffReason ? [`handoff_reason:${result.decision.handoffReason}`] : []), ...(result.teamNote ? [`note:${result.teamNote.raison}`] : []),
+    `calls:${result.calls.map(call => call.kind).join(">")}`,
+  ];
+  return [...new Set(codes)].filter(code => CLOSED_CODE.test(code));
+}
+
 /** The bench outcome of a turn. Sensitive → `equipe_sensible`, never a reply; a failure is never an answer. */
 export function smartBenchTurn(result: SmartTurnResult): SavBenchAgentTurn {
-  const codes = [...result.reasons], citations = [...new Set((result.decision?.facts ?? []).flatMap(fact => fact.cardId ? [fact.cardId] : []))];
+  const codes = smartBenchTurnCodes(result), citations = [...new Set((result.decision?.facts ?? []).flatMap(fact => fact.cardId ? [fact.cardId] : []))];
   switch (result.outcome) {
     case "team_sensitive": return { outcome: "equipe_sensible", reply: null, citations: [], codes };
     case "handoff": return { outcome: "passer_la_main", reply: null, citations, codes };
