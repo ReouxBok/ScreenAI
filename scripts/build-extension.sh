@@ -12,7 +12,15 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$ROOT_DIR/build"
 DIST_DIR="$ROOT_DIR/dist"
 VERSION="$(node -p "JSON.parse(require('fs').readFileSync('$ROOT_DIR/manifest.json','utf8')).version")"
-ZIP_NAME="limova-ai-extension-${VERSION}.zip"
+# TEAM-726: LIMOVA_TEAM_ENV=staging makes a test build whose Limova Team connection
+# talks to staging. User builds (the default) talk to production only. A staging zip
+# gets its own name so it can never be mistaken for the Web Store package.
+LIMOVA_TEAM_ENV="${LIMOVA_TEAM_ENV:-production}"
+case "$LIMOVA_TEAM_ENV" in
+  production) ZIP_NAME="limova-ai-extension-${VERSION}.zip" ;;
+  staging) ZIP_NAME="limova-ai-extension-${VERSION}-team-staging.zip" ;;
+  *) echo "ERROR: LIMOVA_TEAM_ENV must be production or staging"; exit 1 ;;
+esac
 ZIP_PATH="$DIST_DIR/$ZIP_NAME"
 
 echo "==> Cleaning previous build..."
@@ -54,6 +62,17 @@ for d in "${DIRS[@]}"; do
     echo "  WARNING: $d/ not found, skipping"
   fi
 done
+
+if [ "$LIMOVA_TEAM_ENV" != "production" ]; then
+  echo "==> Limova Team test build: ${LIMOVA_TEAM_ENV}"
+  CONFIG="$BUILD_DIR/src/team/build-config.js"
+  sed -i.bak "s/defaultEnvironment: 'production'/defaultEnvironment: '${LIMOVA_TEAM_ENV}'/" "$CONFIG"
+  rm -f "$CONFIG.bak"
+  if ! grep -q "defaultEnvironment: '${LIMOVA_TEAM_ENV}'" "$CONFIG"; then
+    echo "ERROR: could not set the Limova Team environment in $CONFIG"
+    exit 1
+  fi
+fi
 
 echo "==> Bundling the private training-video uploader..."
 "$ROOT_DIR/node_modules/.bin/esbuild" \

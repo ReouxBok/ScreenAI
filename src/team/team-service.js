@@ -8,6 +8,10 @@
 // activity list (domain + label). It also owns the global action badge (« IA » while a
 // call runs, « ⏸ » while the person took over) and a chrome.alarms alarm that
 // reconnects every minute after Chrome restarts the service worker.
+//
+// TEAM-726: user builds connect to production only. The environment is the build's
+// (build-config.js); the choice is only offered, and only accepted, when the developer
+// toggle is on.
 
 import { DeviceSocket } from './device-socket.js';
 import { createConnectionStore, fetchDeviceOwner, revokeConnection } from './connections.js';
@@ -16,6 +20,7 @@ import { createBrowserEngine } from './browser-engine.js';
 import { createApprovalManager } from './approvals.js';
 import { createTeamController } from './team-controller.js';
 import { getEnvironment, getProduct, listProducts } from './products.js';
+import { DEVELOPER_TOGGLE_KEY, TEAM_BUILD } from './build-config.js';
 
 export const RECONNECT_ALARM = 'limova-team-reconnect';
 export const HOLDS_SESSION_KEY = 'limova_socket_holds_v1';
@@ -47,7 +52,8 @@ export function createTeamService({
   WebSocketImpl = globalThis.WebSocket,
   renderCapture,
   timers = globalThis,
-  now = () => Date.now()
+  now = () => Date.now(),
+  build = TEAM_BUILD
 } = {}) {
   const store = createConnectionStore({ storage: chromeApi.storage.local });
   const pairing = createPairing({
@@ -96,8 +102,21 @@ export function createTeamService({
     scheduleBroadcast();
   }
 
+  let developerMode = false;
+
+  async function loadDeveloperMode() {
+    const data = await Promise.resolve(chromeApi.storage.local.get(DEVELOPER_TOGGLE_KEY)).catch(() => ({}));
+    developerMode = data?.[DEVELOPER_TOGGLE_KEY] === true;
+    return developerMode;
+  }
+
+  function buildEnvironment(product) {
+    return getEnvironment(product.id, build.defaultEnvironment) ? build.defaultEnvironment : product.defaultEnvironment;
+  }
+
   function panelState() {
     return {
+      environmentChoice: developerMode,
       products: listProducts().map(product => {
         const link = links.get(product.id);
         const state = link?.controller.getState();
@@ -106,8 +125,10 @@ export function createTeamService({
           id: product.id,
           label: product.label,
           color: product.color,
-          defaultEnvironment: product.defaultEnvironment,
-          environments: Object.values(product.environments).map(env => ({ id: env.id, label: env.label })),
+          defaultEnvironment: buildEnvironment(product),
+          environments: developerMode
+            ? Object.values(product.environments).map(env => ({ id: env.id, label: env.label }))
+            : [{ id: buildEnvironment(product), label: getEnvironment(product.id, buildEnvironment(product)).label }],
           connection: link ? {
             environment: link.connection.environment,
             environment_label: getEnvironment(product.id, link.connection.environment)?.label || '',
@@ -253,7 +274,10 @@ export function createTeamService({
       if (alarm?.name === RECONNECT_ALARM) ensureAll().catch(() => {});
     });
     Promise.resolve(chromeApi.alarms?.create?.(RECONNECT_ALARM, { periodInMinutes: 1 })).catch(() => {});
-    initialized = ensureAll().catch(() => {});
+    chromeApi.storage.onChanged?.addListener?.((changes, area) => {
+      if (area === 'local' && DEVELOPER_TOGGLE_KEY in changes) loadDeveloperMode().then(scheduleBroadcast);
+    });
+    initialized = Promise.all([loadDeveloperMode(), ensureAll()]).catch(() => {});
     return initialized;
   }
 
@@ -269,8 +293,13 @@ export function createTeamService({
         return { ok: true, state: panelState() };
 
       case 'TEAM_CONNECT': {
-        if (!getEnvironment(productId, request.environment)) return { ok: false, error: 'invalid_environment' };
-        const started = await pairing.start({ productId, environment: request.environment });
+        const product = getProduct(productId);
+        if (!product) return { ok: false, error: 'invalid_environment' };
+        // Without the developer toggle, only the build's environment is accepted.
+        const environment = request.environment === undefined ? buildEnvironment(product) : request.environment;
+        if (!getEnvironment(productId, environment)) return { ok: false, error: 'invalid_environment' };
+        if (!developerMode && environment !== buildEnvironment(product)) return { ok: false, error: 'invalid_environment' };
+        const started = await pairing.start({ productId, environment });
         return { ok: true, tabId: started.tabId };
       }
 

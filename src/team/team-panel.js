@@ -6,7 +6,14 @@
 // Every page-derived string (activity domains and labels) is written with textContent.
 //
 // It talks to the service worker with TEAM_* messages and re-renders on TEAM_STATE.
+//
+// TEAM-726: the side panel's home screen first asks « Limova » or « Limova Team ».
+// « Limova » leaves Charly exactly as before (its own sign-in and chat). « Limova
+// Team » shows the Team home: one « Se connecter » button (no environment choice in
+// user builds), then who is connected, online or not, pause, « Tout arrêter » and
+// « Déconnecter ». People already signed in to Charly never see the picker.
 (function teamPanel() {
+  const HOME_KEY = 'limova_home_product_v1';
   const $ = id => document.getElementById(id);
   const tr = key => (typeof globalThis.t === 'function' ? globalThis.t(key) : key);
   const STATUS_KEYS = {
@@ -75,19 +82,25 @@
     card.append(head);
 
     if (!connection) {
-      const select = el('select', 'team-select');
-      select.id = `teamEnv-${product.id}`;
-      for (const env of product.environments) {
-        const option = el('option', '', env.label);
-        option.value = env.id;
-        if (env.id === product.defaultEnvironment) option.selected = true;
-        select.append(option);
+      // Only the developer toggle shows the environment choice (TEAM-726).
+      let select = null;
+      if (state?.environmentChoice && product.environments.length > 1) {
+        select = el('select', 'team-select');
+        select.id = `teamEnv-${product.id}`;
+        for (const env of product.environments) {
+          const option = el('option', '', env.label);
+          option.value = env.id;
+          if (env.id === product.defaultEnvironment) option.selected = true;
+          select.append(option);
+        }
+        card.append(labelled(tr('teamEnvironment'), select));
       }
-      card.append(labelled(tr('teamEnvironment'), select));
-      card.append(button(tr('teamConnect'), 'team-primary', async () => {
+      card.append(button(tr('teamSignIn'), 'team-primary', async () => {
         feedback = tr('teamPairingOpened');
         render();
-        const response = await send({ type: 'TEAM_CONNECT', productId: product.id, environment: select.value });
+        const message = { type: 'TEAM_CONNECT', productId: product.id };
+        if (select) message.environment = select.value;
+        const response = await send(message);
         if (!response?.ok) {
           feedback = tr('teamPairingFailed');
           render();
@@ -96,7 +109,8 @@
       return card;
     }
 
-    const meta = [connection.environment_label, connection.device_name].filter(Boolean).join(' · ');
+    // Production is the normal case; any other environment is spelled out.
+    const meta = [connection.environment === 'production' ? '' : connection.environment_label, connection.device_name].filter(Boolean).join(' · ');
     if (connection.email) card.append(el('p', 'team-muted', `${tr('teamConnectedAs')} ${connection.email}`));
     if (meta) card.append(el('p', 'team-muted', meta));
     if (connection.status === 'replaced' || connection.status === 'disabled' || connection.status === 'offline') {
@@ -186,18 +200,60 @@
     renderActivity();
   }
 
-  function openPanel() {
+  function openPanel(mode = 'overlay') {
     const menu = $('headerMenu');
     if (menu) menu.hidden = true;
-    $('teamPanel').hidden = false;
+    const panel = $('teamPanel');
+    panel.hidden = false;
+    panel.dataset.mode = mode;
+    // As the home screen there is nothing to close to; « Changer de produit » goes back.
+    const close = $('teamPanelClose');
+    if (close) close.hidden = mode === 'home';
     feedback = '';
     refresh();
   }
 
+  function remember(choice) {
+    return Promise.resolve(chrome.storage?.local?.set?.({ [HOME_KEY]: choice })).catch(() => {});
+  }
+
+  function showPicker() {
+    const picker = $('productPicker');
+    if (!picker) return;
+    $('teamPanel').hidden = true;
+    picker.hidden = false;
+    $('pickTeam')?.focus();
+  }
+
+  async function chooseHome() {
+    const stored = await Promise.resolve(chrome.storage?.local?.get?.(HOME_KEY)).then(data => data?.[HOME_KEY]).catch(() => null);
+    await refresh();
+    const teamConnected = (state?.products || []).some(product => product.connection);
+    if (stored === 'limova_team' || (!stored && teamConnected)) {
+      openPanel('home');
+      return;
+    }
+    if (stored === 'limova') return;
+    // Existing Charly users keep Charly as it was.
+    const auth = await send({ type: 'AUTH_GET_STATE' });
+    if (auth?.authenticated === true) return;
+    showPicker();
+  }
+
   function init() {
     if (!$('teamPanel')) return;
-    $('teamConnectionsBtn')?.addEventListener('click', openPanel);
-    $('authTeamConnections')?.addEventListener('click', openPanel);
+    $('teamConnectionsBtn')?.addEventListener('click', () => openPanel('overlay'));
+    $('authTeamConnections')?.addEventListener('click', () => openPanel('overlay'));
+    $('pickLimova')?.addEventListener('click', () => {
+      remember('limova');
+      $('productPicker').hidden = true;
+    });
+    $('pickTeam')?.addEventListener('click', () => {
+      remember('limova_team');
+      $('productPicker').hidden = true;
+      openPanel('home');
+    });
+    $('teamSwitchProduct')?.addEventListener('click', showPicker);
     $('teamPanelClose')?.addEventListener('click', () => { $('teamPanel').hidden = true; });
     const stopAll = () => send({ type: 'TEAM_STOP_ALL' });
     $('teamStopAll')?.addEventListener('click', stopAll);
@@ -210,7 +266,7 @@
         render();
       }
     });
-    refresh();
+    chooseHome();
   }
 
   globalThis.limovaTeamPanel = { refresh, render, openPanel, getState: () => state };

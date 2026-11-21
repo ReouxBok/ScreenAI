@@ -123,4 +123,34 @@ describe('team service', () => {
       .toEqual({ ok: false, error: 'invalid_environment' });
     expect(chromeApi.tabs.create).not.toHaveBeenCalled();
   });
+
+  it('connects to the build environment only, unless the developer toggle is on (TEAM-726)', async () => {
+    const chromeApi = fakeChrome(area());
+    const service = createTeamService({ chromeApi, WebSocketImpl: FakeWebSocket, fetchImpl: vi.fn() });
+    await service.init();
+    const state = (await service.handleMessage({ type: 'TEAM_GET_STATE' })).state;
+    expect(state.environmentChoice).toBe(false);
+    expect(state.products[0].environments).toEqual([{ id: 'production', label: 'Production' }]);
+    expect(await service.handleMessage({ type: 'TEAM_CONNECT', productId: 'limova_team', environment: 'staging' }))
+      .toEqual({ ok: false, error: 'invalid_environment' });
+    expect((await service.handleMessage({ type: 'TEAM_CONNECT', productId: 'limova_team' })).ok).toBe(true);
+    expect(new URL(chromeApi.tabs.create.mock.calls[0][0].url).origin).toBe('https://app.team.limova.ai');
+
+    const developer = fakeChrome(area({ limova_team_developer_v1: true }));
+    const devService = createTeamService({ chromeApi: developer, WebSocketImpl: FakeWebSocket, fetchImpl: vi.fn() });
+    await devService.init();
+    expect((await devService.handleMessage({ type: 'TEAM_GET_STATE' })).state.environmentChoice).toBe(true);
+    expect((await devService.handleMessage({ type: 'TEAM_CONNECT', productId: 'limova_team', environment: 'staging' })).ok).toBe(true);
+    expect(new URL(developer.tabs.create.mock.calls[0][0].url).origin).toBe('https://staging.team.limova.ai');
+  });
+
+  it('a staging test build pairs with staging by default', async () => {
+    const chromeApi = fakeChrome(area());
+    const service = createTeamService({ chromeApi, WebSocketImpl: FakeWebSocket, fetchImpl: vi.fn(), build: { defaultEnvironment: 'staging' } });
+    await service.init();
+    expect((await service.handleMessage({ type: 'TEAM_CONNECT', productId: 'limova_team' })).ok).toBe(true);
+    expect(new URL(chromeApi.tabs.create.mock.calls[0][0].url).origin).toBe('https://staging.team.limova.ai');
+    expect(await service.handleMessage({ type: 'TEAM_CONNECT', productId: 'limova_team', environment: 'production' }))
+      .toEqual({ ok: false, error: 'invalid_environment' });
+  });
 });

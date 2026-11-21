@@ -41,3 +41,18 @@
 .team-panel button:focus-visible, .team-banner button:focus-visible, .team-select:focus-visible { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 2px; }
 @keyframes team-pulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .team-banner-dot { animation: none; } }
+
+/* TEAM-726: home screen product picker, above Charly's sign-in and the Team panel. */
+.product-picker { position: absolute; inset: 0; z-index: 120; display: grid; place-items: center; padding: 24px; background: radial-gradient(circle at 50% 10%, #F3EDFF 0, var(--color-gray-50) 46%); overflow: auto; }
+.product-picker[hidden] { display: none; }
+.product-picker-card { width: min(100%, 360px); display: flex; flex-direction: column; gap: 10px; padding: 28px 24px; border: 1px solid var(--color-gray-200); border-radius: 16px; background: #fff; box-shadow: 0 18px 45px rgba(29, 29, 30, .10); }
+.product-picker-card h1 { font-size: 24px; line-height: 1.1; letter-spacing: -.04em; }
+.product-picker-card > p { font-size: 13px; color: var(--color-gray-500); margin-bottom: 6px; }
+.product-choice { display: grid; gap: 3px; text-align: left; border: 1px solid var(--color-gray-200); border-left: 4px solid var(--color-dark); border-radius: 12px; padding: 14px; background: #fff; cursor: pointer; font-family: var(--font-family); }
+.product-choice strong { font-size: 15px; }
+.product-choice span { font-size: 12px; color: var(--color-gray-500); }
+.product-choice:hover { background: var(--color-gray-50); }
+.product-choice-team { border-left-color: #7C3AED; }
+.product-choice:focus-visible, .team-link-muted:focus-visible { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 2px; }
+.team-link-muted { align-self: flex-start; border: 0; background: transparent; color: var(--color-gray-500); font: 600 12px var(--font-family); cursor: pointer; padding: 2px 0; margin-top: 4px; }
+.training-close[hidden] { display: none; }

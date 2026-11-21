@@ -9,6 +9,22 @@
 </head>
 <body>
   <div class="container">
+    <section class="product-picker" id="productPicker" aria-labelledby="productPickerTitle" hidden>
+      <div class="product-picker-card">
+        <img src="../../assets/branding/charly.png" alt="" class="auth-avatar">
+        <h1 id="productPickerTitle" data-i18n="pickerTitle">Que veux-tu utiliser ?</h1>
+        <p data-i18n="pickerIntro">Tu pourras changer plus tard depuis le menu.</p>
+        <button type="button" class="product-choice" id="pickLimova">
+          <strong data-i18n="pickerLimova">Limova</strong>
+          <span data-i18n="pickerLimovaDescription">Charly t’accompagne pas à pas dans Limova.</span>
+        </button>
+        <button type="button" class="product-choice product-choice-team" id="pickTeam">
+          <strong data-i18n="pickerTeam">Limova Team</strong>
+          <span data-i18n="pickerTeamDescription">Ton agent Limova Team agit pour toi dans Chrome.</span>
+        </button>
+      </div>
+    </section>
+
     <section class="auth-panel" id="authPanel" aria-labelledby="authTitle" hidden>
       <div class="auth-card">
         <img src="../../assets/branding/charly.png" alt="" class="auth-avatar">
@@ -122,12 +138,13 @@
       <button class="training-close" id="teamPanelClose" type="button" data-i18n-aria-label="teamClose" aria-label="Fermer">×</button>
       <span class="team-kicker" data-i18n="teamKicker">Limova dans Chrome</span>
       <h2 id="teamPanelTitle" data-i18n="teamConnections">Connexions</h2>
-      <p data-i18n="teamConnectionsIntro">Connecte ce navigateur à Limova Team : l’agent pourra lire et agir dans son propre groupe d’onglets, selon ton niveau d’autonomie.</p>
+      <p data-i18n="teamConnectionsIntro">Connecte-toi avec ton compte Limova Team : l’agent pourra lire et agir dans Chrome, dans son propre groupe d’onglets.</p>
       <p class="team-feedback" id="teamFeedback" role="status" aria-live="polite"></p>
       <div class="team-products" id="teamProducts"></div>
       <button type="button" class="team-stop-all" id="teamStopAll" data-i18n="teamStopAll" hidden>Tout arrêter</button>
       <h3 data-i18n="teamActivityTitle">Activité récente</h3>
       <ul class="team-activity" id="teamActivity"></ul>
+      <button type="button" class="team-link-muted" id="teamSwitchProduct" data-i18n="teamSwitchProduct">Changer de produit</button>
     </section>
 
     <section class="training-panel" id="trainingPanel" hidden aria-labelledby="trainingTitle">
