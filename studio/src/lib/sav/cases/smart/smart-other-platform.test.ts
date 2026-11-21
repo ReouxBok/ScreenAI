@@ -121,7 +121,7 @@ describe("SAV-122 : même source de vérité que le banc, mesure gratuite sur le
     expect(turn.expect.mustNotMatch).toEqual(expect.arrayContaining([...SAV_OTHER_PLATFORM_SIGNUP]));
   });
 
-  it("aucune réponse attendue (keyFacts) n'est refusée par le contrôle : 528 conversations, 843 tours, 1 294 keyFacts, 0 refus", () => {
+  it("aucune réponse attendue (keyFacts) n'est refusée par le contrôle : 528 conversations, 843 tours, 1 302 keyFacts, 0 refus", () => {
     let turns = 0, facts = 0;
     const refused: string[] = [];
     for (const conversation of all) {
@@ -132,7 +132,7 @@ describe("SAV-122 : même source de vérité que le banc, mesure gratuite sur le
         for (const fact of turn.expect.keyFacts) { facts++; if (smartOtherPlatformSentences(fact, customer).length) refused.push(`${conversation.id}: ${fact}`); }
       }
     }
-    expect({ conversations: all.length, turns, facts, refused }).toEqual({ conversations: 528, turns: 843, facts: 1294, refused: [] });
+    expect({ conversations: all.length, turns, facts, refused }).toEqual({ conversations: 528, turns: 843, facts: 1302, refused: [] });
   });
 });
 
