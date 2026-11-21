@@ -1,5 +1,5 @@
 import { savReplyFooter } from "../../reply-format";
-import { smartServerChecks, type SmartSource } from "./smart-checks";
+import { smartMissingFactSentences, smartServerChecks, type SmartSource } from "./smart-checks";
 import {
   parseSmartOutput, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchema,
   type SmartCallKind, type SmartCheckCode, type SmartDecision, type SmartReading, type SmartTeamNote, type SmartTurnOutcome, type SmartVerdict,
@@ -284,7 +284,10 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   if (!refused(first)) return accepted(decision);
 
   // 4 bis. One correction, with every problem found (server codes and the counter-read's). No tool any more.
-  const problems = [...first.codes.map(code => ({ code, sentence: "" })), ...(first.verdict?.problems ?? [])];
+  // SAV-122: a missing fact sentence is named, one problem per sentence, so the correction can copy it into the reply or drop the fact.
+  const named = (code: SmartCheckCode) => code === "fact_sentence_missing" ? smartMissingFactSentences(decision!.reply?.trim() ?? "", decision!.facts).slice(0, 10) : [];
+  const problems = [...first.codes.flatMap(code => named(code).length ? named(code).map(sentence => ({ code, sentence })) : [{ code, sentence: "" }]),
+    ...(first.verdict?.problems ?? [])];
   corrected = true;
   const fixed = await call("correct", smartCorrectionPrompt(), { ...lastPayload, tools: [], lastStep: true, previousDecision: decision, problems }, 0.3);
   if (fixed.status === "failed") return fixed.problem === "deadline" ? end("interrupted", [...reasons, "correct:deadline"]) : handoff([...reasons, `correct:${fixed.problem}`, "refused_once"], "panne");

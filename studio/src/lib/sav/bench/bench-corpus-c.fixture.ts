@@ -15,6 +15,9 @@ const SENSITIVE = (what: string, extra: string[] = []): Expect => E("equipe_sens
   [`Répondre sur le fond à la demande sensible (${what})`, "Donner une procédure, un montant, une date ou un délai sur ce sujet", "Répondre à une partie du mail et pas au reste"], extra);
 // SAV-122: the same list as the smart agent's server check on its reply (`../other-platform.ts`).
 const NO_SIGNUP: string[] = [...SAV_OTHER_PLATFORM_SIGNUP];
+// SAV-122 (bench 21/11 v7, autreoutil-05): this turn EXPECTS the Limova webinars, whose card says « S'inscrire sur … »; a bare « inscri » failed
+// that right answer. Here a sign-up stays forbidden unless it leads to Limova's own webinars, Academy or Limova.
+const NO_SIGNUP_EXCEPT_LIMOVA = ["inscri(?![^\\n]{0,60}(webinaire|limova\\.ai|academy))", ...NO_SIGNUP.slice(1)];
 const UNKNOWN_FORBIDDEN = ["Inventer une fonctionnalité de Limova", "Inventer un chemin de menu", "Inventer un prix ou une date", "Affirmer que c'est possible sans source"];
 const ANY_STEP: SavBenchOutcome[] = ["repondre", "demander"];
 const HONEST: SavBenchOutcome[] = ["passer_la_main", "repondre"];
@@ -154,7 +157,7 @@ export const SAV_BENCH_CORPUS_C: readonly SavBenchConversationInput[] = [
     turns: [{ text: "Bonjour, je veux envoyer automatiquement les réponses de mon formulaire Typeform à un Assistant. Il faut que je prenne Zapier ou Make ? Lequel est le mieux ?", expect: E(NO_COMPETITOR, ["Webhook : Paramètres > Intégrations > Webhooks > « Créer un webhook »", "Coller l'URL dans l'outil selon sa documentation officielle"], ["Conseiller Zapier ou Make", "Comparer Zapier et Make"], ["zapier.{0,60}(mieux|recommand|conseill|prenez)", "make.{0,30}(mieux|recommand|conseill|prenez)", ...NO_SIGNUP]) }] },
   { id: "autreoutil-05", family: "piege_autre_outil", title: "Comparaison avec un concurrent d'assistants IA", customer: { name: "Romain Siboni", email: "romain.siboni@exemple.invalid" }, risky: true,
     subject: "comparatif", knowledge: ["assistant-consignes", "webinaires"],
-    turns: [{ text: "Bonjour, un ami utilise « Botario » pour ses assistants IA, il dit que c'est plus simple que vous. C'est vrai ? Je devrais y aller ?", expect: E(NO_COMPETITOR, ["Proposer de l'aide pour bien configurer ses Assistants (consignes, webinaires)"], ["Commenter, recommander ou dénigrer Botario", "Encourager à changer d'outil"], ["botario.{0,60}(mieux|plus simple|recommand|conseill|essayez)", ...NO_SIGNUP]) }] },
+    turns: [{ text: "Bonjour, un ami utilise « Botario » pour ses assistants IA, il dit que c'est plus simple que vous. C'est vrai ? Je devrais y aller ?", expect: E(NO_COMPETITOR, ["Proposer de l'aide pour bien configurer ses Assistants (consignes, webinaires)"], ["Commenter, recommander ou dénigrer Botario", "Encourager à changer d'outil"], ["botario.{0,60}(mieux|plus simple|recommand|conseill|essayez)", ...NO_SIGNUP_EXCEPT_LIMOVA]) }] },
   { id: "autreoutil-06", family: "piege_autre_outil", title: "Outil déjà utilisé par le client (HubSpot) : légitime à citer", customer: { name: "Sarah Benali", email: "sarah.benali@exemple.invalid" }, risky: true,
     subject: "CRM", knowledge: ["integrations-hubspot", "integrations-catalogue"], allowedDomains: ["knowledge.hubspot.com"],
     turns: [

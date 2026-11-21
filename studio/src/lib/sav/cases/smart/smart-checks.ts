@@ -142,6 +142,21 @@ function linksOf(text: string) {
   return { urls, domains };
 }
 
+/*
+ * SAV-122 (bench 21/11 v7: sujet-03, sujet-05 refused twice on `fact_sentence_missing`): a fact's sentence must be IN the reply, but its form
+ * may differ from the list line it was written in: the model writes the fact « Partagez le fichier… . » (capital, final period) while the
+ * reply's numbered step reads « 1. Partagez le fichier… » without a period, or the reverse case. Same words, same order: the sentence is
+ * there. Compared without list marker, final punctuation or case; a sentence absent from the reply is still refused.
+ */
+const sentenceKey = (value: string) => normalizeSavEvidenceText(value).toLocaleLowerCase("fr").replace(/^(?:\d+[.)]|[-•*])\s+/, "").replace(/[\s.!?;:…]+$/u, "").trim();
+export function smartFactSentenceInReply(reply: string, sentence: string): boolean {
+  if (savEvidenceContains(reply, sentence) || normalizeSavEvidenceText(reply).includes(normalizeSavEvidenceText(sentence))) return true;
+  const key = sentenceKey(sentence);
+  return key.length > 0 && normalizeSavEvidenceText(reply).toLocaleLowerCase("fr").includes(key);
+}
+/** The facts whose sentence is not in the reply: given to the correction one by one, so it knows WHICH sentence to copy or to remove. */
+export const smartMissingFactSentences = (reply: string, facts: SmartDecision["facts"]) => facts.filter(fact => !smartFactSentenceInReply(reply, fact.sentence)).map(fact => fact.sentence);
+
 /** The server's checks on one decision. Empty `codes`: nothing refused (the counter-read may still refuse). */
 export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   const { decision, reading } = input, codes = new Set<SmartCheckCode>();
@@ -158,7 +173,7 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   const cited = new Map<string, SmartSource>(), citedAcademy = new Map<string, SmartAcademyEvidence>();
   for (const fact of decision.facts) {
     if (!needIds.has(fact.needId)) { codes.add("fact_source_invalid"); continue; }
-    if (!savEvidenceContains(reply, fact.sentence) && !normalizeSavEvidenceText(reply).includes(normalizeSavEvidenceText(fact.sentence))) codes.add("fact_sentence_missing");
+    if (!smartFactSentenceInReply(reply, fact.sentence)) codes.add("fact_sentence_missing");
     if (fact.type === "fait_tiers") { codes.add("third_party_fact_unsourced"); continue; }
     if ((fact.type === "fait_limova" || fact.type === "fait_temporaire") && fact.sourceKind === "academy") {
       const evidence = (input.academy ?? []).find(row => row.callId === fact.toolCallId);
