@@ -48,7 +48,7 @@ export function prepareAccessSkillCall(deps: AccessSkillDeps, kind: AccessSkillC
  * The same preparation for ANY body on the same envelope (chantier « 3 blocs »: the entry's router and block confirmations): V2's key resolution, model,
  * transport bounds and size check, then `send` on the same endpoint. `body` receives the transport's `maxOutputTokens`.
  */
-export function prepareV2SkillCall(deps: AccessSkillDeps, body: (maxOutputTokens: number) => string):
+export function prepareV2SkillCall(deps: AccessSkillDeps, body: (maxOutputTokens: number) => string, read: (json: unknown) => AccessSkillWireResult = readAccessSkillWireResponse):
   | Readonly<{ ok: true; send: () => Promise<AccessSkillWireResult> }> | Readonly<{ ok: false; call: AccessSkillCall }> {
   const env = deps.env(), key = resolveCaseV2GeminiKey(env), model = env[SAV_V2_MODEL_ENV] ?? "";
   const failed = (problem: string) => ({ ok: false as const, call: { status: "failed" as const, problem, uncertain: false } });
@@ -69,7 +69,7 @@ export function prepareV2SkillCall(deps: AccessSkillDeps, body: (maxOutputTokens
         const unprocessed = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429;
         return { status: "failed", problem: `http_${response.status}`, uncertain: !unprocessed, usage: unprocessed ? { inputTokens: 0, outputTokens: 0 } : null };
       }
-      return readAccessSkillWireResponse(await response.json());
+      return read(await response.json());
     } catch { return { status: "failed", problem: "network_failed", uncertain: true, usage: null }; }
   } };
 }

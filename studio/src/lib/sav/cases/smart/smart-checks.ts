@@ -195,9 +195,16 @@ const sentenceKey = (value: string) => normalizeSavEvidenceText(value).replace(/
  */
 const firstLetterForms = (key: string) => key ? [...new Set([key, key.charAt(0).toLocaleLowerCase("fr") + key.slice(1), key.charAt(0).toLocaleUpperCase("fr") + key.slice(1)])] : [];
 export function smartFactSentenceInReply(reply: string, sentence: string): boolean {
-  const text = normalizeSavEvidenceText(reply);
-  if (savEvidenceContains(reply, sentence) || text.includes(normalizeSavEvidenceText(sentence))) return true;
-  return firstLetterForms(sentenceKey(sentence)).some(form => text.includes(form));
+  const text = normalizeSavEvidenceText(reply), declaredNegations = negations(sentence);
+  // SAV-122 (fact binding): a declared sentence found INSIDE a reply sentence right after a negation (« Ne jamais | transmettre son mot de
+  // passe ») says the opposite of what the customer reads: not found, unless the declared sentence carries a negation itself.
+  const negatedBefore = (at: number) => {
+    const head = text.slice(0, at), start = Math.max(...[".", "!", "?", "\n"].map(mark => head.lastIndexOf(mark))) + 1;
+    return !declaredNegations && negations(head.slice(start).trim().split(/\s+/).slice(-3).join(" ")) !== "";
+  };
+  for (const form of new Set([normalizeSavEvidenceText(sentence), ...firstLetterForms(sentenceKey(sentence))].filter(Boolean)))
+    for (let at = text.indexOf(form); at >= 0; at = text.indexOf(form, at + 1)) if (!negatedBefore(at)) return true;
+  return false;
 }
 /** The facts whose sentence is not in the reply: given to the correction one by one, so it knows WHICH sentence to copy or to remove. */
 /**
@@ -218,16 +225,63 @@ export const smartMissingFactSentences = (reply: string, facts: SmartDecision["f
  * cut apart), `:reworded` (most of its words are), `:absent`; `fact_shape:<type>:<sourceKind>:card_<y|n>:excerpt_<y|n>:need_<known|unknown>` for a fact that breaks
  * the `fact_source_invalid` rule.
  */
+/** The form of a fact sentence that is not in the reply (null when it is): cut apart, reworded, or absent. */
+export function smartFactSentenceForm(replyText: string, sentence: string): "split" | "reworded" | "absent" | null {
+  if (smartFactSentenceInReply(replyText, sentence)) return null;
+  const reply = normalizeSavEvidenceText(replyText).toLocaleLowerCase("fr");
+  const wordsOf = (value: string) => value.split(/[^\p{L}\p{N}']+/u).filter(word => word.length > 3);
+  const key = sentenceKey(sentence).toLocaleLowerCase("fr"), clauses = key.split(/[,;:]|\s(?:puis|et|ou)\s/).map(row => row.trim()).filter(row => row.split(/\s+/).length >= 2);
+  const words = wordsOf(key), present = words.filter(word => reply.includes(word)).length;
+  return clauses.length > 1 && clauses.every(row => reply.includes(row)) ? "split" : words.length && present / words.length >= 0.6 ? "reworded" : "absent";
+}
+
+/*
+ * SAV-122 (bench v11: ~14 turns `refused_after_correction` + `fact_sentence_missing` twice, form `reworded`): the model declares in `facts`
+ * a sentence that rewords the one it wrote in the reply, and does it again after the correction. The server now BINDS such a fact to the real
+ * sentence of the reply when they are nearly the same: at least 80 % of the significant words (4+ letters, compared on their first 5 letters)
+ * shared in BOTH directions, at least 3 of them, the SAME numbers and the SAME negation. The real sentence then goes through every source
+ * check (excerpt in the card, counter-read). A weak resemblance, another number or a negation added or removed: never bound, still refused.
+ */
+const BIND_MIN = 0.8;
+const NEGATION = /(?:^|[^\p{L}])(n'|(?:ne|pas|jamais|aucun|aucune|sans|rien|non)(?=$|[^\p{L}]))/gu;
+/** The negation words of a text, in order (« n' » read as « ne »): two texts bind only with the same ones. */
+const negations = (value: string) => [...fold(value).matchAll(NEGATION)].map(match => match[1] === "n'" ? "ne" : match[1]).sort().join("|");
+const bindWords = (value: string) => new Set(fold(value).split(/[^\p{L}\p{N}]+/u).filter(word => word.length >= 4 && !/\d/.test(word)).map(word => word.slice(0, 5)));
+const bindNumbers = (value: string) => [...fold(value).matchAll(/\d+(?:[.,]\d+)?/g)].map(match => match[0]).sort().join("|");
+/** The sentence of the reply a declared fact sentence may be bound to, or null. */
+export function smartBindableSentence(replyText: string, sentence: string): string | null {
+  const wanted = bindWords(sentence);
+  if (wanted.size < 3) return null;
+  let best: { sentence: string; score: number } | null = null;
+  for (const candidate of sentencesOf(replyText).map(row => row.replace(/^(?:\d+[.)]|[-•*])\s+/, ""))) {
+    const own = bindWords(candidate), shared = [...own].filter(word => wanted.has(word)).length;
+    if (!own.size || bindNumbers(candidate) !== bindNumbers(sentence) || negations(candidate) !== negations(sentence)) continue;
+    const score = Math.min(shared / wanted.size, shared / own.size);
+    if (shared >= 3 && score >= BIND_MIN && (!best || score > best.score)) best = { sentence: candidate, score };
+  }
+  return best?.sentence ?? null;
+}
+/** The decision with each reworded fact sentence replaced by the real sentence of the reply it binds to; `bound` counts them. */
+export function smartBindFactSentences(decision: SmartDecision): { decision: SmartDecision; bound: number } {
+  const reply = decision.reply?.trim() ?? "";
+  if (!reply) return { decision, bound: 0 };
+  let bound = 0;
+  const facts = decision.facts.map(fact => {
+    if (smartFactSentenceInReply(reply, fact.sentence)) return fact;
+    const real = smartBindableSentence(reply, fact.sentence);
+    if (!real) return fact;
+    bound++;
+    return { ...fact, sentence: real };
+  });
+  return { decision: bound ? { ...decision, facts } : decision, bound };
+}
+
 export function smartFactDiagnostics(decision: SmartDecision | null, needIds: readonly string[]): string[] {
   if (!decision) return [];
-  const original = decision.reply?.trim() ?? "", reply = normalizeSavEvidenceText(original).toLocaleLowerCase("fr"), out: string[] = [];
-  const wordsOf = (value: string) => value.split(/[^\p{L}\p{N}']+/u).filter(word => word.length > 3);
+  const original = decision.reply?.trim() ?? "", out: string[] = [];
   for (const fact of decision.facts) {
-    if (!smartFactSentenceInReply(original, fact.sentence)) {
-      const key = sentenceKey(fact.sentence).toLocaleLowerCase("fr"), clauses = key.split(/[,;:]|\s(?:puis|et|ou)\s/).map(row => row.trim()).filter(row => row.split(/\s+/).length >= 2);
-      const words = wordsOf(key), present = words.filter(word => reply.includes(word)).length;
-      out.push(`fact_sentence_form:${clauses.length > 1 && clauses.every(row => reply.includes(row)) ? "split" : words.length && present / words.length >= 0.6 ? "reworded" : "absent"}`);
-    }
+    const form = smartFactSentenceForm(original, fact.sentence);
+    if (form) out.push(`fact_sentence_form:${form}`);
     // The shape rule of `fact_source_invalid` (smartServerChecks), mirrored: only a fact that breaks it is described.
     const known = needIds.includes(fact.needId), excerpt = Boolean(fact.excerpt?.trim()), limova = fact.type === "fait_limova" || fact.type === "fait_temporaire";
     const invalid = !known || (limova && fact.sourceKind === "academy" && (!fact.toolCallId || !excerpt))

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { prepareV2SkillCall, type AccessSkillDeps } from "../access-skill/access-skill-judge";
-import { SAV_ACCESS_SKILL_GEMINI_URL, type AccessSkillUsage } from "../access-skill/access-skill-wire";
+import { readAccessSkillWireResponse, SAV_ACCESS_SKILL_GEMINI_URL, type AccessSkillUsage, type AccessSkillWireResult } from "../access-skill/access-skill-wire";
 import { resolveCaseV2GeminiKey, SAV_V2_EMBEDDING_MODEL_ENV, SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
 import { readCaseV2SpendPolicy, readCaseV2TransportPolicy } from "../investigation-v2-spend";
 import type { SmartCallKind } from "./smart-contract";
@@ -40,6 +40,51 @@ export function smartWireBody(system: string, payload: unknown, maxOutputTokens:
   });
 }
 export const smartWireBytes = (system: string, payload: unknown, maxOutputTokens = 8192, temperature = 0) => Buffer.byteLength(smartWireBody(system, payload, maxOutputTokens, temperature), "utf8");
+
+/*
+ * SAV-122 (bench v11: `output_json_invalid` on decide (mdp-03) and correct (mdp-02)). Not the « low » thinking: a cut answer ends with
+ * `MAX_TOKENS` and is read first as `finish_not_stop`; these answers ended with `STOP` and a text that `JSON.parse` refused. The text is never
+ * logged, so its form is now a CLOSED code, and the forms a reader can undo deterministically are read: a Markdown fence, text before or
+ * after the object, a raw line break or tab inside a string. Nothing else is guessed (an unbalanced or otherwise broken object stays refused).
+ */
+export type SmartJsonForm = "fenced" | "leading_text" | "trailing_text" | "control_char" | "unbalanced" | "other";
+export function smartReadJson(text: string): Readonly<{ ok: true; value: unknown; form: SmartJsonForm | null }> | Readonly<{ ok: false; form: SmartJsonForm }> {
+  const parse = (value: string) => { try { return { ok: true as const, value: JSON.parse(value) as unknown }; } catch { return { ok: false as const }; } };
+  const whole = parse(text);
+  if (whole.ok) return { ok: true, value: whole.value, form: null };
+  const unfenced = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const fenced = unfenced !== text.trim();
+  const start = unfenced.search(/[{[]/);
+  if (start < 0) return { ok: false, form: "other" };
+  // One string-aware scan: the end of the first balanced object, raw control characters inside strings escaped.
+  let depth = 0, inString = false, escaped = false, end = -1, repaired = "", control = false;
+  for (let index = start; index < unfenced.length && end < 0; index++) {
+    const char = unfenced[index]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      else if (char === "\n" || char === "\r" || char === "\t") { control = true; repaired += char === "\t" ? "\\t" : char === "\r" ? "\\r" : "\\n"; continue; }
+    } else if (char === '"') inString = true;
+    else if (char === "{" || char === "[") depth++;
+    else if (char === "}" || char === "]") { depth--; if (depth === 0) end = index; }
+    repaired += char;
+  }
+  if (end < 0) return { ok: false, form: "unbalanced" };
+  const read = parse(repaired);
+  if (!read.ok) return { ok: false, form: "other" };
+  const form: SmartJsonForm = control ? "control_char" : fenced ? "fenced" : start > 0 ? "leading_text" : "trailing_text";
+  return { ok: true, value: read.value, form };
+}
+/** V2's reader of a Gemini answer, with the smart agent's JSON reading (above); a refused text says its form: `output_json_invalid:<form>`. */
+export function smartWireResponse(json: unknown): AccessSkillWireResult {
+  const read = readAccessSkillWireResponse(json);
+  if (read.status === "ok" || read.problem !== "output_json_invalid") return read;
+  const text = ((json as { candidates?: Array<{ content?: { parts?: Array<{ text?: unknown }> } }> }).candidates?.[0]?.content?.parts ?? [])
+    .map(part => typeof part.text === "string" ? part.text : "").join("");
+  const own = smartReadJson(text);
+  return own.ok ? { status: "ok", output: own.value, usage: read.usage } : { ...read, problem: `output_json_invalid:${own.form}` };
+}
 
 /** The byte cap of one call: the transport's existing `maxInputBytes`, or an own LOWER cap (`SAV_V2_SMART_MAX_INPUT_BYTES`); never above. */
 export const SAV_SMART_MAX_INPUT_BYTES_ENV = "SAV_V2_SMART_MAX_INPUT_BYTES";
@@ -91,7 +136,7 @@ export function smartGeminiModel(deps: AccessSkillDeps & Readonly<{ callTimeoutM
       const body = smartWireBody(system, payload, maxOutputTokens, temperature, env[SAV_V2_MODEL_ENV] ?? "");
       inputBytes = Buffer.byteLength(body, "utf8");
       return body;
-    });
+    }, smartWireResponse);
     if (!prepared.ok) return { status: "failed", problem: prepared.call.status === "failed" ? prepared.call.problem : "skipped", uncertain: false, usage: null, inputBytes, sent: false };
     if (cap === null) return { status: "failed", problem: "cap_invalid", uncertain: false, usage: null, inputBytes, sent: false };
     if (inputBytes > cap) return { status: "failed", problem: "input_too_large", uncertain: false, usage: null, inputBytes, sent: false };
