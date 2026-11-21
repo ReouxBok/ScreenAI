@@ -15,15 +15,15 @@ export const SAV_BENCH_CORPUS_B: readonly SavBenchConversationInput[] = [
   // ---------------------------------------------------------------------------------------------------------------------------
   // Access and collaborators
   // ---------------------------------------------------------------------------------------------------------------------------
-  { id: "acces-01", family: "acces_collaborateurs", title: "Mot de passe oublié, demande simple de lien de connexion",
+  { id: "acces-01", family: "acces_collaborateurs", title: "« Mot de passe oublié » : la connexion se fait par code à usage unique",
     customer: { name: "Hélène Marchand", email: "helene.marchand@exemple.invalid" }, subject: "Connexion impossible",
     knowledge: ["acces-connexion", "acces-mail-reinitialisation"],
     turns: [
       { text: "Bonjour, j'ai oublié mon mot de passe et je n'arrive plus à me connecter à Limova. Comment faire ? Merci, Hélène",
-        expect: { outcome: "repondre", keyFacts: ["Aller sur https://new.limova.ai", "Cliquer sur « Mot de passe oublié »", "Le lien de réinitialisation est valable 1 heure"],
-          forbidden: ["Demander le mot de passe actuel ou ancien"], mustNotMatch: [NO_PASSWORD] } },
+        expect: { outcome: "repondre", keyFacts: ["Aller sur https://new.limova.ai", "Il n'y a pas de mot de passe : un code à usage unique est envoyé par mail", "Saisir soi-même le code reçu (vérifier les spams)"],
+          forbidden: ["Demander un mot de passe ou le code reçu", "Renvoyer vers un bouton « Mot de passe oublié » (il n'existe pas)"], mustNotMatch: [NO_PASSWORD] } },
     ] },
-  { id: "acces-02", family: "acces_collaborateurs", title: "Mail de réinitialisation jamais reçu, puis adresse oubliée : passer la main",
+  { id: "acces-02", family: "acces_collaborateurs", title: "Code de connexion jamais reçu, puis adresse oubliée : passer la main",
     customer: { name: "Bruno Lefèvre", email: "bruno.lefevre@exemple.invalid" }, subject: "Re: mot de passe",
     knowledge: ["acces-mail-reinitialisation", "acces-connexion"],
     turns: [

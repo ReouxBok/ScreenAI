@@ -37,7 +37,7 @@ describe("SAV-109 current agent under the bench (dry-run)", () => {
   });
 
   it("the whole conversation reaches the decision as customer context, oldest first", () => {
-    const replay = savBenchCurrentCase(input("toujours pareil", ["acces-connexion"], [{ from: "client", text: "je ne peux pas me connecter", at: SAV_BENCH_NOW }, { from: "agent", text: "Essayez Mot de passe oublié", at: SAV_BENCH_NOW }]));
+    const replay = savBenchCurrentCase(input("toujours pareil", ["acces-connexion"], [{ from: "client", text: "je ne peux pas me connecter", at: SAV_BENCH_NOW }, { from: "agent", text: "Saisissez le code reçu par mail", at: SAV_BENCH_NOW }]));
     expect(replay.customerContext.latestMessage?.text).toContain("toujours pareil");
     expect(replay.customerContext.thread.map(message => message.from)).toEqual(["customer", "support"]);
     expect(savBenchCandidate(savBenchCard("incident-sheets-en-cours")!).resolution).toMatchObject({ validUntil: "2026-11-06T00:00:00.000Z" });

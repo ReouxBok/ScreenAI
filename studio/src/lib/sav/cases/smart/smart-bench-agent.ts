@@ -41,7 +41,7 @@ export function smartBenchTurnCodes(result: SmartTurnResult): string[] {
     ...(result.decision?.handoffReason ? [`handoff_reason:${result.decision.handoffReason}`] : []), ...(result.teamNote ? [`note:${result.teamNote.raison}`] : []),
     `calls:${result.calls.map(call => call.kind).join(">")}`,
     // SAV-122: the shape of a fact the final decision got wrong (closed codes, never its text), when the server refused it.
-    ...([...(result.checks.second ?? result.checks.first ?? [])].some(code => code === "fact_sentence_missing" || code === "fact_source_invalid")
+    ...([...(result.checks.second ?? result.checks.first ?? [])].some(code => code === "fact_source_invalid")
       ? smartFactDiagnostics(result.decision, (result.reading?.needs ?? []).map(need => need.id)) : []),
   ];
   return [...new Set(codes)].filter(code => CLOSED_CODE.test(code));

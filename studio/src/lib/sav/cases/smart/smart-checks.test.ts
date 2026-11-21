@@ -108,9 +108,9 @@ describe("contrôles serveur sans modèle (lot D3)", () => {
     expect(check(`${SMART_GOOD_REPLY} Pouvez-vous nous indiquer le numéro de téléphone avec lequel vous écrivez à Charly Max ?`)).toEqual([]);
     expect(check(`${SMART_GOOD_REPLY} Pouvez-vous nous envoyer votre token API ?`)).toContain("credential_request");
   });
-  it("faits : phrase absente, fait d'un autre éditeur, extrait du client introuvable", () => {
+  it("faits : une phrase indicative reformulée n'est plus refusée (SAV-122) ; fait d'un autre éditeur, extrait du client introuvable", () => {
     const fact = smartGoodDecision().facts[0];
-    expect(check(SMART_GOOD_REPLY, { facts: [{ ...fact, sentence: "Une phrase qui n'est pas dans la réponse." }] })).toContain("fact_sentence_missing");
+    expect(check(SMART_GOOD_REPLY, { facts: [{ ...fact, sentence: "Une phrase qui n'est pas dans la réponse." }] })).toEqual([]);
     expect(check(SMART_GOOD_REPLY, { facts: [{ ...fact, type: "fait_tiers" }] })).toContain("third_party_fact_unsourced");
     expect(check(SMART_GOOD_REPLY, { facts: [{ ...fact, type: "dit_par_le_client", sourceKind: "client", cardId: null, version: null, excerpt: "j'ai tout réinstallé" }] })).toContain("excerpt_not_found");
     expect(check(SMART_GOOD_REPLY, { facts: [{ ...fact, version: "v2" }] })).toContain("card_not_retrieved_for_need");

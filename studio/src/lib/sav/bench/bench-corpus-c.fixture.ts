@@ -30,8 +30,8 @@ export const SAV_BENCH_CORPUS_C: readonly SavBenchConversationInput[] = [
   { id: "sujet-01", family: "changement_sujet", title: "Accès réglé puis ajout d'un collaborateur", customer: { name: "Maëlle Dorval", email: "maelle.dorval@exemple.invalid" },
     subject: "Impossible de me connecter", knowledge: ["acces-connexion", "acces-mail-reinitialisation", "collaborateurs-inviter", "collaborateurs-invitation-expiree"],
     turns: [
-      { text: "Bonsoir, plus moyen d'entrer dans mon espace Limova : je ne me souviens plus du tout de mon code d'accès. Vous pouvez m'aider ? Maëlle", expect: E("repondre", ["Lien « Mot de passe oublié » sur new.limova.ai", "Le lien de réinitialisation est valable 1 heure"], ["Demander le mot de passe actuel ou ancien"]) },
-      { text: "Top ça marche, merci ! Par contre je n'arrive pas à ajouter un collaborateur, je ne vois pas où on fait ça.", expect: E(ANY_STEP, ["Paramètres > Équipe > « Inviter un collaborateur »", "Seul un administrateur peut inviter"], ["Reparler de la réinitialisation du mot de passe"]) },
+      { text: "Bonsoir, plus moyen d'entrer dans mon espace Limova : je ne me souviens plus du tout de mon code d'accès. Vous pouvez m'aider ? Maëlle", expect: E("repondre", ["Se connecter sur new.limova.ai avec le code à usage unique envoyé par mail", "Il n'y a pas de mot de passe à retrouver"], ["Demander un mot de passe ou le code reçu", "Renvoyer vers un bouton « Mot de passe oublié » (il n'existe pas)"]) },
+      { text: "Top ça marche, merci ! Par contre je n'arrive pas à ajouter un collaborateur, je ne vois pas où on fait ça.", expect: E(ANY_STEP, ["Paramètres > Équipe > « Inviter un collaborateur »", "Seul un administrateur peut inviter"], ["Reparler de la connexion par code"]) },
       { text: "C'est bon je l'ai trouvé, je l'ai invité. Bonne journée !", expect: E(["repondre"], [], ["Poser une nouvelle question inutile", "Répéter la procédure d'invitation"]) },
     ] },
   { id: "sujet-02", family: "changement_sujet", title: "Extension réparée puis campagne LinkedIn arrêtée", customer: { name: "Bastien Morel", email: "bastien.morel@exemple.invalid" },

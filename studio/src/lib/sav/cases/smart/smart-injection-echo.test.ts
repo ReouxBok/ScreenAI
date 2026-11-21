@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { runSmartTurn, type SmartTurnInput } from "./smart-agent";
-import { smartExcerptInSource, smartFactSentenceInReply, smartInstructionEchoes } from "./smart-checks";
+import { smartExcerptInSource, smartInstructionEchoes } from "./smart-checks";
 import { smartReadingSchema } from "./smart-contract";
 import { smartUnderstandPrompt, smartVerifyPrompt } from "./smart-prompt";
 import { SMART_CONFORME, SMART_GOOD_REPLY, smartGoodDecision, smartReading, smartScriptedModel, smartStaticKnowledge, type SmartScript } from "./smart-test-doubles";
@@ -78,13 +78,10 @@ describe("P1 : une consigne détectée ne peut plus se retrouver dans la répons
 });
 
 describe("P2 : seule la casse de la PREMIÈRE lettre est ignorée", () => {
-  it("« AbC123 » n'est pas « abc123 » : refusé dans la fiche et dans la réponse ; la première lettre et le numéro de liste restent tolérés", () => {
+  it("« AbC123 » n'est pas « abc123 » : refusé dans la fiche ; la première lettre et le numéro de liste restent tolérés", () => {
     const card = "Collez le code AbC123 dans le champ\nRecharger la page";
     expect(smartExcerptInSource(card, "Collez le code abc123 dans le champ")).toBe(false);
     expect(smartExcerptInSource(card, "collez le code AbC123 dans le champ.")).toBe(true);
     expect(smartExcerptInSource(card, "2. recharger la page")).toBe(true);
-    const reply = "Bonjour,\n1. Collez le code AbC123 dans le champ\nBelle journée.";
-    expect(smartFactSentenceInReply(reply, "Collez le code abc123 dans le champ.")).toBe(false);
-    expect(smartFactSentenceInReply(reply, "collez le code AbC123 dans le champ.")).toBe(true);
   });
 });

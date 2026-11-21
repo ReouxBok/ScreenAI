@@ -5,7 +5,7 @@ import type { CaseV2ModelTransport, CaseV2SpendUsage } from "../investigation-v2
 import { SAV_SMART_ENTRY_ADMISSION, savV2EntrySmartOn } from "../smart-entry-switch";
 import { runSmartTurn, type SmartKnowledgePort, type SmartThreadMessage, type SmartTurnInput, type SmartTurnPorts, type SmartTurnResult } from "./smart-agent";
 import type { SmartSource } from "./smart-checks";
-import type { SmartTeamNote } from "./smart-contract";
+import type { SmartFact, SmartTeamNote } from "./smart-contract";
 import { smartEmptyMemory, type SmartCaseMemory } from "./smart-memory";
 import type { SmartModelPort } from "./smart-model";
 
@@ -121,9 +121,16 @@ export function smartProposalFromTurn(result: SmartTurnResult, request: Pick<Cas
   const text = decision?.reply?.trim();
   if (!decision || !text || !open.length || decision.coverage.some(row => row.status === "handed")) return handoff(noteReason);
   const understanding = { requests: open.map(row => ({ id: row.id, summary: cut(caseRequestSearchText(row) || "Demande du client", 600) || "Demande du client", family: row.family, status: "open" as const })), newFacts: [] };
+  /*
+   * SAV-122 (contract v5: a fact's sentence is optional): the step's text, required non-empty by the decision contract. It is INTERNAL only (the
+   * team note `caseDecisionNoteText` and the validator; the customer receives `reply.text`, the model's reply untouched): the sentence hint,
+   * else the fact's excerpt copied word for word from the card, else the card's title.
+   */
+  const stepText = (fact: SmartFact) =>
+    cut(fact.sentence || fact.excerpt || "", 1000) || cut(request.knowledge.find(card => card.id === fact.cardId && card.contentVersionId === fact.version)?.title ?? "", 1000) || "Étape de la fiche citée";
   const known = (cardId: string | null, version: string | null) => request.knowledge.some(card => card.id === cardId && card.contentVersionId === version);
   const cited = [...new Map(decision.facts.filter(fact => fact.sourceKind === "fiche" && known(fact.cardId, fact.version))
-    .map(fact => [`${fact.cardId}:${fact.version}`, { knowledgeId: fact.cardId!, contentVersionId: fact.version!, sentence: fact.sentence }])).values()];
+    .map(fact => [`${fact.cardId}:${fact.version}`, { knowledgeId: fact.cardId!, contentVersionId: fact.version!, sentence: stepText(fact) }])).values()];
   const reply = { text: cut(text, 6000), citations: cited.slice(0, 10).map(({ knowledgeId, contentVersionId }) => ({ knowledgeId, contentVersionId })), impossibilityClaims: [], accountAdvice: "none" as const };
   if (result.outcome === "ask") {
     const question = cut(decision.memory.question || text, 600);
@@ -133,7 +140,7 @@ export function smartProposalFromTurn(result: SmartTurnResult, request: Pick<Cas
   if (!cited.length) return handoff("knowledge_missing", result.teamNote ?? { raison: "no_source", besoin: cut(text, 600) || "Réponse sans fiche retrouvée", compris: "", verifie: [], essaye: [], hypotheses: [],
     prochaineVerification: "La réponse proposée ne s'appuie sur aucune fiche retrouvée par le circuit : vérifier et répondre.", ditAuClient: null });
   return { caseVersion: request.snapshot.version, understanding, reply,
-    nextAction: { kind: "answer", requestIds: open.map(row => row.id).slice(0, 6), steps: cited.slice(0, 8).map(row => ({ text: cut(row.sentence, 1000), knowledge: { knowledgeId: row.knowledgeId, contentVersionId: row.contentVersionId }, newFactIds: [] })),
+    nextAction: { kind: "answer", requestIds: open.map(row => row.id).slice(0, 6), steps: cited.slice(0, 8).map(row => ({ text: row.sentence, knowledge: { knowledgeId: row.knowledgeId, contentVersionId: row.contentVersionId }, newFactIds: [] })),
       expectedResult: "Le client peut reprendre son usage avec les étapes indiquées." } };
 }
 

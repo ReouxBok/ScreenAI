@@ -21,9 +21,11 @@ import { z } from "zod";
  * free call ids renumbered; a final step's leftover calls and a tools step's placeholder decision ignored; a decision written flat (no step)
  * is a final step. NOT tolerated, unchanged: the customer reply above its bound, an unknown outcome, fact type or source kind, a wrong need
  * id, more than 4 needs, a missing `wantsHuman` or `sensitive`; and every safety rule downstream (sensitive barrier, server checks, counter-read).
+ *
+ * v5 (21/11, SAV-122): a fact's `sentence` is optional, a hint for the counter-read only; the server no longer matches it against the reply.
  */
 
-export const SAV_SMART_CONTRACT_REVISION = "sav-smart-contract-2026-11-20.v4";
+export const SAV_SMART_CONTRACT_REVISION = "sav-smart-contract-2026-11-21.v5";
 
 export const SAV_SMART_OUTCOMES = ["reply", "ask", "handoff"] as const;
 export type SmartOutcome = typeof SAV_SMART_OUTCOMES[number];
@@ -88,8 +90,11 @@ export const SAV_SMART_FACT_TYPES = ["fait_limova", "fait_temporaire", "fait_tie
 export type SmartFactType = typeof SAV_SMART_FACT_TYPES[number];
 
 export const smartFactSchema = z.object({
-  /** The sentence of the reply this fact is about, copied as is. */
-  sentence: text(600).min(1),
+  /**
+   * v5 (SAV-122, prod bench 21/11): OPTIONAL, a hint for the counter-read on which sentence of the reply this fact supports. Never matched
+   * against the reply to refuse (the old `fact_sentence_missing` refused good replies the model had reworded). Cut to its bound.
+   */
+  sentence: nullAsAbsent(clipped(600).default("")),
   needId,
   type: looseEnum(SAV_SMART_FACT_TYPES),
   /** Where it comes from: a card (id + version), an Academy tool call (its call id), the customer's message, or nothing (advice only). */
@@ -223,6 +228,7 @@ export type SmartVerdict = z.infer<typeof smartVerdictSchema>;
 
 /** The server's own checks (no model): closed codes. Any of them refuses the reply, whatever the counter-read says. */
 export const SAV_SMART_CHECK_CODES = [
+  // `fact_sentence_missing`: no longer emitted since SAV-122 (contract v5); kept so stored results stay readable.
   "reply_missing", "coverage_invalid", "need_not_covered", "fact_sentence_missing", "excerpt_not_found", "card_not_retrieved_for_need", "fact_source_invalid",
   "third_party_fact_unsourced", "link_not_allowed", "other_platform_recommended", "third_party_named", "credential_request", "promise_unsourced",
   "account_action_claimed", "kernel_in_reply", "team_note_missing",
