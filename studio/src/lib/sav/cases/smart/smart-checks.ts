@@ -124,10 +124,19 @@ const COMMITMENTS: readonly RegExp[] = [
  */
 const SUBSCRIPTION_OBJECT = /\b(?:abonnements?|contrats?|forfaits?|souscriptions?|(?:l'|une?|votre|vos|mon|notre|son|cette|cet|ce|d'|des|les|le|la) ?(?:offres?|plans?))\b/;
 const STOP_VERB = /\b(?:annul\w*|arret\w*|mettre fin|mis fin|mettez fin|met fin|mettons fin|stopp?\w*|suspend\w*|interromp\w*|desactiv\w*)/;
-/** True when the reply commits to a sensitive action on the account, or speaks of cancelling the subscription (exported for the tests and the shadow report). */
+/*
+ * PORTE 2C (one rule, for Ugo: « l'agent ne parle d'argent que pour dire que l'équipe s'en occupe »): a part of a sentence (cut on « ; » and « mais ») that
+ * speaks of money (remboursement, avoir, geste commercial, dédommagement, annulation d'un prélèvement ou d'une facture) is refused, unless that same part
+ * hands it to the team (« notre équipe vous répondra », « un conseiller », « transmis à l'équipe »). A bare « notre équipe reste disponible » is no hand-over.
+ */
+const MONEY = /\brembours\w*|\b(?:un|d'un|l'|votre|cet|son|vos|des) ?avoirs?\b|\bgeste commercial|\bdedommag\w*|\brecredit\w*|\bannul\w* (?:(?:de|du|d'|le|la|les|des|votre|vos|ce|cette|l')\s*){0,2}(?:prelevement|facture)s?\b|\b(?:prelevement|facture)s? (?:\S+ ){0,4}annul\w*/;
+const TO_TEAM = /\b(?:notre equipe|nos equipes|l'equipe|un conseiller|nos conseillers|le service (?:client|facturation|comptabilite))\b.{0,40}\b(?:repond\w*|recontact\w*|revien\w*|traite\w*|trait\w*|examin\w*|etudi\w*|prend\w* en charge|occup\w*|charg\w*|contact\w*|verifi\w*)|\btransmis\w* (?:a|au) (?:notre |l'|un |nos )?(?:equipe|conseiller|service)/;
+const moneyParts = (reply: string) => sentencesOf(reply).flatMap(sentence => fold(sentence).split(/;|\bmais\b/)).map(row => row.trim()).filter(Boolean);
+/** True when the reply commits to a sensitive action on the account, speaks of cancelling the subscription, or of money outside a hand-over to the team. */
 export const smartSensitiveCommitment = (reply: string) => {
   const folded = fold(reply);
-  return COMMITMENTS.some(pattern => pattern.test(folded)) || (SUBSCRIPTION_OBJECT.test(folded) && STOP_VERB.test(folded));
+  return COMMITMENTS.some(pattern => pattern.test(folded)) || (SUBSCRIPTION_OBJECT.test(folded) && STOP_VERB.test(folded))
+    || moneyParts(reply).some(part => MONEY.test(part) && !TO_TEAM.test(part));
 };
 
 /*
@@ -137,10 +146,10 @@ export const smartSensitiveCommitment = (reply: string) => {
  * (« Dans les intégrations de Limova, optez pour HubSpot ») places the tool inside Limova: its orientation is not a redirection.
  */
 const INTEGRATIONS_MENU = /\b(?:dans|depuis|via) (?:le |vos |les )?(?:menu |onglet |rubrique )?integrations?\b|\bintegrations >/;
-// PORTE 2B: the exception holds only for the part of the sentence that carries BOTH the named tool and the Intégrations marker. A sentence is cut on « si »,
-// « mais », « puis », « ; » and parentheses (a leading « Dans les intégrations de Limova, » stays with the choice that follows it); every other part is judged
+// PORTE 2B/2C: the exception holds only for the part of the sentence that carries BOTH the named tool and the Intégrations marker. A sentence is cut on « si »,
+// « mais », « puis », « ou », « et », « ; » and parentheses (a leading « Dans les intégrations de Limova, » stays with the choice that follows it); every other part is judged
 // by the shared per-clause rule (« Dans les intégrations de Limova, si le connecteur manque, optez pour Wix… » refuses).
-const integrationParts = (folded: string) => folded.split(/[;()]|\b(?:si|mais|puis)\b/).map(row => row.trim()).filter(Boolean);
+const integrationParts = (folded: string) => folded.split(/[;()]|\b(?:si|mais|puis|ou|et)\b/).map(row => row.trim()).filter(Boolean);
 export const smartOtherPlatformInvite = (reply: string) => sentencesOf(reply).some(sentence => {
   const folded = fold(sentence);
   if (savOtherPlatformRedirect(folded) || savOtherPlatformEndorses(folded, SAV_OTHER_PLATFORM_THIRD_PARTIES)) return true;

@@ -14,6 +14,9 @@ describe("PORTE 2A (P2) : le filet smart refuse seulement ce que prévoit le CAP
     "Arrêtez la routine depuis votre compte Limova.",
     "Pour toute question de remboursement ou d'avoir, notre équipe vous répondra directement.",
     "Vous pouvez vous désinscrire du webinaire depuis le mail de confirmation.",
+    "Votre demande de remboursement a été transmise à l'équipe facturation.",
+    "Un conseiller reviendra vers vous au sujet du geste commercial.",
+    "Vous devez avoir accès à l'onglet Intégrations.",
   ])("mention neutre : « %s » passe", body => expect(judge(body)).toBeNull());
   it.each([
     "Pour résilier, écrivez-nous.",
@@ -27,6 +30,12 @@ describe("PORTE 2A (P2) : le filet smart refuse seulement ce que prévoit le CAP
     "Notre équipe va effectuer un geste commercial sur votre prochaine facture.",
     "Je lance le remboursement aujourd'hui.",
     "Vous serez remboursé sous peu.",
+    // PORTE 2C: money outside a hand-over to the team
+    "Nous vous confirmons le remboursement de votre paiement.",
+    "Un avoir de 20 euros figure sur votre compte.",
+    "Le prélèvement de ce mois a été annulé, et l'annulation de votre facture est en cours.",
+    "Nous vous confirmons le remboursement, notre équipe reste disponible.",
+    "Notre équipe vous répondra demain, mais votre remboursement est déjà validé.",
   ])("résiliation ou engagement sensible : « %s » refusé", body => expect(judge(body)).toBe("CANCELLED_REPLY_SENSITIVE_WORDING"));
   it("un dossier non smart et une notice de passage ne sont jamais jugés ici", () => {
     expect(smartSendProblem({ admission: ACCESS, body: "Pour résilier, écrivez-nous.", purpose: "answer" })).toBeNull();
@@ -44,6 +53,8 @@ describe("PORTE 2A (P1) : le filet « autre plateforme » suit la règle partag�
     "Si cette option manque dans Limova, essayez Wix pour créer votre site.",
     "Dans les intégrations de Limova, si le connecteur manque, optez pour Wix pour créer votre site.",
     "Dans les intégrations de Limova, choisissez Google Sheets, puis utilisez Wix pour votre site.",
+    "Cherchez le connecteur dans les intégrations de Limova ou utilisez Wix pour créer votre site.",
+    "Activez Google Sheets dans les intégrations de Limova et utilisez Wix pour créer votre site.",
   ])("« %s » est refusé", body => expect(judge(body)).toBe("CANCELLED_REPLY_OTHER_PLATFORM"));
   it("« Inscrivez-vous au webinaire Limova » passe", () => expect(judge("Inscrivez-vous au webinaire Limova de jeudi.")).toBeNull());
 });
