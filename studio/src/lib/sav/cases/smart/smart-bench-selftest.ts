@@ -11,12 +11,16 @@ import type { SavBenchAgent, SavBenchConversation } from "../../bench/bench-type
 import { buildSavBenchVariants, SAV_BENCH_VARIANTS_REVISION } from "../../bench/bench-variants";
 import { resolveCaseV2GeminiKey, SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
 import { readCaseV2TransportPolicy } from "../investigation-v2-spend";
-import { SAV_SMART_MAX_MODEL_CALLS } from "./smart-agent";
+import { SAV_SMART_MAX_EMBED_CALLS, SAV_SMART_MAX_MODEL_CALLS } from "./smart-agent";
 import { createSavBenchAgent } from "./smart-bench-agent";
+import { createSavBenchSearchAgent, emptySmartBenchSearchRecord, smartBenchNoJudge, type SmartBenchSearchRecord } from "./smart-bench-search";
+import { smartDbKnowledge } from "./smart-knowledge";
+import { listSavAdmissibleCards, SAV_RETRIEVAL_EMBEDDING_DIMENSION } from "../../request-retrieval-db";
+import type { SmartKnowledgePort } from "./smart-agent";
 import { SAV_SMART_BENCH_MULTITURN, SAV_SMART_BENCH_MULTITURN_REVISION } from "./smart-bench-multiturn.fixture";
 import { getAcademyTools } from "./tools/academy";
 import { claimSmartItem, readSmartLedger, settleSmartItem, smartContainedErrorCode, smartItemKey, smartLedgerSpent } from "./smart-ledger";
-import { smartInputCap, smartPrices, smartUsageOf } from "./smart-model";
+import { smartGeminiEmbed, smartInputCap, smartPrices, smartUsageOf, type SmartEmbedPort } from "./smart-model";
 import { SAV_SMART_PROMPT_REVISION, smartPromptPinned, smartPromptSha256 } from "./smart-prompt";
 
 /*
@@ -60,7 +64,8 @@ export const SAV_SMART_BENCH_SELFTEST_DEFAULT_BATCH = 6, SAV_SMART_BENCH_SELFTES
 const RUN_ID = /^[A-Za-z0-9._-]{1,64}$/, INTEGER = /^[0-9]{1,12}$/;
 const STEP_MIN_MS = 90_000, CONVERSATION_MIN_MS = 150_000, CALL_MAX_MS = 45_000, CALL_MIN_MS = 8_000, CALL_MARGIN_MS = 3_000;
 const JUDGE_MAX_OUTPUT_TOKENS = 4_096;
-export type SmartBenchAgentName = "current" | "new";
+/** `search` (21/11): the retrieval measurement, the new agent on the REAL Studio search, no judge (`smart-bench-search.ts`). Never part of `both`. */
+export type SmartBenchAgentName = "current" | "new" | "search";
 /** Ceilings per turn: V2's runner (`SAV_CASE_INVESTIGATION_MAX_CALLS`, 3) and the new agent (understand, 3 decide passes, verify, correct, reverify). Tested equal. */
 export const SAV_SMART_BENCH_CURRENT_CALLS = 3, SAV_SMART_BENCH_NEW_CALLS = SAV_SMART_MAX_MODEL_CALLS;
 /** The self-test corpus: the 120 bench conversations, plus the new agent's multi-turn cases (memory and progress rule, 20/11). */
@@ -101,7 +106,7 @@ export function readSmartBenchSelfTestConfig(env: Env): SmartBenchSelfTestConfig
   const runId = env[SAV_SMART_BENCH_SELFTEST_ID_ENV] ?? "";
   if (!RUN_ID.test(runId)) return { mode: "refused", reason: "id_invalid" };
   const agent = env[SAV_SMART_BENCH_SELFTEST_AGENT_ENV] ?? "both";
-  if (agent !== "current" && agent !== "new" && agent !== "both") return { mode: "refused", reason: "agent_invalid" };
+  if (agent !== "current" && agent !== "new" && agent !== "both" && agent !== "search") return { mode: "refused", reason: "agent_invalid" };
   const integer = (name: string, fallback: number, max: number) => {
     const raw = env[name];
     if (raw === undefined) return fallback;
@@ -122,6 +127,8 @@ export function readSmartBenchSelfTestConfig(env: Env): SmartBenchSelfTestConfig
 
 /** Model calls an agent may make on one turn (the judge adds one): the current runner's ceiling, the new agent's five. */
 export const smartBenchCallsPerTurn = (agent: SmartBenchAgentName) => (agent === "current" ? SAV_SMART_BENCH_CURRENT_CALLS : SAV_SMART_BENCH_NEW_CALLS) + 1;
+/** Query embeddings one turn may pay (search only): the first search and up to the agent's embed ceiling with `chercher_fiches`. */
+export const smartBenchEmbedsPerTurn = (agent: SmartBenchAgentName) => (agent === "search" ? SAV_SMART_MAX_EMBED_CALLS : 0);
 /** One item per (pass, agent, conversation); pass 1 keeps the historical key, pass 2 has its own (`:p2`), so it is claimed and paid separately. */
 export const smartBenchItem = (runId: string, agent: SmartBenchAgentName, conversationId: string, pass: SmartBenchPass = 1) =>
   `${runId}:${agent}:${conversationId}${pass === 1 ? "" : `:p${pass}`}`;
@@ -140,6 +147,9 @@ export type SmartBenchSelfTestDeps = Readonly<{
   network?: CaseV2Network;
   /** Tests only: replaces the bench agents and the judge (they still go through the meter's network). */
   agents?: (name: SmartBenchAgentName, network: CaseV2Network) => SavBenchAgent;
+  /** Tests only (search mode): replaces the real Studio search and the catalogue read. */
+  searchKnowledge?: (embed: SmartEmbedPort, now: Date) => SmartKnowledgePort;
+  searchCatalogue?: () => Promise<readonly { id: string; title: string; slug: string }[]>;
   judge?: (network: CaseV2Network) => SavBenchJudge;
   corpus?: readonly SavBenchConversation[];
   log?: (event: string, fields: Record<string, unknown>) => void;
@@ -199,6 +209,11 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
   // - Time: no new conversation below 150 s left; each in-flight call still bounded by the time left (the meter, per conversation).
   // - Stop: the FIRST reason (batch, deadline, money cap, an error) wins; in-flight conversations finish, are settled and logged.
   const concurrency = readSmartBenchSelfTestConcurrency(env) ?? SAV_SMART_BENCH_SELFTEST_DEFAULT_CONCURRENCY;
+  // Search only: the catalogue of the cards the search may return now (ids and titles, read only), once per pass that has work to do.
+  if (config.agents.includes("search") && todo.length) try {
+    const cards = await (deps.searchCatalogue ?? (() => listSavAdmissibleCards({ locale: "fr-FR", audience: "support", now })))();
+    log("sav_smart_bench_search_catalogue", { runId: config.runId, count: cards.length, cards: cards.map(card => ({ id: card.id.slice(0, 8), title: card.title.slice(0, 120), slug: card.slug.slice(0, 80) })) });
+  } catch { try { log("sav_smart_bench_search_catalogue", { runId: config.runId, count: null, error: "catalogue_unreadable" }); } catch { /* never fails the pass */ } }
   let ran = 0, started = 0, next = 0, stopped = false, overrun = false, stoppedBy: Extract<SmartBenchSelfTestPass, { ran: number }>["stoppedBy"] = todo.length ? "batch" : "done";
   const stop = (reason: typeof stoppedBy) => { if (!stopped) { stopped = true; stoppedBy = reason; } };
   const worker = async () => { while (!stopped && next < todo.length) {
@@ -207,7 +222,8 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
     const { pass, agent: agentName, conversation } = todo[next++]!;
     started += 1;
     const item = smartBenchItem(config.runId, agentName, conversation.id, pass), maxCalls = conversation.turns.length * smartBenchCallsPerTurn(agentName);
-    const worst = maxCalls * prices.modelReserve;
+    const maxEmbeds = conversation.turns.length * smartBenchEmbedsPerTurn(agentName);
+    const worst = maxCalls * prices.modelReserve + maxEmbeds * prices.embeddingReserve;
     let claim: Awaited<ReturnType<typeof claimSmartItem>>;
     try { claim = await claimSmartItem({ prefix: SAV_SMART_BENCH_SELFTEST_PREFIX, scope: config.runId, item, worstMicroUsd: worst, capMicroUsd: config.capMicroUsd, maxItems: null, now: deps.now() }); }
     catch (error) { started -= 1; throw error; }
@@ -216,12 +232,20 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
     // The meter: every call of this conversation (agent and judge), refused BEFORE sending when its body exceeds the input bound, when the
     // conversation's spend plus one more reservation would pass its own reservation, or beyond the call count or the time left. Costed at
     // V2's prices from a COMPLETE usage (measured, even above the reservation); an incomplete or unreadable usage costs the reservation.
-    let cost = 0, calls = 0, meterStop: string | null = null;
+    let cost = 0, calls = 0, embeds = 0, meterStop: string | null = null;
     const send = deps.network ?? ((url, init) => fetch(url, init));
     const meter: CaseV2Network = async (url, init) => {
       const timeout = Math.min(CALL_MAX_MS, left() - CALL_MARGIN_MS);
       // A measured cost above a conversation's reservation (in parallel): no other in-flight conversation sends another call either.
       if (overrun) { meterStop ??= "money_budget"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_MONEY_BUDGET" }); }
+      // Search only: a query embedding is its own budget (count and reservation), costed at V2's embedding reservation, never a model call.
+      if (url.includes(":batchEmbedContents")) {
+        if (embeds >= maxEmbeds) { meterStop ??= "call_budget"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_CALL_BUDGET" }); }
+        if (timeout < CALL_MIN_MS) { meterStop ??= "deadline"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_DEADLINE" }); }
+        if (cost + prices.embeddingReserve > worst) { meterStop ??= "money_budget"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_MONEY_BUDGET" }); }
+        embeds += 1; cost += prices.embeddingReserve;
+        return send(url, { ...init, signal: AbortSignal.timeout(timeout) });
+      }
       if (calls >= maxCalls) { meterStop ??= "call_budget"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_CALL_BUDGET" }); }
       if (timeout < CALL_MIN_MS) { meterStop ??= "deadline"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_DEADLINE" }); }
       if (cost + prices.modelReserve > worst) { meterStop ??= "money_budget"; return new Response(null, { status: 400, statusText: "SAV_SMART_BENCH_MONEY_BUDGET" }); }
@@ -237,11 +261,16 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
       if (cost > worst) { overrun = true; stop("money_cap"); }
       return json === null ? new Response("not json", { status: 200 }) : Response.json(json);
     };
-    const agent = deps.agents?.(agentName, meter) ?? (agentName === "new"
+    const record: SmartBenchSearchRecord = emptySmartBenchSearchRecord(conversation);
+    const agent = deps.agents?.(agentName, meter) ?? (agentName === "search"
+      ? createSavBenchSearchAgent({ network: meter, env, conversation, record, academy: getAcademyTools(),
+        embed: smartGeminiEmbed({ env: () => env, now: deps.now, network: meter, dimension: SAV_RETRIEVAL_EMBEDDING_DIMENSION, callTimeoutMs: () => Math.min(CALL_MAX_MS, left() - CALL_MARGIN_MS) }),
+        knowledge: deps.searchKnowledge ?? ((embed, at) => smartDbKnowledge({ now: () => at, embed })) })
+      : agentName === "new"
       // Academy (off unless `SAV_V2_SMART_ACADEMY=on`) is a free public read: it does not go through the meter.
       ? createSavBenchAgent({ dryRun: false, network: meter, env, academy: getAcademyTools() })
       : createSavBenchCurrentAgent({ model: createSavBenchCurrentModel({ env, network: meter, dryRun: false }), revision: `v2-decision:${model}` }));
-    const judge = deps.judge?.(meter) ?? createSavBenchGeminiJudge({ network: meter, model, key: key.ok ? key.key : "", maxOutputTokens, maxInputBytes: inputCap });
+    const judge = agentName === "search" ? smartBenchNoJudge : deps.judge?.(meter) ?? createSavBenchGeminiJudge({ network: meter, model, key: key.ok ? key.key : "", maxOutputTokens, maxInputBytes: inputCap });
     const startedAt = clock();
     let stored: SmartBenchStored;
     try {
@@ -259,6 +288,8 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
     await settleSmartItem({ prefix: SAV_SMART_BENCH_SELFTEST_PREFIX, scope: config.runId, item, costMicroUsd: cost, status: "done", now: deps.now(), result: stored });
     // One line per conversation, codes and numbers only (fictional corpus ids, no reply text): the judge's verdict readable from the logs.
     try { log("sav_smart_bench_conversation", smartBenchConversationLine(stored)); } catch { /* the log never fails the pass */ }
+    // Search only: the record of every search (fictional needs, real cards by short id and title), the material of the retrieval analysis.
+    if (agentName === "search") try { log("sav_smart_bench_search", { runId: config.runId, pass, ...record }); } catch { /* never fails the pass */ }
     ran += 1;
     if (meterStop === "deadline") { stop("deadline"); break; }
   } };

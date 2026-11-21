@@ -184,3 +184,33 @@ export function createSavRequestRetrievalBackend(options: { locale?: string; aud
 export async function searchSavKnowledgeByRequest(input: Parameters<typeof retrieveSavKnowledgeByRequest>[0]) {
   return retrieveSavKnowledgeByRequest(input, createSavRequestRetrievalBackend(input));
 }
+
+/**
+ * Retrieval measurement (Ugo 21/11, read only): the catalogue of the SAV cards the search may return right now, with the SAME filters as
+ * `searchByVectors` (SAV article, published, AI enabled, indexed, locale, audience, check date within 90 days), ids and titles only, no
+ * embedding, no content. Used by the bench's « search only » mode to tell « the right card exists but was not found » from « no such card ».
+ */
+export async function listSavAdmissibleCards(options: { locale?: string; audience?: "support" | "lead"; now?: Date } = {}): Promise<{ id: string; title: string; slug: string }[]> {
+  const locale = options.locale ?? "fr-FR", audience = options.audience ?? "support", now = options.now ?? new Date();
+  const response = await requireDb().execute(sql`
+    SELECT DISTINCT item.id, activation.title AS title, item.slug AS slug
+    FROM content_items item
+    JOIN sav_knowledge_activations activation ON activation.item_id = item.id
+    JOIN content_versions version ON version.id = activation.version_id AND version.item_id = item.id
+    LEFT JOIN LATERAL (
+      SELECT max(event.created_at) AS verified_at FROM review_events event
+      WHERE event.version_id = version.id AND event.item_id = item.id
+        AND event.action IN ('approved', 'emergency_published')
+    ) version_review ON TRUE
+    WHERE EXISTS (SELECT 1 FROM content_chunks chunk WHERE chunk.item_id = item.id AND chunk.version_id = activation.version_id)
+      AND item.agent_key = 'sav' AND item.slug <> 'sav-master-playbook' AND item.type = 'article' AND item.status <> 'archived'
+      AND item.ai_enabled = true AND item.published_version_id IS NOT NULL AND item.locale = ${locale}
+      AND COALESCE(version.metadata -> 'resolution' ->> 'audience', 'support') = ${audience}
+      AND ${VERIFICATION} >= ${new Date(now.getTime() - 90 * 86_400_000).toISOString()}::timestamptz
+      AND ${VERIFICATION} <= ${now.toISOString()}::timestamptz
+      AND item.verified_at <= ${now.toISOString()}::timestamptz
+    ORDER BY title
+    LIMIT ${SAV_RETRIEVAL_EXACT_READ_MAX}
+  `);
+  return rowsOf(response).map(row => ({ id: String(row.id), title: String(row.title), slug: String(row.slug) }));
+}
