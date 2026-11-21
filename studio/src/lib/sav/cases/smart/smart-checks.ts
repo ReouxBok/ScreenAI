@@ -13,7 +13,7 @@ import type { SmartAcademyEvidence } from "./smart-tools";
  * Agent SAV intelligent, lot D3, server part (20/11): the checks WITHOUT any model on one decision. Pure: no model, network, database or clock.
  * They cannot be talked out of by the prompt nor by the counter-read: any code here refuses the reply (a lying counter-read changes nothing).
  *
- *   facts      each sentence is in the reply; each card fact cites a card retrieved FOR THAT NEED (id + version) and its excerpt is in the card
+ *   facts      each card fact cites a card retrieved FOR THAT NEED (id + version) and its excerpt is in the card
  *              word for word; a customer fact's excerpt is in the customer's own text; a fact about another vendor has no source in this scope;
  *   links      every link or domain of the reply comes from the resources or from a card given for the mail;
  *   platform   a sentence inviting to sign up / switch / use another product, or praising a named third party, is refused even without a link
@@ -183,118 +183,64 @@ function linksOf(text: string) {
 }
 
 /*
- * SAV-122 (bench 21/11 v7: sujet-03, sujet-05 refused twice on `fact_sentence_missing`): a fact's sentence must be IN the reply, but its form
- * may differ from the list line it was written in: the model writes the fact « Partagez le fichier… . » (capital, final period) while the
- * reply's numbered step reads « 1. Partagez le fichier… » without a period, or the reverse case. Same words, same order: the sentence is
- * there. Compared without list marker, final punctuation or case; a sentence absent from the reply is still refused.
+ * The comparison of an excerpt with its source: no list number, no final punctuation, and the case of the FIRST letter only (PORTE 2E, P2:
+ * « AbC123 » is not « abc123 », a value the customer must copy stays exact).
  */
 const sentenceKey = (value: string) => normalizeSavEvidenceText(value).replace(/^(?:\d+[.)]|[-•*])\s+/, "").replace(/[\s.!?;:…]+$/u, "").trim();
-/**
- * PORTE 2E (P2): only the FIRST letter's case is ignored (a sentence starts with a capital, a step inside a sentence does not). The rest keeps
- * its case: « AbC123 » is not « abc123 », a value the customer must copy stays exact.
- */
 const firstLetterForms = (key: string) => key ? [...new Set([key, key.charAt(0).toLocaleLowerCase("fr") + key.slice(1), key.charAt(0).toLocaleUpperCase("fr") + key.slice(1)])] : [];
-export function smartFactSentenceInReply(reply: string, sentence: string): boolean {
-  const text = normalizeSavEvidenceText(reply), declaredNegations = negations(sentence);
-  // SAV-122 (fact binding): a declared sentence found INSIDE a reply sentence right after a negation (« Ne jamais | transmettre son mot de
-  // passe ») says the opposite of what the customer reads: not found, unless the declared sentence carries a negation itself.
-  const negatedBefore = (at: number) => {
-    const head = text.slice(0, at), start = Math.max(...[".", "!", "?", "\n"].map(mark => head.lastIndexOf(mark))) + 1;
-    return !declaredNegations && negations(head.slice(start).trim().split(/\s+/).slice(-3).join(" ")) !== "";
-  };
-  for (const form of new Set([normalizeSavEvidenceText(sentence), ...firstLetterForms(sentenceKey(sentence))].filter(Boolean)))
-    for (let at = text.indexOf(form); at >= 0; at = text.indexOf(form, at + 1)) if (!negatedBefore(at)) return true;
-  return false;
-}
-/** The facts whose sentence is not in the reply: given to the correction one by one, so it knows WHICH sentence to copy or to remove. */
 /**
- * SAV-122 (bench v7, pareil-02, plateforme-04-v2: `excerpt_not_found`): the same comparison defect as the fact sentence. A card's steps are
- * joined by line breaks without final punctuation and start with a capital, so an excerpt copied as « épingler l'extension via l'icône
- * puzzle. » or « 2. Recharger la page » was refused. The excerpt must STILL be in the source: only its list number, its final punctuation and
- * the case of its FIRST letter are ignored (PORTE 2E, P2), with the word boundaries of `savEvidenceContains` (no fuzzy match, no accent removal, no word dropped).
+ * SAV-122 (bench v7, pareil-02, plateforme-04-v2: `excerpt_not_found`): a card's steps are joined by line breaks without final punctuation
+ * and start with a capital, so an excerpt copied as « épingler l'extension via l'icône puzzle. » or « 2. Recharger la page » was refused.
+ * The excerpt must STILL be in the source: only its list number, its final punctuation and the case of its FIRST letter are ignored, with
+ * the word boundaries of `savEvidenceContains` (no fuzzy match, no accent removal, no word dropped).
  */
 export function smartExcerptInSource(source: string, excerpt: string): boolean {
   if (savEvidenceContains(source, excerpt)) return true;
   return firstLetterForms(sentenceKey(excerpt)).some(form => savEvidenceContains(source, form));
 }
-export const smartMissingFactSentences = (reply: string, facts: SmartDecision["facts"]) => facts.filter(fact => !smartFactSentenceInReply(reply, fact.sentence)).map(fact => fact.sentence);
-
-/**
- * SAV-122 diagnostic (bench v8: `fact_sentence_missing` / `fact_source_invalid` at the second pass, form unknown): CLOSED codes describing the
- * shape of each fact the final decision got wrong, never its text. `fact_sentence_form:split` (every clause of the sentence is in the reply,
- * cut apart), `:reworded` (most of its words are), `:absent`; `fact_shape:<type>:<sourceKind>:card_<y|n>:excerpt_<y|n>:need_<known|unknown>` for a fact that breaks
- * the `fact_source_invalid` rule.
- */
-/** The form of a fact sentence that is not in the reply (null when it is): cut apart, reworded, or absent. */
-export function smartFactSentenceForm(replyText: string, sentence: string): "split" | "reworded" | "absent" | null {
-  if (smartFactSentenceInReply(replyText, sentence)) return null;
-  const reply = normalizeSavEvidenceText(replyText).toLocaleLowerCase("fr");
-  const wordsOf = (value: string) => value.split(/[^\p{L}\p{N}']+/u).filter(word => word.length > 3);
-  const key = sentenceKey(sentence).toLocaleLowerCase("fr"), clauses = key.split(/[,;:]|\s(?:puis|et|ou)\s/).map(row => row.trim()).filter(row => row.split(/\s+/).length >= 2);
-  const words = wordsOf(key), present = words.filter(word => reply.includes(word)).length;
-  return clauses.length > 1 && clauses.every(row => reply.includes(row)) ? "split" : words.length && present / words.length >= 0.6 ? "reworded" : "absent";
-}
 
 /*
- * SAV-122 (bench v11: ~14 turns `refused_after_correction` + `fact_sentence_missing` twice, form `reworded`): the model declares in `facts`
- * a sentence that rewords the one it wrote in the reply, and does it again after the correction. The server BINDS such a fact to the real
- * sentence of the reply ONLY when both say the same words in the same order (PORTE 2G: a share of common words let « Contacts » / « Contrats »,
- * swapped roles, swapped delays and a moved negation through). The sequence of a sentence: its significant words (4+ letters) reduced to a
- * root (agreement endings dropped, first 5 letters), its numbers, and its negations, IN ORDER. Two sentences bind only with the SAME
- * sequence: only small words (articles, short prepositions), punctuation, the first letter's case and agreements may differ. A synonym is
- * never bound (it goes to the correction, the safe side). The real sentence then goes through every source check and the counter-read.
+ * SAV-122 (prod bench 21/11, 98 conversations: 12 turns `fact_source_invalid`, dominant shape `fait_limova:fiche:card_n:excerpt_y`, then
+ * `fait_limova:aucune:card_n:excerpt_y` and `fait_limova:academy:card_n:excerpt_y`): a Limova fact WITH its word-for-word excerpt but
+ * without the reference of its source (card id, version, or Academy call id). The server fills the reference ONLY when it is unambiguous:
+ * exactly one card retrieved FOR THAT NEED (or one Academy result of that need) contains the excerpt, or the named card has exactly one
+ * version retrieved for the need. The repaired fact then goes through every check unchanged (card retrieved for the need, excerpt in the
+ * source): nothing is weakened, only the model's missing label is filled. Zero or several candidates: left as is (refused).
  */
-const NEGATION = /(?:^|[^\p{L}])(n'|(?:ne|pas|jamais|aucun|aucune|sans|rien|non)(?=$|[^\p{L}]))/gu;
-const NEGATION_WORD = /^(?:ne|pas|jamais|aucun|aucune|sans|rien|non)$/;
-/** The negation words of a text (« n' » read as « ne »), sorted: used to see a negation just before a declared sentence. */
-const negations = (value: string) => [...fold(value).matchAll(NEGATION)].map(match => match[1] === "n'" ? "ne" : match[1]).sort().join("|");
-/**
- * The ordered sequence of a sentence: roots of its significant words, its numbers (#n) and its negations (!). PORTE 2G bis: the word or symbol
- * right after a number is its unit and is ALWAYS kept, exactly, without root (« 5 min » ≠ « 5 h » ≠ « 5 minutes », « 10 € » ≠ « 10 % »),
- * attached or not (« 5min », « 10€ »).
- */
-export function smartFactSequence(value: string): string[] {
-  const tokens = fold(value).replace(/(^|[^\p{L}])n'/gu, "$1ne ").match(/\d+(?:[.,]\d+)?|\p{L}+|[^\s\p{L}\p{N}.,;:!?'"«»()[\]{}\-–—/]/gu) ?? [];
-  const out: string[] = [];
-  for (let index = 0; index < tokens.length; index++) {
-    const word = tokens[index]!;
-    if (/^\d/.test(word)) {
-      out.push(`#${word}`);
-      const unit = tokens[index + 1];
-      if (unit !== undefined && !/^\d/.test(unit)) { out.push(`@${unit}`); index++; }
-    } else if (NEGATION_WORD.test(word)) out.push("!");
-    else if (/^\p{L}{4,}$/u.test(word)) out.push(word.replace(/(?:es|s|e|x)$/, "").slice(0, 5));
-  }
-  return out;
-}
-/** The sentence of the reply a declared fact sentence may be bound to (same sequence, at least 3 significant words), or null. */
-export function smartBindableSentence(replyText: string, sentence: string): string | null {
-  const wanted = smartFactSequence(sentence);
-  if (wanted.filter(item => !item.startsWith("#") && !item.startsWith("@") && item !== "!").length < 3) return null;
-  const key = wanted.join(" ");
-  return sentencesOf(replyText).map(row => row.replace(/^(?:\d+[.)]|[-•*])\s+/, "")).find(candidate => smartFactSequence(candidate).join(" ") === key) ?? null;
-}
-/** The decision with each reworded fact sentence replaced by the real sentence of the reply it binds to; `bound` counts them. */
-export function smartBindFactSentences(decision: SmartDecision): { decision: SmartDecision; bound: number } {
-  const reply = decision.reply?.trim() ?? "";
-  if (!reply) return { decision, bound: 0 };
-  let bound = 0;
+export function smartRepairFactSources(decision: SmartDecision, sources: readonly SmartSource[], academy: readonly SmartAcademyEvidence[] = []): { decision: SmartDecision; repaired: number } {
+  let repaired = 0;
   const facts = decision.facts.map(fact => {
-    if (smartFactSentenceInReply(reply, fact.sentence)) return fact;
-    const real = smartBindableSentence(reply, fact.sentence);
-    if (!real) return fact;
-    bound++;
-    return { ...fact, sentence: real };
+    if (fact.type !== "fait_limova" && fact.type !== "fait_temporaire") return fact;
+    const excerpt = fact.excerpt?.trim();
+    if (!excerpt || fact.sourceKind === "client") return fact;
+    if (fact.sourceKind === "fiche" && fact.cardId && fact.version) return fact;
+    if (fact.sourceKind === "academy" && fact.toolCallId) return fact;
+    const forNeed = sources.filter(source => source.needIds.includes(fact.needId));
+    if (fact.sourceKind === "fiche" && fact.cardId) {
+      const versions = forNeed.filter(source => source.cardId === fact.cardId);
+      if (versions.length !== 1 || !smartExcerptInSource(cardText(versions[0]!), excerpt)) return fact;
+      repaired++;
+      return { ...fact, version: versions[0]!.version };
+    }
+    const cards = forNeed.filter(source => smartExcerptInSource(cardText(source), excerpt));
+    const calls = academy.filter(row => row.needId === fact.needId && smartExcerptInSource(row.text, excerpt));
+    if (cards.length + calls.length !== 1) return fact;
+    repaired++;
+    return cards.length
+      ? { ...fact, sourceKind: "fiche" as const, cardId: cards[0]!.cardId, version: cards[0]!.version, toolCallId: null }
+      : { ...fact, sourceKind: "academy" as const, toolCallId: calls[0]!.callId, cardId: null, version: null };
   });
-  return { decision: bound ? { ...decision, facts } : decision, bound };
+  return { decision: repaired ? { ...decision, facts } : decision, repaired };
 }
 
+/**
+ * SAV-122 diagnostic: CLOSED codes describing the shape of each fact that breaks the `fact_source_invalid` rule, never its text:
+ * `fact_shape:<type>:<sourceKind>:card_<y|n>:excerpt_<y|n>:need_<known|unknown>`.
+ */
 export function smartFactDiagnostics(decision: SmartDecision | null, needIds: readonly string[]): string[] {
   if (!decision) return [];
-  const original = decision.reply?.trim() ?? "", out: string[] = [];
+  const out: string[] = [];
   for (const fact of decision.facts) {
-    const form = smartFactSentenceForm(original, fact.sentence);
-    if (form) out.push(`fact_sentence_form:${form}`);
     // The shape rule of `fact_source_invalid` (smartServerChecks), mirrored: only a fact that breaks it is described.
     const known = needIds.includes(fact.needId), excerpt = Boolean(fact.excerpt?.trim()), limova = fact.type === "fait_limova" || fact.type === "fait_temporaire";
     const invalid = !known || (limova && fact.sourceKind === "academy" && (!fact.toolCallId || !excerpt))
@@ -340,30 +286,34 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   // Facts and their sources.
   const cited = new Map<string, SmartSource>(), citedAcademy = new Map<string, SmartAcademyEvidence>();
   const factProblems: Array<{ code: SmartCheckCode; sentence: string }> = [];
+  // The fact named to the correction: its sentence hint, else its excerpt (the sentence is optional since SAV-122).
+  const factLabel = (fact: SmartDecision["facts"][number]) => fact.sentence.trim() || (fact.excerpt?.trim() ? `extrait : « ${fact.excerpt.trim()} »` : `fait du besoin ${fact.needId}`);
   const flag = (code: SmartCheckCode, sentence: string) => { codes.add(code); factProblems.push({ code, sentence: String(sentence ?? "").slice(0, 300) }); };
   for (const fact of decision.facts) {
-    if (!needIds.has(fact.needId)) { flag("fact_source_invalid", fact.sentence); continue; }
-    if (!smartFactSentenceInReply(reply, fact.sentence)) flag("fact_sentence_missing", fact.sentence);
-    if (fact.type === "fait_tiers") { flag("third_party_fact_unsourced", fact.sentence); continue; }
+    // SAV-122 (prod bench 21/11): no `fact_sentence_missing` any more. It only checked that a DECLARED fact's sentence was copied into the
+    // reply (never an undeclared invention) and refused good replies the model had reworded. A fact's `sentence` is a hint for the
+    // counter-read; the excerpt in its source, the card retrieved for the need and the counter-read's `unlisted_claim` / `source_mismatch` stay.
+    if (!needIds.has(fact.needId)) { flag("fact_source_invalid", factLabel(fact)); continue; }
+    if (fact.type === "fait_tiers") { flag("third_party_fact_unsourced", factLabel(fact)); continue; }
     if ((fact.type === "fait_limova" || fact.type === "fait_temporaire") && fact.sourceKind === "academy") {
       const evidence = (input.academy ?? []).find(row => row.callId === fact.toolCallId);
-      if (!fact.toolCallId || !fact.excerpt?.trim()) { flag("fact_source_invalid", fact.sentence); continue; }
-      if (!evidence || evidence.needId !== fact.needId) { flag("card_not_retrieved_for_need", fact.sentence); continue; }
+      if (!fact.toolCallId || !fact.excerpt?.trim()) { flag("fact_source_invalid", factLabel(fact)); continue; }
+      if (!evidence || evidence.needId !== fact.needId) { flag("card_not_retrieved_for_need", factLabel(fact)); continue; }
       citedAcademy.set(evidence.callId, evidence);
-      if (!smartExcerptInSource(evidence.text, fact.excerpt)) flag("excerpt_not_found", fact.sentence);
+      if (!smartExcerptInSource(evidence.text, fact.excerpt)) flag("excerpt_not_found", factLabel(fact));
       continue;
     }
     if (fact.type === "fait_limova" || fact.type === "fait_temporaire") {
-      if (fact.sourceKind !== "fiche" || !fact.cardId || !fact.version || !fact.excerpt?.trim()) { flag("fact_source_invalid", fact.sentence); continue; }
+      if (fact.sourceKind !== "fiche" || !fact.cardId || !fact.version || !fact.excerpt?.trim()) { flag("fact_source_invalid", factLabel(fact)); continue; }
       const source = input.sources.find(row => row.cardId === fact.cardId && row.version === fact.version);
-      if (!source || !source.needIds.includes(fact.needId)) { flag("card_not_retrieved_for_need", fact.sentence); continue; }
+      if (!source || !source.needIds.includes(fact.needId)) { flag("card_not_retrieved_for_need", factLabel(fact)); continue; }
       cited.set(`${source.cardId}:${source.version}`, source);
-      if (!smartExcerptInSource(cardText(source), fact.excerpt)) flag("excerpt_not_found", fact.sentence);
+      if (!smartExcerptInSource(cardText(source), fact.excerpt)) flag("excerpt_not_found", factLabel(fact));
       continue;
     }
     if (fact.type === "dit_par_le_client") {
-      if (fact.sourceKind !== "client" || !fact.excerpt?.trim()) { flag("fact_source_invalid", fact.sentence); continue; }
-      if (!smartExcerptInSource(input.customerText, fact.excerpt)) flag("excerpt_not_found", fact.sentence);
+      if (fact.sourceKind !== "client" || !fact.excerpt?.trim()) { flag("fact_source_invalid", factLabel(fact)); continue; }
+      if (!smartExcerptInSource(input.customerText, fact.excerpt)) flag("excerpt_not_found", factLabel(fact));
       continue;
     }
     // conseil: no source by definition; a source given to advice is ignored.

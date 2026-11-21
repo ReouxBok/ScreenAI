@@ -6,7 +6,7 @@ import { SMART_CONFORME, smartGoodDecision, smartReading, smartScriptedModel, sm
 
 /*
  * SAV-122 (bench 21/11 v8): `fact_source_invalid` at the second pass (expiree-01, autreoutil-06), `fact_sentence_missing` at the second pass
- * (expiree-05). Proven defect: the correction received `fact_source_invalid` with an EMPTY sentence, so it could not know which fact to fix.
+ * (expiree-05; that refusal is gone since SAV-122, prod bench). Proven defect: the correction received `fact_source_invalid` with an EMPTY sentence, so it could not know which fact to fix.
  * The form that escaped is not provable offline (the bench stores no text): closed diagnostic codes now say it. Fictional texts only.
  */
 const run = (script: SmartScript, input: SmartTurnInput) => {
@@ -40,12 +40,9 @@ describe("fact_source_invalid : la correction sait maintenant QUEL fait réparer
 describe("diagnostic fermé de la forme du fait raté (jamais son texte)", () => {
   const decision = (reply: string, facts: unknown[]) => smartGoodDecision({ reply, facts }) as Parameters<typeof smartFactDiagnostics>[0];
   const fact = (sentence: string, extra: Record<string, unknown> = {}) => ({ sentence, needId: "n1", type: "conseil", sourceKind: "aucune", cardId: null, version: null, excerpt: null, ...extra });
-  it("split : chaque morceau est dans la réponse, séparé ; reworded : la plupart des mots ; absent", () => {
-    const reply = "Bonjour,\n1. Ouvrez Charly Max > Canaux > WhatsApp > « Relier un numéro »\n2. Scannez le QR code avec WhatsApp Business\nBelle journée.";
-    expect(smartFactDiagnostics(decision(reply, [fact("Ouvrez Charly Max > Canaux > WhatsApp > « Relier un numéro », puis scannez le QR code avec WhatsApp Business.")]), ["n1"])).toEqual(["fact_sentence_form:split"]);
-    expect(smartFactDiagnostics(decision(reply, [fact("Scannez ensuite le QR code depuis WhatsApp Business.")]), ["n1"])).toEqual(["fact_sentence_form:reworded"]);
-    expect(smartFactDiagnostics(decision(reply, [fact("Le plan Pro vous est offert.")]), ["n1"])).toEqual(["fact_sentence_form:absent"]);
-    expect(smartFactDiagnostics(decision(reply, [fact("Scannez le QR code avec WhatsApp Business.")]), ["n1"])).toEqual([]);
+  it("SAV-122 : la forme de la phrase d'un fait n'est plus diagnostiquée (elle n'est qu'un indice, jamais comparée à la réponse)", () => {
+    const reply = "Bonjour,\n1. Ouvrez Charly Max > Canaux > WhatsApp > « Relier un numéro »\nBelle journée.";
+    expect(smartFactDiagnostics(decision(reply, [fact("Le plan Pro vous est offert.")]), ["n1"])).toEqual([]);
   });
   it("fact_shape : seul un fait qui casse la règle de fact_source_invalid est décrit", () => {
     const reply = `Bonjour. ${SENTENCE}`;

@@ -1,5 +1,5 @@
 import { savReplyFooter } from "../../reply-format";
-import { smartBindFactSentences, smartFactSentenceForm, smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
+import { smartRepairFactSources, smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
 import {
   parseSmartOutput, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchema,
   type SmartCallKind, type SmartCheckCode, type SmartDecision, type SmartReading, type SmartTeamNote, type SmartTurnOutcome, type SmartVerdict,
@@ -253,8 +253,9 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     coverage: reading!.needs.map(need => ({ needId: need.id, status: "handed" as const })),
     teamNote: smartFallbackNote({ reason, reading, memory: memoryBefore, modelNote: current.teamNote }), facts: [],
   });
-  // SAV-122 (bench v11): a fact sentence that rewords a sentence of the reply is bound to the real one (smartBindFactSentences), then checked.
-  const bind = (current: SmartDecision) => { const done = smartBindFactSentences(current); if (done.bound) reasons.push("facts:bound"); return done.decision; };
+  // SAV-122 (prod bench 21/11, fact_source_invalid): a Limova fact with its excerpt but no source reference gets it when exactly one source
+  // retrieved for its need holds the excerpt; every check then runs unchanged. The reply itself is never touched.
+  const bind = (current: SmartDecision) => { const done = smartRepairFactSources(current, sources, academy); if (done.repaired) reasons.push("facts:source_repaired"); return done.decision; };
   decision = bind(decision);
   if (gate.mustHandOff && decision.outcome !== "handoff") decision = forceHandoff(decision, "trop_d_echanges");
   const tentative = smartMergeMemory({ memory: memoryBefore, decision, reading, latestCustomerText, recordOwn: false });
@@ -270,7 +271,9 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     const read = await call(kind, smartVerifyPrompt(), {
       customer: { subject: customer.subject, mail: customer.mail },
       needs: reading!.needs.map(need => ({ id: need.id, ask: need.ask, alreadyDone: need.alreadyDone })),
-      reply: current.reply, facts: current.facts.map(fact => ({ sentence: fact.sentence, type: fact.type, excerpt: fact.excerpt })),
+      // Each fact with its source and excerpt; its sentence is only a hint (SAV-122): the counter-read judges every claim against the excerpts.
+      reply: current.reply, facts: current.facts.map(fact => ({ type: fact.type, source: fact.cardId ?? fact.toolCallId ?? fact.sourceKind, excerpt: fact.excerpt,
+        ...(fact.sentence.trim() ? { sentence: fact.sentence } : {}) })),
       ...(reading!.instructionText ? { injectedInstruction: reading!.instructionText } : {}),
     }, 0);
     if (read.status === "failed") return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: read.problem === "deadline" ? "deadline" : `${kind}:${read.problem}` };
@@ -292,13 +295,10 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   if (!refused(first)) return accepted(decision);
 
   // 4 bis. One correction, with every problem found (server codes and the counter-read's). No tool any more.
-  // SAV-122: a fact-level problem (missing sentence, invalid source, excerpt not found, card not retrieved, third-party fact) is named, one
+  // SAV-122: a fact-level problem (invalid source, excerpt not found, card not retrieved, third-party fact) is named, one
   // problem per fact sentence, so the correction knows WHICH fact to fix or drop (bench v8: fact_source_invalid came back at the second pass).
   const named = (code: SmartCheckCode) => [...new Set(first.factProblems.filter(row => row.code === code && row.sentence.trim()).map(row => row.sentence))].slice(0, 10);
-  // A declared sentence with no equivalent in the reply (form « absent »): the fix is to drop that fact, not to rewrite the reply.
-  const fix = (code: SmartCheckCode, sentence: string) => code === "fact_sentence_missing" && smartFactSentenceForm(decision!.reply?.trim() ?? "", sentence) === "absent"
-    ? { fix: "retire ce fait de facts : il n'est pas dans la réponse" } : {};
-  const problems = [...first.codes.flatMap(code => named(code).length ? named(code).map(sentence => ({ code, sentence, ...fix(code, sentence) })) : [{ code, sentence: "" }]),
+  const problems = [...first.codes.flatMap(code => named(code).length ? named(code).map(sentence => ({ code, sentence })) : [{ code, sentence: "" }]),
     ...(first.verdict?.problems ?? [])];
   corrected = true;
   const fixed = await call("correct", smartCorrectionPrompt(), { ...lastPayload, tools: [], lastStep: true, previousDecision: decision, problems }, 0.3);
