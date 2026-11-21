@@ -1,0 +1,58 @@
+/* Side panel « Connexions » section and activity banner (TEAM-724). */
+.team-panel { position: absolute; inset: 0; z-index: 110; background: #fff; padding: 28px 22px; overflow: auto; display: flex; flex-direction: column; gap: 12px; }
+.team-panel[hidden] { display: none; }
+.team-kicker { align-self: flex-start; display: inline-flex; background: #F3EDFF; color: #5B21B6; border-radius: 999px; padding: 5px 9px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+.team-panel h2 { font-size: 24px; line-height: 1.05; letter-spacing: -.04em; }
+.team-panel h3 { font-size: 13px; margin-top: 8px; }
+.team-panel > p { font-size: 13px; color: var(--color-gray-500); }
+.team-feedback { min-height: 18px; font-size: 12px; color: #246648; }
+.team-products { display: grid; gap: 12px; }
+.team-card { --product: #7C3AED; border: 1px solid var(--color-gray-200); border-left: 4px solid var(--product); border-radius: 12px; padding: 14px; display: grid; gap: 10px; background: #fff; }
+.team-card-head { display: flex; align-items: center; gap: 8px; }
+.team-card-title { font-size: 15px; flex: 1; }
+.team-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--product); }
+.team-status { font-size: 11px; font-weight: 700; border-radius: 999px; padding: 3px 8px; background: var(--color-gray-100); color: var(--color-gray-600); }
+.team-status-online { background: #E4F8DE; color: #235C43; }
+.team-status-connecting { background: #FFF3D8; color: #8A5600; }
+.team-status-disabled, .team-status-replaced, .team-status-offline { background: #FEE4DF; color: #9A2F22; }
+.team-muted { font-size: 12px; color: var(--color-gray-500); }
+.team-paused { font-size: 12px; font-weight: 600; color: #8A5600; }
+.team-field { display: grid; gap: 5px; }
+.team-field-label { font-size: 11px; font-weight: 700; }
+.team-select { width: 100%; border: 1px solid var(--color-gray-300); border-radius: 9px; padding: 9px 10px; font: 13px var(--font-family); background: #fff; }
+.team-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.team-primary, .team-secondary, .team-stop-all { flex: 1; border: 0; border-radius: 9px; padding: 10px 12px; font: 600 13px var(--font-family); cursor: pointer; }
+.team-primary { background: var(--color-dark); color: #fff; }
+.team-secondary { background: var(--color-gray-100); color: var(--color-dark); border: 1px solid var(--color-gray-200); }
+.team-stop-all { flex: none; width: 100%; background: #FEE4DF; color: #9A2F22; }
+.team-stop-all[hidden] { display: none; }
+.team-link-danger { justify-self: start; border: 0; background: transparent; color: #9A2F22; font: 600 12px var(--font-family); cursor: pointer; padding: 2px 0; }
+.team-activity { list-style: none; display: grid; gap: 6px; }
+.team-activity-item { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; font-size: 12px; }
+.team-activity-item.is-failed .team-activity-label { color: #9A2F22; }
+.team-activity-domain { grid-column: 2; font-size: 11px; color: var(--color-gray-500); }
+.team-time { font-size: 11px; color: var(--color-gray-500); font-variant-numeric: tabular-nums; }
+.team-banner { --product: #7C3AED; display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #F5F0FF; border-bottom: 1px solid var(--color-gray-200); font-size: 12px; }
+.team-banner[hidden] { display: none; }
+.team-banner-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--product); animation: team-pulse 1.4s ease-in-out infinite; }
+.team-banner-text { flex: 1; font-weight: 600; }
+.team-banner-btn { border: 1px solid var(--color-gray-300); background: #fff; border-radius: 7px; padding: 4px 8px; font: 600 11px var(--font-family); cursor: pointer; }
+.team-banner-btn.danger { color: #9A2F22; border-color: #F4C7BE; }
+.team-panel button:focus-visible, .team-banner button:focus-visible, .team-select:focus-visible { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 2px; }
+@keyframes team-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .team-banner-dot { animation: none; } }
+
+/* TEAM-726: home screen product picker, above Charly's sign-in and the Team panel. */
+.product-picker { position: absolute; inset: 0; z-index: 120; display: grid; place-items: center; padding: 24px; background: radial-gradient(circle at 50% 10%, #F3EDFF 0, var(--color-gray-50) 46%); overflow: auto; }
+.product-picker[hidden] { display: none; }
+.product-picker-card { width: min(100%, 360px); display: flex; flex-direction: column; gap: 10px; padding: 28px 24px; border: 1px solid var(--color-gray-200); border-radius: 16px; background: #fff; box-shadow: 0 18px 45px rgba(29, 29, 30, .10); }
+.product-picker-card h1 { font-size: 24px; line-height: 1.1; letter-spacing: -.04em; }
+.product-picker-card > p { font-size: 13px; color: var(--color-gray-500); margin-bottom: 6px; }
+.product-choice { display: grid; gap: 3px; text-align: left; border: 1px solid var(--color-gray-200); border-left: 4px solid var(--color-dark); border-radius: 12px; padding: 14px; background: #fff; cursor: pointer; font-family: var(--font-family); }
+.product-choice strong { font-size: 15px; }
+.product-choice span { font-size: 12px; color: var(--color-gray-500); }
+.product-choice:hover { background: var(--color-gray-50); }
+.product-choice-team { border-left-color: #7C3AED; }
+.product-choice:focus-visible, .team-link-muted:focus-visible { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 2px; }
+.team-link-muted { align-self: flex-start; border: 0; background: transparent; color: var(--color-gray-500); font: 600 12px var(--font-family); cursor: pointer; padding: 2px 0; margin-top: 4px; }
+.training-close[hidden] { display: none; }

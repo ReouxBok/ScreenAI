@@ -44,10 +44,37 @@ Le schéma privé `charly_memory` stocke les profils, sessions, messages, résum
 
 `src/utils/analytics.js` met en file les événements d’usage du service worker (persistés dans `chrome.storage.session`, envoyés par lots au proxy sur `/api/events`). Le proxy (`proxy/analytics.js`) applique une liste blanche, rattache le compte OTP vérifié (`$identify` de l’identifiant d’installation) et transmet à PostHog UE. Il émet aussi des événements serveur (`server_*`) sur les routes copilote, voix, connaissances et OTP. `chrome.runtime.setUninstallURL` pointe vers `/api/uninstalled`. L’opt-out du menu coupe les deux sources. Détails : `docs/PRIVACY.md`.
 
+## Limova Team dans Chrome (TEAM-724)
+
+L’extension est aussi un « appareil navigateur » de Limova Team : l’agent de Limova Team, qui tourne dans le cloud, peut lire et agir dans le Chrome de la personne qui lui écrit. Le contrat est `docs/browser-device-protocol.md` du dépôt team-backend ; le résumé est dans `docs/LIMOVA_TEAM.md`. Tout le code vit dans `src/team/` ; `background.js` ne fait que créer le service et lui transmettre les messages `TEAM_*`.
+
+```text
+Panneau « Connexions » ── TEAM_* ──► team-service.js ── une connexion par produit
+                                       │
+             connections.js (jeton lmd_, autonomie, pause) ── chrome.storage.local
+             device-socket.js ── wss://api.team.limova.ai/api/v1/devices/me/socket
+                                       │ call / set_autonomy / browser_control
+             team-controller.js (autonomie, approbations, prise de main, Tout arrêter)
+                                       │
+             browser-engine.js (groupe d’onglets « Limova Team ») ── chrome.scripting
+                                       │
+             page-snapshot.js / page-actions.js (monde isolé de l’onglet)
+```
+
+- **Un moteur, une connexion par produit.** `products.js` fixe la liste des produits et de leurs origines (production, préproduction) ; aucune URL arbitraire n’est acceptée. Chaque produit a son jeton, son identifiant d’appareil, son groupe d’onglets et sa couleur. « Limova » s’ajoutera comme second produit sans voir les onglets de Limova Team.
+- **Appairage PKCE** (`pairing.js`, `pair-callback.html`) : vérificateur et `state` dans `chrome.storage.session`, onglet normal sur le tableau de bord, retour sur une page de l’extension accessible seulement depuis les deux origines du tableau de bord, échange du code contre le jeton par le service worker.
+- **Socket** : le jeton voyage comme second sous-protocole WebSocket, jamais dans l’URL. Ping toutes les 25 s, reconnexion exponentielle (1 s → 60 s), alarme `chrome.alarms` chaque minute après un redémarrage du service worker, résultats en cache 10 minutes par `call_id`.
+- **Carte de page dans le monde isolé.** `chrome.scripting.executeScript` injecte des fonctions autonomes ; la carte `e1…` et ses éléments restent dans le monde isolé de l’extension, jamais en attributs dans la page. Un identifiant n’est valable qu’avec son `snapshot_id`, et l’élément vivant doit toujours porter le nom annoncé (`target`), sinon `stale_snapshot`.
+- **Risque** (`risk.js`) : l’extension relit le risque sur l’élément vivant et garde la lecture la plus stricte entre celle du serveur et la sienne. LinkedIn, `lnkd.in`, le tableau de bord et l’API de Limova Team sont refusés (`blocked_site`) ; un champ sensible n’est jamais rempli (`sensitive_field`).
+- **`browser.v2` (TEAM-726) : plus de fenêtre d’accord, sauf pour payer.** Les actions s’exécutent quel que soit le niveau d’autonomie ; les confirmations voulues par la personne se font dans le chat, décidées par le serveur à partir de ce niveau. Seul un paiement (`pay`, lu par le serveur ou par l’extension) ouvre la petite fenêtre Chrome (`approval.html`, qui ne reçoit qu’un identifiant opaque dans son URL). `set_autonomy` s’applique tout de suite, sans fenêtre ; une nouvelle connexion démarre en « Accès complet ». « Prendre la main », « Rendre la main » et « Tout arrêter » sont dans le panneau ; le badge affiche « IA » pendant une action et « ⏸ » pendant une prise de main.
+- **Moins d’étapes** : `include_page: true` sur les actions renvoie la carte de page (`data.page`, même contenu que `read_page`) une fois la page stabilisée, et `browser.batch` enchaîne jusqu’à 20 saisies, choix, cases et clics sur un même instantané, vérifiés avant le premier. Les attentes suivent les événements de l’onglet et le calme du DOM plutôt que des délais fixes (plafond de 20 s pour une navigation).
+- **Accueil** : le panneau demande d’abord « Limova » (Charly, inchangé) ou « Limova Team » (un bouton « Se connecter »). Les versions publiques ne parlent qu’à la production ; une version de test pour la préproduction se construit avec `LIMOVA_TEAM_ENV=staging npm run build`, et le réglage développeur `limova_team_developer_v1` affiche le choix d’environnement.
+- **Captures** : onglet mis au premier plan, `captureVisibleTab`, champs masqués et repères `#eN` dessinés par `renderSilentVisualCapture` (partagé avec Charly) dans un `OffscreenCanvas`, au plus 1,5 Mo, jamais stockés.
+
 ## Sécurité et confidentialité
 
 - Consentement IA affirmatif et distinct.
-- Permissions et hôtes limités au fonctionnement déclaré ; aucune permission supplémentaire ajoutée en 2.2.44.
+- Permissions et hôtes limités au fonctionnement déclaré ; aucune permission supplémentaire ajoutée en 2.2.44. TEAM-724 ajoute `tabGroups` (le groupe d’onglets de Limova Team) et `alarms` (reconnexion après un redémarrage du service worker), et Chrome 116 au minimum ; aucun hôte nouveau.
 - CSP sans script inline, `unsafe-eval` ou code distant.
 - Clés Gemini uniquement sur le proxy.
 - Payloads JSON bornés, rate limiting, idempotence et identifiants de requête.

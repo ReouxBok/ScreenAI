@@ -23,6 +23,26 @@ L’extension n’envoie jamais de mot de passe, clé API, valeur de formulaire 
 
 Le modèle ne peut fournir que l’identifiant numérique d’un élément cartographié localement. Aucun sélecteur, script, clic par coordonnées ni URL distant n’est exécuté. L’envoi d’un message nécessite une demande explicite associée au bouton exact. Le membre choisit dans le panneau « Demander une approbation », « Approuver pour moi » (par défaut) ou « Accès complet ». Le niveau est conservé localement et communiqué à la session IA pour adapter son comportement. Selon ce niveau et le risque, une action attend un accord dans le panneau ou à la voix avant de poursuivre ; une cible ambiguë entraîne une nouvelle observation puis une clarification. Les approbations en attente restent en mémoire, expirent après cinq minutes et sont annulées si la consigne change ou si la session s’arrête. Charly vérifie à nouveau la page avant d’exécuter une action approuvée.
 
+## Limova Team dans Chrome (TEAM-724)
+
+Ce traitement n’a lieu que si la personne choisit « Limova Team » sur l’écran d’accueil du panneau (ou « Connexions » dans le menu), clique sur « Se connecter » et se connecte au tableau de bord de Limova Team. Depuis TEAM-726, cette connexion vaut accord pour agir : le tableau de bord approuve l’extension Limova sans écran supplémentaire. L’extension ne demande ensuite plus d’accord avant une action, sauf pour un paiement ; elle ne saisit jamais de mot de passe, de numéro de carte ni de code. Il s’arrête avec « Déconnecter », qui révoque le jeton sur le serveur, ou quand le tableau de bord révoque l’appareil.
+
+Envoyé à l’API Limova Team (`api.team.limova.ai`, ou `api.staging.team.limova.ai` si la personne a choisi la préproduction), uniquement en réponse à une demande de l’agent et uniquement pour les onglets du groupe « Limova Team » (ou un onglet que la personne a choisi de partager) :
+
+- le titre, l’origine et le chemin de l’onglet (jamais la query string ni le fragment), l’adresse `https` de son icône ;
+- le texte visible de la page (au plus 20 000 caractères), sans le texte saisi dans les zones de saisie ;
+- la carte des éléments interactifs : rôle, nom visible, état `empty` / `filled` / `sensitive`, libellé de l’option choisie d’une liste, case cochée ou non ; jamais la valeur d’un champ ;
+- les textes cachés qui ressemblent à des consignes adressées à un assistant (pour la protection contre l’injection de consignes) ;
+- une capture JPEG de la zone visible, avec tous les champs masqués, uniquement quand l’agent la demande ; le serveur la fait décrire puis la supprime ;
+- le nombre d’autres onglets ouverts (un nombre, sans titre ni adresse) ;
+- ce que la page affiche après une action (alertes et messages de statut, au plus 5 lignes).
+
+Jamais envoyé : les valeurs des champs, les mots de passe, numéros de carte et codes (l’extension refuse de les saisir), les cookies, les onglets hors du groupe, le contenu des iframes.
+
+Conservé dans Chrome : dans `chrome.storage.local`, pour chaque produit connecté, le jeton d’appareil `lmd_…`, l’identifiant d’appareil, un identifiant de machine aléatoire, le nom affiché (« Chrome · macOS »), l’environnement, le niveau d’autonomie et la pause ; le produit choisi sur l’écran d’accueil (`limova_home_product_v1`) et, pour les développeurs seulement, le réglage `limova_team_developer_v1` ; dans `chrome.storage.session` (effacé à la fermeture de Chrome), le vérificateur PKCE et le `state` d’un appairage en cours, l’identifiant du groupe d’onglets et l’attente imposée par le serveur avant une reconnexion. L’adresse e-mail du compte (« Connecté en tant que … ») et la liste d’activité récente (domaine et libellé de l’action) restent en mémoire. Aucune capture, aucun DOM, aucun texte de page ni aucune valeur de champ n’est écrit dans `chrome.storage` ni dans les journaux.
+
+Justification des permissions ajoutées : `tabGroups` crée et nomme le groupe d’onglets « Limova Team », seul endroit où l’agent peut agir ; `alarms` reconnecte la connexion chaque minute après un redémarrage du service worker par Chrome. Aucun hôte n’est ajouté : les appels vers l’API Limova Team sont couverts par l’accès existant à tous les sites, et la CSP autorise explicitement ses deux origines `https` et `wss`.
+
 ## Cookies et statistiques d’utilisation
 
 L’extension ne lit, n’écrit et ne demande aucun cookie.
@@ -44,5 +64,6 @@ Le bouton « Vérifier Charly » contacte uniquement le endpoint public `/health
 - Mentionner PostHog (UE) comme sous-traitant des statistiques d’utilisation dans la politique publique.
 - Décrire Google Gemini et OpenAI comme prestataires de traitement et aligner la politique publique sur les flux ci-dessus.
 - Cocher l’engagement Limited Use et ne pas utiliser les données pour la publicité ou le scoring.
-- Fournir une justification distincte pour `storage`, `scripting`, `webNavigation`, `sidePanel` et les deux hôtes déclarés (application Limova et proxy IA). L’extension ne demande pas la permission sensible `tabs` ; l’authentification est appelée dans le contexte isolé de la page Limova.
+- Fournir une justification distincte pour `storage`, `scripting`, `webNavigation`, `sidePanel`, `tabGroups`, `alarms` et les deux hôtes déclarés (application Limova et proxy IA).
+- Mentionner Limova Team comme destinataire des données de page décrites ci-dessus, uniquement après connexion explicite. L’extension ne demande pas la permission sensible `tabs` ; l’authentification est appelée dans le contexte isolé de la page Limova.
 - Vérifier la suppression/rétention dans les contrats et journaux du proxy avant publication.

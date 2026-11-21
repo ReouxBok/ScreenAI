@@ -32,11 +32,14 @@ try {
 
 if (manifest.manifest_version !== 3) failures.push('manifest_version must be 3');
 if (!/^\d+\.\d+\.\d+(?:\.\d+)?$/.test(manifest.version || '')) failures.push('version is invalid');
-if (Number.parseInt(manifest.minimum_chrome_version, 10) < 114) {
-  failures.push('minimum_chrome_version must cover the Side Panel API (114+)');
+if (Number.parseInt(manifest.minimum_chrome_version, 10) < 116) {
+  // 114 for the Side Panel API; 116 keeps the service worker alive while the
+  // Limova Team WebSocket exchanges messages (TEAM-724).
+  failures.push('minimum_chrome_version must be 116 or later');
 }
 
-const expectedPermissions = ['activeTab', 'sidePanel', 'storage', 'scripting', 'webNavigation'];
+// tabGroups: the Limova Team tab group; alarms: reconnect after a worker restart (TEAM-724).
+const expectedPermissions = ['activeTab', 'sidePanel', 'storage', 'scripting', 'webNavigation', 'tabGroups', 'alarms'];
 const actualPermissions = [...(manifest.permissions || [])].sort();
 if (JSON.stringify(actualPermissions) !== JSON.stringify([...expectedPermissions].sort())) {
   failures.push(`permissions must stay least-privilege: ${expectedPermissions.join(', ')}`);
@@ -63,6 +66,17 @@ if (!extensionCsp.includes('connect-src') || !extensionCsp.includes('https://ver
 }
 if (/unsafe-(?:eval|inline)/.test(extensionCsp)) failures.push('CSP must not allow unsafe-eval or unsafe-inline');
 if (!extensionCsp.includes('https://api.openai.com')) failures.push('CSP must allow GPT Live WebRTC negotiation');
+for (const origin of ['https://api.team.limova.ai', 'wss://api.team.limova.ai', 'https://api.staging.team.limova.ai', 'wss://api.staging.team.limova.ai']) {
+  if (!extensionCsp.includes(origin)) failures.push(`CSP must allow the Limova Team API (${origin})`);
+}
+// Only the pairing callback is web-accessible, and only from the Team dashboards.
+const expectedAccessible = JSON.stringify([{
+  resources: ['src/team/pair-callback.html'],
+  matches: ['https://app.team.limova.ai/*', 'https://staging.team.limova.ai/*']
+}]);
+if (JSON.stringify(manifest.web_accessible_resources || []) !== expectedAccessible) {
+  failures.push('web_accessible_resources must expose only src/team/pair-callback.html to the Limova Team dashboards');
+}
 const sidebarHtml = fs.readFileSync(path.join(target, 'src/sidebar/sidebar.html'), 'utf8');
 for (const script of ['voice.js', 'voice-openai.js', 'voice-thread.js']) {
   if (!sidebarHtml.includes(`src="${script}"`)) failures.push(`GPT Live release must load ${script}`);
