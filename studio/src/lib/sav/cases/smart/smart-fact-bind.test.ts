@@ -46,12 +46,12 @@ describe("rattachement d'un fait reformulé à la vraie phrase de la réponse", 
     // A declared sentence found right after a negation of the reply is not « in » it.
     expect(smartFactSentenceInReply(reply, "partagez votre mot de passe")).toBe(false);
   });
-  it("mesure gratuite sur les 1 334 keyFacts : reformulations légères acceptées, fausses toujours refusées", () => {
-    expect(smartBindMeasure()).toEqual({ total: 1334,
-      light: { article: { applicable: 731, accepted: 698, refused: 33 }, ponctuation: { applicable: 1334, accepted: 1330, refused: 4 },
-        premiere_lettre: { applicable: 1310, accepted: 1310, refused: 0 }, accord: { applicable: 1298, accepted: 1204, refused: 94 } },
-      wrong: { chiffre: { applicable: 114, accepted: 0, refused: 114 }, negation: { applicable: 1330, accepted: 0, refused: 1330 },
-        mot_change: { applicable: 1326, accepted: 0, refused: 1326 }, ordre: { applicable: 165, accepted: 0, refused: 165 } } });
+  it("mesure gratuite sur les 1 294 keyFacts : reformulations légères acceptées, fausses toujours refusées", () => {
+    expect(smartBindMeasure()).toEqual({ total: 1294,
+      light: { article: { applicable: 715, accepted: 682, refused: 33 }, ponctuation: { applicable: 1294, accepted: 1290, refused: 4 },
+        premiere_lettre: { applicable: 1270, accepted: 1270, refused: 0 }, accord: { applicable: 1258, accepted: 1164, refused: 94 } },
+      wrong: { chiffre: { applicable: 114, accepted: 0, refused: 114 }, negation: { applicable: 1290, accepted: 0, refused: 1290 },
+        mot_change: { applicable: 1286, accepted: 0, refused: 1286 }, ordre: { applicable: 161, accepted: 0, refused: 161 } } });
   });
   it("PORTE 2G : les 4 contre-exemples d'Astra sont refusés (mot changé, rôles inversés, délais permutés, négation déplacée) ; un synonyme aussi", () => {
     for (const [declared, written] of [

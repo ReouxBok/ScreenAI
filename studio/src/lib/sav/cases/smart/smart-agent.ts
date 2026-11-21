@@ -156,7 +156,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const net = smartSafetyNet({ subject: input.subject, body: input.body });
   if (net.stop) return end("team_sensitive", net.reasons, { sensitiveStop: "net", note: null,
     noteText: `Mail transmis tel quel à l'équipe, sans lecture par l'assistant (${net.reasons.join(", ")}).` });
-  let hints: readonly string[] = net.hints;
+  const hints: readonly string[] = net.hints;
 
   // 1. Understand.
   const understood = await call("understand", smartUnderstandPrompt(), { customer }, 0);
@@ -173,11 +173,11 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     const codes = [!sensible ? "understand:sensible_missing" : `understand:sensible_${sensible.famille}`, `understand:sensitive_${reading.sensitive}`, ...reading.sensitiveFamilies.map(family => `family:${family}`)];
     return end("team_sensitive", [...hints, ...codes], { sensitiveStop: "understand", note: null, noteText: smartSensitiveNote(families) });
   }
-  // SAV-122 (bench v7: injection-01..06 handed over): an instruction found in the mail is never followed (prompts, counter-read
-  // `instruction_followed`), and is no longer a reason to hand the case over: the real support request is answered. Kept as an info code.
-  if (reading.instructionInMail) hints = [...hints, "understand:instruction_in_mail"];
-  // PORTE 2E (P1): an instruction seen but not quoted cannot be checked in the reply: by prudence, the team.
-  if (reading.instructionInMail && !reading.instructionText) return handoff([...hints, "understand:instruction_text_missing"], "other");
+  // Product decision (Ugo, 21/11): a mail carrying an instruction addressed to the assistant (prompt injection, even reworded) NEVER gets an
+  // automatic reply: the team, whether the reading quoted the instruction or not, before any decision. The server net (`smartSafetyNet`)
+  // stops the obvious forms before the reading; this is the model's judgement for the rest. The counter-read `instruction_followed`
+  // (smart-checks.ts) stays as a second net on every reply.
+  if (reading.instructionInMail) return handoff([...hints, "understand:instruction_in_mail", ...(reading.instructionText ? [] : ["understand:instruction_text_missing"])], "other");
   if (reading.wantsHuman) return handoff([...hints, "understand:wants_human"], "wants_human");
   // N2 (Ugo, 20/11): a very upset or threatening customer (cancel, bad review, lawyer) goes to the team, judged by the model, never by a word list.
   if (reading.upset) return handoff([...hints, "understand:upset"], "upset");
@@ -271,7 +271,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
       customer: { subject: customer.subject, mail: customer.mail },
       needs: reading!.needs.map(need => ({ id: need.id, ask: need.ask, alreadyDone: need.alreadyDone })),
       reply: current.reply, facts: current.facts.map(fact => ({ sentence: fact.sentence, type: fact.type, excerpt: fact.excerpt })),
-      ...(reading!.instructionInMail && reading!.instructionText ? { injectedInstruction: reading!.instructionText } : {}),
+      ...(reading!.instructionText ? { injectedInstruction: reading!.instructionText } : {}),
     }, 0);
     if (read.status === "failed") return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: read.problem === "deadline" ? "deadline" : `${kind}:${read.problem}` };
     const verdict = parseSmartOutput(smartVerdictSchema, read.output);

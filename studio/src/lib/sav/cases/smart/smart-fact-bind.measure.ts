@@ -3,7 +3,7 @@ import { buildSavBenchVariants } from "../../bench/bench-variants";
 import { SAV_SMART_BENCH_MULTITURN } from "./smart-bench-multiturn.fixture";
 import { smartBindableSentence, smartFactSentenceInReply } from "./smart-checks";
 
-/** SAV-122 (bench v11): the free measure of the fact binding on the bench's 1 334 keyFacts (used by the test; fictional texts only). */
+/** SAV-122 (bench v11): the free measure of the fact binding on the bench's keyFacts (1 294 since the injection turns hand over, 21/11) (used by the test; fictional texts only). */
 const cap = (value: string) => value.charAt(0).toLocaleUpperCase("fr") + value.slice(1);
 const low = (value: string) => value.charAt(0).toLocaleLowerCase("fr") + value.slice(1);
 // PORTE 2G: only what keeps the same words in the same order is « light »; everything else must be refused.
