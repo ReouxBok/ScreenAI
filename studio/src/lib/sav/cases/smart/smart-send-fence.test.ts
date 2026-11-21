@@ -12,12 +12,21 @@ describe("PORTE 2A (P2) : le filet smart refuse seulement ce que prévoit le CAP
     "Pour la question de remboursement, notre équipe vous répondra.",
     "Votre question sur la facturation est transmise à notre équipe.",
     "Arrêtez la routine depuis votre compte Limova.",
+    "Pour toute question de remboursement ou d'avoir, notre équipe vous répondra directement.",
+    "Vous pouvez vous désinscrire du webinaire depuis le mail de confirmation.",
   ])("mention neutre : « %s » passe", body => expect(judge(body)).toBeNull());
   it.each([
     "Pour résilier, écrivez-nous.",
     "Ouvrez la rubrique Abonnement puis cliquez sur Annuler.",
     "Nous allons vous rembourser dès aujourd'hui.",
     "Votre compte a été supprimé.",
+    // PORTE 2B
+    "Pour vous désabonner, cliquez ici.",
+    "Vous pouvez vous désinscrire de votre abonnement depuis vos paramètres.",
+    "Nous allons procéder au remboursement de votre paiement.",
+    "Notre équipe va effectuer un geste commercial sur votre prochaine facture.",
+    "Je lance le remboursement aujourd'hui.",
+    "Vous serez remboursé sous peu.",
   ])("résiliation ou engagement sensible : « %s » refusé", body => expect(judge(body)).toBe("CANCELLED_REPLY_SENSITIVE_WORDING"));
   it("un dossier non smart et une notice de passage ne sont jamais jugés ici", () => {
     expect(smartSendProblem({ admission: ACCESS, body: "Pour résilier, écrivez-nous.", purpose: "answer" })).toBeNull();
@@ -33,6 +42,8 @@ describe("PORTE 2A (P1) : le filet « autre plateforme » suit la règle partag�
   it.each([
     "Je vous recommande d'utiliser Zapier pour remplir votre tableau.",
     "Si cette option manque dans Limova, essayez Wix pour créer votre site.",
+    "Dans les intégrations de Limova, si le connecteur manque, optez pour Wix pour créer votre site.",
+    "Dans les intégrations de Limova, choisissez Google Sheets, puis utilisez Wix pour votre site.",
   ])("« %s » est refusé", body => expect(judge(body)).toBe("CANCELLED_REPLY_OTHER_PLATFORM"));
   it("« Inscrivez-vous au webinaire Limova » passe", () => expect(judge("Inscrivez-vous au webinaire Limova de jeudi.")).toBeNull());
 });

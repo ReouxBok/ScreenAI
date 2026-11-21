@@ -408,11 +408,19 @@ describe("SAV-96 new Gmail thread through entry, approval, effect and inbound re
 });
 
 describe("PORTE 2A (P1, risk of PORTE 1F): an Access first mail already queued needs a fresh Access qualification", () => {
-  it("SAV_V2_ENTRY_SMART turned on after the queue: the ticket now qualifies as smart, the Access first mail sends nothing", async () => {
+  it("SAV_V2_ENTRY_SMART turned on after the queue: the Access first mail sends nothing, the case goes back to the team once (smart_requalified), the next pass does nothing", async () => {
     const s = fixture(), start = await approveAndQueue(s);
     vi.stubEnv("SAV_V2_ENTRY_SMART", "on");
-    expect((await s.run(start.executionId)).supervised).not.toMatchObject([{ state: "confirmed" }]);
+    expect((await s.run(start.executionId)).supervised).toMatchObject([{ state: "refused", reason: "smart_requalified" }]);
+    expect(await readCase(start.caseId)).toMatchObject({ owner: "human", phase: "handoff_pending", threadIds: [] });
+    const handoffs = (await listCaseEvents(start.caseId)).filter(event => event.kind === "owner_changed").length;
+    expect(handoffs).toBe(1);
     expect(await effects(start.executionId)).toEqual([]);
+    expect(s.counts).toMatchObject({ gmailPosts: 0, crmPosts: 0 });
+    await s.run(start.executionId);
+    await s.run();
+    expect((await listCaseEvents(start.caseId)).filter(event => event.kind === "owner_changed").length).toBe(handoffs);
+    expect(await readCase(start.caseId)).toMatchObject({ owner: "human", phase: "handoff_pending" });
     expect(s.counts).toMatchObject({ gmailPosts: 0, crmPosts: 0 });
   });
   it("the same first mail with the switch off still leaves once (control)", async () => {

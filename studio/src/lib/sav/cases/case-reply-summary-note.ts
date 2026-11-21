@@ -90,6 +90,7 @@ const NOT_TAKEN: Readonly<Record<string, string>> = {
   thread_ambiguous: "le ticket est lié à plusieurs fils de mails, ou son fil à un autre ticket ; l'agent ne choisit pas seul",
   identity_mismatch: "l'expéditeur du mail ne correspond pas au contact du ticket dans HubSpot",
   smart_no_thread: "aucun fil de mail n'est lié à ce ticket ; l'agent ne commence pas seul l'échange avec le client",
+  smart_requalified: "le premier mail préparé n'est pas parti : la demande relève désormais du nouvel agent, qui ne commence pas seul l'échange avec le client",
 };
 /** Unknown, absent or technical reasons: the generic label, never the code itself. */
 const NOT_TAKEN_GENERIC = "la demande sort du périmètre actuel de l'agent";
