@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Charly - Assistant Onboarding Limova</title>
   <link rel="stylesheet" href="sidebar.css">
+  <link rel="stylesheet" href="../team/team-panel.css">
 </head>
 <body>
   <div class="container">
@@ -26,6 +27,7 @@
           <button type="button" class="auth-secondary" id="authBack">Changer d’adresse</button>
         </form>
         <p class="auth-feedback" id="authFeedback" role="status" aria-live="polite"></p>
+        <button type="button" class="auth-secondary" id="authTeamConnections" data-i18n="teamOpenConnections">Connexions Limova Team</button>
         <a href="https://bienvenue.limova.ai/" target="_blank" rel="noopener noreferrer">Je n’ai pas encore de compte Limova</a>
       </div>
     </section>
@@ -57,6 +59,11 @@
             <button class="menu-item" id="evaluationBtn">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
               Tester un parcours
+            </button>
+            <div class="menu-divider"></div>
+            <button class="menu-item" id="teamConnectionsBtn">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 9h18"/><path d="M8 21h8"/></svg>
+              <span data-i18n="teamConnections">Connexions</span>
             </button>
             <div class="menu-divider"></div>
             <button class="menu-item" id="linksBtn">
@@ -103,6 +110,25 @@
         </div>
       </div>
     </header>
+
+    <div class="team-banner" id="teamBanner" role="status" aria-live="polite" hidden>
+      <span class="team-banner-dot" aria-hidden="true"></span>
+      <span class="team-banner-text" id="teamBannerText"></span>
+      <button type="button" class="team-banner-btn" id="teamBannerControl"></button>
+      <button type="button" class="team-banner-btn danger" id="teamBannerStop" data-i18n="teamStopAll">Tout arrêter</button>
+    </div>
+
+    <section class="team-panel" id="teamPanel" aria-labelledby="teamPanelTitle" hidden>
+      <button class="training-close" id="teamPanelClose" type="button" data-i18n-aria-label="teamClose" aria-label="Fermer">×</button>
+      <span class="team-kicker" data-i18n="teamKicker">Limova dans Chrome</span>
+      <h2 id="teamPanelTitle" data-i18n="teamConnections">Connexions</h2>
+      <p data-i18n="teamConnectionsIntro">Connecte ce navigateur à Limova Team : l’agent pourra lire et agir dans son propre groupe d’onglets, selon ton niveau d’autonomie.</p>
+      <p class="team-feedback" id="teamFeedback" role="status" aria-live="polite"></p>
+      <div class="team-products" id="teamProducts"></div>
+      <button type="button" class="team-stop-all" id="teamStopAll" data-i18n="teamStopAll" hidden>Tout arrêter</button>
+      <h3 data-i18n="teamActivityTitle">Activité récente</h3>
+      <ul class="team-activity" id="teamActivity"></ul>
+    </section>
 
     <section class="training-panel" id="trainingPanel" hidden aria-labelledby="trainingTitle">
       <button class="training-close" id="trainingClose" aria-label="Fermer">×</button>
@@ -274,6 +300,7 @@
   <script src="training-recorder.js"></script>
   <script src="site-access.js"></script>
   <script src="sidebar.js"></script>
+  <script src="../team/team-panel.js"></script>
   <script src="voice-thread.js"></script>
 </body>
 </html>
