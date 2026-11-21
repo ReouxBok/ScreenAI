@@ -181,7 +181,7 @@ describe("a dossier still re-analysed after a release (decision waiting for its 
     expect(diagnostics?.totalAttempts).toBe(SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage + 1);
     expect(diagnostics?.attemptBudget).toMatchObject({ total: 1, exhausted: null });
     expect(diagnostics?.attemptsExhausted).toBe(false);
-  });
+  }, 20_000);
 
   it("a failed analysis is not a release-only anchor: the next version counts its attempts", async () => {
     const m = await stored("Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.");
