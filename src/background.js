@@ -8,6 +8,7 @@ import { createAnalytics } from './utils/analytics.js';
 import { buildSystemPrompt } from './prompts/system-prompt.js';
 import { searchKB } from './knowledge-base/kb-search.js';
 import { createOnboardingPlan, advanceStep } from './prompts/onboarding-plan.js';
+import { createTeamService, isTeamMessage } from './team/team-service.js';
 
 // ============================================================================
 // Config
@@ -395,6 +396,11 @@ chrome.runtime.onInstalled.addListener((details) => {
     }
   });
 });
+
+// TEAM-724: Limova Team (and later « Limova ») connect to this browser as a device.
+// The whole feature lives in src/team/; the screenshot renderer is shared with Charly.
+const teamService = createTeamService({ renderCapture: renderSilentVisualCapture });
+teamService.init();
 
 function syncUninstallUrl() {
   // Chrome opens this page after removal; an empty URL disables it (opt-out).
@@ -833,6 +839,7 @@ function isTrustedMessageSource(request, sender) {
 
 async function handleMessage(request, sender) {
   await initializationPromise;
+  if (isTeamMessage(request.type)) return teamService.handleMessage(request, sender);
   if (request.taskRevision !== undefined && request.taskRevision !== voiceTaskRevision) return cancelledOperation();
   if (trainingState.active && [
     'USER_MESSAGE', 'ANALYZE_PAGE', 'TAKE_SCREENSHOT', 'NEXT_STEP',
@@ -2672,8 +2679,10 @@ async function renderSilentVisualCapture(dataUrl, preparation) {
     context.textAlign = 'center';
     context.font = `700 ${Math.max(10, Math.round(10 * scaleY))}px sans-serif`;
     for (const marker of preparation.markers.slice(0, 80)) {
-      const label = `#${Number(marker.id)}`;
-      if (!/^#\d+$/.test(label)) continue;
+      const label = typeof marker.label === 'string' && /^#e\d{1,4}$/.test(marker.label)
+        ? marker.label
+        : `#${Number(marker.id)}`;
+      if (!/^#e?\d+$/.test(label)) continue;
       const left = Math.max(2, Number(marker.left) * scaleX);
       const top = Math.max(2, Number(marker.top) * scaleY);
       const width = Math.max(24, context.measureText(label).width + 10 * scaleX);
