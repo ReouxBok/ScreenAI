@@ -1,5 +1,5 @@
 import { savReplyFooter } from "../../reply-format";
-import { smartMissingFactSentences, smartServerChecks, type SmartSource } from "./smart-checks";
+import { smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
 import {
   parseSmartOutput, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchema,
   type SmartCallKind, type SmartCheckCode, type SmartDecision, type SmartReading, type SmartTeamNote, type SmartTurnOutcome, type SmartVerdict,
@@ -259,17 +259,17 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   }
 
   // 4. Verify: server and the independent counter-read (never on a handoff without customer text).
-  const review = async (current: SmartDecision, kind: "verify" | "reverify"): Promise<{ codes: SmartCheckCode[]; verdict: SmartVerdict | null; failed: string | null }> => {
+  const review = async (current: SmartDecision, kind: "verify" | "reverify"): Promise<{ codes: SmartCheckCode[]; factProblems: SmartCheckResult["factProblems"]; verdict: SmartVerdict | null; failed: string | null }> => {
     const server = smartServerChecks({ decision: current, reading: reading!, customerText, sources, academy, memory: memoryBefore });
-    if (current.outcome === "handoff" && !current.reply?.trim()) return { codes: [...server.codes], verdict: null, failed: null };
+    if (current.outcome === "handoff" && !current.reply?.trim()) return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: null };
     const read = await call(kind, smartVerifyPrompt(), {
       customer: { subject: customer.subject, mail: customer.mail },
       needs: reading!.needs.map(need => ({ id: need.id, ask: need.ask, alreadyDone: need.alreadyDone })),
       reply: current.reply, facts: current.facts.map(fact => ({ sentence: fact.sentence, type: fact.type, excerpt: fact.excerpt })),
     }, 0);
-    if (read.status === "failed") return { codes: [...server.codes], verdict: null, failed: read.problem === "deadline" ? "deadline" : `${kind}:${read.problem}` };
+    if (read.status === "failed") return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: read.problem === "deadline" ? "deadline" : `${kind}:${read.problem}` };
     const verdict = parseSmartOutput(smartVerdictSchema, read.output);
-    return { codes: [...server.codes], verdict: verdict.ok ? verdict.value : null, failed: verdict.ok ? null : `${kind}:output_invalid` };
+    return { codes: [...server.codes], factProblems: server.factProblems, verdict: verdict.ok ? verdict.value : null, failed: verdict.ok ? null : `${kind}:output_invalid` };
   };
   // A counter-read that lists a problem refuses the reply, whatever its verdict says ("conforme" with problems is a reservation, not an approval).
   const refused = (result: Awaited<ReturnType<typeof review>>) =>
@@ -286,8 +286,9 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   if (!refused(first)) return accepted(decision);
 
   // 4 bis. One correction, with every problem found (server codes and the counter-read's). No tool any more.
-  // SAV-122: a missing fact sentence is named, one problem per sentence, so the correction can copy it into the reply or drop the fact.
-  const named = (code: SmartCheckCode) => code === "fact_sentence_missing" ? smartMissingFactSentences(decision!.reply?.trim() ?? "", decision!.facts).slice(0, 10) : [];
+  // SAV-122: a fact-level problem (missing sentence, invalid source, excerpt not found, card not retrieved, third-party fact) is named, one
+  // problem per fact sentence, so the correction knows WHICH fact to fix or drop (bench v8: fact_source_invalid came back at the second pass).
+  const named = (code: SmartCheckCode) => [...new Set(first.factProblems.filter(row => row.code === code && row.sentence.trim()).map(row => row.sentence))].slice(0, 10);
   const problems = [...first.codes.flatMap(code => named(code).length ? named(code).map(sentence => ({ code, sentence })) : [{ code, sentence: "" }]),
     ...(first.verdict?.problems ?? [])];
   corrected = true;
