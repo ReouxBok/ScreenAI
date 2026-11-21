@@ -248,19 +248,29 @@ const NEGATION = /(?:^|[^\p{L}])(n'|(?:ne|pas|jamais|aucun|aucune|sans|rien|non)
 const NEGATION_WORD = /^(?:ne|pas|jamais|aucun|aucune|sans|rien|non)$/;
 /** The negation words of a text (« n' » read as « ne »), sorted: used to see a negation just before a declared sentence. */
 const negations = (value: string) => [...fold(value).matchAll(NEGATION)].map(match => match[1] === "n'" ? "ne" : match[1]).sort().join("|");
-/** The ordered sequence of a sentence: roots of its significant words, its numbers (#n) and its negations (!). */
+/**
+ * The ordered sequence of a sentence: roots of its significant words, its numbers (#n) and its negations (!). PORTE 2G bis: the word or symbol
+ * right after a number is its unit and is ALWAYS kept, exactly, without root (« 5 min » ≠ « 5 h » ≠ « 5 minutes », « 10 € » ≠ « 10 % »),
+ * attached or not (« 5min », « 10€ »).
+ */
 export function smartFactSequence(value: string): string[] {
-  return fold(value).replace(/(^|[^\p{L}])n'/gu, "$1ne ").split(/[^\p{L}\p{N}]+/u).flatMap(word => {
-    if (!word) return [];
-    if (/^\d/.test(word)) return [`#${word}`];
-    if (NEGATION_WORD.test(word)) return ["!"];
-    return word.length >= 4 ? [word.replace(/(?:es|s|e|x)$/, "").slice(0, 5)] : [];
-  });
+  const tokens = fold(value).replace(/(^|[^\p{L}])n'/gu, "$1ne ").match(/\d+(?:[.,]\d+)?|\p{L}+|[^\s\p{L}\p{N}.,;:!?'"«»()[\]{}\-–—/]/gu) ?? [];
+  const out: string[] = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const word = tokens[index]!;
+    if (/^\d/.test(word)) {
+      out.push(`#${word}`);
+      const unit = tokens[index + 1];
+      if (unit !== undefined && !/^\d/.test(unit)) { out.push(`@${unit}`); index++; }
+    } else if (NEGATION_WORD.test(word)) out.push("!");
+    else if (/^\p{L}{4,}$/u.test(word)) out.push(word.replace(/(?:es|s|e|x)$/, "").slice(0, 5));
+  }
+  return out;
 }
 /** The sentence of the reply a declared fact sentence may be bound to (same sequence, at least 3 significant words), or null. */
 export function smartBindableSentence(replyText: string, sentence: string): string | null {
   const wanted = smartFactSequence(sentence);
-  if (wanted.filter(item => !item.startsWith("#") && item !== "!").length < 3) return null;
+  if (wanted.filter(item => !item.startsWith("#") && !item.startsWith("@") && item !== "!").length < 3) return null;
   const key = wanted.join(" ");
   return sentencesOf(replyText).map(row => row.replace(/^(?:\d+[.)]|[-•*])\s+/, "")).find(candidate => smartFactSequence(candidate).join(" ") === key) ?? null;
 }

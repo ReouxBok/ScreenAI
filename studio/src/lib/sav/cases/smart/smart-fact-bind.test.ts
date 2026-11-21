@@ -48,8 +48,8 @@ describe("rattachement d'un fait reformulé à la vraie phrase de la réponse", 
   });
   it("mesure gratuite sur les 1 334 keyFacts : reformulations légères acceptées, fausses toujours refusées", () => {
     expect(smartBindMeasure()).toEqual({ total: 1334,
-      light: { article: { applicable: 731, accepted: 698, refused: 33 }, ponctuation: { applicable: 1334, accepted: 1334, refused: 0 },
-        premiere_lettre: { applicable: 1310, accepted: 1310, refused: 0 }, accord: { applicable: 1298, accepted: 1224, refused: 74 } },
+      light: { article: { applicable: 731, accepted: 698, refused: 33 }, ponctuation: { applicable: 1334, accepted: 1330, refused: 4 },
+        premiere_lettre: { applicable: 1310, accepted: 1310, refused: 0 }, accord: { applicable: 1298, accepted: 1204, refused: 94 } },
       wrong: { chiffre: { applicable: 114, accepted: 0, refused: 114 }, negation: { applicable: 1330, accepted: 0, refused: 1330 },
         mot_change: { applicable: 1326, accepted: 0, refused: 1326 }, ordre: { applicable: 165, accepted: 0, refused: 165 } } });
   });
@@ -61,6 +61,18 @@ describe("rattachement d'un fait reformulé à la vraie phrase de la réponse", 
       ["L'administrateur peut supprimer l'Assistant, le collaborateur ne peut pas.", "L'administrateur ne peut pas supprimer l'Assistant, le collaborateur peut."],
       ["Cliquez sur le bouton Connecter dans Paramètres.", "Appuyez sur le bouton Connecter dans Paramètres."],
     ]) expect(smartBindableSentence(`Bonjour,\n\n${written}\n\nBelle journée.`, declared!), declared).toBeNull();
+  });
+  it("PORTE 2G bis : l'unité qui suit un nombre compte, exactement (5 min ≠ 5 h ≠ 5 minutes, 10 € ≠ 10 %, collée ou non)", () => {
+    for (const [declared, written] of [
+      ["Le lien de connexion arrive dans votre boîte en 5 min environ.", "Le lien de connexion arrive dans votre boîte en 5 h environ."],
+      ["Le module complémentaire Agenda coûte 10 € chaque mois.", "Le module complémentaire Agenda coûte 10 % chaque mois."],
+      ["Le lien de connexion arrive dans votre boîte en 5 minutes environ.", "Le lien de connexion arrive dans votre boîte en 5 min environ."],
+      ["Le lien de connexion arrive dans votre boîte en 5min environ.", "Le lien de connexion arrive dans votre boîte en 5h environ."],
+      ["Le module complémentaire Agenda coûte 10€ chaque mois.", "Le module complémentaire Agenda coûte 10% chaque mois."],
+    ]) expect(smartBindableSentence(`Bonjour,\n\n${written}\n\nBelle journée.`, declared!), declared).toBeNull();
+    // Same number, same unit, attached or not: still bound.
+    expect(smartBindableSentence("Bonjour,\n\nLe lien de connexion arrive dans votre boîte en 5 min environ.\n\nBelle journée.", "Un lien de connexion arrive dans votre boîte en 5min environ"))
+      .toBe("Le lien de connexion arrive dans votre boîte en 5 min environ.");
   });
   it("PORTE 2G, tour complet : relecture « conforme », fait déclaré « Contacts », réponse « Contrats » → jamais envoyé", async () => {
     const card = { cardId: "fiche-import", version: "v1", title: "Importer des contacts", content: "Allez dans le menu Contacts puis cliquez sur Importer.", steps: [], needIds: ["n1"], validUntil: null };
