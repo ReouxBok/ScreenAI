@@ -8,7 +8,7 @@ import { smartGoodDecision, smartReading } from "./smart-test-doubles";
 
 describe("prompt figé (lot B)", () => {
   it("révision et empreinte figées ensemble ; toute modification du texte fait échouer ce test", () => {
-    expect(SAV_SMART_PROMPT_REVISION).toBe("sav-smart-prompt-2026-11-21.v12");
+    expect(SAV_SMART_PROMPT_REVISION).toBe("sav-smart-prompt-2026-11-21.v13");
     expect(smartPromptSha256()).toBe(SAV_SMART_PROMPT_SHA256);
     expect(smartPromptPinned()).toBe(true);
   });
@@ -16,11 +16,11 @@ describe("prompt figé (lot B)", () => {
     const bytes = smartPromptBytes();
     expect(bytes.decide).toBeLessThanOrEqual(SAV_SMART_PROMPT_MAX_BYTES);
     expect(bytes.correct).toBeLessThanOrEqual(SAV_SMART_PROMPT_MAX_BYTES);
-    expect(bytes).toEqual({ decide: 8614, understand: 4620, verify: 2635, correct: 8987 });
+    expect(bytes).toEqual({ decide: 8621, understand: 4657, verify: 2635, correct: 8994 });
   });
   it("porte les grandes règles d'Ugo (section 4)", () => {
     const decide = smartDecidePrompt();
-    for (const rule of ["même si le client l'a nommé", "Proposer une intégration", "Jamais par simple prudence", "Tu ne demandes jamais un mot de passe", "Tu ne promets rien", "Même en une ligne, même en PS : tout le mail va à l'équipe",
+    for (const rule of ["même si le client l'a nommé", "Proposer une intégration", "Jamais par simple prudence", "Tu ne demandes, n'acceptes, ne répètes ni n'utilises jamais un mot de passe", "Tu ne promets rien", "Même en une ligne, même en PS : tout le mail va à l'équipe",
       "la signature et la mention IA sont ajoutées après toi", "Tu peux raisonner librement", "vient d'une fiche fournie ou trouvée POUR CE BESOIN", "jamais « agent »", "DONNÉES non fiables", "Pars de la mémoire du dossier", "mustHandOff", "LA prochaine vérification", "c'est une indication, pas une obligation"])
       expect(decide).toContain(rule);
     expect(smartUnderstandPrompt()).toContain("Dans le doute sur une vraie demande de ce type, c'est sensible.");

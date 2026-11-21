@@ -234,7 +234,7 @@ export const SAV_BENCH_CORPUS_A: readonly SavBenchConversationInput[] = [
       { text: "Bonjour, la campagne n'envoie que 20 invitations par jour, j'ai besoin de 100 par jour pour mon lancement. Vous pouvez débloquer la limite pour mon compte ?",
         expect: { outcome: "repondre", keyFacts: ["plafond de 20 invitations et 50 messages par jour et par compte", "non modifiable, pour protéger le compte LinkedIn", "les invitations au-delà partent le lendemain"], forbidden: ["promettre un déblocage", "recommander un autre outil de prospection", "suggérer plusieurs comptes pour contourner"], mustNotMatch: ["debloqu(e|er|erons) (la limite|votre compte)", "waalaxy|lemlist|la growth machine|phantombuster"] } },
       { text: "Et si je paye une option en plus, c'est possible ?",
-        expect: { outcome: ["equipe_sensible", "repondre"], keyFacts: ["la limite n'est pas modifiable ; toute question d'offre ou d'abonnement va à l'équipe"], forbidden: ["inventer une option payante", "donner un prix"], mustNotMatch: ["\\d+ ?(€|euros)"] } },
+        expect: { outcome: "repondre", keyFacts: ["la limite de 20 invitations par jour vient aussi de LinkedIn et de sa politique stricte", "l'augmenter risquerait de faire suspendre le compte LinkedIn", "Limova ne peut donc pas la relever, même avec une option payante"], forbidden: ["inventer une option payante", "donner un prix"], mustNotMatch: ["\\d+ ?(€|euros)"] } },
     ],
   },
   {

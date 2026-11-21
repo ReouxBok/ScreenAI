@@ -95,26 +95,30 @@ describe("excerpt_not_found : même normalisation que la phrase du fait, l'extra
         }
       }
     }
-    expect({ total, counts }).toEqual({ total: 117, counts: { exacte: { before: 0, after: 0 }, point_final: { before: 117, after: 0 }, minuscule: { before: 109, after: 0 },
-      numero: { before: 117, after: 0 }, mot_change: { before: 117, after: 117 } } });
+    expect({ total, counts }).toEqual({ total: 118, counts: { exacte: { before: 0, after: 0 }, point_final: { before: 118, after: 0 }, minuscule: { before: 110, after: 0 },
+      numero: { before: 118, after: 0 }, mot_change: { before: 118, after: 118 } } });
   });
 });
 
-describe("linkedin-02 (banc v8, tour 1 devenu equipe_sensible) : seule une demande d'acheter, changer ou payer une offre est sensible", () => {
+describe("linkedin-02 (banc v8, tour 1 devenu equipe_sensible ; décision produit 21/11 : le tour 2 « payer une option » est une question sur la limite, on répond)", () => {
   const T1 = "Vous pouvez débloquer la limite pour mon compte ?", T2 = "Et si je paie une option en plus, c'est possible ?";
   it("la lecture a les deux exemples et la règle, sans liste de mots", () => {
     const prompt = smartUnderstandPrompt();
     expect(prompt).toContain("Seule une demande d'acheter, de changer ou de payer une offre est sensible ; une question sur une limite ou sur le fonctionnement d'une fonction reste du support.");
     expect(prompt).toContain(`« ${T1} » : une question sur une limite, {"famille":"aucune","preuve":"${T1}"}`);
-    expect(prompt).toContain(`« ${T2} » : il veut payer une offre, {"famille":"abonnement","preuve":"${T2}"}`);
+    expect(prompt).toContain(`« ${T2} » : il demande si payer lève la limite, une question sur une limite, {"famille":"aucune","preuve":"${T2}"}`);
   });
-  it("tour 1 (question de limite, lu « aucune ») : réponse ; tour 2 (payer une option, lu « abonnement ») : l'équipe, sans décision", async () => {
+  it("tour 1 et tour 2 (questions sur la limite, lues « aucune ») : réponse ; une vraie demande d'offre lue « abonnement » va toujours à l'équipe, sans décision", async () => {
     const first = await run({ understand: { output: smartReading({ sensible: { famille: "aucune", preuve: T1 } }) }, decide: { output: smartGoodDecision() }, verify: { output: SMART_CONFORME } },
       { subject: "Limite 20 invitations", body: `Bonjour, la campagne n'envoie que 20 invitations par jour. ${T1}`, thread: [] });
     expect(first.result.outcome).toBe("reply");
-    const second = await run({ understand: { output: smartReading({ sensitive: "yes", sensitiveFamilies: ["subscription"], sensible: { famille: "abonnement", preuve: T2 } }) } },
+    const second = await run({ understand: { output: smartReading({ sensible: { famille: "aucune", preuve: T2 } }) }, decide: { output: smartGoodDecision() }, verify: { output: SMART_CONFORME } },
       { subject: "Limite 20 invitations", body: T2, thread: [] });
-    expect(second.result).toMatchObject({ outcome: "team_sensitive", sensitiveStop: "understand" });
-    expect(second.calls.map(call => call.kind)).toEqual(["understand"]);
+    expect(second.result.outcome).toBe("reply");
+    const offer = "Je veux passer à l'offre supérieure, comment je paie ?";
+    const third = await run({ understand: { output: smartReading({ sensitive: "yes", sensitiveFamilies: ["subscription"], sensible: { famille: "abonnement", preuve: offer } }) } },
+      { subject: "Changer d'offre", body: offer, thread: [] });
+    expect(third.result).toMatchObject({ outcome: "team_sensitive", sensitiveStop: "understand" });
+    expect(third.calls.map(call => call.kind)).toEqual(["understand"]);
   });
 });
