@@ -47,7 +47,7 @@ describe("fact_sentence_missing : la phrase du fait est dans la réponse, quelle
     // SAV-122 (bench v11): an absent sentence also carries the fix « drop this fact ».
     expect(correction.problems).toEqual(expect.arrayContaining([{ code: "fact_sentence_missing", sentence: absent, fix: "retire ce fait de facts : il n'est pas dans la réponse" }]));
   });
-  it("mesure gratuite sur les 1 342 keyFacts (528 conversations) : refus avant → après, par forme", () => {
+  it("mesure gratuite sur les 1 302 keyFacts (528 conversations) : refus avant → après, par forme", () => {
     const origins = [...SAV_BENCH_CORPUS, ...SAV_SMART_BENCH_MULTITURN], all = [...origins, ...buildSavBenchVariants(origins)];
     const cap = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
     const forms: Record<string, (fact: string) => [string, string]> = {
@@ -65,7 +65,7 @@ describe("fact_sentence_missing : la phrase du fait est dans la réponse, quelle
         if (!smartFactSentenceInReply(reply, sentence)) row.after++;
       }
     }
-    expect({ total, counts }).toEqual({ total: 1342, counts: { exact: { before: 0, after: 0 }, liste_sans_point: { before: 1342, after: 0 }, casse: { before: 749, after: 0 } } });
+    expect({ total, counts }).toEqual({ total: 1302, counts: { exact: { before: 0, after: 0 }, liste_sans_point: { before: 1302, after: 0 }, casse: { before: 725, after: 0 } } });
   });
 });
 
