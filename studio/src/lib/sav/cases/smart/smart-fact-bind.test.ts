@@ -48,9 +48,9 @@ describe("rattachement d'un fait reformulé à la vraie phrase de la réponse", 
   });
   it("mesure gratuite sur les 1 302 keyFacts : reformulations légères acceptées, fausses toujours refusées", () => {
     expect(smartBindMeasure()).toEqual({ total: 1302,
-      light: { article: { applicable: 723, accepted: 690, refused: 33 }, ponctuation: { applicable: 1302, accepted: 1298, refused: 4 },
-        premiere_lettre: { applicable: 1278, accepted: 1278, refused: 0 }, accord: { applicable: 1266, accepted: 1172, refused: 94 } },
-      wrong: { chiffre: { applicable: 118, accepted: 0, refused: 118 }, negation: { applicable: 1298, accepted: 0, refused: 1298 },
+      light: { article: { applicable: 735, accepted: 702, refused: 33 }, ponctuation: { applicable: 1302, accepted: 1298, refused: 4 },
+        premiere_lettre: { applicable: 1278, accepted: 1278, refused: 0 }, accord: { applicable: 1266, accepted: 1168, refused: 98 } },
+      wrong: { chiffre: { applicable: 110, accepted: 0, refused: 110 }, negation: { applicable: 1298, accepted: 0, refused: 1298 },
         mot_change: { applicable: 1294, accepted: 0, refused: 1294 }, ordre: { applicable: 165, accepted: 0, refused: 165 } } });
   });
   it("PORTE 2G : les 4 contre-exemples d'Astra sont refusés (mot changé, rôles inversés, délais permutés, négation déplacée) ; un synonyme aussi", () => {

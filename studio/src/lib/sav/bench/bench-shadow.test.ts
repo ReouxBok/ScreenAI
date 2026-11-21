@@ -6,8 +6,8 @@ import { judgeSavShadowCase, summarizeSavShadow, type SavShadowCase } from "./be
 // SAV-109: the shadow-mode interface (not wired): the same judge and checks compare the agent's draft with what the team did.
 const base: SavShadowCase = { ref: "shadow-1", subject: "Connexion", now: SAV_BENCH_NOW, sensitive: false, cards: [savBenchCard("acces-connexion")!],
   messages: [{ from: "client", text: "je n'arrive pas à me connecter", at: SAV_BENCH_NOW }],
-  agentTurn: { outcome: "repondre", reply: "Bonjour, cliquez sur « Mot de passe oublié » sur https://new.limova.ai", citations: ["acces-connexion"], codes: [] },
-  team: { outcome: "repondre", reply: "Bonjour, utilisez Mot de passe oublié." } };
+  agentTurn: { outcome: "repondre", reply: "Bonjour, connectez-vous sur https://new.limova.ai avec le code à usage unique reçu par mail", citations: ["acces-connexion"], codes: [] },
+  team: { outcome: "repondre", reply: "Bonjour, utilisez le code reçu par mail." } };
 
 describe("SAV-109 shadow mode", () => {
   it("agreement with the team, judged with the same grid", async () => {

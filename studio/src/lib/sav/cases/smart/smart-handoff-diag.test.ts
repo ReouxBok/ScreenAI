@@ -36,7 +36,9 @@ describe("SAV-122 diagnostic : le contrôle serveur ne refuse pas la réponse at
   it("la relecture (v7) ne compte pas comme faute ce qui protège ou guide le client ni un prérequis donné par une fiche", () => {
     const verify = smartVerifyPrompt();
     expect(verify).toContain("ou un prérequis donné par une fiche (Google Chrome), n'en est pas un.");
-    expect(verify).toContain("lui dire de saisir lui-même son mot de passe dans Limova, d'utiliser « Mot de passe oublié » ou de ne jamais l'envoyer n'est ni secret_requested ni sensitive_commitment");
+    expect(verify).toContain("Limova n'a pas de mot de passe ; lui dire de se connecter lui-même avec le code à usage unique reçu par e-mail");
+    expect(verify).toContain("ou de ne jamais envoyer un code ou un mot de passe n'est ni secret_requested ni sensitive_commitment");
+    expect(verify).not.toContain("Mot de passe oublié");
     expect(verify).toContain("Une étape qui reprend une fiche citée dans facts n'est pas unlisted_claim.");
   });
 });
