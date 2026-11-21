@@ -138,7 +138,7 @@ describe("SAV-122 : même source de vérité que le banc, mesure gratuite sur le
 
 describe("SAV-122 bis : transferts évitables (sujet-05, ps-04, plateforme-03, plateforme-04 au tour 1)", () => {
   it("la relecture sait que l'outil du client cité pour le relier à Limova n'est pas une autre plateforme", () => {
-    expect(smartVerifyPrompt()).toContain("Citer l'outil que le client utilise déjà (son site, WhatsApp Business, son CRM) pour le relier à Limova n'en est pas un.");
+    expect(smartVerifyPrompt()).toContain("Citer l'outil que le client utilise déjà (son site, WhatsApp Business, son CRM) pour le relier à Limova, ou un prérequis donné par une fiche (Google Chrome), n'en est pas un.");
   });
 
   it("réponse Charly Max / WhatsApp Business fondée, relecture conforme : réponse au tour 1, pas de transfert", async () => {
