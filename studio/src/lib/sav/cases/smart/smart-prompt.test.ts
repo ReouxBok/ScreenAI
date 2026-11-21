@@ -8,7 +8,7 @@ import { smartGoodDecision, smartReading } from "./smart-test-doubles";
 
 describe("prompt figé (lot B)", () => {
   it("révision et empreinte figées ensemble ; toute modification du texte fait échouer ce test", () => {
-    expect(SAV_SMART_PROMPT_REVISION).toBe("sav-smart-prompt-2026-11-21.v10");
+    expect(SAV_SMART_PROMPT_REVISION).toBe("sav-smart-prompt-2026-11-21.v11");
     expect(smartPromptSha256()).toBe(SAV_SMART_PROMPT_SHA256);
     expect(smartPromptPinned()).toBe(true);
   });
@@ -16,7 +16,7 @@ describe("prompt figé (lot B)", () => {
     const bytes = smartPromptBytes();
     expect(bytes.decide).toBeLessThanOrEqual(SAV_SMART_PROMPT_MAX_BYTES);
     expect(bytes.correct).toBeLessThanOrEqual(SAV_SMART_PROMPT_MAX_BYTES);
-    expect(bytes).toEqual({ decide: 8614, understand: 4461, verify: 2560, correct: 8977 });
+    expect(bytes).toEqual({ decide: 8614, understand: 4620, verify: 2635, correct: 8977 });
   });
   it("porte les grandes règles d'Ugo (section 4)", () => {
     const decide = smartDecidePrompt();

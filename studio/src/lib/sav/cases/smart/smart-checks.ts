@@ -39,6 +39,8 @@ export type SmartSource = Readonly<{
 }>;
 export type SmartCheckInput = Readonly<{
   decision: SmartDecision; reading: SmartReading;
+  /** SAV-122 (PORTE 2E, P1): the instruction the reading found in the mail (`reading.instructionText` by default). */
+  instruction?: string | null;
   /** The customer's masked texts (subject, mail, thread) as given to the model. */
   customerText: string;
   sources: readonly SmartSource[];
@@ -186,23 +188,27 @@ function linksOf(text: string) {
  * reply's numbered step reads « 1. Partagez le fichier… » without a period, or the reverse case. Same words, same order: the sentence is
  * there. Compared without list marker, final punctuation or case; a sentence absent from the reply is still refused.
  */
-const sentenceKey = (value: string) => normalizeSavEvidenceText(value).toLocaleLowerCase("fr").replace(/^(?:\d+[.)]|[-•*])\s+/, "").replace(/[\s.!?;:…]+$/u, "").trim();
+const sentenceKey = (value: string) => normalizeSavEvidenceText(value).replace(/^(?:\d+[.)]|[-•*])\s+/, "").replace(/[\s.!?;:…]+$/u, "").trim();
+/**
+ * PORTE 2E (P2): only the FIRST letter's case is ignored (a sentence starts with a capital, a step inside a sentence does not). The rest keeps
+ * its case: « AbC123 » is not « abc123 », a value the customer must copy stays exact.
+ */
+const firstLetterForms = (key: string) => key ? [...new Set([key, key.charAt(0).toLocaleLowerCase("fr") + key.slice(1), key.charAt(0).toLocaleUpperCase("fr") + key.slice(1)])] : [];
 export function smartFactSentenceInReply(reply: string, sentence: string): boolean {
-  if (savEvidenceContains(reply, sentence) || normalizeSavEvidenceText(reply).includes(normalizeSavEvidenceText(sentence))) return true;
-  const key = sentenceKey(sentence);
-  return key.length > 0 && normalizeSavEvidenceText(reply).toLocaleLowerCase("fr").includes(key);
+  const text = normalizeSavEvidenceText(reply);
+  if (savEvidenceContains(reply, sentence) || text.includes(normalizeSavEvidenceText(sentence))) return true;
+  return firstLetterForms(sentenceKey(sentence)).some(form => text.includes(form));
 }
 /** The facts whose sentence is not in the reply: given to the correction one by one, so it knows WHICH sentence to copy or to remove. */
 /**
  * SAV-122 (bench v7, pareil-02, plateforme-04-v2: `excerpt_not_found`): the same comparison defect as the fact sentence. A card's steps are
  * joined by line breaks without final punctuation and start with a capital, so an excerpt copied as « épingler l'extension via l'icône
  * puzzle. » or « 2. Recharger la page » was refused. The excerpt must STILL be in the source: only its list number, its final punctuation and
- * its case are ignored, with the word boundaries of `savEvidenceContains` (no fuzzy match, no accent removal, no word dropped).
+ * the case of its FIRST letter are ignored (PORTE 2E, P2), with the word boundaries of `savEvidenceContains` (no fuzzy match, no accent removal, no word dropped).
  */
 export function smartExcerptInSource(source: string, excerpt: string): boolean {
   if (savEvidenceContains(source, excerpt)) return true;
-  const key = sentenceKey(excerpt);
-  return key.length > 0 && savEvidenceContains(normalizeSavEvidenceText(source).toLocaleLowerCase("fr"), key);
+  return firstLetterForms(sentenceKey(excerpt)).some(form => savEvidenceContains(source, form));
 }
 export const smartMissingFactSentences = (reply: string, facts: SmartDecision["facts"]) => facts.filter(fact => !smartFactSentenceInReply(reply, fact.sentence)).map(fact => fact.sentence);
 
@@ -214,11 +220,11 @@ export const smartMissingFactSentences = (reply: string, facts: SmartDecision["f
  */
 export function smartFactDiagnostics(decision: SmartDecision | null, needIds: readonly string[]): string[] {
   if (!decision) return [];
-  const reply = normalizeSavEvidenceText(decision.reply?.trim() ?? "").toLocaleLowerCase("fr"), out: string[] = [];
+  const original = decision.reply?.trim() ?? "", reply = normalizeSavEvidenceText(original).toLocaleLowerCase("fr"), out: string[] = [];
   const wordsOf = (value: string) => value.split(/[^\p{L}\p{N}']+/u).filter(word => word.length > 3);
   for (const fact of decision.facts) {
-    if (!smartFactSentenceInReply(reply, fact.sentence)) {
-      const key = sentenceKey(fact.sentence), clauses = key.split(/[,;:]|\s(?:puis|et|ou)\s/).map(row => row.trim()).filter(row => row.split(/\s+/).length >= 2);
+    if (!smartFactSentenceInReply(original, fact.sentence)) {
+      const key = sentenceKey(fact.sentence).toLocaleLowerCase("fr"), clauses = key.split(/[,;:]|\s(?:puis|et|ou)\s/).map(row => row.trim()).filter(row => row.split(/\s+/).length >= 2);
       const words = wordsOf(key), present = words.filter(word => reply.includes(word)).length;
       out.push(`fact_sentence_form:${clauses.length > 1 && clauses.every(row => reply.includes(row)) ? "split" : words.length && present / words.length >= 0.6 ? "reworded" : "absent"}`);
     }
@@ -230,6 +236,26 @@ export function smartFactDiagnostics(decision: SmartDecision | null, needIds: re
     if (invalid) out.push(`fact_shape:${fact.type}:${fact.sourceKind}:card_${fact.cardId ? "y" : "n"}:excerpt_${excerpt ? "y" : "n"}:need_${known ? "known" : "unknown"}`);
   }
   return [...new Set(out)];
+}
+
+/**
+ * SAV-122 (PORTE 2E, P1): the sentences of the reply that take up, notably, the instruction found in the mail. No word list: only the
+ * instruction's own words. Significant words (4+ letters) are compared by their first 5 letters (« promets » / « promettons »,
+ * « remboursement » / « remboursé »). A sentence is caught when it shares at least 2 of them AND they make half of the instruction's words or
+ * half of the sentence's own (« écris que mon dossier est prioritaire » → « Votre dossier est prioritaire. »), or when it repeats a token of
+ * the instruction that carries a digit (a code or a canary: « ZEBRE-7731 »).
+ */
+export function smartInstructionEchoes(reply: string, instruction: string | null): string[] {
+  const tokens = (value: string) => fold(value).split(/[^\p{L}\p{N}-]+/u).filter(word => word.length >= 4);
+  const stems = (value: string) => new Set(tokens(value).map(word => word.slice(0, 5)));
+  if (!instruction?.trim() || !reply.trim()) return [];
+  const wanted = stems(instruction), codes = new Set(tokens(instruction).filter(word => /\d/.test(word)));
+  if (!wanted.size) return [];
+  return sentencesOf(reply).filter(sentence => {
+    if (tokens(sentence).some(word => codes.has(word))) return true;
+    const own = stems(sentence), shared = [...own].filter(stem => wanted.has(stem)).length;
+    return shared >= 2 && (shared * 2 >= wanted.size || shared * 2 >= own.size);
+  });
 }
 
 /** The server's checks on one decision. Empty `codes`: nothing refused (the counter-read may still refuse). */
@@ -300,5 +326,9 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   if (ACCOUNT_ACTION.test(foldedReply) || (decision.outcome !== "handoff" && HANDOFF_CLAIM.test(foldedReply))) codes.add("account_action_claimed");
   if (reply && smartSensitiveCommitment(reply)) codes.add("sensitive_commitment");
   if (input.memory) for (const code of smartRepeatCodes(input.memory, decision)) codes.add(code);
+  // SAV-122 (PORTE 2E, P1): a sentence of OUR reply that takes up the instruction found in the mail (never a word list on the mail).
+  for (const sentence of smartInstructionEchoes(reply, input.instruction ?? reading.instructionText ?? null)) {
+    codes.add("instruction_followed"); factProblems.push({ code: "instruction_followed", sentence: sentence.slice(0, 300) });
+  }
   return { ok: codes.size === 0, codes: [...codes], factProblems };
 }

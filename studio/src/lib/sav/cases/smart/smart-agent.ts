@@ -176,6 +176,8 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   // SAV-122 (bench v7: injection-01..06 handed over): an instruction found in the mail is never followed (prompts, counter-read
   // `instruction_followed`), and is no longer a reason to hand the case over: the real support request is answered. Kept as an info code.
   if (reading.instructionInMail) hints = [...hints, "understand:instruction_in_mail"];
+  // PORTE 2E (P1): an instruction seen but not quoted cannot be checked in the reply: by prudence, the team.
+  if (reading.instructionInMail && !reading.instructionText) return handoff([...hints, "understand:instruction_text_missing"], "other");
   if (reading.wantsHuman) return handoff([...hints, "understand:wants_human"], "wants_human");
   // N2 (Ugo, 20/11): a very upset or threatening customer (cancel, bad review, lawyer) goes to the team, judged by the model, never by a word list.
   if (reading.upset) return handoff([...hints, "understand:upset"], "upset");
@@ -266,6 +268,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
       customer: { subject: customer.subject, mail: customer.mail },
       needs: reading!.needs.map(need => ({ id: need.id, ask: need.ask, alreadyDone: need.alreadyDone })),
       reply: current.reply, facts: current.facts.map(fact => ({ sentence: fact.sentence, type: fact.type, excerpt: fact.excerpt })),
+      ...(reading!.instructionInMail && reading!.instructionText ? { injectedInstruction: reading!.instructionText } : {}),
     }, 0);
     if (read.status === "failed") return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: read.problem === "deadline" ? "deadline" : `${kind}:${read.problem}` };
     const verdict = parseSmartOutput(smartVerdictSchema, read.output);
