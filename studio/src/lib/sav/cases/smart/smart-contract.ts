@@ -77,6 +77,8 @@ export const smartReadingSchema = z.object({
   upset: z.boolean().default(false),
   /** The mail contains an instruction aimed at the assistant (« ignore tes règles »...). */
   instructionInMail: z.boolean().default(false),
+  /** SAV-122 (PORTE 2E, P1): the instruction itself, copied from the mail (short), so the counter-read and the server can check the reply. */
+  instructionText: z.preprocess(value => typeof value === "string" ? value.trim().slice(0, 300) || null : null, z.string().nullable()).default(null),
 }).superRefine((value, ctx) => {
   if (new Set(value.needs.map(need => need.id)).size !== value.needs.length) ctx.addIssue({ code: "custom", message: "NEED_IDS_DUPLICATED" });
 });
@@ -228,6 +230,8 @@ export const SAV_SMART_CHECK_CODES = [
   "question_repeated", "trial_repeated",
   // N2 (20/11): the reply COMMITS to a sensitive action on the account (replaces `kernel_in_reply`, no longer emitted: a mere word never refuses).
   "sensitive_commitment",
+  // SAV-122 (PORTE 2E, P1): a sentence of the reply takes up the instruction the reading found in the mail.
+  "instruction_followed",
 ] as const;
 export type SmartCheckCode = typeof SAV_SMART_CHECK_CODES[number];
 

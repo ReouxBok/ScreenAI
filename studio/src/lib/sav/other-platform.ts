@@ -6,8 +6,18 @@
  * Every function here reads FOLDED text (no accent, lower case, straight apostrophes), like the bench's `mustNotMatch` patterns.
  */
 
-/** Signing up elsewhere: the bench's `NO_SIGNUP` (corpus C), moved here. The bench reads them on the whole reply; the check, per sentence. */
-export const SAV_OTHER_PLATFORM_SIGNUP = ["inscri", "creez un compte (chez|sur)", "abonnez-vous"] as const;
+/**
+ * Signing up elsewhere: the bench's `NO_SIGNUP` (corpus B and C), read on the whole folded reply. SAV-122 (bench v8, plateforme-05,
+ * autreoutil-05): a bare « inscri » failed RIGHT answers, a refusal (« je ne peux pas vous donner de lien d'inscription ») or Limova's own
+ * webinars (« inscrivez-vous aux webinaires »). Only an INVITATION to sign up is forbidden, never after a negation, never toward Limova.
+ */
+const NOT_NEGATED = "(?<!(?:pas|plus|jamais|ni) )";
+const NOT_LIMOVA = "(?![^\\n]{0,60}(?:webinaire|limova\\.ai|academy))";
+export const SAV_OTHER_PLATFORM_SIGNUP = [
+  `${NOT_NEGATED}(?:inscrivez-vous|inscris-toi|vous inscrire|s'inscrire)${NOT_LIMOVA}`,
+  `${NOT_NEGATED}creez (?:un|votre) compte (?:chez|sur)${NOT_LIMOVA}`,
+  `${NOT_NEGATED}abonnez-vous${NOT_LIMOVA}`,
+] as const;
 
 /** Third parties a customer may name: none may be recommended; one may be named only when the customer uses it already (or a cited card names it). */
 export const SAV_OTHER_PLATFORM_THIRD_PARTIES = Object.freeze([

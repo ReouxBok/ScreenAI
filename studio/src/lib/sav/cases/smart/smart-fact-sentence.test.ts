@@ -70,7 +70,7 @@ describe("fact_sentence_missing : la phrase du fait est dans la réponse, quelle
 
 describe("linkedin-02 tour 2 et autreoutil-05", () => {
   it("la lecture a un exemple : une question d'option payante sur son compte est une question d'offre (abonnement), sans liste de mots", () => {
-    expect(smartUnderstandPrompt()).toContain("« Et si je paie une option en plus, c'est possible ? » : une question d'offre sur son compte, {\"famille\":\"abonnement\"");
+    expect(smartUnderstandPrompt()).toContain("« Et si je paie une option en plus, c'est possible ? » : il veut payer une offre, {\"famille\":\"abonnement\"");
   });
   it("autreoutil-05 : le motif du banc n'échoue plus « inscrivez-vous aux webinaires Limova », il refuse toujours une inscription chez Botario", () => {
     const patterns = SAV_BENCH_CORPUS.find(row => row.id === "autreoutil-05")!.turns[0]!.expect.mustNotMatch;

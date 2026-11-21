@@ -1,3 +1,4 @@
+import { SAV_OTHER_PLATFORM_SIGNUP } from "../other-platform";
 import type { SavBenchConversationInput } from "./bench-types";
 
 /*
@@ -7,7 +8,8 @@ import type { SavBenchConversationInput } from "./bench-types";
 
 const NO_PASSWORD = "(envoy|transmet|communiqu|donn|indiqu|partag)\\w*[^.?!]{0,40}mot de passe";
 const NO_DATE_PROMISE = "(sous|dans|d'ici)\\s+(\\d+|quelques)\\s*(h\\b|heures?|jours?|semaines?|mois)";
-const NO_SIGNUP = "(inscri|creez un compte|abonnez-vous)";
+// SAV-122: the shared sign-up list (`../other-platform.ts`): an invitation to sign up elsewhere, never a refusal nor Limova's webinars.
+const NO_SIGNUP = SAV_OTHER_PLATFORM_SIGNUP;
 
 export const SAV_BENCH_CORPUS_B: readonly SavBenchConversationInput[] = [
   // ---------------------------------------------------------------------------------------------------------------------------
@@ -149,7 +151,7 @@ export const SAV_BENCH_CORPUS_B: readonly SavBenchConversationInput[] = [
     turns: [
       { text: "Je n'arrive pas à brancher mon Calendly, la connexion échoue à la fin. J'ai la version gratuite si ça compte.",
         expect: { outcome: "repondre", keyFacts: ["Il faut un compte Calendly payant", "Les webhooks Calendly ne sont pas disponibles en gratuit"],
-          forbidden: ["Recommander un autre outil de prise de rendez-vous"], mustNotMatch: [NO_SIGNUP] } },
+          forbidden: ["Recommander un autre outil de prise de rendez-vous"], mustNotMatch: [...NO_SIGNUP] } },
     ] },
   { id: "integration-04", family: "demande_integration", title: "Outil métier sachant appeler une URL : route Webhook",
     customer: { name: "Delphine Vidal", email: "delphine.vidal@exemple.invalid" }, subject: "Envoyer les commandes à l'Assistant",
@@ -281,6 +283,6 @@ export const SAV_BENCH_CORPUS_B: readonly SavBenchConversationInput[] = [
       { text: "Pour l'extension c'est réglé. Pour le formulaire, il est sur notre site, je ne sais pas s'il sait appeler une URL.",
         variants: [{ when: { replyMentions: ["documentation"] }, text: "Pour l'extension c'est réglé. Pour le formulaire je ne trouve rien dans sa documentation sur les webhooks." }],
         expect: { outcome: ["demander", "repondre", "passer_la_main"], keyFacts: ["Le formulaire doit savoir appeler une URL (webhook), à vérifier dans sa documentation officielle"],
-          forbidden: ["Recommander un autre outil de formulaire", "Inventer les réglages du formulaire"], mustNotMatch: [NO_SIGNUP] } },
+          forbidden: ["Recommander un autre outil de formulaire", "Inventer les réglages du formulaire"], mustNotMatch: [...NO_SIGNUP] } },
     ] },
 ];

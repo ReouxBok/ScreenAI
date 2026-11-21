@@ -1,5 +1,5 @@
 import { savReplyFooter } from "../../reply-format";
-import { smartMissingFactSentences, smartServerChecks, type SmartSource } from "./smart-checks";
+import { smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
 import {
   parseSmartOutput, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchema,
   type SmartCallKind, type SmartCheckCode, type SmartDecision, type SmartReading, type SmartTeamNote, type SmartTurnOutcome, type SmartVerdict,
@@ -156,7 +156,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const net = smartSafetyNet({ subject: input.subject, body: input.body });
   if (net.stop) return end("team_sensitive", net.reasons, { sensitiveStop: "net", note: null,
     noteText: `Mail transmis tel quel à l'équipe, sans lecture par l'assistant (${net.reasons.join(", ")}).` });
-  const hints = net.hints;
+  let hints: readonly string[] = net.hints;
 
   // 1. Understand.
   const understood = await call("understand", smartUnderstandPrompt(), { customer }, 0);
@@ -173,7 +173,11 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     const codes = [!sensible ? "understand:sensible_missing" : `understand:sensible_${sensible.famille}`, `understand:sensitive_${reading.sensitive}`, ...reading.sensitiveFamilies.map(family => `family:${family}`)];
     return end("team_sensitive", [...hints, ...codes], { sensitiveStop: "understand", note: null, noteText: smartSensitiveNote(families) });
   }
-  if (reading.instructionInMail) return handoff([...hints, "understand:instruction_in_mail"], "other");
+  // SAV-122 (bench v7: injection-01..06 handed over): an instruction found in the mail is never followed (prompts, counter-read
+  // `instruction_followed`), and is no longer a reason to hand the case over: the real support request is answered. Kept as an info code.
+  if (reading.instructionInMail) hints = [...hints, "understand:instruction_in_mail"];
+  // PORTE 2E (P1): an instruction seen but not quoted cannot be checked in the reply: by prudence, the team.
+  if (reading.instructionInMail && !reading.instructionText) return handoff([...hints, "understand:instruction_text_missing"], "other");
   if (reading.wantsHuman) return handoff([...hints, "understand:wants_human"], "wants_human");
   // N2 (Ugo, 20/11): a very upset or threatening customer (cancel, bad review, lawyer) goes to the team, judged by the model, never by a word list.
   if (reading.upset) return handoff([...hints, "understand:upset"], "upset");
@@ -257,17 +261,18 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   }
 
   // 4. Verify: server and the independent counter-read (never on a handoff without customer text).
-  const review = async (current: SmartDecision, kind: "verify" | "reverify"): Promise<{ codes: SmartCheckCode[]; verdict: SmartVerdict | null; failed: string | null }> => {
+  const review = async (current: SmartDecision, kind: "verify" | "reverify"): Promise<{ codes: SmartCheckCode[]; factProblems: SmartCheckResult["factProblems"]; verdict: SmartVerdict | null; failed: string | null }> => {
     const server = smartServerChecks({ decision: current, reading: reading!, customerText, sources, academy, memory: memoryBefore });
-    if (current.outcome === "handoff" && !current.reply?.trim()) return { codes: [...server.codes], verdict: null, failed: null };
+    if (current.outcome === "handoff" && !current.reply?.trim()) return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: null };
     const read = await call(kind, smartVerifyPrompt(), {
       customer: { subject: customer.subject, mail: customer.mail },
       needs: reading!.needs.map(need => ({ id: need.id, ask: need.ask, alreadyDone: need.alreadyDone })),
       reply: current.reply, facts: current.facts.map(fact => ({ sentence: fact.sentence, type: fact.type, excerpt: fact.excerpt })),
+      ...(reading!.instructionInMail && reading!.instructionText ? { injectedInstruction: reading!.instructionText } : {}),
     }, 0);
-    if (read.status === "failed") return { codes: [...server.codes], verdict: null, failed: read.problem === "deadline" ? "deadline" : `${kind}:${read.problem}` };
+    if (read.status === "failed") return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: read.problem === "deadline" ? "deadline" : `${kind}:${read.problem}` };
     const verdict = parseSmartOutput(smartVerdictSchema, read.output);
-    return { codes: [...server.codes], verdict: verdict.ok ? verdict.value : null, failed: verdict.ok ? null : `${kind}:output_invalid` };
+    return { codes: [...server.codes], factProblems: server.factProblems, verdict: verdict.ok ? verdict.value : null, failed: verdict.ok ? null : `${kind}:output_invalid` };
   };
   // A counter-read that lists a problem refuses the reply, whatever its verdict says ("conforme" with problems is a reservation, not an approval).
   const refused = (result: Awaited<ReturnType<typeof review>>) =>
@@ -284,8 +289,9 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   if (!refused(first)) return accepted(decision);
 
   // 4 bis. One correction, with every problem found (server codes and the counter-read's). No tool any more.
-  // SAV-122: a missing fact sentence is named, one problem per sentence, so the correction can copy it into the reply or drop the fact.
-  const named = (code: SmartCheckCode) => code === "fact_sentence_missing" ? smartMissingFactSentences(decision!.reply?.trim() ?? "", decision!.facts).slice(0, 10) : [];
+  // SAV-122: a fact-level problem (missing sentence, invalid source, excerpt not found, card not retrieved, third-party fact) is named, one
+  // problem per fact sentence, so the correction knows WHICH fact to fix or drop (bench v8: fact_source_invalid came back at the second pass).
+  const named = (code: SmartCheckCode) => [...new Set(first.factProblems.filter(row => row.code === code && row.sentence.trim()).map(row => row.sentence))].slice(0, 10);
   const problems = [...first.codes.flatMap(code => named(code).length ? named(code).map(sentence => ({ code, sentence })) : [{ code, sentence: "" }]),
     ...(first.verdict?.problems ?? [])];
   corrected = true;
