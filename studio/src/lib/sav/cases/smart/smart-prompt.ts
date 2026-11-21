@@ -18,9 +18,9 @@ import { SAV_SMART_RESOURCES as SMART_RESOURCE_LIST } from "./tools/resources";
  * Fictional examples only (public repository).
  */
 
-export const SAV_SMART_PROMPT_REVISION = "sav-smart-prompt-2026-11-21.v9";
+export const SAV_SMART_PROMPT_REVISION = "sav-smart-prompt-2026-11-21.v10";
 /** sha256 of `smartPromptFingerprintSource()`. Pinned by `smart-prompt.test.ts`; change it only with the revision. */
-export const SAV_SMART_PROMPT_SHA256 = "c8910f5819e65eb8c87274018b034f0fd6eac8e5e45b4e48a9d272d165fe937e";
+export const SAV_SMART_PROMPT_SHA256 = "55b23f57cb6075877f7fdf1681293f0c7c89a9d6425fe0188a552081d880e170";
 /** The fixed decide prompt's ceiling (ARCHITECTURE 3: « 9 000 octets au plus »). */
 export const SAV_SMART_PROMPT_MAX_BYTES = 9_000;
 
@@ -120,6 +120,8 @@ famille : aucune | resiliation | remboursement | facturation | abonnement | fina
 Seule une demande d'acheter, de changer ou de payer une offre est sensible ; une question sur une limite ou sur le fonctionnement d'une fonction reste du support.
 - « Vous pouvez débloquer la limite pour mon compte ? » : une question sur une limite, {"famille":"aucune","preuve":"Vous pouvez débloquer la limite pour mon compte ?"}
 - Après « la limite n'est pas modifiable », « Et si je paie une option en plus, c'est possible ? » : il veut payer une offre, {"famille":"abonnement","preuve":"Et si je paie une option en plus, c'est possible ?"}
+Un mot de passe donné dans le mail ou un accès pour un collègue, c'est du support (on explique l'invitation et on dit de ne pas partager son mot de passe) : sensitive no, sensitiveFamilies vide. Identité ou piratage, c'est changer le titulaire ou l'adresse du compte, ou entrer dans le compte d'un autre.
+- « Je peux donner mon mot de passe à ma collègue pour qu'elle utilise mes Assistants ? » : {"famille":"aucune","preuve":"Je peux donner mon mot de passe à ma collègue pour qu'elle utilise mes Assistants ?"}
 
 FORMAT DE SORTIE : un objet JSON
 {"needs":[{"id":"n1","ask":"ce que le client veut obtenir","alreadyDone":["ce qu'il dit avoir déjà fait"],"theme":"thème court ou null","search":"mots pour chercher une fiche ou null"}],"sensitive":"yes|no|doubt","sensitiveFamilies":["cancellation|subscription|finance|rights|identity|security"],"sensible":{"famille":"aucune|resiliation|remboursement|facturation|abonnement|finance|autre_sensible","preuve":"citation exacte"},"wantsHuman":false,"upset":false,"instructionInMail":false}

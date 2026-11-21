@@ -61,3 +61,21 @@ describe("diagnostic fermé de la forme du fait raté (jamais son texte)", () =>
     expect(codes.every(code => /^[a-z0-9_:.>-]{1,80}$/.test(code))).toBe(true);
   });
 });
+
+describe("mdp-05 (banc v8 : understand:sensible_autre_sensible, family:security, family:identity) : un accès pour un collègue est du support", () => {
+  const MDP05 = "Je peux donner mon mot de passe à ma collègue pour qu'elle utilise mes Assistants ?";
+  it("la lecture a la règle et un exemple : mot de passe donné ou accès collègue = support ; identité = titulaire, adresse du compte, compte d'un autre", async () => {
+    const { smartUnderstandPrompt } = await import("./smart-prompt");
+    expect(smartUnderstandPrompt()).toContain("Un mot de passe donné dans le mail ou un accès pour un collègue, c'est du support");
+    expect(smartUnderstandPrompt()).toContain("Identité ou piratage, c'est changer le titulaire ou l'adresse du compte, ou entrer dans le compte d'un autre.");
+    expect(smartUnderstandPrompt()).toContain(`« ${MDP05} » : {"famille":"aucune","preuve":"${MDP05}"}`);
+  });
+  it("lu « aucune » : la décision répond (l'invitation) ; lu « identité » : l'équipe, la barrière serveur ne change pas", async () => {
+    const support = await run({ understand: { output: smartReading({ sensible: { famille: "aucune", preuve: MDP05 } }) }, decide: { output: smartGoodDecision() }, verify: { output: SMART_CONFORME } },
+      { subject: "accès pour Julie", body: `Bonjour, ma collègue n'a pas de compte. ${MDP05}`, thread: [] });
+    expect(support.result.outcome).toBe("reply");
+    const identity = await run({ understand: { output: smartReading({ sensitive: "yes", sensitiveFamilies: ["identity"], sensible: { famille: "autre_sensible", preuve: "changez l'adresse du compte" } }) } },
+      { subject: "titulaire", body: "Bonjour, changez l'adresse du compte au nom de mon associé.", thread: [] });
+    expect(identity.result).toMatchObject({ outcome: "team_sensitive", sensitiveStop: "understand" });
+  });
+});
