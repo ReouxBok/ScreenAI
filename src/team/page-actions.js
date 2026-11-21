@@ -24,6 +24,9 @@ export function performPageAction(options) {
 
   function startWatch() {
     const previous = globalThis.__limovaBrowserWatch;
+    // A batch keeps one watcher across its steps, so the final verification sees
+    // every change, not only the last step's.
+    if (options?.keepWatch && previous?.observer) return;
     try { previous?.observer?.disconnect(); } catch (_) { /* ignore */ }
     const before = new Set();
     document.querySelectorAll('[role="alert"], [role="status"], [aria-live]:not([aria-live="off"])').forEach(node => {
@@ -130,6 +133,23 @@ export function performPageAction(options) {
       option.selected = true;
       dispatchValueEvents(el, null);
       return { ok: true, field_state: kit.fieldState(el), selected: kit.clean(option.label || option.text, 80) };
+    }
+
+    if (action === 'check') {
+      const want = options?.checked === true;
+      const native = el instanceof HTMLInputElement && ['checkbox', 'radio'].includes(kit.inputType(el));
+      const role = el.getAttribute('role') || '';
+      if (!native && !['checkbox', 'switch', 'radio', 'menuitemcheckbox', 'menuitemradio'].includes(role)) {
+        return { ok: false, code: 'invalid_args', message: 'Cet élément n’est pas une case à cocher.' };
+      }
+      const read = () => (native ? el.checked : el.getAttribute('aria-checked') === 'true');
+      if (!want && (native ? kit.inputType(el) === 'radio' : role === 'radio' || role === 'menuitemradio') && read()) {
+        return { ok: false, code: 'invalid_args', message: 'Un bouton radio se décoche en choisissant une autre option.' };
+      }
+      startWatch();
+      if (read() !== want) clickElement(el);
+      if (read() !== want) return { ok: false, code: 'internal', message: 'La case n’a pas changé d’état.' };
+      return { ok: true, field_state: kit.fieldState(el) ?? (want ? 'filled' : 'empty') };
     }
 
     if (action === 'submit') {

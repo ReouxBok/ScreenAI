@@ -6,17 +6,18 @@
 // stricter of the two, so a wrong or manipulated server reading can only add an
 // approval, never remove one.
 //
-// Autonomy table (pay / account always ask, at every level):
-//   level            read   write  risky  risky pay/account
-//   ask_every_time   runs   asks   asks   asks
-//   approve_for_me   runs   runs   asks   asks
-//   full_access      runs   runs   runs   asks
+// `browser.v2` (TEAM-726): the extension no longer asks before actions, whatever its
+// autonomy level. Only paying (`pay`, from the server or from this reading) waits for
+// the person's click in a Chrome window. Other confirmations happen in the chat,
+// decided by the server from the autonomy level. Sensitive fields, blocked sites,
+// pause and take-over are still enforced elsewhere, at every level.
 //
 // Everything here is pure and runs in the service worker; the page only reports facts
 // about the element (name, form, type), never a decision.
 
 export const RISK_REASONS = Object.freeze(['send', 'pay', 'publish', 'delete', 'account', 'external_form']);
-export const ALWAYS_ASK_REASONS = Object.freeze(['pay', 'account']);
+// The only reason the extension itself still asks the person (TEAM-726).
+export const OWNER_APPROVAL_REASONS = Object.freeze(['pay']);
 export const HINT_REASONS = Object.freeze(['send', 'pay', 'publish', 'delete', 'account']);
 
 export const READ_TOOLS = Object.freeze([
@@ -24,7 +25,8 @@ export const READ_TOOLS = Object.freeze([
   'browser.screenshot', 'browser.navigate', 'browser.scroll'
 ]);
 export const ACTION_TOOLS = Object.freeze([
-  'browser.click', 'browser.fill', 'browser.select', 'browser.submit', 'browser.download'
+  'browser.click', 'browser.fill', 'browser.select', 'browser.submit', 'browser.download',
+  'browser.batch'
 ]);
 export const ACCESS_TOOLS = Object.freeze(['browser.request_tab']);
 export const BROWSER_TOOLS = Object.freeze([...READ_TOOLS, ...ACTION_TOOLS, ...ACCESS_TOOLS]);
@@ -149,20 +151,21 @@ export function stricterRisk(server = {}, local = {}) {
 }
 
 /**
- * Should the person approve this call?
- * @param {string} autonomy ask_every_time | approve_for_me | full_access
- * @param {'read'|'action'|'access'} kind
- * @param {{risk: string, reason: string|null}} [risk]
- * @returns {'run'|'ask'}
+ * Must the person click « Autoriser » in Chrome before this action runs?
+ * Only for a payment (TEAM-726); everything else runs, at every autonomy level.
+ * @param {{risk: string, reason: string|null}} risk the stricter reading
+ * @returns {boolean}
  */
-export function approvalDecision(autonomy, kind, risk = { risk: 'write', reason: null }) {
-  if (kind === 'read') return 'run';
-  if (kind === 'access') return 'ask';
-  if (ALWAYS_ASK_REASONS.includes(risk.reason)) return 'ask';
-  if (autonomy === 'full_access') return 'run';
-  if (autonomy === 'approve_for_me') return risk.risk === 'risky' ? 'ask' : 'run';
-  // ask_every_time, or anything unknown: ask.
-  return 'ask';
+export function needsOwnerApproval(risk = {}) {
+  return OWNER_APPROVAL_REASONS.includes(risk.reason);
+}
+
+/**
+ * The strictest reading of several steps (`browser.batch`).
+ * @param {Array<{risk: string, reason: string|null}>} readings
+ */
+export function strictestOf(readings) {
+  return readings.reduce((acc, reading) => stricterRisk(acc, reading), { risk: 'write', reason: null });
 }
 
 /**
@@ -193,24 +196,12 @@ const VERBS = {
   'browser.fill': 'écrire dans',
   'browser.select': 'choisir une option dans',
   'browser.submit': 'envoyer le formulaire',
-  'browser.download': 'télécharger'
+  'browser.download': 'télécharger',
+  'browser.batch': 'agir sur'
 };
 
-const REASON_TEXT = {
-  send: 'Cette action envoie un message ou des données.',
-  pay: 'Cette action peut déclencher un paiement.',
-  publish: 'Cette action publie du contenu.',
-  delete: 'Cette action supprime quelque chose.',
-  account: 'Cette action peut modifier les réglages de votre compte.',
-  external_form: 'Ce formulaire envoie vos données vers un autre site.'
-};
-
-export function reasonText(reason, autonomy) {
-  if (REASON_TEXT[reason]) return REASON_TEXT[reason];
-  return autonomy === 'ask_every_time'
-    ? 'Vous avez choisi « Demander une approbation » : chaque modification attend votre accord.'
-    : 'Cette action modifie la page.';
-}
+// The approval window only opens for a payment now (TEAM-726).
+export const PAY_REASON_TEXT = 'Cette action peut déclencher un paiement. Limova attend votre accord avant de payer.';
 
 function quoted(text, max = 80) {
   const clean = String(text || '').replace(/\s+/g, ' ').trim();
@@ -239,6 +230,7 @@ export function activityLabel(tool, args = {}, targetName = '') {
     case 'browser.select': return `Choix dans ${quoted(name, 40)}`;
     case 'browser.submit': return `Envoi de ${quoted(name, 40)}`;
     case 'browser.download': return `Téléchargement de ${quoted(name, 40)}`;
+    case 'browser.batch': return `Remplissage de la page (${Number(args.steps?.length) || 0} étapes)`;
     case 'browser.request_tab': return 'Demande d’accès à un onglet';
     default: return 'Action';
   }

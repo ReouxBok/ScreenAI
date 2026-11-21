@@ -74,7 +74,7 @@ describe('connections registry', () => {
     expect(sanitizeConnection('limova_team', { ...CONNECTION, environment: 'https://evil.example' })).toBeNull();
     expect(sanitizeConnection('evil', { ...CONNECTION, product: 'evil' })).toBeNull();
     expect(sanitizeConnection('limova_team', { ...CONNECTION, device_token: 'Bearer x' })).toBeNull();
-    expect(sanitizeConnection('limova_team', { ...CONNECTION, autonomy: 'yolo' }).autonomy).toBe('approve_for_me');
+    expect(sanitizeConnection('limova_team', { ...CONNECTION, autonomy: 'yolo' }).autonomy).toBe('full_access');
   });
 
   it('revokes with the device token, then forgets locally', async () => {
@@ -188,7 +188,8 @@ describe('pairing (PKCE)', () => {
       app_version: '2.2.63',
       machine_id: pending.machine_id
     });
-    expect(connection).toEqual(expect.objectContaining({ device_token: 'lmd_newtoken_abcdefghijklmnop', autonomy: 'approve_for_me', environment: 'production' }));
+    // TEAM-726: a new browser connection starts at « Accès complet ».
+    expect(connection).toEqual(expect.objectContaining({ device_token: 'lmd_newtoken_abcdefghijklmnop', autonomy: 'full_access', environment: 'production' }));
     expect(session.data.has(PAIRING_SESSION_KEY)).toBe(false);
     await expect(pairing.complete({ code: 'abc', state: pending.state })).rejects.toMatchObject({ code: 'no_pending_pairing' });
   });

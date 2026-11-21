@@ -11,6 +11,12 @@
 // - never stores what it reads: page text, element names, screenshots and field values
 //   live in memory until the answer is sent.
 //
+// `browser.v2` (TEAM-726): every page-changing tool takes `include_page: true` and
+// answers `data.page` (read_page's data, read once the page settled), and
+// `browser.batch` runs up to 20 fill/select/check/click steps on one snapshot, all
+// checked before the first one runs. Waits follow the tab's events and DOM quiet
+// rather than fixed delays; a navigation still gets at most 20 s.
+//
 // Approvals and autonomy are not decided here (see team-controller.js). For actions the
 // engine splits the work in two: `prepareAction` checks everything and reads the live
 // element (so the controller can judge risk and ask the person), then `executeAction`
@@ -20,18 +26,29 @@
 // (background.js's renderSilentVisualCapture) to avoid a circular import.
 
 import { classifyUrl, domainOf, safeFavicon, safeUrl } from './products.js';
-import { riskHint, targetMatches } from './risk.js';
+import { classifyAction, riskHint, strictestOf, targetMatches } from './risk.js';
 import { inspectPageElement, pageSnapshot, preparePageCapture } from './page-snapshot.js';
 import { collectPageVerification, performPageAction, scrollPage } from './page-actions.js';
 
 export const GROUPS_SESSION_KEY = 'limova_tab_groups_v1';
 export const SCREENSHOT_MAX_BASE64 = 1_500_000;
 const NAVIGATION_SETTLE_MAX_MS = 20_000;
-const VERIFY_MIN_MS = 600;
+// Verification polls the page instead of sleeping a fixed time (TEAM-726): it ends as
+// soon as the DOM has been quiet for VERIFY_QUIET_MS, after at least VERIFY_MIN_MS, and
+// never later than VERIFY_MAX_MS (a navigation still gets its 20 s).
+const VERIFY_FIRST_CHECK_MS = 120;
+const VERIFY_POLL_MS = 100;
+const VERIFY_MIN_MS = 350;
 const VERIFY_MAX_MS = 3_000;
-const VERIFY_QUIET_MS = 400;
+const VERIFY_QUIET_MS = 300;
+const LOAD_POLL_FALLBACK_MS = 500;
+const BATCH_NAVIGATION_PEEK_MS = 120;
+const BATCH_MAX_STEPS = 20;
+const BATCH_ACTIONS = ['fill', 'select', 'check', 'click'];
 const OPEN_TAB_WAIT_MS = 10_000;
 const TEXT_LIMITS = { min: 500, max: 20000, fallback: 8000 };
+// `include_page` reads a shorter page by default (TEAM-726).
+const INCLUDED_TEXT_LIMITS = { min: 500, max: 20000, fallback: 4000 };
 const ELEMENT_LIMITS = { min: 1, max: 400, fallback: 200 };
 
 export function toolError(code, message) {
@@ -200,22 +217,35 @@ export function createBrowserEngine({
         : 'Chrome does not let extensions read this page.');
     }
 
+    function settled(tab) {
+      // A new tab first reports `about:blank` as complete; wait for the real page.
+      return Boolean(tab && tab.status !== 'loading' && !tab.pendingUrl && tab.url && tab.url !== 'about:blank');
+    }
+
+    // Wait for the tab to finish loading: woken by the tab's own onUpdated events,
+    // with a slow poll as a fallback, capped at maxMs.
     async function waitForLoad(tabId, maxMs, signal) {
       const started = now();
-      let tab = null;
-      while (now() - started < maxMs) {
-        if (isCancelled(signal)) return tab;
-        try {
-          tab = await chromeApi.tabs.get(tabId);
-        } catch {
-          return null;
+      let wake = null;
+      const listener = id => { if (id === tabId && wake) wake(); };
+      chromeApi.tabs.onUpdated?.addListener?.(listener);
+      try {
+        let tab = null;
+        while (now() - started < maxMs) {
+          if (isCancelled(signal)) return tab;
+          try {
+            tab = await chromeApi.tabs.get(tabId);
+          } catch {
+            return null;
+          }
+          if (settled(tab)) return tab;
+          await Promise.race([new Promise(resolve => { wake = resolve; }), sleep(LOAD_POLL_FALLBACK_MS)]);
+          wake = null;
         }
-        // A new tab first reports `about:blank` as complete; wait for the real page.
-        const settled = tab.status !== 'loading' && !tab.pendingUrl && tab.url && tab.url !== 'about:blank';
-        if (settled) return tab;
-        await sleep(200);
+        return tab;
+      } finally {
+        chromeApi.tabs.onUpdated?.removeListener?.(listener);
       }
-      return tab;
     }
 
     async function targetWindowId() {
@@ -330,7 +360,8 @@ export function createBrowserEngine({
       // captureVisibleTab only captures the visible tab of a window: bring it to the front.
       await chromeApi.windows.update(tab.windowId, { focused: true }).catch(() => {});
       await chromeApi.tabs.update(tab.id, { active: true }).catch(() => {});
-      await sleep(250);
+      // One frame for the window to come to the front before the capture.
+      await sleep(150);
       const prep = await executeWhenReady(tab.id, preparePageCapture, { productKey });
       if (!prep.ok || !prep.result?.ok) return toolError('page_unavailable', 'Chrome cannot capture this page.');
       let capture = null;
@@ -367,7 +398,7 @@ export function createBrowserEngine({
 
     async function verify(tabId, before, { elementId = null, signal, newTabs, busy } = {}) {
       const started = now();
-      await sleep(VERIFY_MIN_MS);
+      await sleep(VERIFY_FIRST_CHECK_MS);
       let tab = await chromeApi.tabs.get(tabId).catch(() => null);
       if (tab?.status === 'loading') tab = await waitForLoad(tabId, NAVIGATION_SETTLE_MAX_MS, signal);
       let info = null;
@@ -375,8 +406,9 @@ export function createBrowserEngine({
         const run = await execute(tabId, collectPageVerification, { productKey, elementId, finish: false });
         info = run.ok ? run.result : null;
         const elapsed = now() - started;
-        if (!info || !info.same_document || elapsed >= VERIFY_MAX_MS || (info.quiet_ms ?? 0) >= VERIFY_QUIET_MS) break;
-        await sleep(200);
+        if (!info || !info.same_document || elapsed >= VERIFY_MAX_MS) break;
+        if (elapsed >= VERIFY_MIN_MS && (info.quiet_ms ?? 0) >= VERIFY_QUIET_MS) break;
+        await sleep(VERIFY_POLL_MS);
         tab = await chromeApi.tabs.get(tabId).catch(() => null);
         if (tab?.status === 'loading') tab = await waitForLoad(tabId, NAVIGATION_SETTLE_MAX_MS, signal);
       }
@@ -403,6 +435,33 @@ export function createBrowserEngine({
         },
         snapshot_stale: urlChanged || newDocument || Boolean(info?.structural)
       };
+    }
+
+    // `include_page: true` (TEAM-726): validated before acting, read after settling.
+    function pageOptions(args) {
+      if (args.include_page === undefined || args.include_page === false) return { include: false };
+      if (args.include_page !== true) return { error: toolError('invalid_args', 'include_page must be a boolean') };
+      const maxText = boundedInt(args.max_text_chars, INCLUDED_TEXT_LIMITS);
+      const maxElements = boundedInt(args.max_elements, ELEMENT_LIMITS);
+      if (maxText === null) return { error: toolError('invalid_args', 'max_text_chars must be 500 to 20000') };
+      if (maxElements === null) return { error: toolError('invalid_args', 'max_elements must be 1 to 400') };
+      return { include: true, maxText, maxElements };
+    }
+
+    // `data.page` is exactly read_page's data; its snapshot replaces the previous one.
+    async function attachPage(result, tabId, page, signal) {
+      if (!page?.include || !result?.ok || !isTabId(tabId)) return result;
+      const read = await readPage({ tab_id: tabId, max_text_chars: page.maxText, max_elements: page.maxElements }, { signal });
+      if (read.ok) result.data.page = read.data;
+      else result.data.page_error = read.error.code;
+      return result;
+    }
+
+    async function withPage(args, run, tabIdOf, signal) {
+      const page = pageOptions(args);
+      if (page.error) return page.error;
+      const result = await run();
+      return attachPage(result, tabIdOf(result), page, signal);
     }
 
     async function navigate(args, { signal, busy } = {}) {
@@ -491,6 +550,9 @@ export function createBrowserEngine({
      * plan.element holds the facts risk.classifyAction needs (never a value).
      */
     async function prepareAction(tool, args) {
+      if (tool === 'browser.batch') return prepareBatch(args);
+      const page = pageOptions(args);
+      if (page.error) return { error: page.error };
       const action = ACTIONS[tool];
       if (!action) return { error: toolError('unsupported', `Unknown tool ${tool}`) };
       if (typeof args.snapshot_id !== 'string' || !args.snapshot_id) return { error: toolError('invalid_args', 'snapshot_id is required') };
@@ -536,7 +598,7 @@ export function createBrowserEngine({
       }
       return {
         plan: {
-          tool, action, tab, args, element,
+          tool, action, tab, args, element, page,
           domain: domainOf(tab.url || ''),
           snapshotId: args.snapshot_id,
           elementId: args.element_id
@@ -544,7 +606,9 @@ export function createBrowserEngine({
       };
     }
 
-    async function executeAction(plan, { signal, busy } = {}) {
+    async function executeAction(plan, options = {}) {
+      if (plan.kind === 'batch') return executeBatch(plan, options);
+      const { signal, busy } = options;
       if (isCancelled(signal)) return toolError('paused', 'Stopped.');
       const tab = await chromeApi.tabs.get(plan.tab.id).catch(() => null);
       if (!tab) return toolError('tab_not_found', 'This tab was closed.');
@@ -583,12 +647,166 @@ export function createBrowserEngine({
       if (plan.action === 'fill' && verification.field_state === null && run.result?.field_state) {
         verification.field_state = run.result.field_state;
       }
-      return ok({
+      return attachPage(ok({
         tab: outcome.tab || toTab(tab),
         done: true,
         verification,
         snapshot_stale: outcome.snapshot_stale
-      });
+      }), tab.id, plan.page, signal);
+    }
+
+    // ---------------------------------------------------------------- batch (TEAM-726)
+
+    function stepError(index, error) {
+      return toolError(error.error.code, `Étape ${index + 1} : ${error.error.message}`);
+    }
+
+    // Every step is checked before the first one runs: a bad step fails the whole call.
+    async function prepareBatch(args) {
+      const page = pageOptions(args);
+      if (page.error) return { error: page.error };
+      if (typeof args.snapshot_id !== 'string' || !args.snapshot_id) return { error: toolError('invalid_args', 'snapshot_id is required') };
+      if (!Array.isArray(args.steps) || args.steps.length < 1 || args.steps.length > BATCH_MAX_STEPS) {
+        return { error: toolError('invalid_args', `steps must hold 1 to ${BATCH_MAX_STEPS} steps`) };
+      }
+      for (const [index, step] of args.steps.entries()) {
+        const fail = message => ({ error: toolError('invalid_args', `Étape ${index + 1} : ${message}`) });
+        if (!step || typeof step !== 'object' || Array.isArray(step)) return fail('a step must be an object');
+        if (!BATCH_ACTIONS.includes(step.action)) return fail('action must be fill, select, check or click');
+        if (typeof step.element_id !== 'string' || !/^e\d{1,4}$/.test(step.element_id)) return fail('element_id must look like e12');
+        if (typeof step.target !== 'string' || !step.target.trim() || step.target.length > 300) return fail('target must name the element');
+        if (step.action === 'fill') {
+          if (typeof step.value !== 'string') return fail('value must be text');
+          if (step.value.length > 5000) return { error: toolError('too_large', `Étape ${index + 1} : value is limited to 5000 characters`) };
+        }
+        if (step.action === 'select' && (typeof step.option !== 'string' || !step.option.trim())) return fail('option must name the choice');
+        if (step.action === 'check' && typeof step.checked !== 'boolean') return fail('checked must be true or false');
+      }
+      const { tab, error } = await groupTab(args.tab_id);
+      if (error) return { error };
+      const unavailable = pageError(tab);
+      if (unavailable) return { error: unavailable };
+      const known = latestSnapshots.get(tab.id);
+      if (known && known !== args.snapshot_id) return { error: toolError('stale_snapshot', 'These ids come from an older read. Read the page again.') };
+
+      const steps = [];
+      const readings = [];
+      for (const [index, step] of args.steps.entries()) {
+        const run = await executeWhenReady(tab.id, inspectPageElement, { productKey, snapshotId: args.snapshot_id, elementId: step.element_id });
+        if (!run.ok || !run.result) return { error: toolError('page_unavailable', 'Chrome cannot read this page.') };
+        if (!run.result.ok) {
+          return { error: stepError(index, toolError(run.result.code, run.result.code === 'stale_snapshot' ? 'Read the page again.' : 'The element is gone, hidden or disabled.')) };
+        }
+        const element = { ...run.result.element, page: run.result.page };
+        if (!targetMatches(step.target, element.name)) {
+          return { error: stepError(index, toolError('stale_snapshot', `This id now names « ${String(element.name).slice(0, 60)} », not the target.`)) };
+        }
+        if (step.action === 'fill') {
+          if (element.sensitive) return { error: stepError(index, toolError('sensitive_field', 'Limova never types passwords, card numbers or codes. Ask the person to take over.')) };
+          if (!element.editable) return { error: stepError(index, toolError('invalid_args', 'This element is not a text field.')) };
+        }
+        if (step.action === 'select' && !element.is_select) return { error: stepError(index, toolError('invalid_args', 'This element is not a list of choices.')) };
+        if (step.action === 'check' && !element.is_checkable && !['checkbox', 'switch', 'radio', 'menuitemcheckbox', 'menuitemradio'].includes(element.role)) {
+          return { error: stepError(index, toolError('invalid_args', 'This element is not a checkbox.')) };
+        }
+        if (step.action === 'click') {
+          if (element.href && classifyUrl(element.href, { fromAgent: true }).code === 'blocked_site') {
+            return { error: stepError(index, toolError('blocked_site', 'This link leads to a site Limova does not act on.')) };
+          }
+          if (element.submits && element.form?.action_origin && classifyUrl(element.form.action_origin, { fromAgent: true }).code === 'blocked_site') {
+            return { error: stepError(index, toolError('blocked_site', 'This form sends to a site Limova does not act on.')) };
+          }
+        }
+        readings.push(classifyAction(step.action === 'click' ? 'browser.click' : 'browser.fill', element));
+        steps.push({ ...step, element });
+      }
+      const local = strictestOf(readings);
+      // The element the approval window names: the riskiest step, else the last one.
+      const riskiest = steps[readings.findIndex(reading => reading.reason && reading.reason === local.reason)] || steps.at(-1);
+      return {
+        plan: {
+          kind: 'batch', tool: 'browser.batch', tab, args, steps, local, page,
+          element: riskiest.element,
+          domain: domainOf(tab.url || ''),
+          snapshotId: args.snapshot_id
+        }
+      };
+    }
+
+    async function executeBatch(plan, { signal, busy } = {}) {
+      if (isCancelled(signal)) return toolError('paused', 'Stopped.');
+      const tab = await chromeApi.tabs.get(plan.tab.id).catch(() => null);
+      if (!tab) return toolError('tab_not_found', 'This tab was closed.');
+      const groupId = await currentGroupId();
+      if (groupId === null || tab.groupId !== groupId) return toolError('not_in_group', 'This tab left the group.');
+      if (safeUrl(tab.url) !== safeUrl(plan.tab.url)) return toolError('stale_snapshot', 'The page changed. Read it again.');
+      const newTabs = watchNewTabs(tab.id);
+      const before = { url: tab.url || '' };
+      const results = [];
+      let done = 0;
+      let navigated = false;
+      let lastFieldState = null;
+      for (const [index, step] of plan.steps.entries()) {
+        if (isCancelled(signal)) {
+          newTabs.stop();
+          return toolError('paused', 'Stopped.');
+        }
+        const run = await execute(tab.id, performPageAction, {
+          productKey,
+          snapshotId: plan.snapshotId,
+          elementId: step.element_id,
+          action: step.action,
+          value: step.action === 'fill' ? step.value : undefined,
+          option: step.action === 'select' ? step.option : undefined,
+          checked: step.action === 'check' ? step.checked : undefined,
+          expectName: step.element.name,
+          keepWatch: index > 0
+        });
+        if (!run.ok) {
+          if (/removed|navigat|closed|unloaded|No frame/i.test(run.message)) {
+            // The page went away while this step ran: it did run, and it ends the batch.
+            results.push({ element_id: step.element_id, ok: true });
+            done += 1;
+            navigated = true;
+            break;
+          }
+          results.push({ element_id: step.element_id, ok: false, error: { code: 'page_unavailable', message: 'Chrome cannot act on this page.' } });
+          break;
+        }
+        if (!run.result?.ok) {
+          const code = run.result?.code || 'internal';
+          results.push({ element_id: step.element_id, ok: false, error: { code, message: run.result?.message || code } });
+          break;
+        }
+        results.push({ element_id: step.element_id, ok: true });
+        done += 1;
+        lastFieldState = run.result.field_state ?? lastFieldState;
+        if (step.action === 'click' && index < plan.steps.length - 1) {
+          // A click may navigate: a quick look at the tab, and a new page ends the batch.
+          await sleep(BATCH_NAVIGATION_PEEK_MS);
+          const peek = await chromeApi.tabs.get(tab.id).catch(() => null);
+          if (!peek || peek.status === 'loading' || (peek.url || '') !== before.url) {
+            navigated = true;
+            break;
+          }
+        }
+      }
+      if (navigated) {
+        for (const step of plan.steps.slice(results.length)) {
+          results.push({ element_id: step.element_id, ok: false, error: { code: 'stale_snapshot', message: 'The page changed before this step.' } });
+        }
+      }
+      const outcome = await verify(tab.id, before, { signal, newTabs, busy });
+      newTabs.stop();
+      if (outcome.verification.url_changed || navigated) latestSnapshots.delete(tab.id);
+      if (outcome.verification.field_state === null && lastFieldState) outcome.verification.field_state = lastFieldState;
+      return attachPage(ok({
+        tab: outcome.tab || toTab(tab),
+        done,
+        steps: results,
+        verification: outcome.verification,
+        snapshot_stale: navigated || outcome.snapshot_stale
+      }), tab.id, plan.page, signal);
     }
 
     // ---------------------------------------------------------------- access
@@ -634,12 +852,12 @@ export function createBrowserEngine({
       runRead(tool, args, options) {
         switch (tool) {
           case 'browser.list_tabs': return listTabs(args, options);
-          case 'browser.open_tab': return openTab(args, options);
+          case 'browser.open_tab': return withPage(args, () => openTab(args, options), result => result?.data?.tab?.tab_id, options?.signal);
           case 'browser.close_tab': return closeTab(args, options);
           case 'browser.read_page': return readPage(args, options);
           case 'browser.screenshot': return screenshot(args, options);
-          case 'browser.navigate': return navigate(args, options);
-          case 'browser.scroll': return scroll(args, options);
+          case 'browser.navigate': return withPage(args, () => navigate(args, options), () => args.tab_id, options?.signal);
+          case 'browser.scroll': return withPage(args, () => scroll(args, options), () => args.tab_id, options?.signal);
           default: return Promise.resolve(toolError('unsupported', `Unknown tool ${tool}`));
         }
       }

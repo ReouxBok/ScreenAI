@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  approvalDecision, approvalTitle, classifyAction, reasonFromName, riskHint, stricterRisk, targetMatches, toolKind
+  approvalTitle, classifyAction, needsOwnerApproval, reasonFromName, riskHint, strictestOf, stricterRisk, targetMatches, toolKind
 } from '../../../src/team/risk.js';
 import { createApprovalManager } from '../../../src/team/approvals.js';
 
@@ -48,29 +48,18 @@ describe('risk classification', () => {
     expect(stricterRisk({}, { risk: 'write', reason: null })).toEqual({ risk: 'write', reason: null });
   });
 
-  it('applies the autonomy table, with pay and account always asking', () => {
-    const write = { risk: 'write', reason: null };
-    const risky = { risk: 'risky', reason: 'send' };
-    const pay = { risk: 'risky', reason: 'pay' };
-    const account = { risk: 'risky', reason: 'account' };
-    const table = {
-      ask_every_time: ['run', 'ask', 'ask', 'ask', 'ask'],
-      approve_for_me: ['run', 'run', 'ask', 'ask', 'ask'],
-      full_access: ['run', 'run', 'run', 'ask', 'ask']
-    };
-    for (const [level, expected] of Object.entries(table)) {
-      expect([
-        approvalDecision(level, 'read'),
-        approvalDecision(level, 'action', write),
-        approvalDecision(level, 'action', risky),
-        approvalDecision(level, 'action', pay),
-        approvalDecision(level, 'action', account)
-      ]).toEqual(expected);
-      expect(approvalDecision(level, 'access')).toBe('ask');
+  it('only asks the person before paying (browser.v2)', () => {
+    expect(needsOwnerApproval({ risk: 'risky', reason: 'pay' })).toBe(true);
+    for (const reason of ['send', 'publish', 'delete', 'account', 'external_form', null]) {
+      expect(needsOwnerApproval({ risk: 'risky', reason })).toBe(false);
     }
-    expect(approvalDecision('unknown', 'action', write)).toBe('ask');
+    expect(needsOwnerApproval({ risk: 'write', reason: null })).toBe(false);
+    // A batch takes the strictest of its steps.
+    expect(strictestOf([{ risk: 'write', reason: null }, { risk: 'risky', reason: 'pay' }, { risk: 'risky', reason: 'send' }]))
+      .toEqual({ risk: 'risky', reason: 'pay' });
     expect(toolKind('browser.read_page')).toBe('read');
     expect(toolKind('browser.submit')).toBe('action');
+    expect(toolKind('browser.batch')).toBe('action');
     expect(toolKind('browser.request_tab')).toBe('access');
     expect(toolKind('files.list')).toBeNull();
   });

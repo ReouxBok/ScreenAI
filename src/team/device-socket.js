@@ -13,6 +13,9 @@
 //   4400  first message was not a hello   -> reconnect after a delay
 //   other (1000, 1011, 4408, network)     -> exponential backoff 1 s -> 60 s with jitter
 //
+// `browser.v2` (TEAM-726) tells the server this app returns `data.page` on
+// `include_page`, runs `browser.batch`, and only asks the person before paying.
+//
 // Results are cached by call_id for 10 minutes: a repeated call_id gets the same
 // answer without running again. A call is only answered on the socket it arrived on
 // (or the socket that last repeated it), as the server only accepts that.
@@ -21,7 +24,7 @@
 // fake timers.
 
 export const DEVICE_SUBPROTOCOL = 'limova-device.v1';
-export const CAPABILITIES = Object.freeze(['browser.v1', 'autonomy.v1', 'browser_control.v1']);
+export const CAPABILITIES = Object.freeze(['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1']);
 export const PING_INTERVAL_MS = 25_000;
 export const RESULT_CACHE_MS = 10 * 60_000;
 export const BACKOFF_MIN_MS = 1_000;

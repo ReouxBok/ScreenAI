@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createBrowserEngine } from '../../../src/team/browser-engine.js';
 import { pageSnapshot } from '../../../src/team/page-snapshot.js';
 import { createChromeFake, installLayout, resetIsolatedWorld, steppingClock, TEAM_PRODUCT } from './helpers.js';
@@ -304,5 +304,138 @@ describe('browser engine: actions', () => {
     const rebuilt = new Function(`return (${source})`)();
     resetIsolatedWorld();
     expect(rebuilt({ productKey: 'limova_team', snapshotId: 's1' }).ok).toBe(true);
+  });
+
+  describe('browser.v2 (TEAM-726)', () => {
+    it('answers data.page with exactly the read_page data after an action', async () => {
+      const { browser } = setup();
+      const { snapshot, id } = await read(browser);
+      const prepared = await browser.prepareAction('browser.fill', {
+        tab_id: 812, snapshot_id: snapshot, element_id: id('E-mail'), target: 'E-mail', value: 'a@b.c', include_page: true
+      });
+      const result = await browser.executeAction(prepared.plan);
+      const page = result.data.page;
+      expect(page.snapshot_id).not.toBe(snapshot);
+      expect(Object.keys(page).sort()).toEqual(['elements', 'elements_truncated', 'forms', 'snapshot_id', 'suspicious', 'tab', 'text', 'text_truncated']);
+      expect(globalThis.__limovaBrowserMaps.limova_team.snapshotId).toBe(page.snapshot_id);
+      // The new snapshot replaces the old one.
+      const old = await browser.prepareAction('browser.click', { tab_id: 812, snapshot_id: snapshot, element_id: id('Envoyer'), target: 'Envoyer' });
+      expect(old.error.error.code).toBe('stale_snapshot');
+      const fresh = page.elements.find(element => element.name === 'Envoyer').id;
+      expect((await browser.prepareAction('browser.click', { tab_id: 812, snapshot_id: page.snapshot_id, element_id: fresh, target: 'Envoyer' })).error).toBeUndefined();
+    });
+
+    it('uses 4000 characters of text by default and validates include_page', async () => {
+      const { browser } = setup();
+      document.body.insertAdjacentHTML('beforeend', `<p>${'x'.repeat(9000)}</p>`);
+      window.scrollTo = () => {};
+      const scrolled = await browser.runRead('browser.scroll', { tab_id: 812, direction: 'top', include_page: true });
+      expect(scrolled.data.page.text.length).toBe(4000);
+      expect(scrolled.data.page.text_truncated).toBe(true);
+      expect((await browser.runRead('browser.scroll', { tab_id: 812, direction: 'top', include_page: 'yes' })).error.code).toBe('invalid_args');
+      expect((await browser.runRead('browser.scroll', { tab_id: 812, direction: 'top', include_page: true, max_elements: 0 })).error.code).toBe('invalid_args');
+      const opened = await browser.runRead('browser.open_tab', { url: 'https://example.com/', include_page: true });
+      expect(opened.ok).toBe(true);
+      expect(opened.data.page).toBeDefined();
+    });
+
+    it('runs a batch in order and returns the page', async () => {
+      const { browser } = setup();
+      const clicked = [];
+      document.getElementById('delete').addEventListener('click', () => clicked.push('delete'));
+      const { snapshot, id } = await read(browser);
+      const prepared = await browser.prepareAction('browser.batch', {
+        tab_id: 812, snapshot_id: snapshot, include_page: true, risk: 'write', risk_reason: null,
+        steps: [
+          { action: 'fill', element_id: id('E-mail'), target: 'E-mail', value: 'camille@example.com' },
+          { action: 'select', element_id: id('Pays'), target: 'Pays', option: 'Espagne' },
+          { action: 'check', element_id: id('Newsletter'), target: 'Newsletter', checked: false },
+          { action: 'click', element_id: id('Supprimer le compte'), target: 'Supprimer le compte' }
+        ]
+      });
+      expect(prepared.error).toBeUndefined();
+      expect(prepared.plan.local).toEqual({ risk: 'risky', reason: 'account' });
+      const result = await browser.executeAction(prepared.plan);
+      expect(result.ok).toBe(true);
+      expect(result.data.done).toBe(4);
+      expect(result.data.steps.map(step => step.ok)).toEqual([true, true, true, true]);
+      expect(document.getElementById('email').value).toBe('camille@example.com');
+      expect(document.getElementById('country').value).toBe('es');
+      expect(document.getElementById('news').checked).toBe(false);
+      expect(clicked).toEqual(['delete']);
+      expect(result.data.page.snapshot_id).toMatch(/^s\d+$/);
+      expect(JSON.stringify(result)).not.toContain('camille@example.com');
+    });
+
+    it('checks every step before running any: one bad step and nothing runs', async () => {
+      const { browser } = setup();
+      const { snapshot, id } = await read(browser);
+      const sensitive = await browser.prepareAction('browser.batch', {
+        tab_id: 812, snapshot_id: snapshot,
+        steps: [
+          { action: 'fill', element_id: id('E-mail'), target: 'E-mail', value: 'x@y.z' },
+          { action: 'fill', element_id: id('Mot de passe'), target: 'Mot de passe', value: 'secret' }
+        ]
+      });
+      expect(sensitive.error.error.code).toBe('sensitive_field');
+      expect(sensitive.error.error.message).toMatch(/^Étape 2/);
+      const mismatch = await browser.prepareAction('browser.batch', {
+        tab_id: 812, snapshot_id: snapshot,
+        steps: [{ action: 'click', element_id: id('Envoyer'), target: 'Supprimer' }]
+      });
+      expect(mismatch.error.error.code).toBe('stale_snapshot');
+      expect(document.getElementById('email').value).toBe('jean@example.com');
+      for (const steps of [[], Array.from({ length: 21 }, () => ({ action: 'click', element_id: 'e1', target: 'x' })), [{ action: 'type', element_id: 'e1', target: 'x' }], [{ action: 'check', element_id: 'e1', target: 'x' }]]) {
+        expect((await browser.prepareAction('browser.batch', { tab_id: 812, snapshot_id: snapshot, steps })).error.error.code).toBe('invalid_args');
+      }
+      expect((await browser.prepareAction('browser.batch', {
+        tab_id: 812, snapshot_id: snapshot, steps: [{ action: 'fill', element_id: id('E-mail'), target: 'E-mail', value: 'x'.repeat(5001) }]
+      })).error.error.code).toBe('too_large');
+    });
+
+    it('stops at the first failing step and counts what ran', async () => {
+      const { browser } = setup();
+      const { snapshot, id } = await read(browser);
+      const prepared = await browser.prepareAction('browser.batch', {
+        tab_id: 812, snapshot_id: snapshot,
+        steps: [
+          { action: 'fill', element_id: id('E-mail'), target: 'E-mail', value: 'ok@example.com' },
+          { action: 'select', element_id: id('Pays'), target: 'Pays', option: 'Atlantide' },
+          { action: 'click', element_id: id('Supprimer le compte'), target: 'Supprimer le compte' }
+        ]
+      });
+      const clicked = vi.fn();
+      document.getElementById('delete').addEventListener('click', clicked);
+      const result = await browser.executeAction(prepared.plan);
+      expect(result.ok).toBe(true);
+      expect(result.data.done).toBe(1);
+      expect(result.data.steps).toEqual([
+        { element_id: id('E-mail'), ok: true },
+        { element_id: id('Pays'), ok: false, error: expect.objectContaining({ code: 'invalid_args' }) }
+      ]);
+      expect(clicked).not.toHaveBeenCalled();
+    });
+
+    it('ends the batch when a step navigates: the rest answer stale_snapshot', async () => {
+      const { browser, chromeApi } = setup();
+      const { snapshot, id } = await read(browser);
+      document.getElementById('delete').addEventListener('click', () => {
+        chromeApi._tabs.get(812).url = 'http://localhost:3000/merci';
+        history.replaceState(null, '', '/merci');
+      });
+      const prepared = await browser.prepareAction('browser.batch', {
+        tab_id: 812, snapshot_id: snapshot, include_page: true,
+        steps: [
+          { action: 'click', element_id: id('Supprimer le compte'), target: 'Supprimer le compte' },
+          { action: 'fill', element_id: id('E-mail'), target: 'E-mail', value: 'late@example.com' }
+        ]
+      });
+      const result = await browser.executeAction(prepared.plan);
+      expect(result.data.done).toBe(1);
+      expect(result.data.steps[1]).toEqual({ element_id: id('E-mail'), ok: false, error: expect.objectContaining({ code: 'stale_snapshot' }) });
+      expect(document.getElementById('email').value).toBe('jean@example.com');
+      expect(result.data.snapshot_stale).toBe(true);
+      expect(result.data.page.tab.url).toBe('http://localhost:3000/merci');
+    });
   });
 });

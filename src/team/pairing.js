@@ -180,7 +180,8 @@ export function createPairing({
       device_token: body?.device_token,
       machine_id: pending.machine_id,
       device_name: pending.device_name,
-      // Pairing again keeps the person's own level; a new connection starts at the default.
+      // Pairing again keeps the person's own level; a new connection starts at
+      // « Accès complet » (TEAM-726).
       autonomy: existing?.autonomy || DEFAULT_AUTONOMY,
       paused: false,
       paired_at: now()

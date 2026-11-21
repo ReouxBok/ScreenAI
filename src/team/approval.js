@@ -87,9 +87,8 @@
       $('approve').textContent = 'Partager cet onglet';
     } else {
       $('approve').disabled = false;
-      $('approve').textContent = details.confirmLabel || 'Autoriser';
+      $('approve').textContent = 'Autoriser';
     }
-    $('deny').textContent = details.denyLabel || 'Refuser';
     const tick = () => {
       const left = Math.max(0, Math.round((Number(details.expires_at) - Date.now()) / 1000));
       $('countdown').textContent = left > 0 ? `Sans réponse dans ${left} s, l’action sera abandonnée.` : 'Temps écoulé.';

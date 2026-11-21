@@ -1,9 +1,9 @@
 // approvals.js — Ask the person in a small Chrome window (TEAM-724).
 //
-// Used for: an action the autonomy level does not allow on its own (« Limova Team veut
-// cliquer sur « Envoyer » sur example.com », « Autoriser » / « Refuser »), a raise of
-// the autonomy level asked from the dashboard (`set_autonomy`, 50 s), and
-// `browser.request_tab` (the person picks one of their tabs, or refuses).
+// Used for two things only since `browser.v2` (TEAM-726): a payment (« Limova Team veut
+// cliquer sur « Payer » sur example.com », « Autoriser » / « Refuser »), and
+// `browser.request_tab` (the person picks one of their tabs, or refuses). Routine
+// actions and autonomy changes no longer open a window.
 //
 // The window only carries an opaque id in its URL; it reads the details from the
 // service worker by message, so element names and domains never land in Chrome's
@@ -107,6 +107,8 @@ export function createApprovalManager({
       }
       return count;
     },
-    size: () => pending.size
+    size: () => pending.size,
+    // Ids of the open approvals, oldest first (tests, diagnostics).
+    ids: () => [...pending.keys()]
   };
 }

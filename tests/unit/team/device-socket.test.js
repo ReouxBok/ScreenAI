@@ -64,7 +64,7 @@ describe('DeviceSocket', () => {
     expect(ws.sent[0]).toEqual({
       type: 'hello',
       app_version: '2.2.63',
-      capabilities: ['browser.v1', 'autonomy.v1', 'browser_control.v1'],
+      capabilities: ['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1'],
       autonomy: 'approve_for_me',
       paused: false,
       control: 'agent',

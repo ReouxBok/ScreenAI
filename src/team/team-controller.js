@@ -9,23 +9,25 @@
 // - taken over (« Prendre la main »): new calls are held (`progress` `taken_over`) and
 //   run in order on « Rendre la main »; a call still held at its deadline answers
 //   `taken_over`;
-// - otherwise reads run, actions are checked by the engine, judged with the stricter
-//   of the server's and the extension's risk reading, and run or wait for the person
-//   (approval window, `progress` `waiting_approval`, `approval_timeout` at the
-//   deadline, `denied_by_owner` on « Refuser »);
+// - otherwise reads and actions run at once (`browser.v2`, TEAM-726): the engine checks
+//   every action (sensitive fields, blocked sites, stale ids) and the only approval
+//   window left is for paying, judged with the stricter of the server's and the
+//   extension's reading (`progress` `waiting_approval`, `approval_timeout` at the
+//   deadline, `denied_by_owner` on « Refuser »). Other confirmations happen in the
+//   chat, decided by the server from the autonomy level;
 // - « Tout arrêter » cancels running and held calls (`paused`), closes open approval
 //   windows as refused, sets paused and sends `state`.
 //
-// `set_autonomy` follows docs/desktop-device-protocol.md: lower applies at once, higher
-// asks the person in the browser within 50 s; the level never resumes a paused app.
+// `set_autonomy` applies at once, in both directions, without a window (TEAM-726: only
+// the signed-in owner can send it, and the level now only drives the chat's
+// confirmations). It sends `state` before answering and never resumes a paused app.
 
-import { autonomyRank, isAutonomyLevel } from './products.js';
+import { DEFAULT_AUTONOMY, isAutonomyLevel } from './products.js';
 import {
-  activityLabel, approvalDecision, approvalTitle, classifyAction, reasonText, stricterRisk, toolKind
+  activityLabel, approvalTitle, classifyAction, needsOwnerApproval, PAY_REASON_TEXT, stricterRisk, toolKind
 } from './risk.js';
 import { toolError } from './browser-engine.js';
 
-export const AUTONOMY_CONFIRM_MS = 50_000;
 const DEFAULT_READ_DEADLINE_MS = 40_000;
 const DEFAULT_ACTION_DEADLINE_MS = 115_000;
 
@@ -53,7 +55,7 @@ export function createTeamController({
   onActivity = () => {}
 }) {
   const state = {
-    autonomy: isAutonomyLevel(initial.autonomy) ? initial.autonomy : 'approve_for_me',
+    autonomy: isAutonomyLevel(initial.autonomy) ? initial.autonomy : DEFAULT_AUTONOMY,
     paused: initial.paused === true,
     control: 'agent'
   };
@@ -135,28 +137,32 @@ export function createTeamController({
       return result;
     }
 
-    // Actions: check, judge, maybe ask, then act.
+    // Actions: check, judge, ask only before paying, then act.
     const prepared = await browser.prepareAction(call.tool, args);
     if (prepared.error) {
       record(call, prepared.error);
       return prepared.error;
     }
     const { plan } = prepared;
-    const local = classifyAction(call.tool, plan.element);
+    // A batch carries the strictest reading of its steps; a single action is read here.
+    const local = plan.local || classifyAction(call.tool, plan.element);
     const risk = stricterRisk({ risk: args.risk, reason: args.risk_reason }, local);
-    if (approvalDecision(state.autonomy, 'action', risk) === 'ask') {
+    if (needsOwnerApproval(risk)) {
       const lines = [];
       if (call.tool === 'browser.fill') lines.push({ label: 'Texte', text: previewValue(args.value) });
       if (call.tool === 'browser.select') lines.push({ label: 'Choix', text: previewValue(args.option) });
-      if (risk.reason === 'external_form' && plan.element.form?.action_origin) {
-        lines.push({ label: 'Destination', text: plan.element.form.action_origin });
+      if (plan.kind === 'batch') {
+        lines.push({
+          label: 'Étapes',
+          text: plan.steps.map((step, index) => `${index + 1}. ${activityLabel(`browser.${step.action === 'check' ? 'click' : step.action}`, {}, step.element.name)}`).join('\n')
+        });
       }
       const outcome = await ask({
         kind: 'action',
         title: approvalTitle(product.label, call.tool, plan.element.name, plan.domain),
         domain: plan.domain,
         target: plan.element.name,
-        reason: reasonText(risk.reason, state.autonomy),
+        reason: PAY_REASON_TEXT,
         lines
       }, call, ctx, signal);
       if (outcome.decision !== 'approve') {
@@ -235,38 +241,20 @@ export function createTeamController({
   }
 
   async function applyAutonomy(level) {
+    // Apply and announce before persisting: two quick changes must each send their own
+    // `state` before their own answer, never the other one's level.
     state.autonomy = level;
-    await store?.update(product.id, { autonomy: level }).catch(() => null);
     sendState();
+    await store?.update(product.id, { autonomy: level }).catch(() => null);
     onActivity({ product: product.id, at: now(), domain: null, label: `Autonomie : ${AUTONOMY_LABELS[level]}`, outcome: 'done' });
   }
 
+  // From the dashboard chat (TEAM-726): applied at once, either way, without a window.
   async function handleSetAutonomy(message) {
     const level = message?.autonomy;
     if (!isAutonomyLevel(level)) return { status: 'rejected' };
-    if (level === state.autonomy) return { status: 'applied' };
-    if (autonomyRank(level) < autonomyRank(state.autonomy)) {
-      // Less freedom is always safe: apply at once.
-      await applyAutonomy(level);
-      return { status: 'applied' };
-    }
-    const outcome = await approvals.request({
-      kind: 'autonomy',
-      productId: product.id,
-      productLabel: product.label,
-      productColor: product.color,
-      title: `Passer ${product.label} en « ${AUTONOMY_LABELS[level]} » dans ce navigateur ?`,
-      reason: level === 'full_access'
-        ? 'Limova agira sans demander, sauf pour payer ou modifier votre compte.'
-        : 'Limova ne demandera plus que pour les actions risquées.',
-      confirmLabel: 'Confirmer',
-      denyLabel: 'Annuler'
-    }, { deadlineMs: now() + AUTONOMY_CONFIRM_MS });
-    if (outcome.decision === 'approve') {
-      await applyAutonomy(level);
-      return { status: 'applied' };
-    }
-    return { status: outcome.decision === 'timeout' ? 'timeout' : 'rejected' };
+    if (level !== state.autonomy) await applyAutonomy(level);
+    return { status: 'applied' };
   }
 
   function takeOver() {

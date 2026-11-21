@@ -49,7 +49,9 @@ export const ALWAYS_BLOCKED_HOSTS = Object.freeze(['linkedin.com', 'lnkd.in']);
 const UNSCRIPTABLE_HOSTS = Object.freeze(['chromewebstore.google.com', 'chrome.google.com']);
 
 export const AUTONOMY_LEVELS = Object.freeze(['ask_every_time', 'approve_for_me', 'full_access']);
-export const DEFAULT_AUTONOMY = 'approve_for_me';
+// TEAM-726: a browser connection starts at « Accès complet »; confirmations the person
+// wants happen in the chat, decided by the server from this level.
+export const DEFAULT_AUTONOMY = 'full_access';
 
 export function getProduct(productId) {
   return Object.prototype.hasOwnProperty.call(PRODUCTS, productId) ? PRODUCTS[productId] : null;
@@ -74,10 +76,6 @@ export function allDashboardOrigins() {
 
 export function isAutonomyLevel(value) {
   return AUTONOMY_LEVELS.includes(value);
-}
-
-export function autonomyRank(value) {
-  return AUTONOMY_LEVELS.indexOf(value);
 }
 
 function hostMatches(host, suffix) {

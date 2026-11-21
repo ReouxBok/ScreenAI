@@ -47,48 +47,57 @@ describe('team controller: autonomy and approvals', () => {
     expect(activity[0]).toEqual(expect.objectContaining({ domain: 'example.com', label: 'Lecture de la page' }));
   });
 
-  it('asks for a write under « Demander une approbation » and sends waiting_approval', async () => {
-    const { controller, approvals, browser } = setup({ autonomy: 'ask_every_time' });
+  it('never asks before routine or risky actions, at any autonomy level (browser.v2)', async () => {
+    for (const autonomy of ['ask_every_time', 'approve_for_me', 'full_access']) {
+      const { controller, approvals, browser } = setup({ autonomy });
+      const progress = vi.fn();
+      expect((await controller.handleCall(click('Tarifs'), { progress })).ok).toBe(true);
+      expect((await controller.handleCall(click('Envoyer', 'risky', 'send'), { progress })).ok).toBe(true);
+      expect((await controller.handleCall(click('Supprimer le compte', 'risky', 'account'), { progress })).ok).toBe(true);
+      expect(approvals.request).not.toHaveBeenCalled();
+      expect(progress).not.toHaveBeenCalledWith('waiting_approval');
+      expect(browser.executeAction).toHaveBeenCalledTimes(3);
+    }
+  });
+
+  it('still asks before paying, from the server reading or its own', async () => {
+    const fromServer = setup({ autonomy: 'full_access' });
     const progress = vi.fn();
-    const result = await controller.handleCall(click('Tarifs'), { progress });
+    await fromServer.controller.handleCall(click('Continuer', 'risky', 'pay'), { progress });
     expect(progress).toHaveBeenCalledWith('waiting_approval');
-    expect(approvals.request).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'action', title: 'Limova Team veut cliquer sur « Tarifs » sur example.com', productId: 'limova_team' }),
+    expect(fromServer.approvals.request).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'action', title: 'Limova Team veut cliquer sur « Continuer » sur example.com' }),
       expect.objectContaining({ deadlineMs: expect.any(Number) })
     );
-    expect(browser.executeAction).toHaveBeenCalled();
-    expect(result.ok).toBe(true);
+    // The server said « write », but the live button reads « Payer ».
+    const fromLocal = setup({ autonomy: 'full_access' });
+    await fromLocal.controller.handleCall(click('Payer 49 €', 'write', null));
+    expect(fromLocal.approvals.request).toHaveBeenCalledOnce();
   });
 
-  it('keeps the stricter reading: a server « write » on « Envoyer » still asks under « Approuver pour moi »', async () => {
-    const { controller, approvals } = setup({ autonomy: 'approve_for_me' });
-    await controller.handleCall(click('Envoyer', 'write', null));
-    expect(approvals.request).toHaveBeenCalledOnce();
-    expect(approvals.request.mock.calls[0][0].reason).toBe('Cette action envoie un message ou des données.');
-  });
-
-  it('runs a plain write under « Approuver pour moi » and a risky one under « Accès complet »', async () => {
-    const balanced = setup({ autonomy: 'approve_for_me' });
-    await balanced.controller.handleCall(click('Tarifs'));
-    expect(balanced.approvals.request).not.toHaveBeenCalled();
-    const full = setup({ autonomy: 'full_access' });
-    await full.controller.handleCall(click('Envoyer', 'risky', 'send'));
-    expect(full.approvals.request).not.toHaveBeenCalled();
-  });
-
-  it('always asks to pay or change the account, even under « Accès complet »', async () => {
-    const { controller, approvals } = setup({ autonomy: 'full_access' });
-    await controller.handleCall(click('Payer', 'risky', 'pay'));
-    await controller.handleCall(click('Continuer', 'write', 'account'));
-    expect(approvals.request).toHaveBeenCalledTimes(2);
-  });
-
-  it('answers denied_by_owner on refuse and approval_timeout at the deadline', async () => {
-    const denied = setup({ autonomy: 'ask_every_time', decide: async () => ({ decision: 'deny' }) });
-    expect((await denied.controller.handleCall(click())).error.code).toBe('denied_by_owner');
+  it('answers denied_by_owner on refuse and approval_timeout at the deadline for a payment', async () => {
+    const denied = setup({ decide: async () => ({ decision: 'deny' }) });
+    expect((await denied.controller.handleCall(click('Payer', 'risky', 'pay'))).error.code).toBe('denied_by_owner');
     expect(denied.browser.executeAction).not.toHaveBeenCalled();
-    const late = setup({ autonomy: 'ask_every_time', decide: async () => ({ decision: 'timeout' }) });
-    expect((await late.controller.handleCall(click())).error.code).toBe('approval_timeout');
+    const late = setup({ decide: async () => ({ decision: 'timeout' }) });
+    expect((await late.controller.handleCall(click('Payer', 'risky', 'pay'))).error.code).toBe('approval_timeout');
+  });
+
+  it('asks once for a batch whose strictest step pays', async () => {
+    const { controller, browser, approvals } = setup();
+    browser.prepareAction.mockResolvedValueOnce({
+      plan: {
+        kind: 'batch',
+        local: { risk: 'risky', reason: 'pay' },
+        element: { name: 'Payer', role: 'button' },
+        steps: [{ action: 'fill', element: { name: 'E-mail' } }, { action: 'click', element: { name: 'Payer' } }],
+        domain: 'shop.example',
+        tab: { id: 1 }
+      }
+    });
+    await controller.handleCall(call('browser.batch', { tab_id: 1, snapshot_id: 's1', steps: [], risk: 'write', risk_reason: null }));
+    expect(approvals.request).toHaveBeenCalledOnce();
+    expect(approvals.request.mock.calls[0][0].lines[0].text).toContain('Payer');
   });
 
   it('returns the engine error without asking (sensitive field, stale snapshot…)', async () => {
@@ -116,28 +125,32 @@ describe('team controller: autonomy and approvals', () => {
 });
 
 describe('team controller: set_autonomy', () => {
-  it('lowers at once, then sends state before answering', async () => {
-    const { controller, store, socket, approvals } = setup({ autonomy: 'full_access' });
-    const answer = await controller.handleSetAutonomy({ autonomy: 'ask_every_time' });
-    expect(answer).toEqual({ status: 'applied' });
-    expect(approvals.request).not.toHaveBeenCalled();
-    expect(store.update).toHaveBeenCalledWith('limova_team', { autonomy: 'ask_every_time' });
-    expect(socket.sendState).toHaveBeenCalled();
-    expect(controller.getState().autonomy).toBe('ask_every_time');
+  it('applies any level at once, without a window, then sends state before answering', async () => {
+    for (const [from, to] of [['full_access', 'ask_every_time'], ['ask_every_time', 'full_access'], ['approve_for_me', 'full_access']]) {
+      const { controller, store, socket, approvals } = setup({ autonomy: from });
+      const answer = await controller.handleSetAutonomy({ autonomy: to });
+      expect(answer).toEqual({ status: 'applied' });
+      expect(approvals.request).not.toHaveBeenCalled();
+      expect(store.update).toHaveBeenCalledWith('limova_team', { autonomy: to });
+      expect(socket.sendState).toHaveBeenCalledOnce();
+      expect(controller.getState().autonomy).toBe(to);
+    }
   });
 
-  it('asks before raising, within 50 s', async () => {
-    const approve = setup({ autonomy: 'ask_every_time' });
-    const before = Date.now();
-    expect(await approve.controller.handleSetAutonomy({ autonomy: 'full_access' })).toEqual({ status: 'applied' });
-    const [details, options] = approve.approvals.request.mock.calls[0];
-    expect(details.kind).toBe('autonomy');
-    expect(options.deadlineMs - before).toBeLessThanOrEqual(50_100);
-    const refuse = setup({ autonomy: 'ask_every_time', decide: async () => ({ decision: 'deny' }) });
-    expect(await refuse.controller.handleSetAutonomy({ autonomy: 'full_access' })).toEqual({ status: 'rejected' });
-    expect(refuse.controller.getState().autonomy).toBe('ask_every_time');
-    const late = setup({ autonomy: 'ask_every_time', decide: async () => ({ decision: 'timeout' }) });
-    expect(await late.controller.handleSetAutonomy({ autonomy: 'approve_for_me' })).toEqual({ status: 'timeout' });
+  it('sends each change its own state when two arrive together', async () => {
+    const { controller, socket } = setup({ autonomy: 'full_access' });
+    const levels = [];
+    socket.sendState.mockImplementation(() => levels.push(controller.getState().autonomy));
+    await Promise.all([
+      controller.handleSetAutonomy({ autonomy: 'ask_every_time' }),
+      controller.handleSetAutonomy({ autonomy: 'approve_for_me' })
+    ]);
+    expect(levels).toEqual(['ask_every_time', 'approve_for_me']);
+  });
+
+  it('starts at « Accès complet » when nothing is stored', () => {
+    const controller = createTeamController({ product: TEAM_PRODUCT, browser: {}, approvals: {} });
+    expect(controller.getState().autonomy).toBe('full_access');
   });
 
   it('answers applied for the same level, rejected for an unknown one, and never resumes', async () => {
