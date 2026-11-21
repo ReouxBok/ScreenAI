@@ -331,9 +331,6 @@ export const creationOwnerForIntake = async (env: Env, input: Parameters<NonNull
     || disposition.kind !== "ticket" || disposition.target.operation !== "create"
     || disposition.target.contactId !== disposition.contactScope.primaryContactId)
     return { assign: false as const, reason: "not_admitted" };
-  // SAV-117: a smart admission records the revision `smart-entry.v1`, which no V2 actor accepts until the smart brain is wired (N8). Until then the ticket is
-  // never created with the V2 owner on it: it would be held by an owner whose case cannot act.
-  if (savV2EntrySmartOn(env)) return { assign: false as const, reason: "not_admitted" };
   const sources = v2EntryPolicySources(env);
   const decided = await v2OwnerAtCreationPort({ env,
     readAdmissionPolicy: admissionPolicyPort({ read: sources.readPolicyRecord, now: () => new Date() }),

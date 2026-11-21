@@ -407,18 +407,24 @@ describe("SAV-96 new Gmail thread through entry, approval, effect and inbound re
   });
 });
 
-describe("SAV-117 review 1F: the central hold before N8 (`smartEntryEffectsHold`)", () => {
-  it("an approved first mail already queued: SAV_V2_ENTRY_SMART=on sends nothing, writes nothing in HubSpot, claims nothing; switch off, the same entry is sent", async () => {
+describe("PORTE 2A (P1, risk of PORTE 1F): an Access first mail already queued needs a fresh Access qualification", () => {
+  it("SAV_V2_ENTRY_SMART turned on after the queue: the Access first mail sends nothing, the case goes back to the team once (smart_requalified), the next pass does nothing", async () => {
     const s = fixture(), start = await approveAndQueue(s);
-    const [before] = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.id, start.executionId));
-    const counted = { ...s.counts };
     vi.stubEnv("SAV_V2_ENTRY_SMART", "on");
-    for (const executionId of [start.executionId, undefined]) expect(await s.run(executionId)).toMatchObject({ skipped: "smart_entry_awaiting_n8", supervised: [] });
-    expect(s.counts).toEqual({ ...counted, gmailPosts: 0, crmPosts: 0 }); // not even a read: the hold comes before anything
+    expect((await s.run(start.executionId)).supervised).toMatchObject([{ state: "refused", reason: "smart_requalified" }]);
+    expect(await readCase(start.caseId)).toMatchObject({ owner: "human", phase: "handoff_pending", threadIds: [] });
+    const handoffs = (await listCaseEvents(start.caseId)).filter(event => event.kind === "owner_changed").length;
+    expect(handoffs).toBe(1);
     expect(await effects(start.executionId)).toEqual([]);
-    const [held] = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.id, start.executionId));
-    expect(held).toEqual(before);
-    vi.stubEnv("SAV_V2_ENTRY_SMART", "");
+    expect(s.counts).toMatchObject({ gmailPosts: 0, crmPosts: 0 });
+    await s.run(start.executionId);
+    await s.run();
+    expect((await listCaseEvents(start.caseId)).filter(event => event.kind === "owner_changed").length).toBe(handoffs);
+    expect(await readCase(start.caseId)).toMatchObject({ owner: "human", phase: "handoff_pending" });
+    expect(s.counts).toMatchObject({ gmailPosts: 0, crmPosts: 0 });
+  });
+  it("the same first mail with the switch off still leaves once (control)", async () => {
+    const s = fixture(), start = await approveAndQueue(s);
     expect((await s.run(start.executionId)).supervised).toMatchObject([{ state: "confirmed" }]);
     expect(s.counts).toMatchObject({ gmailPosts: 1, crmPosts: 1 });
   });

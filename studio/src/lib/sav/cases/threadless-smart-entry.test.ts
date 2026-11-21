@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const request = vi.hoisted(() => vi.fn());
 vi.mock("../hubspot-transport", () => ({ requestSavHubspot: request }));
-// The smart-pending guard of the case store answers before any database access: nothing else of the database is reachable from this file.
+// No database in this file: a write attempt is visible as NO_DB_ALLOWED.
 vi.mock("@/db", () => ({ requireDb: () => { throw Error("NO_DB_ALLOWED"); } }));
 
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
@@ -15,7 +15,7 @@ import { qualifyThreadlessTicket, readThreadlessTicket, threadlessRequestId, typ
  * SAV-118 (N5), SYNTHETIC only: a ticket a person gave the Agent SAV in HubSpot takes the same door as a mail under `SAV_V2_ENTRY_SMART=on`. Same simulated
  * HubSpot reads as `threadless-source.test.ts` (reads only). Proven: a support ticket outside Access is admitted (no word list, no Access rule or skill, no
  * policy), the CRM category is never a gate (the content decides), a ticket with no contact goes to the team with `crm_missing_primary`, a ticket without
- * any mail thread is admitted, and before N8 an admitted ticket opens no case (nothing written). Switch off: exactly the historical answers.
+ * any mail thread is admitted, and since N8 an admitted ticket without a thread reaches the case store (born with the team). Switch off: unchanged.
  */
 
 const AT = "2026-11-20T10:00:00.000Z";
@@ -85,15 +85,13 @@ describe("switch on: a HubSpot ticket handed to the agent takes the same door as
     expect(await qualifyThreadlessTicket(read.source, SMART, new Date(AT))).toMatchObject({ status: "human_wait", reason: "untrusted_source" });
   });
 
-  it("before N8, an admitted ticket opens no case: no agent case, no hand-back, nothing written (the database is not even reached)", async () => {
+  it("N8: an admitted ticket is no longer left waiting without a write: the case store is reached (its case is born with the team, `threadless-handback.flow.test.ts`)", async () => {
     const read = await ticket(SMART);
     const result = await qualifyThreadlessTicket(read.source, SMART, new Date(AT));
     if (result.status !== "admitted") throw Error("ADMISSION_REQUIRED");
     const start = { source: read.source as ThreadlessTicketSource, ownerTransitionKey: "hubspot-owner:987:1:123", observedAt: AT, env: { ...SMART, SAV_CASE_RECORDING: "on" },
       admission: result.admission, request: result.request };
-    await expect(openCaseFromHubspotTicket(start)).resolves.toEqual({ status: "out_of_scope" });
-    // Even with a later team reason (the Access block closed), it is not handed back.
-    await expect(openCaseFromHubspotTicket({ ...start, waitReason: "access_block_closed" })).resolves.toEqual({ status: "out_of_scope" });
+    await expect(openCaseFromHubspotTicket(start)).rejects.toThrow("NO_DB_ALLOWED");
   });
 });
 

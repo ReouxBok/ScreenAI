@@ -1,0 +1,89 @@
+import { describe, expect, it } from "vitest";
+import { smartSendProblem } from "./smart-send-fence";
+import { smartSwitchProblem } from "../smart-support-scope";
+
+// PORTE 2A: the smart send fence and the switches read again before a queued smart reply leaves (pure).
+const SMART = { qualification: { requests: [{ provenance: { kind: "qualified_rule", ruleId: "smart-entry", revision: "smart-entry.v1", blockId: "smart-support" } }] } };
+const ACCESS = { qualification: { requests: [{ provenance: { kind: "qualified_rule", ruleId: "rule-access", revision: "r1", blockId: "access" } }] } };
+const judge = (body: string) => smartSendProblem({ admission: SMART, body, purpose: "answer" });
+
+describe("PORTE 2A (P2) : le filet smart refuse seulement ce que prévoit le CAP", () => {
+  it.each([
+    "Pour la question de remboursement, notre équipe vous répondra.",
+    "Votre question sur la facturation est transmise à notre équipe.",
+    "Arrêtez la routine depuis votre compte Limova.",
+    "Pour toute question de remboursement ou d'avoir, notre équipe vous répondra directement.",
+    "Vous pouvez vous désinscrire du webinaire depuis le mail de confirmation.",
+    "Votre demande de remboursement a été transmise à l'équipe facturation.",
+    "Un conseiller reviendra vers vous au sujet du geste commercial.",
+    "Pour votre remboursement, notre équipe va vous recontacter.",
+    "Notre équipe prendra le relais sur la question de l'avoir.",
+    "Votre demande de remboursement est transmise à notre équipe, qui vous répondra rapidement.",
+    "Vous devez avoir accès à l'onglet Intégrations.",
+  ])("mention neutre : « %s » passe", body => expect(judge(body)).toBeNull());
+  it.each([
+    "Pour résilier, écrivez-nous.",
+    "Ouvrez la rubrique Abonnement puis cliquez sur Annuler.",
+    "Nous allons vous rembourser dès aujourd'hui.",
+    "Votre compte a été supprimé.",
+    // PORTE 2B
+    "Pour vous désabonner, cliquez ici.",
+    "Vous pouvez vous désinscrire de votre abonnement depuis vos paramètres.",
+    "Nous allons procéder au remboursement de votre paiement.",
+    "Notre équipe va effectuer un geste commercial sur votre prochaine facture.",
+    "Je lance le remboursement aujourd'hui.",
+    "Vous serez remboursé sous peu.",
+    // PORTE 2C: money outside a hand-over to the team
+    "Nous vous confirmons le remboursement de votre paiement.",
+    "Un avoir de 20 euros figure sur votre compte.",
+    "Le prélèvement de ce mois a été annulé, et l'annulation de votre facture est en cours.",
+    "Nous vous confirmons le remboursement, notre équipe reste disponible.",
+    "Notre équipe vous répondra demain, mais votre remboursement est déjà validé.",
+    // PORTE 2D: a past or a statement is no hand-over; a financial result always refuses
+    "Notre équipe a traité votre demande et votre remboursement est validé.",
+    "Notre équipe a validé votre avoir.",
+    "L'équipe confirme que le remboursement est effectué.",
+    "Un conseiller vous recontactera : votre geste commercial est accordé.",
+  ])("résiliation ou engagement sensible : « %s » refusé", body => expect(judge(body)).toBe("CANCELLED_REPLY_SENSITIVE_WORDING"));
+  it("un dossier non smart et une notice de passage ne sont jamais jugés ici", () => {
+    expect(smartSendProblem({ admission: ACCESS, body: "Pour résilier, écrivez-nous.", purpose: "answer" })).toBeNull();
+    expect(smartSendProblem({ admission: SMART, body: "Pour résilier, écrivez-nous.", purpose: "handoff" })).toBeNull();
+  });
+});
+
+describe("PORTE 2A (P1) : le filet « autre plateforme » suit la règle partagée (other-platform.ts)", () => {
+  it.each(["HubSpot", "Google Sheets", "Zapier"])("« Dans les intégrations de Limova, optez pour %s » passe", tool =>
+    expect(judge(`Dans les intégrations de Limova, optez pour ${tool}.`)).toBeNull());
+  it("« Pour remplacer Limova, inscrivez-vous sur Wix » est refusé", () =>
+    expect(judge("Pour remplacer Limova, inscrivez-vous sur Wix.")).toBe("CANCELLED_REPLY_OTHER_PLATFORM"));
+  it.each([
+    "Je vous recommande d'utiliser Zapier pour remplir votre tableau.",
+    "Si cette option manque dans Limova, essayez Wix pour créer votre site.",
+    "Dans les intégrations de Limova, si le connecteur manque, optez pour Wix pour créer votre site.",
+    "Dans les intégrations de Limova, choisissez Google Sheets, puis utilisez Wix pour votre site.",
+    "Cherchez le connecteur dans les intégrations de Limova ou utilisez Wix pour créer votre site.",
+    "Activez Google Sheets dans les intégrations de Limova et utilisez Wix pour créer votre site.",
+  ])("« %s » est refusé", body => expect(judge(body)).toBe("CANCELLED_REPLY_OTHER_PLATFORM"));
+  it("« Inscrivez-vous au webinaire Limova » passe", () => expect(judge("Inscrivez-vous au webinaire Limova de jeudi.")).toBeNull());
+});
+
+describe("PORTE 2A (P1) : interrupteurs smart relus avant l'envoi", () => {
+  const RULE = "30000000-0000-4000-8000-000000000009";
+  const ON = { SAV_V2_ENTRY_SMART: "on", SAV_V2_SMART_SUPPORT_MODE: "auto", SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: RULE };
+  const auto = (env: Record<string, string | undefined>) => smartSwitchProblem({ env, admission: SMART, basis: "auto_access.v1", approvedBy: RULE });
+  const person = (env: Record<string, string | undefined>) => smartSwitchProblem({ env, admission: SMART, basis: "fixture.human", approvedBy: "someone" });
+  it("tout allumé : rien à redire", () => expect(auto(ON)).toBeNull());
+  it.each([
+    [{ SAV_V2_ENTRY_SMART: "off" }, "CANCELLED_SMART_ENTRY_OFF"],
+    [{ SAV_V2_SMART_SUPPORT_MODE: undefined }, "CANCELLED_SMART_AUTO_OFF"],
+    [{ SAV_V2_SMART_SUPPORT_MODE: "AUTO" }, "CANCELLED_SMART_AUTO_OFF"],
+    [{ SAV_V2_AUTO_REPLY: "off" }, "CANCELLED_SMART_AUTO_OFF"],
+    [{ SAV_V2_AUTO_APPROVER_ID: "30000000-0000-4000-8000-000000000001" }, "CANCELLED_SMART_AUTO_OFF"],
+  ])("approbation par la règle, %o : refus", (change, code) => expect(auto({ ...ON, ...change })).toBe(code));
+  it("approbation humaine : SAV_V2_ENTRY_SMART seul est exigé", () => {
+    expect(person({ SAV_V2_ENTRY_SMART: "on" })).toBeNull();
+    expect(person({})).toBe("CANCELLED_SMART_ENTRY_OFF");
+  });
+  it("un dossier non smart n'est pas concerné", () =>
+    expect(smartSwitchProblem({ env: {}, admission: ACCESS, basis: "auto_access.v1", approvedBy: RULE })).toBeNull());
+});

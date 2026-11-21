@@ -6,7 +6,7 @@ import { caseEffectHash } from "./case-effects";
 import { finalizeCaseReplyProposal } from "./case-reply-outbound";
 import { submitCaseReplyProposal } from "./case-reply-store";
 import { hasLocalThreadForTicket, openCaseFromHubspotTicket, readCase, readCaseThreadlessSource } from "./case-store";
-import type { CaseSnapshot } from "./case-types";
+import { isSmartSupportProvenance, SAV_SMART_NO_THREAD_WAIT, type CaseSnapshot } from "./case-types";
 import { composeThreadlessFirstMail, type ThreadlessFirstMailResult } from "./first-mail/threadless-first-mail";
 import { savV2NewThreadAutoEnabled, savV2NewThreadEnabled, THREADLESS_ACCESS_DRAFT, THREADLESS_ADMIT_PERMISSION, threadlessReplySubject } from "./threadless-config";
 import { readThreadlessAuthority, threadlessAccessRevision, threadlessActionAllowed, threadlessAuthorityStillGranted, threadlessSchemaInstalled } from "./threadless-guard";
@@ -50,7 +50,9 @@ async function start(input: Input, env: NodeJS.ProcessEnv, options: EntryOptions
   if (read.status !== "ready" && read.status !== "human_wait") return { status: read.status };
   // SAV-96 B: under SAV-97 `on`, the entry is the one place that may pay for the skill's reading of the ticket; every later check reads it.
   const qualification = await qualifyThreadlessTicket(read.source, env, new Date(), { accessSkillCompute: true });
-  const revision = qualification.status === "admitted" ? await threadlessAccessRevision(env, db) : null;
+  // SAV-123 (N8): a ticket the smart entry admits with no mail thread goes to the team (`smart_no_thread`): the first mail of a ticket is not the smart brain's.
+  const smartTicket = qualification.status === "admitted" && qualification.admission.qualification.requests.some(request => isSmartSupportProvenance(request.provenance));
+  const revision = qualification.status === "admitted" && !smartTicket ? await threadlessAccessRevision(env, db) : null;
 
   // SAV-99 (Ugo 19/11): a person gave this ticket to the agent. When the agent does not take it (not an Access request by its content, no rule,
   // Access closed, sensitive, contact not found...), it never stays in the agent's name with nobody on it: the case is born with the team
@@ -58,7 +60,7 @@ async function start(input: Input, env: NodeJS.ProcessEnv, options: EntryOptions
   const waitReason = qualification.status === "human_wait"
     ? qualification.reason === "identity_unconfirmed" && read.status === "human_wait" ? read.reason : qualification.reason
     : qualification.status === "out_of_scope" ? threadlessWaitReason(qualification.reason)
-      : !revision ? "access_block_closed" : undefined;
+      : smartTicket ? SAV_SMART_NO_THREAD_WAIT : !revision ? "access_block_closed" : undefined;
   const opened = await openCaseFromHubspotTicket({
     source: read.source, ownerTransitionKey: input.ownerTransitionKey, observedAt: input.observedAt, env,
     assertFresh: tx => threadlessAuthorityStillGranted(tx, authority, THREADLESS_ADMIT_PERMISSION),

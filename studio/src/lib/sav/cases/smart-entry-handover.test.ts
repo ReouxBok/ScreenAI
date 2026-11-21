@@ -1,7 +1,8 @@
 /*
  * SAV-117 review P1B (finding 1), SYNTHETIC only: the harness of `owner-handover.test.ts` (real stores on PGlite, HubSpot and Gmail transports simulated, the
- * hand-back permission granted). Under `SAV_V2_ENTRY_SMART=on`, a ticket a person gave the agent, with its linked mail, is read by the smart entry: before N8 it
- * waits (`owner_handover_smart_pending`). Proven: 0 hand-back, 0 HubSpot write (every CRM call is a read), 0 Gmail send, no case recorded.
+ * hand-back permission granted). Under `SAV_V2_ENTRY_SMART=on`, a ticket a person gave the agent, with its linked mail, is read by the smart entry.
+ * SAV-123 (N8): the smart brain is wired, so the waits before N8 are gone: a smart reading is relayed to an agent case (the brain decides next), any other
+ * reading goes back to the team once (`out_of_scope`, `no_block_match`, `crm_missing_primary`). Never a word list at the door. Switch off: unchanged.
  */
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
@@ -252,74 +253,25 @@ function smartReading(): CaseBoundaryDeps {
   }) };
 }
 
-describe("SAV_V2_ENTRY_SMART=on before N8: a handed-over ticket read by the smart entry waits, nothing is handed back or written", () => {
+describe("SAV_V2_ENTRY_SMART=on (N8): a handed-over ticket read by the smart entry is the agent's, any other reading goes back to the team once", () => {
   // Switch off, nothing produces a smart reading, so the hand-back paths of `owner-handover.test.ts` are unchanged (that file is untouched and green).
   beforeEach(() => { vi.stubEnv("SAV_V2_ENTRY_SMART", "on"); });
 
-  it("a linked mail V1 executed (formerly an Access ticket, now `other`): smart pending, 0 hand-back, 0 HubSpot write, 0 Gmail send, no case", async () => {
+  async function agentCase(ticketId: string) {
+    const stored = await readCaseByTicket(ticketId);
+    return stored && { owner: stored.owner, admission: stored.admission?.admission, policyRevision: stored.admission?.policyRevision };
+  }
+
+  it("a linked mail V1 executed (formerly an Access ticket, now `other`): relayed to an agent case admitted smart_support, 0 hand-back, 0 HubSpot write, 0 Gmail send", async () => {
     const input = await scheduled();
     await storedMail(input.ticketId);
     const read = liveTicket(input.ticketId);
     fixture.relayDeps = smartReading();
-    await expect(wake(input)).resolves.toEqual({ status: "owner_handover_smart_pending" });
+    await expect(wake(input)).resolves.toEqual({ status: "relayed" });
     expect(fixture.handBack).not.toHaveBeenCalled();
-    expect(fixture.continueCase).not.toHaveBeenCalled();
-    expect(await readCaseByTicket(input.ticketId)).toBeNull();
+    expect(fixture.continueCase).toHaveBeenCalledOnce();
+    expect(await agentCase(input.ticketId)).toEqual({ owner: "agent", admission: "smart_support", policyRevision: "smart-entry.v1" });
     onlyReads(read);
-  });
-
-  it("a mail V1 never executed (manual handover): smart pending as well, 0 hand-back, 0 HubSpot write, 0 Gmail send, no case", async () => {
-    const input = await scheduled();
-    const mail = await storedMail(input.ticketId);
-    await database.db.delete(savIntakeEffects).where(inArray(savIntakeEffects.executionId,
-      database.db.select({ id: savIntakeExecutions.id }).from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, mail.messageId))));
-    await database.db.delete(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, mail.messageId));
-    const read = liveTicket(input.ticketId, { contact: CLIENT });
-    fixture.blockEvidence.mockImplementation(async (_env: unknown, _messageId: string, _gmailId: string, requests: { requestId: string }[]) =>
-      requests.map(({ requestId }) => ({ requestId, family: "other", provenance: smartSupportProvenance(new Date(SETTLED_EVENT_AT).toISOString()) })));
-    await expect(wake(input)).resolves.toEqual({ status: "owner_handover_smart_pending" });
-    expect(fixture.handBack).not.toHaveBeenCalled();
-    expect(await readCaseByTicket(input.ticketId)).toBeNull();
-    onlyReads(read);
-  });
-
-  it("review 1D: 14 support requests + 1 cancellation (the smart entry leaves the whole mail to the team): still waits, 0 hand-back, 0 HubSpot write, no case", async () => {
-    const input = await scheduled();
-    await storedMail(input.ticketId, false, undefined, [...Array(14).fill("support"), "cancellation"]);
-    const read = liveTicket(input.ticketId);
-    // What the entry's rule port gives such a mail under the switch: no request of its own (V1's hints stay, a sensitive one included).
-    fixture.relayDeps = { ...admission(), readQualification: async () => ({ requests: [], identity: { status: "confirmed", source: { type: "hubspot_object", id: "123" } },
-      crmContext: "complete", teamSignals: [] }) };
-    await expect(wake(input)).resolves.toEqual({ status: "owner_handover_smart_pending" });
-    expect(fixture.handBack).not.toHaveBeenCalled();
-    expect(fixture.continueCase).not.toHaveBeenCalled();
-    expect(await readCaseByTicket(input.ticketId)).toBeNull();
-    onlyReads(read);
-  });
-
-  it("review 1D: manual handover the smart entry leaves to the team (no request of its own, mixed mail): waits, 0 hand-back (no `no_block_match`), 0 HubSpot write", async () => {
-    const input = await scheduled();
-    const mail = await storedMail(input.ticketId);
-    await database.db.delete(savIntakeEffects).where(inArray(savIntakeEffects.executionId,
-      database.db.select({ id: savIntakeExecutions.id }).from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, mail.messageId))));
-    await database.db.delete(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, mail.messageId));
-    const read = liveTicket(input.ticketId, { contact: CLIENT });
-    fixture.blockEvidence.mockResolvedValue([]);
-    await expect(wake(input)).resolves.toEqual({ status: "owner_handover_smart_pending" });
-    expect(fixture.handBack).not.toHaveBeenCalled();
-    expect(await readCaseByTicket(input.ticketId)).toBeNull();
-    onlyReads(read);
-  });
-
-  it("review 1D: switch off, the same mixed mail is handed back as before (out_of_scope)", async () => {
-    vi.stubEnv("SAV_V2_ENTRY_SMART", "");
-    const input = await scheduled();
-    await storedMail(input.ticketId, false, undefined, [...Array(14).fill("support"), "cancellation"]);
-    liveTicket(input.ticketId);
-    fixture.relayDeps = { ...admission(), readQualification: async () => ({ requests: [], identity: { status: "confirmed", source: { type: "hubspot_object", id: "123" } },
-      crmContext: "complete", teamSignals: [] }) };
-    await expect(wake(input)).resolves.toEqual({ status: "handed_back:out_of_scope" });
-    expect(fixture.handBack).toHaveBeenCalledExactlyOnceWith(input, "out_of_scope");
   });
 
   /** « Traité hors Studio »: no V1 execution for the mail (SAV-99's manual handover). */
@@ -333,27 +285,70 @@ describe("SAV_V2_ENTRY_SMART=on before N8: a handed-over ticket read by the smar
   const smartEvidence = async (_env: unknown, _messageId: string, _gmailId: string, requests: { requestId: string }[]) =>
     requests.map(({ requestId }) => ({ requestId, family: "other", provenance: smartSupportProvenance(new Date(SETTLED_EVENT_AT).toISOString()) }));
 
-  it("SAV-118: a manual handover worded « résilier » is not handed back on words (the smart brain judges): smart pending, nothing written", async () => {
+  it("a mail V1 never executed (manual handover): relayed to an agent case as well, 0 hand-back, 0 HubSpot write", async () => {
+    const input = await scheduled();
+    await manualMail(input.ticketId);
+    const read = liveTicket(input.ticketId, { contact: CLIENT });
+    fixture.blockEvidence.mockImplementation(smartEvidence);
+    await expect(wake(input)).resolves.toEqual({ status: "relayed" });
+    expect(fixture.handBack).not.toHaveBeenCalled();
+    expect(await agentCase(input.ticketId)).toEqual({ owner: "agent", admission: "smart_support", policyRevision: "smart-entry.v1" });
+    onlyReads(read);
+  });
+
+  it("14 support requests + 1 cancellation (the smart entry leaves the whole mail to the team): handed back once (`out_of_scope`), no agent case", async () => {
+    const input = await scheduled();
+    await storedMail(input.ticketId, false, undefined, [...Array(14).fill("support"), "cancellation"]);
+    liveTicket(input.ticketId);
+    // What the entry's rule port gives such a mail under the switch: no request of its own (V1's hints stay, a sensitive one included).
+    fixture.relayDeps = { ...admission(), readQualification: async () => ({ requests: [], identity: { status: "confirmed", source: { type: "hubspot_object", id: "123" } },
+      crmContext: "complete", teamSignals: [] }) };
+    await expect(wake(input)).resolves.toEqual({ status: "handed_back:out_of_scope" });
+    expect(fixture.handBack).toHaveBeenCalledExactlyOnceWith(input, "out_of_scope");
+    expect(fixture.continueCase).not.toHaveBeenCalled();
+    expect((await readCaseByTicket(input.ticketId))?.owner ?? null).not.toBe("agent");
+  });
+
+  it("manual handover the smart entry leaves to the team (no request of its own): handed back once (`no_block_match`)", async () => {
+    const input = await scheduled();
+    await manualMail(input.ticketId);
+    liveTicket(input.ticketId, { contact: CLIENT });
+    fixture.blockEvidence.mockResolvedValue([]);
+    await expect(wake(input)).resolves.toEqual({ status: "handed_back:no_block_match" });
+    expect(fixture.handBack).toHaveBeenCalledExactlyOnceWith(input, "no_block_match");
+  });
+
+  it("switch off, the same mixed mail is handed back as before (out_of_scope)", async () => {
+    vi.stubEnv("SAV_V2_ENTRY_SMART", "");
+    const input = await scheduled();
+    await storedMail(input.ticketId, false, undefined, [...Array(14).fill("support"), "cancellation"]);
+    liveTicket(input.ticketId);
+    fixture.relayDeps = { ...admission(), readQualification: async () => ({ requests: [], identity: { status: "confirmed", source: { type: "hubspot_object", id: "123" } },
+      crmContext: "complete", teamSignals: [] }) };
+    await expect(wake(input)).resolves.toEqual({ status: "handed_back:out_of_scope" });
+    expect(fixture.handBack).toHaveBeenCalledExactlyOnceWith(input, "out_of_scope");
+  });
+
+  it("SAV-118: a manual handover worded « résilier » is not handed back on words (the smart brain judges): relayed to the agent, nothing written", async () => {
     const input = await scheduled();
     await manualMail(input.ticketId, "Bonjour, je veux résilier et mon Google Sheet est vide.");
     const read = liveTicket(input.ticketId, { contact: CLIENT });
     fixture.blockEvidence.mockImplementation(smartEvidence);
-    await expect(wake(input)).resolves.toEqual({ status: "owner_handover_smart_pending" });
+    await expect(wake(input)).resolves.toEqual({ status: "relayed" });
     expect(fixture.handBack).not.toHaveBeenCalled();
     onlyReads(read);
   });
 
-  it("SAV-118 + review 1F: a manual handover on a ticket with no contact keeps `crm_missing_primary` but waits before N8: 0 hand-back, 0 HubSpot write", async () => {
+  it("SAV-118: a manual handover on a ticket with no contact goes back to the team once with `crm_missing_primary`; the marker is consumed once", async () => {
     const input = await scheduled();
     await manualMail(input.ticketId);
-    const read = liveTicket(input.ticketId);
+    const marker = async () => (await database.db.select().from(savSyncState).where(eq(savSyncState.key, `sav-v2-owner-handover:${input.ticketId}`)))[0]!;
+    const before = await marker();
+    liveTicket(input.ticketId);
     fixture.blockEvidence.mockImplementation(smartEvidence);
-    const info = vi.spyOn(console, "info");
-    await expect(wake(input)).resolves.toEqual({ status: "smart_entry_awaiting_n8" });
-    expect(info).toHaveBeenCalledWith("sav_v2_owner_handover_held", { hold: "smart_entry_awaiting_n8", reason: "crm_missing_primary" });
-    expect(fixture.handBack).not.toHaveBeenCalled();
-    expect(fixture.blockEvidence).not.toHaveBeenCalled();
-    onlyReads(read);
+    await expect(wake(input)).resolves.toEqual({ status: "handed_back:crm_missing_primary" });
+    expect(fixture.handBack).toHaveBeenCalledExactlyOnceWith(input, "crm_missing_primary");
+    expect((await marker()).processedCount).toBe(before.processedCount + 1);
   });
 
   it("SAV-118: switch off, the same mails keep their historical hand-backs (words, `no_contact`)", async () => {

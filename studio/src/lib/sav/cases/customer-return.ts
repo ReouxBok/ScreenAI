@@ -243,6 +243,9 @@ export type AccessAutoApprovalFacts = Readonly<{
   /** B's latest decision on the version the reply was proposed at: accepted, its access scope stamp current, every source shown to the customer verified. */
   decision: Readonly<{ accepted: boolean; scopeCurrent: boolean; shownSourcesVerified: boolean; nextAction: string }> | null;
   ownerNow: CustomerReturnOwnerNow;
+  /** SAV-123 (N8): the decision carries the smart stamp, every open request is of the smart block, and `SAV_V2_ENTRY_SMART=on` (read now by B). The rule then
+   * accepts the smart family (`other`) instead of `access`; every other check is the same. The block's mode (`SAV_V2_SMART_SUPPORT_MODE=auto`) is checked before. */
+  smartSupport?: boolean;
 }>;
 export type AccessAutoApprovalOutcome = Readonly<{ allowed: true; basis: typeof ACCESS_AUTO_APPROVAL_BASIS }> | Readonly<{ allowed: false; reason: string }>;
 
@@ -258,7 +261,8 @@ export function decideAccessAutoApproval(input: Readonly<{ config: AccessAutoApp
   if (!facts) return { allowed: false, reason: "facts_unread" };
   if (facts.case.owner !== "agent" || !facts.case.admitted) return { allowed: false, reason: "case_not_admitted" };
   if (facts.case.sensitivity !== "none") return { allowed: false, reason: "sensitive" };
-  if (!facts.openFamilies.length || facts.openFamilies.some(family => family !== "access")) return { allowed: false, reason: "not_access_only" };
+  const family = facts.smartSupport ? "other" : "access";
+  if (!facts.openFamilies.length || facts.openFamilies.some(open => open !== family)) return { allowed: false, reason: "not_access_only" };
   if (input.purpose !== "reminder") {
     if (!facts.decision?.accepted) return { allowed: false, reason: "decision_not_accepted" };
     const matches = terminal

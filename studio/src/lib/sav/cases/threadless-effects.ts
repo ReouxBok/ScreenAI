@@ -14,7 +14,8 @@ import { caseReplyTextProblemForBasis, caseReplyModeForBasis } from "./case-repl
 import { savCaseReplyValidations } from "./case-reply-validation-table";
 import { savV2NewThreadEnabled, THREADLESS_ADMIT_PERMISSION, THREADLESS_CRM_PERMISSION, THREADLESS_SEND_PERMISSION } from "./threadless-config";
 import { readThreadlessAuthority, threadlessAccessRevision, threadlessActionAllowed, threadlessAuthorityStillGranted, threadlessSchemaInstalled } from "./threadless-guard";
-import { qualifyThreadlessTicket, readThreadlessTicket } from "./threadless-source";
+import { isSmartSupportProvenance, SAV_SMART_REQUALIFIED } from "./case-types";
+import { qualifyThreadlessTicket, readThreadlessTicket, threadlessAccessQualified } from "./threadless-source";
 import { threadlessAutoSendProblem } from "./first-mail/first-mail-rights";
 import { buildNewThreadSendIntent, THREADLESS_MAILBOX, type createThreadlessTransport, type NewThreadAck, type NewThreadReceipt, type NewThreadSendIntent, type ThreadlessCrmAck } from "./threadless-transport";
 import type { CaseRuntimeDeps } from "./case-runtime-effects";
@@ -203,8 +204,15 @@ async function passOne(parent: Parent, deps: PassDeps) {
     if (!gmail) await waitBeforeSend(parent, read.status === "human_wait" ? read.reason : "threadless_source_changed", true);
     return;
   }
-  const accessRevision = !gmail && (await qualifyThreadlessTicket(read.source, env)).status === "admitted"
-    ? await threadlessAccessRevision(env, db) : null;
+  const qualification = gmail ? null : await qualifyThreadlessTicket(read.source, env);
+  // PORTE 2B: the ticket now qualifies on the smart path (SAV_V2_ENTRY_SMART turned on after the queue): the Access first mail never leaves and the case goes back
+  // to the team ONCE through the existing hand-over (owner human, `handoff_pending`: note, stage and Slack by the hand-over notice, no mail); the parent is refused,
+  // so no later pass takes it again.
+  if (qualification?.status === "admitted" && qualification.admission.qualification.requests.some(row => isSmartSupportProvenance(row.provenance))) {
+    await waitBeforeSend(parent, SAV_SMART_REQUALIFIED, true);
+    return;
+  }
+  const accessRevision = qualification && threadlessAccessQualified(qualification) ? await threadlessAccessRevision(env, db) : null;
   if (!gmail && !accessRevision) return;
   if (!gmail) {
     // SAV-96 B: the last look before the marker, exactly as a thread reply (`case-effect-driver.ts`): the decision, its scope and every cited card

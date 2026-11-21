@@ -9,7 +9,7 @@ import { admissionPolicyPort, v2OwnerConfiguration, type AdmissionPolicyRecord }
 import { SAV_CASE_BLOCK_REGISTRY } from "./case-block-registry";
 import { caseBlockCandidates, caseBlockRuleProvenance, selectCaseBlockRule, type CaseEntryRule } from "./case-blocks";
 import type { CaseOpenedRequest } from "./case-store";
-import { SAV_CASE_ACCESS_BLOCK_ID, type SourceRef } from "./case-types";
+import { isSmartSupportProvenance, SAV_CASE_ACCESS_BLOCK_ID, type SourceRef } from "./case-types";
 import { savCaseSensitiveWording } from "./investigation-return-qualify";
 import { readSavV2QualificationScope } from "./qualification-scope";
 import { caseSensitiveFamiliesInText } from "./sensitive-words";
@@ -177,6 +177,15 @@ export function threadlessTicketPlainDescription(source: ThreadlessTicketSource)
 export type ThreadlessTicketQualification =
   | { status: "admitted"; admission: CaseAdmissionInput; request: CaseOpenedRequest }
   | { status: "out_of_scope" | "human_wait"; reason: string };
+
+/**
+ * PORTE 2A (P1, risk of PORTE 1F): a first mail is only ever an Access answer (a smart ticket with no thread goes to the team, `smart_no_thread`). Before it
+ * leaves, the qualification read NOW must still be the Access path: admitted, every request of the family `access` under a block rule, never the smart
+ * provenance. With `SAV_V2_ENTRY_SMART=on` the ticket qualifies as smart: an Access first mail already queued then sends nothing; gone or changed, nothing either.
+ */
+export const threadlessAccessQualified = (qualification: ThreadlessTicketQualification): boolean => qualification.status === "admitted"
+  && qualification.admission.qualification.requests.length > 0
+  && qualification.admission.qualification.requests.every(row => row.family === "access" && !isSmartSupportProvenance(row.provenance));
 
 /** SAV-96 B: the one request of a ticket case (`openCaseFromHubspotTicket`), and SAV-97's input for it: subject and whole description, never a note. */
 export const threadlessRequestId = (source: Pick<ThreadlessTicketSource, "ticketId">) => `hubspot-ticket:${source.ticketId}/access`;

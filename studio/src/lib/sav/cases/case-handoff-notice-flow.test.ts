@@ -399,6 +399,13 @@ describe("holds: nothing leaves, nothing is lost", () => {
     expect(slack.state.calls).toHaveLength(0);
   });
 
+  it("SAV-123 (N8): SAV_V2_ENTRY_SMART=on no longer holds the notice pass (the brain is wired): the one message goes, exactly as with the switch off", async () => {
+    await handedOver("gm-hold-smart-entry");
+    environment = { ...environment, SAV_V2_ENTRY_SMART: "on" };
+    await pass();
+    expect(posts()).toHaveLength(1);
+  });
+
   it("the execution policy mode off (no V1 execution configuration) stops the pass", async () => {
     await handedOver("gm-hold-exec-off");
     environment = { ...environment, SAV_INTAKE_EXECUTION_MODE: undefined };

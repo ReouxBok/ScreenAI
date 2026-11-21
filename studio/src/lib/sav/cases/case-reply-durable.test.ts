@@ -4,6 +4,7 @@ import { drizzle } from "drizzle-orm/pglite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { finalReplyText } from "../../../../test/sav-case-reply-text";
+import { prepareCaseReplyText } from "./case-reply-outbound";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
@@ -52,7 +53,7 @@ const setV2Pause = async (level: "actions_paused" | "fully_paused" | null) => {
     cursor: encryptSavPayload({ revision: "sav-agent-pause.v1", agent: "v2", level, setBy: "fixture@example.invalid", setAt: AT, reason: "release fictive" }) });
 };
 
-async function scenario(purpose: CaseReplyProposal["purpose"] = "question", extra: { note?: boolean; text?: string; admission?: typeof ADMITTED } = {}) {
+async function scenario(purpose: CaseReplyProposal["purpose"] = "question", extra: { note?: boolean; text?: string; admission?: typeof ADMITTED; automated?: boolean } = {}) {
   const gmailThreadId = `gmail-thread-${randomUUID()}`, gmailMessageId = `gm-${randomUUID()}`, ticketId = String(++ticketSeq);
   const thread = (await f.db.insert(savThreads).values({ mailboxId, gmailThreadId, customerEmail: "customer@example.invalid" }).returning())[0]!;
   const message = (await f.db.insert(savMessages).values({
@@ -72,7 +73,7 @@ async function scenario(purpose: CaseReplyProposal["purpose"] = "question", extr
   const snapshot = (await readCase(opened.caseId))!;
   const proposal: CaseReplyProposal = {
     caseId: opened.caseId, caseVersion: snapshot.version, triggerEventId: `inbound:${gmailMessageId}`, inboundMessageId: message.id, purpose, recipient: "customer@example.invalid",
-    subject: "Synthetic connection failure", text: finalReplyText(extra.text ?? "SYNTHETIC reply.\nSignature kept exactly."),
+    subject: "Synthetic connection failure", text: extra.automated ? prepareCaseReplyText(extra.text ?? "SYNTHETIC reply.", "fr", "automated", purpose) : finalReplyText(extra.text ?? "SYNTHETIC reply.\nSignature kept exactly."),
     ...(purpose === "question" ? { question: { id: "q1", text: "SYNTHETIC question?", factKeys: [] } } : {}),
   };
   const note: CaseEffectNote | undefined = extra.note ? { interactionId: inboundInteractionId(gmailMessageId), text: "Synthetic interaction note.", at: "2026-10-30T10:00:00.000Z" } : undefined;
@@ -83,10 +84,10 @@ const allow: CaseReplyAuthorizer = () => ({ allowed: true, basis: "fixture.allow
 const storeDeps = (env: () => Record<string, string | undefined> = () => environment) => ({ env, readTicketOwner: async () => "v2" as const, currentPolicyRevision: async () => POLICY });
 const seenOf = (proposal: CaseReplyProposal) => ({ payloadHash: caseReplyPayloadHash(proposal), caseVersion: proposal.caseVersion, recipient: proposal.recipient });
 /** The whole durable path: the proposal is stored, a person approves what they saw, the execution is queued from the stored validation. */
-async function validate(proposal: CaseReplyProposal) {
+async function validate(proposal: CaseReplyProposal, by: { approverId: string; authorizer: CaseReplyAuthorizer } = { approverId: APPROVER, authorizer: allow }) {
   const submitted = await submitCaseReplyProposal(proposal, storeDeps());
   if (!submitted.ok) throw Error(`SUBMIT_REFUSED:${submitted.code}`);
-  const decided = await decideCaseReply({ action: "approve", validationId: submitted.id, approverId: APPROVER, seen: seenOf(proposal), authorizer: allow, deps: storeDeps() });
+  const decided = await decideCaseReply({ action: "approve", validationId: submitted.id, approverId: by.approverId, seen: seenOf(proposal), authorizer: by.authorizer, deps: storeDeps() });
   if (!decided.ok) throw Error(`APPROVE_REFUSED:${decided.code}`);
   return submitted.id;
 }
@@ -759,5 +760,99 @@ describe("SAV-97 : dernier contrôle avant envoi d'un dossier admis par le skill
     const { id } = await admit(s);
     expect(await run(id)).toMatchObject({ state: "confirmed" });
     expect(sends).toBe(1);
+  });
+});
+
+/*
+ * SAV-123 (N8): the smart reply's last look on the real executor (`smart/smart-send-fence.ts`), whoever approved it. A case the smart entry admitted
+ * (`smart_support`, `SAV_V2_ENTRY_SMART=on` in the process): OUR text with a cancellation word or an invitation to another platform is cancelled, never sent;
+ * a clean reply leaves once; a pause holds it.
+ */
+describe("SAV-123 : dernier contrôle avant envoi d'un dossier smart (filet sur notre réponse)", () => {
+  const SMART_ADMITTED = { policy: null, qualification: { ...ADMITTED.qualification, requests: [{ requestId: "r1", family: "other" as const,
+    provenance: { kind: "qualified_rule" as const, ruleId: "smart-entry", revision: "smart-entry.v1", at: AT, blockId: "smart-support" } }] } } as unknown as typeof ADMITTED;
+  beforeEach(() => { vi.stubEnv("SAV_V2_ENTRY_SMART", "on"); vi.stubEnv("SAV_V2_SMART_SUPPORT_MODE", "auto"); environment = { ...environment, SAV_V2_ENTRY_SMART: "on", SAV_V2_SMART_SUPPORT_MODE: "auto" }; });
+
+  it("une réponse smart propre part une fois", async () => {
+    const s = await scenario("answer", { admission: SMART_ADMITTED, text: "Ouvrez l'onglet Intégrations puis reconnectez Google Sheets." });
+    expect((await readCase(s.caseId))!.admission).toMatchObject({ admission: "smart_support" });
+    const { id } = await admit(s);
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+  });
+  it.each([
+    ["résiliation", "Pour résilier votre abonnement, rendez-vous dans les paramètres.", "SAV_CASE_EFFECT_CANCELLED_REPLY_SENSITIVE_WORDING"],
+    ["autre plateforme", "Je vous recommande d'utiliser Zapier pour remplir votre tableau.", "SAV_CASE_EFFECT_CANCELLED_REPLY_OTHER_PLATFORM"],
+  ])("même approuvée (mode auto), une réponse smart bloquée par le filet (%s) est annulée, jamais envoyée", async (_label, text, reason) => {
+    const s = await scenario("answer", { admission: SMART_ADMITTED, text });
+    const { id } = await admit(s);
+    expect(await run(id)).toMatchObject({ reason });
+    expect(await effectsOf(id)).toEqual([]);
+    expect(sends).toBe(0);
+  });
+  it("PORTE 2A (P2) : une mention neutre de remboursement part (seuls résiliation et engagement sensible sont refusés)", async () => {
+    const s = await scenario("answer", { admission: SMART_ADMITTED, text: "Pour la question de remboursement, notre équipe vous répondra." });
+    const { id } = await admit(s);
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+  });
+  it("pause d'Ugo active : la réponse smart approuvée attend, rien ne part", async () => {
+    const s = await scenario("answer", { admission: SMART_ADMITTED, text: "Ouvrez l'onglet Intégrations puis reconnectez Google Sheets." });
+    const { id } = await admit(s);
+    await setV2Pause("fully_paused");
+    await run(id);
+    expect(sends).toBe(0);
+    expect((await execution(id)).state).not.toBe("confirmed");
+  });
+});
+
+/*
+ * PORTE 2A (P1): a smart reply already queued is judged again on the switches at the last look. Approved by the RULE (`auto_access.v1`): turning off
+ * `SAV_V2_ENTRY_SMART`, `SAV_V2_SMART_SUPPORT_MODE=auto` or `SAV_V2_AUTO_REPLY=access` after the queue sends nothing on resume. Approved by a PERSON:
+ * only `SAV_V2_ENTRY_SMART` is required (the smart stamp depends on it).
+ */
+describe("PORTE 2A : interrupteurs smart relus avant l'envoi d'une réponse déjà en file", () => {
+  const SMART_ADMITTED = { policy: null, qualification: { ...ADMITTED.qualification, requests: [{ requestId: "r1", family: "other" as const,
+    provenance: { kind: "qualified_rule" as const, ruleId: "smart-entry", revision: "smart-entry.v1", at: AT, blockId: "smart-support" } }] } } as unknown as typeof ADMITTED;
+  const RULE = "30000000-0000-4000-8000-000000000009";
+  const ruleApproval = { approverId: RULE, authorizer: (() => ({ allowed: true, basis: "auto_access.v1" })) as CaseReplyAuthorizer };
+  const TEXT = "Ouvrez l'onglet Intégrations puis reconnectez Google Sheets.";
+  const ALL_ON = { SAV_V2_ENTRY_SMART: "on", SAV_V2_SMART_SUPPORT_MODE: "auto", SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: RULE };
+  beforeEach(() => { vi.stubEnv("SAV_V2_ENTRY_SMART", "on"); environment = { ...environment, ...ALL_ON }; });
+  async function queuedByRule() {
+    const s = await scenario("answer", { admission: SMART_ADMITTED, text: TEXT, automated: true });
+    const queued = await queue(await validate(s.proposal, ruleApproval));
+    if (!queued.ok) throw Error(`ENQUEUE_REFUSED:${queued.code}`);
+    return queued.executionId;
+  }
+
+  it("tout allumé : la réponse approuvée par la règle part une fois", async () => {
+    expect(await run(await queuedByRule())).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+  });
+  it.each([
+    ["SAV_V2_ENTRY_SMART", "SAV_CASE_EFFECT_CANCELLED_SMART_ENTRY_OFF"],
+    ["SAV_V2_SMART_SUPPORT_MODE", "SAV_CASE_EFFECT_CANCELLED_SMART_AUTO_OFF"],
+    ["SAV_V2_AUTO_REPLY", "SAV_CASE_EFFECT_CANCELLED_SMART_AUTO_OFF"],
+  ])("approuvée par la règle puis %s éteint après la mise en file : 0 envoi à la reprise", async (name, reason) => {
+    const id = await queuedByRule();
+    environment = { ...environment, [name]: "off" };
+    expect(await run(id)).toMatchObject({ reason });
+    expect(await effectsOf(id)).toEqual([]);
+    expect(sends).toBe(0);
+  });
+  it("approuvée par une personne : part sans SAV_V2_SMART_SUPPORT_MODE ni SAV_V2_AUTO_REPLY", async () => {
+    const s = await scenario("answer", { admission: SMART_ADMITTED, text: TEXT });
+    const { id } = await admit(s);
+    environment = { ...environment, SAV_V2_SMART_SUPPORT_MODE: undefined, SAV_V2_AUTO_REPLY: undefined };
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    expect(sends).toBe(1);
+  });
+  it("approuvée par une personne puis SAV_V2_ENTRY_SMART éteint : 0 envoi", async () => {
+    const s = await scenario("answer", { admission: SMART_ADMITTED, text: TEXT });
+    const { id } = await admit(s);
+    environment = { ...environment, SAV_V2_ENTRY_SMART: "off" };
+    expect(await run(id)).toMatchObject({ reason: "SAV_CASE_EFFECT_CANCELLED_SMART_ENTRY_OFF" });
+    expect(sends).toBe(0);
   });
 });

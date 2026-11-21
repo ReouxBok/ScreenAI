@@ -21,7 +21,7 @@ import { ownerHandoverPollFloor } from "./owner-handover-poll";
 import { readSavV2QualificationScope } from "./qualification-scope";
 import { handBackOwnerHandoverTicket, startV2FromThreadlessTicket } from "./threadless-entry";
 import { readOwnerHandoverContact, threadlessIdentityReason } from "./threadless-source";
-import { savV2EntrySmartOn, smartEntryEffectsHold } from "./smart-entry-switch";
+import { savV2EntrySmartOn } from "./smart-entry-switch";
 import { continueCaseAfterCommit, firstBlockEvidence, v2EntryRelayDeps } from "./v2-entry";
 import { SAV_CASE_BLOCK_REGISTRY } from "./case-block-registry";
 import { savCaseSensitiveWording } from "./investigation-return-qualify";
@@ -122,9 +122,8 @@ async function manualQualification(messageId: string, ticketId: string, env: Env
   const request = ownerHandoverMailRequest(message.gmailId);
   const requests = await firstBlockEvidence(env, messageId, message.gmailId, [request], SAV_CASE_BLOCK_REGISTRY,
     { run: { runId: null, runVersion: null }, accessSkillCompute: "always" });
-  // SAV-117 review 1D: under `SAV_V2_ENTRY_SMART=on` a reading no block takes (support + cancellation, for one) is not handed back before N8: the relay's handover
-  // gate leaves it waiting (`owner_handover_smart_pending`). Off: exactly as before.
-  if (!smart && requests.every(row => row.provenance.kind === "team_part")) return { handBack: "no_block_match" };
+  // A reading nobody takes (no block; under `SAV_V2_ENTRY_SMART=on`, no support request) goes back to the team.
+  if (requests.every(row => row.provenance.kind === "team_part")) return { handBack: "no_block_match" };
   return { qualification: { requests, identity: { status: "confirmed", source: { type: "hubspot_object", id: read.contact.id } }, crmContext: "complete", teamSignals: [] } };
 }
 
@@ -145,9 +144,6 @@ async function processOwnerHandover(input: OwnerHandoverTransition, claim: Claim
 
   // SAV-99 (Ugo 19/11): a ticket the agent does not take goes back to the team, once, with no mail (`handBackOwnerHandoverTicket`).
   const handBack = async (reason: string) => {
-    // SAV-117 review 1F: the central hold before N8 (`smartEntryEffectsHold`, to remove in N8): no hand-back, no HubSpot write; the reason is only logged.
-    const hold = smartEntryEffectsHold(env);
-    if (hold) { console.info("sav_v2_owner_handover_held", { hold, reason }); return hold; }
     if (!await ownerHandoverClaimIsCurrent(claim) || await relayPaused(db)) return "superseded_or_paused";
     const back = await handBackOwnerHandoverTicket(input, reason);
     return back.status === "human_wait" ? `handed_back:${back.reason}` : `handback_${back.status}`;

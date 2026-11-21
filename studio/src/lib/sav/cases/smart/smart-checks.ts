@@ -100,7 +100,7 @@ const OUR_SIDE = String.raw`\b(?:je|j'|nous|on|l'equipe|notre equipe|nos equipes
 const AUX = String.raw`(?:(?:vais|allons|va|vont|pouvons|peux|peut|devons|dois|doit|viens d'|venons d'|vient d'|ai|avons|a|ont|me charge d[e']|nous chargeons d[e']|m'occupe d[e']|nous occupons d[e']|procede a|procedons a)\s*)?`;
 const PRONOUNS = String.raw`(?:(?:vous|le|la|les|l'|en|lui|y|bien|immediatement|aujourd'hui|directement|tout de suite)\s*)*`;
 const VERB_END = String.raw`(?:e|es|er|erai|erons|era|eront|ons|ee|ees)\b`;
-const ACTION = String.raw`(?:(?:annul|resili|rembours|supprim|effac|recredit)${VERB_END}|(?:ferm|clotur|desactiv|suspend)\w* (?:votre|le|ce|l'|son) ?(?:compte|abonnement|contrat|acces|offre)|transfer\w* (?:la propriete|la titularite|le compte|votre compte|l'abonnement|votre abonnement)|chang\w* (?:le|de) (?:titulaire|proprietaire)|reinitialis\w* (?:votre|le|vos) (?:mot de passe|identifiant|acces|code)|(?:envoi\w*|envoy\w*|communiqu\w*|donn\w*|transmet\w*|fourni\w*) (?:votre|un|le|vos|un nouveau|votre nouveau) (?:mot de passe|identifiant|code d'acces|code de connexion|acces)|(?:accord|offr|propos)\w* (?:un |une )?(?:remboursement|avoir|geste commercial|dedommagement|mois offert|reduction|remise))`;
+const ACTION = String.raw`(?:(?:annul|resili|rembours|supprim|effac|recredit)${VERB_END}|(?:ferm|clotur|desactiv|suspend)\w* (?:votre|le|ce|l'|son) ?(?:compte|abonnement|contrat|acces|offre)|transfer\w* (?:la propriete|la titularite|le compte|votre compte|l'abonnement|votre abonnement)|chang\w* (?:le|de) (?:titulaire|proprietaire)|reinitialis\w* (?:votre|le|vos) (?:mot de passe|identifiant|acces|code)|(?:envoi\w*|envoy\w*|communiqu\w*|donn\w*|transmet\w*|fourni\w*) (?:votre|un|le|vos|un nouveau|votre nouveau) (?:mot de passe|identifiant|code d'acces|code de connexion|acces)|(?:accord|offr|propos)\w* (?:un |une )?(?:remboursement|avoir|geste commercial|dedommagement|mois offert|reduction|remise)|(?:proced|effectu|lanc|realis|fai|emet|emett|vers|appliqu)\w* (?:au |a un |a une |un |une |le |la |votre |l')?(?:remboursement|avoir|geste commercial|dedommagement|recredit))`;
 const COMMITMENTS: readonly RegExp[] = [
   new RegExp(`${OUR_SIDE}${AUX}${PRONOUNS}${ACTION}`),
   /\b(?:votre|vos|le|l'|ce|cet|son) ?(?:abonnement|compte|contrat|commande|offre|donnees|paiement|prelevement|acces)s? (?:sera|seront|va etre|vont etre|a ete|ont ete) (?:bien |immediatement |automatiquement |definitivement |integralement )?(?:annule|resilie|rembourse|supprime|efface|ferme|clos|cloture|desactive|transfere|suspendu|recredite)e?s?\b/,
@@ -111,6 +111,8 @@ const COMMITMENTS: readonly RegExp[] = [
   new RegExp(String.raw`\b(?:vous pouvez|vous pourrez|vous pourriez|il (?:vous )?suffit d[e']|pour|afin d[e']|vous devez|il faut|merci d[e']|n'hesitez pas a)\s*(?:\w+ ){0,2}(?:resilier\b|(?:annuler|arreter|stopper|suspendre|interrompre|mettre fin a|ne pas renouveler|desactiver|clore|cloturer|fermer) (?:le renouvellement (?:de |d')?)?(?:votre|l'|le|ce|cet|son) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement)\b)`),
   // Orchestrator decision (Ugo: cancellation is never handled by the agent on its own): any word of cancellation in OUR reply, always.
   /\bresili\w*/,
+  // PORTE 2B: unsubscribing is a cancellation (« pour vous désabonner, cliquez ici », « se désinscrire de l'abonnement »).
+  /\bdesabonn\w*|\bdesinscri\w* (?:de |d'|a )?(?:votre |l'|ce |cet |son |mon )?abonnement/,
   /\b(?:resiliez|(?:annulez|arretez|stoppez|suspendez|mettez fin a|cloturez|fermez) (?:votre|l'|le) ?(?:abonnement|contrat|offre|forfait|engagement|renouvellement))\b/,
 ];
 /*
@@ -122,11 +124,43 @@ const COMMITMENTS: readonly RegExp[] = [
  */
 const SUBSCRIPTION_OBJECT = /\b(?:abonnements?|contrats?|forfaits?|souscriptions?|(?:l'|une?|votre|vos|mon|notre|son|cette|cet|ce|d'|des|les|le|la) ?(?:offres?|plans?))\b/;
 const STOP_VERB = /\b(?:annul\w*|arret\w*|mettre fin|mis fin|mettez fin|met fin|mettons fin|stopp?\w*|suspend\w*|interromp\w*|desactiv\w*)/;
-/** True when the reply commits to a sensitive action on the account, or speaks of cancelling the subscription (exported for the tests and the shadow report). */
+/*
+ * PORTE 2C (one rule, for Ugo: « l'agent ne parle d'argent que pour dire que l'équipe s'en occupe »): a part of a sentence (cut on « ; » and « mais ») that
+ * speaks of money (remboursement, avoir, geste commercial, dédommagement, annulation d'un prélèvement ou d'une facture) is refused, unless that same part
+ * hands it to the team (« notre équipe vous répondra », « un conseiller », « transmis à l'équipe »). A bare « notre équipe reste disponible » is no hand-over.
+ */
+const MONEY = /\brembours\w*|\b(?:un|d'un|l'|votre|cet|son|vos|des) ?avoirs?\b|\bgeste commercial|\bdedommag\w*|\brecredit\w*|\bannul\w* (?:(?:de|du|d'|le|la|les|des|votre|vos|ce|cette|l')\s*){0,2}(?:prelevement|facture)s?\b|\b(?:prelevement|facture)s? (?:\S+ ){0,4}annul\w*/;
+// PORTE 2D: only a hand-over to COME or a transmission counts (« vous répondra », « reviendra vers vous », « va vous recontacter », « prendra le relais »,
+// « transmis à l'équipe »); a past or a statement (« a traité », « a validé ») does not.
+const TO_TEAM = /\b(?:notre equipe|nos equipes|l'equipe|un conseiller|nos conseillers|le service (?:client|facturation|comptabilite))\b.{0,40}\b(?:(?:vous )?(?:repondr|reviendr|recontacter|contacter|examiner|etudier|traiter|verifier)(?:a|ont)\b|(?:va|vont) vous (?:repondre|recontacter|contacter)|(?:va|vont) (?:revenir vers vous|examiner|etudier|traiter)|prendr(?:a|ont) (?:le relais|en charge)|s'en occupera)|\btransmis\w* (?:a|au) (?:notre |l'|un |nos )?(?:equipe|conseiller|service)/;
+// PORTE 2D: a financial RESULT announced (remboursement / avoir / geste / dédommagement + validé, effectué, confirmé, accordé, en cours, versé, crédité) refuses always.
+const MONEY_NOUN = String.raw`(?:rembours\w*|(?:un|d'un|l'|votre|cet|son|vos|des) ?avoirs?\b|geste commercial|dedommag\w*)`;
+const MONEY_RESULT_WORD = String.raw`(?:valid\w*|effectu\w*|confirm\w*|accord\w*|en cours|vers[ee]s?\b|verse\w*|credit\w*|recredit\w*|appliqu\w*|vire\w*)`;
+const MONEY_RESULT = new RegExp(String.raw`\b${MONEY_NOUN}.{0,40}\b${MONEY_RESULT_WORD}|\b${MONEY_RESULT_WORD}.{0,40}\b${MONEY_NOUN}`);
+const moneyParts = (reply: string) => sentencesOf(reply).flatMap(sentence => fold(sentence).split(/;|\bmais\b/)).map(row => row.trim()).filter(Boolean);
+/** True when the reply commits to a sensitive action on the account, speaks of cancelling the subscription, or of money outside a hand-over to the team. */
 export const smartSensitiveCommitment = (reply: string) => {
   const folded = fold(reply);
-  return COMMITMENTS.some(pattern => pattern.test(folded)) || (SUBSCRIPTION_OBJECT.test(folded) && STOP_VERB.test(folded));
+  return COMMITMENTS.some(pattern => pattern.test(folded)) || (SUBSCRIPTION_OBJECT.test(folded) && STOP_VERB.test(folded))
+    || moneyParts(reply).some(part => MONEY_RESULT.test(part) || (MONEY.test(part) && !TO_TEAM.test(part)));
 };
+
+/*
+ * SAV-123 (N8), PORTE 2A: the send fence's other-platform rule is the shared one (`../../other-platform.ts`), no list of its own: per sentence, advice to
+ * leave Limova or go to another tool (`savOtherPlatformRedirect`, « pour remplacer Limova… » included), a named third party compared favourably
+ * (`savOtherPlatformEndorses`), or a clause orienting to a named third party (`savOtherPlatformOrients`). A sentence set in Limova's Intégrations menu
+ * (« Dans les intégrations de Limova, optez pour HubSpot ») places the tool inside Limova: its orientation is not a redirection.
+ */
+const INTEGRATIONS_MENU = /\b(?:dans|depuis|via) (?:le |vos |les )?(?:menu |onglet |rubrique )?integrations?\b|\bintegrations >/;
+// PORTE 2B/2C: the exception holds only for the part of the sentence that carries BOTH the named tool and the Intégrations marker. A sentence is cut on « si »,
+// « mais », « puis », « ou », « et », « ; » and parentheses (a leading « Dans les intégrations de Limova, » stays with the choice that follows it); every other part is judged
+// by the shared per-clause rule (« Dans les intégrations de Limova, si le connecteur manque, optez pour Wix… » refuses).
+const integrationParts = (folded: string) => folded.split(/[;()]|\b(?:si|mais|puis|ou|et)\b/).map(row => row.trim()).filter(Boolean);
+export const smartOtherPlatformInvite = (reply: string) => sentencesOf(reply).some(sentence => {
+  const folded = fold(sentence);
+  if (savOtherPlatformRedirect(folded) || savOtherPlatformEndorses(folded, SAV_OTHER_PLATFORM_THIRD_PARTIES)) return true;
+  return integrationParts(folded).some(part => !INTEGRATIONS_MENU.test(part) && savOtherPlatformOrients(part, SAV_OTHER_PLATFORM_THIRD_PARTIES));
+});
 
 const URL_RE = /\bhttps?:\/\/[^\s<>"')\]]+/giu;
 const DOMAIN = /(?<![\p{L}\p{N}@./-])(?:www\.)?[a-z0-9][a-z0-9-]{1,62}(?:\.[a-z0-9-]{1,62})*\.(?:com|fr|io|ai|net|org|co|app|eu|be|ch|ca|me|so|dev)(?![\p{L}\p{N}-])/giu;

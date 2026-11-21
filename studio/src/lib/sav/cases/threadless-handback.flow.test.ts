@@ -190,6 +190,23 @@ describe("SAV-99: an assigned ticket without mail, the category never decides", 
     expect([s.counts.gmail, s.counts.writes]).toEqual([0, 0]);
   });
 
+  it("SAV-123 (N8): SAV_V2_ENTRY_SMART=on, a support ticket with no mail thread is admitted by the smart entry but goes to the team ONCE (`smart_no_thread`), never a mail", async () => {
+    vi.stubEnv("SAV_V2_ENTRY_SMART", "on");
+    const s = ticket({ subject: "Export de mes contacts", content: "Comment exporter la liste de mes contacts au format CSV ?" }, SAV_HUBSPOT_SUPPORT.categories.other);
+    expect(await startV2FromThreadlessTicket(s.input)).toMatchObject({ status: "human_wait", reason: "smart_no_thread" });
+    const row = await caseOf(s.input.ticketId);
+    expect(await readCase(row!.id)).toMatchObject({ owner: "human", phase: "handoff_pending", threadIds: [], body: { handoff: { reason: "smart_no_thread" } } });
+    let owner: "v2" | "none" = "v2";
+    const first = await runHandBack(() => owner, s.input.ticketId);
+    expect(first.notes.map(intent => intent.kind)).toEqual(["note_create", "note_associate"]);
+    expect(JSON.stringify(first.notes[0])).toContain("aucun fil de mail n'est lié à ce ticket");
+    expect(s.counts.stageWrites).toEqual([{ hs_pipeline_stage: SAV_HUBSPOT_SUPPORT.stages.new, hubspot_owner_id: "" }]);
+    owner = "none";
+    expect(first.slack).toHaveLength(1);
+    expect(await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, row!.id))).toEqual([]);
+    expect([s.counts.gmail, s.counts.writes]).toEqual([0, 0]);
+  });
+
   it("a ticket WITH a mail the agent does not take (linked thread, sensitive...) is handed back the same way, once, with no mail", async () => {
     const s = ticket(ACCESS_CONTENT, SAV_HUBSPOT_SUPPORT.categories.access, [CONTACT], { mails: 1, stage: SAV_HUBSPOT_SUPPORT.stages.awaitingContact });
     const [thread] = await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: `gmail-${s.input.ticketId}`, customerEmail: CUSTOMER, hubspotTicketId: s.input.ticketId }).returning();

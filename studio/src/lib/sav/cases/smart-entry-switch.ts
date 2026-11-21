@@ -9,7 +9,9 @@
  *   5. La sensibilité et l'énervement du client sont jugés ensuite par le cerveau smart (N8), jamais par une liste de mots à l'entrée.
  *
  * Tickets attribués à l'Agent SAV dans HubSpot (SAV-118, N5) : même porte. Pas de tri V1 sur un ticket ; la lecture du cerveau smart classe la demande et passe
- * la main sur le sensible. Un ticket sans aucun contact va à l'équipe (`crm_missing_primary`). Avant N8, un ticket admis attend : ni dossier, ni restitution.
+ * la main sur le sensible. Un ticket sans aucun contact va à l'équipe (`crm_missing_primary`).
+ * N8 (SAV-123) : un cas admis est décidé par le cerveau smart (`smart/smart-case-provider.ts`), sans périmètre pilote (`smart-support-scope.ts`) ; un ticket
+ * sans fil de mail va à l'équipe (`smart_no_thread`).
  *
  * `SAV_V2_ENTRY_SMART=on` is the ONLY value that switches it on (like `smart-switch.ts`). Absent, empty or any other value (`ON`, `true`, `shadow`...): off,
  * and the entry is exactly the block entry it was. Nothing else reads this switch: the admission decision recognises a smart admission by its provenance.
@@ -18,24 +20,16 @@
 type Env = Readonly<Record<string, string | undefined>>;
 export const SAV_V2_ENTRY_SMART_ENV = "SAV_V2_ENTRY_SMART";
 export const savV2EntrySmartOn = (env: Env) => env[SAV_V2_ENTRY_SMART_ENV] === "on";
+/** SAV-123 (N8): the smart block may be approved by the rule only with `SAV_V2_SMART_SUPPORT_MODE=auto` (exactly); read by the block switch and at the send fence. */
+export const SAV_V2_SMART_SUPPORT_MODE_ENV = "SAV_V2_SMART_SUPPORT_MODE";
+export const savV2SmartSupportAuto = (env: Env) => env[SAV_V2_SMART_SUPPORT_MODE_ENV] === "auto";
 
 // The label, policy revision and provenance of a smart admission live with the case types (the pure admission rule imports nothing else).
 export {
-  isSmartSupportProvenance, SAV_SMART_ENTRY_ADMISSION, SAV_SMART_ENTRY_BLOCK_ID, SAV_SMART_ENTRY_FAMILY, SAV_SMART_ENTRY_POLICY_REVISION, SAV_SMART_ENTRY_RULE_ID,
+  isSmartSupportProvenance, SAV_SMART_ENTRY_ADMISSION, SAV_SMART_NO_THREAD_WAIT, SAV_SMART_ENTRY_BLOCK_ID, SAV_SMART_ENTRY_FAMILY, SAV_SMART_ENTRY_POLICY_REVISION, SAV_SMART_ENTRY_RULE_ID,
   smartSupportProvenance,
 } from "./case-types";
 
 /** SAV-118 (N5): the wait reason of a HubSpot ticket handed to the agent with no contact at all (no primary record), switch on only. Nothing is invented: the
  * ticket goes back to the team with this reason, through the existing hand-over (stage « Nouveau », no owner, one short note). */
 export const SAV_SMART_ENTRY_MISSING_PRIMARY = "crm_missing_primary";
-
-/**
- * SAV-117 review 1F — THE central hold of external effects before N8 (TO REMOVE IN N8, here only: make it return null, then drop its call sites).
- * While `SAV_V2_ENTRY_SMART=on` and the smart brain is not wired, no external effect of the Agent SAV leaves: no hand-back of a HubSpot-assigned ticket
- * (`owner-handover.ts`), no Gmail send nor HubSpot write of the case effects executor (`runCaseEffectsPass`: thread replies, first mail of a ticket, CRM
- * journal, summary note) nor of the ticket stage executor (`runCaseTicketStagePass`). Each executor stops BEFORE claiming or marking anything, with this
- * reason: nothing is consumed, nothing irreversible is written, the work stays due. It is a guard against an accidental switch-on, not a filter.
- * Off: null, every executor exactly as before.
- */
-export const SAV_SMART_ENTRY_EFFECTS_HOLD = "smart_entry_awaiting_n8";
-export const smartEntryEffectsHold = (env: Env): typeof SAV_SMART_ENTRY_EFFECTS_HOLD | null => savV2EntrySmartOn(env) ? SAV_SMART_ENTRY_EFFECTS_HOLD : null;
