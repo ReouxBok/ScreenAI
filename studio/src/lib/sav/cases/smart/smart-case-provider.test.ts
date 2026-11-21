@@ -7,6 +7,7 @@ import {
 } from "./smart-case-provider";
 import { SMART_CONFORME, smartGoodDecision, smartReading, smartScriptedModel, type SmartScript } from "./smart-test-doubles";
 import type { SmartTurnResult } from "./smart-agent";
+import { caseDecisionProposalSchema } from "../decision-contract";
 
 // Fictional data only: no database, no key, no network.
 const CARD = { id: "fiche-connexion", contentVersionId: "v3", title: "Se connecter", source: "fixture", verifiedAt: "2026-11-10T00:00:00Z", semanticScore: null,
@@ -62,6 +63,21 @@ describe("SAV-123 smart-case-provider", () => {
     expect(out.usage).toEqual({ inputTokens: 3_000, outputTokens: 600 });
     const decidePayload = brain.calls.find(call => call.kind === "decide")!.payload as { cards: Array<{ cardId: string }> };
     expect(decidePayload.cards.map(row => row.cardId)).toEqual(["fiche-connexion"]);
+  });
+
+  it("SAV-122 (contract v5): a fact with NO sentence still gives a valid answer; the step text is internal (excerpt), the reply is the model's, untouched", async () => {
+    const decision = smartGoodDecision({ facts: [{ ...smartGoodDecision().facts[0], sentence: undefined }] });
+    const { run } = provider({ understand: { output: smartReading() }, decide: { output: decision }, verify: { output: SMART_CONFORME } });
+    const out = await run(requestOf());
+    expect(out.result.status).toBe("ok");
+    const proposal = (out.result as { output: unknown }).output;
+    expect(caseDecisionProposalSchema.safeParse(proposal).success).toBe(true);
+    expect(proposal).toMatchObject({ reply: { text: decision.reply }, nextAction: { kind: "answer", steps: [{ text: "utilisez l'adresse e-mail de votre invitation", knowledge: { knowledgeId: "fiche-connexion" } }] } });
+    // No sentence and no excerpt (built directly): the card's title, never an empty step.
+    const bare = smartProposalFromTurn(turn({ outcome: "reply", decision: { ...(decision as unknown as NonNullable<SmartTurnResult["decision"]>),
+      facts: [{ sentence: "", needId: "n1", type: "fait_limova", sourceKind: "fiche", cardId: "fiche-connexion", version: "v3", toolCallId: null, excerpt: null }] } as never }), requestOf());
+    expect(caseDecisionProposalSchema.safeParse(bare).success).toBe(true);
+    expect(bare).toMatchObject({ reply: { text: decision.reply }, nextAction: { steps: [{ text: "Se connecter" }] } });
   });
 
   it("a refusal goes to the brain once (decide payload); the second refusal hands over with NO brain call", async () => {
