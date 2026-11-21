@@ -6,20 +6,21 @@ import { smartBindableSentence, smartFactSentenceInReply } from "./smart-checks"
 /** SAV-122 (bench v11): the free measure of the fact binding on the bench's 1 334 keyFacts (used by the test; fictional texts only). */
 const cap = (value: string) => value.charAt(0).toLocaleUpperCase("fr") + value.slice(1);
 const low = (value: string) => value.charAt(0).toLocaleLowerCase("fr") + value.slice(1);
-const SYNONYMS: ReadonlyArray<[RegExp, string]> = [
-  [/\bcliquez\b/, "appuyez"], [/\bcliquer\b/, "appuyer"], [/\bouvrez\b/, "affichez"], [/\bouvrir\b/, "afficher"], [/\bvérifiez\b/, "contrôlez"], [/\bvérifier\b/, "contrôler"],
-  [/\bchoisissez\b/, "sélectionnez"], [/\bchoisir\b/, "sélectionner"], [/\bcoller\b/, "insérer"], [/\bcollez\b/, "insérez"], [/\butiliser\b/, "employer"], [/\bajouter\b/, "insérer"],
-];
+// PORTE 2G: only what keeps the same words in the same order is « light »; everything else must be refused.
 export const SMART_BIND_LIGHT: Record<string, (fact: string) => string | null> = {
   article: fact => { for (const [from, to] of [[" le ", " un "], [" la ", " une "], [" les ", " des "], [" un ", " le "], [" une ", " la "]] as const) if (fact.includes(from)) return fact.replace(from, to); return null; },
-  ordre: fact => { const at = fact.indexOf(", "); return at > 0 ? `${cap(fact.slice(at + 2))}, ${low(fact.slice(0, at))}` : null; },
-  synonyme: fact => { for (const [from, to] of SYNONYMS) if (from.test(fact)) return fact.replace(from, to); return null; },
+  ponctuation: fact => fact.includes(", ") ? fact.replace(", ", " ") : `${fact} !`,
+  premiere_lettre: fact => /^\p{Ll}/u.test(fact) ? cap(fact) : low(fact),
+  accord: fact => { const word = fact.match(/(?<![\p{L}'])\p{L}{5,}(?<![sx])(?![\p{L}'])/u)?.[0]; return word ? fact.replace(word, `${word}s`) : null; },
 };
 export const SMART_BIND_FALSE: Record<string, (fact: string) => string | null> = {
   chiffre: fact => /\d+/.test(fact) ? fact.replace(/\d+/, digits => String(Number(digits) + 1)) : null,
   // A negation added, or every negation word of the fact removed (« ne jamais transmettre » → « transmettre »).
   negation: fact => /(^|[^\p{L}])(ne|n'|pas|jamais|aucun|aucune|sans|rien)($|[^\p{L}])/u.test(fact)
     ? fact.replace(/(?<!\p{L})(?:ne |n'|pas |jamais |aucun |aucune |sans |rien )/gu, "") : `Il ne faut pas ${low(fact)}`,
+  // One significant word replaced by another (« Contacts » → « Contrats »).
+  mot_change: fact => { const word = fact.match(/(?<![\p{L}'])\p{L}{5,}(?![\p{L}'])/u)?.[0]; return word ? fact.replace(word, word.toLowerCase().startsWith("contr") ? "Paramètres" : "Contrats") : null; },
+  ordre: fact => { const at = fact.indexOf(", "); return at > 0 ? `${cap(fact.slice(at + 2))}, ${low(fact.slice(0, at))}` : null; },
 };
 export function smartBindMeasure() {
   const origins = [...SAV_BENCH_CORPUS, ...SAV_SMART_BENCH_MULTITURN], all = [...origins, ...buildSavBenchVariants(origins)];

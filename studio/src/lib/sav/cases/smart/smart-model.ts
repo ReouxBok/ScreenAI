@@ -45,9 +45,10 @@ export const smartWireBytes = (system: string, payload: unknown, maxOutputTokens
  * SAV-122 (bench v11: `output_json_invalid` on decide (mdp-03) and correct (mdp-02)). Not the « low » thinking: a cut answer ends with
  * `MAX_TOKENS` and is read first as `finish_not_stop`; these answers ended with `STOP` and a text that `JSON.parse` refused. The text is never
  * logged, so its form is now a CLOSED code, and the forms a reader can undo deterministically are read: a Markdown fence, text before or
- * after the object, a raw line break or tab inside a string. Nothing else is guessed (an unbalanced or otherwise broken object stays refused).
+ * after the object, a raw line break or tab inside a string. Nothing else is guessed (an unbalanced, repeated or otherwise broken object stays
+ * refused).
  */
-export type SmartJsonForm = "fenced" | "leading_text" | "trailing_text" | "control_char" | "unbalanced" | "other";
+export type SmartJsonForm = "fenced" | "leading_text" | "trailing_text" | "control_char" | "unbalanced" | "multiple" | "other";
 export function smartReadJson(text: string): Readonly<{ ok: true; value: unknown; form: SmartJsonForm | null }> | Readonly<{ ok: false; form: SmartJsonForm }> {
   const parse = (value: string) => { try { return { ok: true as const, value: JSON.parse(value) as unknown }; } catch { return { ok: false as const }; } };
   const whole = parse(text);
@@ -71,6 +72,8 @@ export function smartReadJson(text: string): Readonly<{ ok: true; value: unknown
     repaired += char;
   }
   if (end < 0) return { ok: false, form: "unbalanced" };
+  // PORTE 2G (P1): more than one root object (« conforme » then « non_conforme », even cut) is never read as its first one.
+  if (/[{[]/.test(unfenced.slice(end + 1))) return { ok: false, form: "multiple" };
   const read = parse(repaired);
   if (!read.ok) return { ok: false, form: "other" };
   const form: SmartJsonForm = control ? "control_char" : fenced ? "fenced" : start > 0 ? "leading_text" : "trailing_text";
