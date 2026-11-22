@@ -7,7 +7,7 @@ import { createSavBenchCurrentAgent, createSavBenchCurrentModel } from "../../be
 import { SAV_BENCH_CORPUS, SAV_BENCH_CORPUS_REVISION } from "../../bench/bench-corpus";
 import { createSavBenchGeminiJudge, SAV_BENCH_JUDGE_REVISION, type SavBenchJudge } from "../../bench/bench-judge";
 import { runSavBench, savBenchCardsOf, savBenchMetrics, type SavBenchConversationRow, type SavBenchTurnRow } from "../../bench/bench-run";
-import { SAV_BENCH_CRITERIA, savBenchNormalize, type SavBenchAgent, type SavBenchConversation } from "../../bench/bench-types";
+import { SAV_BENCH_CRITERIA, savBenchNormalize, type SavBenchAgent, type SavBenchConversation, type SavBenchMessage } from "../../bench/bench-types";
 import { buildSavBenchVariants, SAV_BENCH_VARIANTS_REVISION } from "../../bench/bench-variants";
 import { resolveCaseV2GeminiKey, SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
 import { readCaseV2TransportPolicy } from "../investigation-v2-spend";
@@ -15,6 +15,9 @@ import { SAV_SMART_MAX_EMBED_CALLS, SAV_SMART_MAX_MODEL_CALLS } from "./smart-ag
 import { createSavBenchAgent } from "./smart-bench-agent";
 import { createSavBenchSearchAgent, emptySmartBenchSearchRecord, smartBenchNoJudge, type SmartBenchSearchRecord } from "./smart-bench-search";
 import { smartDbKnowledge } from "./smart-knowledge";
+import { createSmartBenchRealJudge, SAV_SMART_BENCH_REAL_JUDGE_REVISION, SMART_BENCH_REAL_CRITERIA, smartBenchRealPassed, type SmartBenchRealJudge,
+  type SmartBenchRealJudgeResult } from "./smart-bench-real-judge";
+import type { SmartSource } from "./smart-checks";
 import { listSavAdmissibleCards, SAV_RETRIEVAL_EMBEDDING_DIMENSION } from "../../request-retrieval-db";
 import type { SmartKnowledgePort } from "./smart-agent";
 import { SAV_SMART_BENCH_MULTITURN, SAV_SMART_BENCH_MULTITURN_REVISION } from "./smart-bench-multiturn.fixture";
@@ -64,8 +67,11 @@ export const SAV_SMART_BENCH_SELFTEST_DEFAULT_BATCH = 6, SAV_SMART_BENCH_SELFTES
 const RUN_ID = /^[A-Za-z0-9._-]{1,64}$/, INTEGER = /^[0-9]{1,12}$/;
 const STEP_MIN_MS = 90_000, CONVERSATION_MIN_MS = 150_000, CALL_MAX_MS = 45_000, CALL_MIN_MS = 8_000, CALL_MARGIN_MS = 3_000;
 const JUDGE_MAX_OUTPUT_TOKENS = 4_096;
-/** `search` (21/11): the retrieval measurement, the new agent on the REAL Studio search, no judge (`smart-bench-search.ts`). Never part of `both`. */
-export type SmartBenchAgentName = "current" | "new" | "search";
+/** `search` (21/11): the retrieval measurement, the new agent on the REAL Studio search, no judge (`smart-bench-search.ts`). Never part of `both`.
+ * `real` (22/11): the same turn as `search`, each turn then judged by the REAL judge on the real cards returned (`smart-bench-real-judge.ts`). Never part of `both`. */
+export type SmartBenchAgentName = "current" | "new" | "search" | "real";
+/** The agents that run on the real Studio search (query embeddings paid, searches recorded). */
+const smartBenchRealSearch = (agent: SmartBenchAgentName) => agent === "search" || agent === "real";
 /** Ceilings per turn: V2's runner (`SAV_CASE_INVESTIGATION_MAX_CALLS`, 3) and the new agent (understand, 3 decide passes, verify, correct, reverify). Tested equal. */
 export const SAV_SMART_BENCH_CURRENT_CALLS = 3, SAV_SMART_BENCH_NEW_CALLS = SAV_SMART_MAX_MODEL_CALLS;
 /** The self-test corpus: the 120 bench conversations, plus the new agent's multi-turn cases (memory and progress rule, 20/11). */
@@ -106,7 +112,7 @@ export function readSmartBenchSelfTestConfig(env: Env): SmartBenchSelfTestConfig
   const runId = env[SAV_SMART_BENCH_SELFTEST_ID_ENV] ?? "";
   if (!RUN_ID.test(runId)) return { mode: "refused", reason: "id_invalid" };
   const agent = env[SAV_SMART_BENCH_SELFTEST_AGENT_ENV] ?? "both";
-  if (agent !== "current" && agent !== "new" && agent !== "both" && agent !== "search") return { mode: "refused", reason: "agent_invalid" };
+  if (agent !== "current" && agent !== "new" && agent !== "both" && agent !== "search" && agent !== "real") return { mode: "refused", reason: "agent_invalid" };
   const integer = (name: string, fallback: number, max: number) => {
     const raw = env[name];
     if (raw === undefined) return fallback;
@@ -125,10 +131,10 @@ export function readSmartBenchSelfTestConfig(env: Env): SmartBenchSelfTestConfig
   return { mode: "run", runId, agents: agent === "both" ? ["current", "new"] : [agent], batch, capMicroUsd, set: set as SmartBenchSelfTestSet, passes: passes as SmartBenchPass };
 }
 
-/** Model calls an agent may make on one turn (the judge adds one): the current runner's ceiling, the new agent's five. */
+/** Model calls an agent may make on one turn (the judge adds one, `real` included: its real judge is called on every turn): the current runner's ceiling, the new agent's. */
 export const smartBenchCallsPerTurn = (agent: SmartBenchAgentName) => (agent === "current" ? SAV_SMART_BENCH_CURRENT_CALLS : SAV_SMART_BENCH_NEW_CALLS) + 1;
 /** Query embeddings one turn may pay (search only): the first search and up to the agent's embed ceiling with `chercher_fiches`. */
-export const smartBenchEmbedsPerTurn = (agent: SmartBenchAgentName) => (agent === "search" ? SAV_SMART_MAX_EMBED_CALLS : 0);
+export const smartBenchEmbedsPerTurn = (agent: SmartBenchAgentName) => (smartBenchRealSearch(agent) ? SAV_SMART_MAX_EMBED_CALLS : 0);
 /** One item per (pass, agent, conversation); pass 1 keeps the historical key, pass 2 has its own (`:p2`), so it is claimed and paid separately. */
 export const smartBenchItem = (runId: string, agent: SmartBenchAgentName, conversationId: string, pass: SmartBenchPass = 1) =>
   `${runId}:${agent}:${conversationId}${pass === 1 ? "" : `:p${pass}`}`;
@@ -141,6 +147,14 @@ export type SmartBenchStored = Readonly<{
   /** Why the conversation stopped early: the meter (`call_budget`, `deadline`), the bench (`sensitive_admitted`), or null. */
   stopped: string | null;
   conversation: SavBenchConversationRow | null; turns: readonly SavBenchTurnRow[];
+  /** `real` only: the real judge's verdict of every turn played, and the real cards seen (short id and title, never their content). */
+  real?: readonly SmartBenchRealTurn[];
+}>;
+export type SmartBenchRealTurn = Readonly<{
+  turn: number; expected: readonly string[]; outcome: string; failure: string | null;
+  /** null when the judge failed (« indéterminé », never « ok »). */
+  passed: boolean | null; judge: SmartBenchRealJudgeResult;
+  cards: readonly Readonly<{ id: string; title: string }>[];
 }>;
 export type SmartBenchSelfTestDeps = Readonly<{
   env: () => Env; now: () => Date; deadlineMs?: number; clock?: () => number;
@@ -151,6 +165,8 @@ export type SmartBenchSelfTestDeps = Readonly<{
   searchKnowledge?: (embed: SmartEmbedPort, now: Date) => SmartKnowledgePort;
   searchCatalogue?: () => Promise<readonly { id: string; title: string; slug: string }[]>;
   judge?: (network: CaseV2Network) => SavBenchJudge;
+  /** Tests only (real mode): replaces the real judge (it still goes through the meter's network). */
+  realJudge?: (network: CaseV2Network) => SmartBenchRealJudge;
   corpus?: readonly SavBenchConversation[];
   log?: (event: string, fields: Record<string, unknown>) => void;
 }>;
@@ -210,7 +226,7 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
   // - Stop: the FIRST reason (batch, deadline, money cap, an error) wins; in-flight conversations finish, are settled and logged.
   const concurrency = readSmartBenchSelfTestConcurrency(env) ?? SAV_SMART_BENCH_SELFTEST_DEFAULT_CONCURRENCY;
   // Search only: the catalogue of the cards the search may return now (ids and titles, read only), once per pass that has work to do.
-  if (config.agents.includes("search") && todo.length) try {
+  if (config.agents.some(smartBenchRealSearch) && todo.length) try {
     const cards = await (deps.searchCatalogue ?? (() => listSavAdmissibleCards({ locale: "fr-FR", audience: "support", now })))();
     log("sav_smart_bench_search_catalogue", { runId: config.runId, count: cards.length, cards: cards.map(card => ({ id: card.id.slice(0, 8), title: card.title.slice(0, 120), slug: card.slug.slice(0, 80) })) });
   } catch { try { log("sav_smart_bench_search_catalogue", { runId: config.runId, count: null, error: "catalogue_unreadable" }); } catch { /* never fails the pass */ } }
@@ -262,31 +278,54 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
       return json === null ? new Response("not json", { status: 200 }) : Response.json(json);
     };
     const record: SmartBenchSearchRecord = emptySmartBenchSearchRecord(conversation);
-    const agent = deps.agents?.(agentName, meter) ?? (agentName === "search"
-      ? createSavBenchSearchAgent({ network: meter, env, conversation, record, academy: getAcademyTools(),
+    // Real mode: the real cards every search of the current turn returned, kept in memory for the real judge only (never logged nor stored).
+    let turnSources: SmartSource[] = [];
+    const searchKnowledge = deps.searchKnowledge ?? ((embed: SmartEmbedPort, at: Date) => smartDbKnowledge({ now: () => at, embed }));
+    const agent = deps.agents?.(agentName, meter) ?? (smartBenchRealSearch(agentName)
+      ? createSavBenchSearchAgent({ network: meter, env, conversation, record, academy: getAcademyTools(), name: agentName === "real" ? "real" : "search",
         embed: smartGeminiEmbed({ env: () => env, now: deps.now, network: meter, dimension: SAV_RETRIEVAL_EMBEDDING_DIMENSION, callTimeoutMs: () => Math.min(CALL_MAX_MS, left() - CALL_MARGIN_MS) }),
-        knowledge: deps.searchKnowledge ?? ((embed, at) => smartDbKnowledge({ now: () => at, embed })) })
+        knowledge: agentName === "real" ? (embed, at) => { const port = searchKnowledge(embed, at); return async needs => {
+          const result = await port(needs); turnSources.push(...result.sources); return result; }; } : searchKnowledge })
       : agentName === "new"
       // Academy (off unless `SAV_V2_SMART_ACADEMY=on`) is a free public read: it does not go through the meter.
       ? createSavBenchAgent({ dryRun: false, network: meter, env, academy: getAcademyTools() })
       : createSavBenchCurrentAgent({ model: createSavBenchCurrentModel({ env, network: meter, dryRun: false }), revision: `v2-decision:${model}` }));
     // The failed turns' detail (`sav_smart_bench_turn_detail`): what the agent received and gave back on each turn, captured here only.
-    const captures = new Map<number, SmartBenchTurnCapture>();
+    const captures = new Map<number, SmartBenchTurnCapture>(), realCaptures = new Map<number, SmartBenchRealCapture>();
     const played: SavBenchAgent = { name: agent.name, revision: agent.revision, respond: async input => {
+      turnSources = [];
       const turn = await agent.respond(input);
       captures.set(input.turn, { customerMessage: input.messages.at(-1)?.text ?? "", citations: turn.citations, handoffNote: turn.handoffNote ?? null });
+      if (agentName === "real") realCaptures.set(input.turn, { messages: input.messages, now: input.now, sources: turnSources });
       return turn;
     } };
-    const judge = agentName === "search" ? smartBenchNoJudge : deps.judge?.(meter) ?? createSavBenchGeminiJudge({ network: meter, model, key: key.ok ? key.key : "", maxOutputTokens, maxInputBytes: inputCap });
+    // The bench judge never runs on the real search (its grid reads the fictional cards): `real` has its own judge, called below on every turn.
+    const judge = smartBenchRealSearch(agentName) ? smartBenchNoJudge : deps.judge?.(meter) ?? createSavBenchGeminiJudge({ network: meter, model, key: key.ok ? key.key : "", maxOutputTokens, maxInputBytes: inputCap });
+    const realJudge = agentName === "real" ? deps.realJudge?.(meter) ?? createSmartBenchRealJudge({ network: meter, model, key: key.ok ? key.key : "", maxOutputTokens, maxInputBytes: inputCap }) : null;
     const startedAt = clock();
     let stored: SmartBenchStored;
     try {
       const report = await runSavBench({ conversations: [conversation], agent: played, judge, passes: 1, stopOnSensitiveAdmitted: true, shouldStop: () => meterStop });
-      stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, pass, set: config.set, judgeRevision: SAV_BENCH_JUDGE_REVISION, corpusRevision, model,
+      // Real mode: one real-judge call per turn played (answer, question or handoff), through the same meter, counted in the claim's worst case.
+      const real: SmartBenchRealTurn[] = [];
+      if (realJudge) for (const row of report.turns) {
+        const capture = realCaptures.get(row.turn), sources = capture?.sources ?? [];
+        const verdict: SmartBenchRealJudgeResult = meterStop || !capture ? { status: "failed", problem: meterStop ? `stopped_${meterStop}` : "turn_not_captured" }
+          : await realJudge.judge({ messages: capture.messages, now: capture.now, expected: row.expected,
+            agent: { outcome: row.outcome, reply: row.reply, handoffNote: captures.get(row.turn)?.handoffNote ?? null }, cards: sources });
+        const seen = new Set<string>();
+        real.push({ turn: row.turn, expected: [...row.expected], outcome: row.outcome, failure: row.failure,
+          passed: verdict.status === "ok" ? smartBenchRealPassed(verdict.verdicts) : null, judge: verdict,
+          cards: sources.filter(source => !seen.has(source.cardId) && Boolean(seen.add(source.cardId))).slice(0, 10)
+            .map(source => ({ id: source.cardId.slice(0, 8), title: clip(source.title, 120) ?? "" })) });
+      }
+      stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, pass, set: config.set,
+        judgeRevision: agentName === "real" ? SAV_SMART_BENCH_REAL_JUDGE_REVISION : SAV_BENCH_JUDGE_REVISION, corpusRevision, model,
         codeSha: env.VERCEL_GIT_COMMIT_SHA?.slice(0, 40) ?? null, conversationId: conversation.id, costMicroUsd: cost, calls, durationMs: clock() - startedAt,
-        stopped: meterStop ?? report.stopped?.reason ?? null, conversation: report.conversations[0] ?? null, turns: report.turns };
+        stopped: meterStop ?? report.stopped?.reason ?? null, conversation: report.conversations[0] ?? null, turns: report.turns, ...(realJudge ? { real } : {}) };
     } catch {
-      stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, pass, set: config.set, judgeRevision: SAV_BENCH_JUDGE_REVISION, corpusRevision, model,
+      stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, pass, set: config.set,
+        judgeRevision: agentName === "real" ? SAV_SMART_BENCH_REAL_JUDGE_REVISION : SAV_BENCH_JUDGE_REVISION, corpusRevision, model,
         codeSha: null, conversationId: conversation.id, costMicroUsd: worst, calls, durationMs: clock() - startedAt, stopped: "crashed", conversation: null, turns: [] };
       cost = Math.max(cost, worst);
       stored = { ...stored, costMicroUsd: cost };
@@ -297,13 +336,18 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
     try { log("sav_smart_bench_conversation", smartBenchConversationLine(stored)); } catch { /* the log never fails the pass */ }
     // Failed turns only, judged agents only (search has no judge): the reply text and the judge's words, to tell a real fault from a false
     // positive. Safe because the conversation is one of the bundled FICTIONAL ones (guarded again in `smartBenchTurnDetailLine`).
-    if (agentName !== "search") for (const row of stored.turns) {
+    if (!smartBenchRealSearch(agentName)) for (const row of stored.turns) {
       if (row.verdict.passed) continue;
       try { const line = smartBenchTurnDetailLine(stored, row, conversation, captures.get(row.turn)); if (line) log("sav_smart_bench_turn_detail", line); }
       catch { /* the log never fails the pass */ }
     }
     // Search only: the record of every search (fictional needs, real cards by short id and title), the material of the retrieval analysis.
-    if (agentName === "search") try { log("sav_smart_bench_search", { runId: config.runId, pass, ...record }); } catch { /* never fails the pass */ }
+    if (smartBenchRealSearch(agentName)) try { log("sav_smart_bench_search", { runId: config.runId, pass, ...record }); } catch { /* never fails the pass */ }
+    // Real only: EVERY turn (not only failed ones), so the replies can be read: fictional texts, verdicts and reasons, real cards by short id and title.
+    if (agentName === "real") for (const realTurn of stored.real ?? []) {
+      try { const line = smartBenchRealTurnLine(stored, realTurn, conversation, captures.get(realTurn.turn)); if (line) log("sav_smart_bench_real_turn", line); }
+      catch { /* the log never fails the pass */ }
+    }
     ran += 1;
     if (meterStop === "deadline") { stop("deadline"); break; }
   } };
@@ -358,8 +402,10 @@ export function aggregateSmartBenchSelfTest(allRows: readonly SmartBenchStored[]
         pass1: { passed: first.conversation?.passed ?? false, outcomes: first.turns.map(turn => turn.outcome) }, pass2: { passed: row.conversation?.passed ?? false, outcomes: row.turns.map(turn => turn.outcome) } };
     }) };
   };
+  // `real` (22/11): its own side (pass 1), present only when the run has real rows, so the other modes' report is unchanged.
+  const real = aggregateSmartBenchReal(rows);
   return {
-    current, new: next,
+    current, new: next, ...(real ? { real } : {}),
     pass2: second.length ? { current: per("current", second), new: per("new", second), stability: { current: stability("current"), new: stability("new") } } : null,
     comparison: { paired: paired.length, bothPass: paired.filter(id => currentPassed.has(id) && newPassed.has(id)).length,
       onlyNewPasses: paired.filter(id => newPassed.has(id) && !currentPassed.has(id)), onlyCurrentPasses: paired.filter(id => currentPassed.has(id) && !newPassed.has(id)),
@@ -451,6 +497,74 @@ export function smartBenchTurnDetailLine(stored: SmartBenchStored, row: SavBench
   return line;
 }
 
+/*
+ * `sav_smart_bench_real_turn` (22/11, mode `real`): ONE line per turn played, failed or not, so Ugo can read the replies made on the real cards.
+ * The fictional texts (customer's message, reply, question, team's note, same bounds as the turn detail), the real judge's verdicts and reasons,
+ * and the real cards by SHORT ID AND TITLE ONLY: the cards' content is never logged (nor stored). Same fictional-only guard, same 6 000-byte cap.
+ */
+export type SmartBenchRealCapture = Readonly<{ messages: readonly SavBenchMessage[]; now: string; sources: readonly SmartSource[] }>;
+const SMART_BENCH_REAL_REASON_MAX = 300;
+export function smartBenchRealTurnLine(stored: SmartBenchStored, realTurn: SmartBenchRealTurn, conversation: SavBenchConversation, capture: SmartBenchTurnCapture | undefined) {
+  if (!smartBenchFictional(conversation) || conversation.id !== stored.conversationId) return null;
+  const row = stored.turns.find(turn => turn.turn === realTurn.turn);
+  const build = (limits: typeof SMART_BENCH_TURN_DETAIL_LIMITS & { reason: number }) => ({
+    runId: stored.runId, pass: stored.pass ?? 1, agent: stored.agent, conversationId: stored.conversationId, family: conversation.family, turn: realTurn.turn,
+    expectedOutcomes: realTurn.expected, outcome: realTurn.outcome, failure: realTurn.failure, passed: realTurn.passed,
+    customerMessage: clip(capture?.customerMessage ?? null, limits.customerMessage),
+    reply: clip(row?.reply ?? null, limits.reply),
+    question: realTurn.outcome === "demander" ? clip(smartBenchQuestion(row?.reply ?? null), limits.question) : null,
+    handoffNote: clip(capture?.handoffNote ?? null, limits.handoffNote),
+    judge: realTurn.judge.status === "failed" ? { status: "failed" as const, problem: realTurn.judge.problem.slice(0, 80) }
+      : { status: "ok" as const, verdicts: Object.fromEntries(SMART_BENCH_REAL_CRITERIA.map(criterion => {
+        const value = (realTurn.judge as Extract<SmartBenchRealJudgeResult, { status: "ok" }>).verdicts[criterion];
+        return [criterion, { verdict: value.verdict, reason: clip(value.reason, limits.reason) }];
+      })) },
+    cards: realTurn.cards.slice(0, 10).map(card => ({ id: card.id.slice(0, 8), title: clip(card.title, 120) })),
+  });
+  const limits = { ...SMART_BENCH_TURN_DETAIL_LIMITS, reason: SMART_BENCH_REAL_REASON_MAX };
+  let line = build(limits);
+  for (const key of ["reply", "handoffNote", "customerMessage", "reason", "question"] as const) {
+    const excess = Buffer.byteLength(JSON.stringify(line), "utf8") - SMART_BENCH_TURN_DETAIL_MAX_BYTES;
+    if (excess <= 0) break;
+    const length = key === "reason" ? (line.judge.status === "ok" ? Math.max(0, ...Object.values(line.judge.verdicts).map(value => (value as { reason: string | null }).reason?.length ?? 0)) : 0)
+      : line[key]?.length ?? 0;
+    if (!length) continue;
+    limits[key] = Math.max(key === "reason" ? 60 : 120, Math.min(limits[key], length) - (key === "reason" ? Math.ceil(excess / SMART_BENCH_REAL_CRITERIA.length) : excess) - 16);
+    line = build(limits);
+  }
+  return line;
+}
+
+/** The `real` side of the report: rates per criterion and per family, the `no_card` count, failed turns (codes only). Null without real rows. */
+export function aggregateSmartBenchReal(rows: readonly SmartBenchStored[]) {
+  const mine = rows.filter(row => row.agent === "real");
+  if (!mine.length) return null;
+  const turns = mine.flatMap(row => (row.real ?? []).map(turn => ({ ...turn, conversationId: row.conversationId, family: row.conversation?.family ?? "inconnue" })));
+  const rate = (ok: number, echec: number) => ok + echec ? Math.round((ok / (ok + echec)) * 1000) / 1000 : null;
+  const tally = (list: typeof turns) => {
+    const judged = list.filter(turn => turn.judge.status === "ok") as Array<(typeof turns)[number] & { judge: Extract<SmartBenchRealJudgeResult, { status: "ok" }> }>;
+    const byCriterion = Object.fromEntries(SMART_BENCH_REAL_CRITERIA.map(criterion => {
+      const count = (verdict: string) => judged.filter(turn => turn.judge.verdicts[criterion].verdict === verdict).length;
+      const ok = count("ok"), echec = count("echec");
+      return [criterion, { ok, echec, sans_objet: count("sans_objet"), no_card: count("no_card"), rate: rate(ok, echec) }];
+    }));
+    const passed = list.filter(turn => turn.passed === true).length, failed = list.filter(turn => turn.passed === false).length;
+    return { turns: list.length, judged: judged.length, judgeFailures: list.length - judged.length, passed, failed, passRate: rate(passed, failed), byCriterion };
+  };
+  const families = [...new Set(turns.map(turn => turn.family))].sort();
+  return {
+    conversationsStored: mine.length, costMicroUsd: mine.reduce((sum, row) => sum + row.costMicroUsd, 0), calls: mine.reduce((sum, row) => sum + row.calls, 0),
+    revisions: [...new Set(mine.map(row => row.agentRevision))], stopped: mine.filter(row => row.stopped).map(row => ({ conversationId: row.conversationId, reason: row.stopped })),
+    conversationsPassed: mine.filter(row => (row.real ?? []).length > 0 && (row.real ?? []).every(turn => turn.passed === true) && !row.stopped).length,
+    noCard: turns.filter(turn => turn.judge.status === "ok" && turn.judge.verdicts.decision.verdict === "no_card").length,
+    ...tally(turns),
+    byFamily: Object.fromEntries(families.map(family => [family, tally(turns.filter(turn => turn.family === family))])),
+    failures: turns.filter(turn => turn.passed !== true).map(turn => ({ conversationId: turn.conversationId, family: turn.family, turn: turn.turn, expected: turn.expected, outcome: turn.outcome,
+      failed: turn.judge.status === "ok" ? SMART_BENCH_REAL_CRITERIA.filter(criterion => (turn.judge as Extract<SmartBenchRealJudgeResult, { status: "ok" }>).verdicts[criterion].verdict === "echec") : [],
+      judgeProblem: turn.judge.status === "failed" ? turn.judge.problem.slice(0, 80) : null })),
+  };
+}
+
 /** The run's report as one log line: metrics per agent, the comparison, and at most 150 failed turns per agent (the count says if cut). */
 export function smartBenchReportLine(runId: string, report: ReturnType<typeof aggregateSmartBenchSelfTest>) {
   const side = (agent: ReturnType<typeof aggregateSmartBenchSelfTest>["current"]) => ({
@@ -459,7 +573,8 @@ export function smartBenchReportLine(runId: string, report: ReturnType<typeof ag
   const stabilityLine = (value: NonNullable<typeof report.pass2>["stability"]["current"]) => ({ compared: value.compared, unstableCount: value.unstable.length, unstable: value.unstable.slice(0, SMART_BENCH_REPORT_MAX_FAILURES) });
   return { runId, current: side(report.current), new: side(report.new), comparison: report.comparison,
     pass2: report.pass2 ? { current: side(report.pass2.current), new: side(report.pass2.new),
-      stability: { current: stabilityLine(report.pass2.stability.current), new: stabilityLine(report.pass2.stability.new) } } : null };
+      stability: { current: stabilityLine(report.pass2.stability.current), new: stabilityLine(report.pass2.stability.new) } } : null,
+    ...(report.real ? { real: { ...report.real, failuresCount: report.real.failures.length, failures: report.real.failures.slice(0, SMART_BENCH_REPORT_MAX_FAILURES) } } : {}) };
 }
 
 export async function readSmartBenchSelfTestRows(runId: string): Promise<SmartBenchStored[]> {
