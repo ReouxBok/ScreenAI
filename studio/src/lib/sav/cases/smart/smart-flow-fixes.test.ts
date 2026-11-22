@@ -127,10 +127,8 @@ describe("e. refus après correction alors que la fiche était bonne : une corre
   const unlisted = { verdict: "non_conforme", problems: [{ code: "unlisted_claim", sentence: "Si le code n'arrive pas, regardez dans le dossier des indésirables." }] };
   it("relecture qui refuse encore sur le fondement (unlisted_claim), une fiche existe : 2e correction (narrow) puis réponse, 7 appels au plus", async () => {
     const narrowed = smartGoodDecision({ reply: "Bonjour,\n\nUtilisez l'adresse e-mail de votre invitation pour vous connecter.\n\nBelle journée." });
-    // v18: a passage the server cannot find in the reply (here, not written in it) is not dropped by the server: the model's narrowing correction runs.
-    const unlistedElsewhere = { verdict: "non_conforme", problems: [{ code: "unlisted_claim", sentence: "Le service est en panne." }] };
-    const { result, calls, kinds } = await run({ understand: { output: smartReading() }, decide: { output: smartGoodDecision() }, verify: { output: unlistedElsewhere },
-      correct: [{ output: smartGoodDecision() }, { output: narrowed }], reverify: [{ output: unlistedElsewhere }, { output: SMART_CONFORME }] });
+    const { result, calls, kinds } = await run({ understand: { output: smartReading() }, decide: { output: smartGoodDecision() }, verify: { output: unlisted },
+      correct: [{ output: smartGoodDecision() }, { output: narrowed }], reverify: [{ output: unlisted }, { output: SMART_CONFORME }] });
     expect(kinds).toEqual(["understand", "decide", "verify", "correct", "reverify", "correct", "reverify"]);
     expect(result).toMatchObject({ outcome: "reply", corrected: true });
     expect(result.reasons).toContain("correction:narrowed");
@@ -156,10 +154,8 @@ describe("e. refus après correction alors que la fiche était bonne : une corre
   });
   it("le budget d'appels décide : après 2 passes de décision, pas de 2e correction (7 appels au plus)", async () => {
     const tools = { thinking: "", action: "tools", calls: [{ id: "t1", tool: "chercher_fiches", needId: "n1", args: { query: "connexion" } }], decision: null };
-    // v18: a passage the server can find is dropped instead (smart-v18.test.ts); here it is not in the reply, so the handoff stays.
-    const elsewhere = { verdict: "non_conforme", problems: [{ code: "unlisted_claim", sentence: "Le service est en panne." }] };
-    const { result, kinds } = await run({ understand: { output: smartReading() }, decide: [{ output: tools }, { output: smartGoodDecision() }], verify: { output: elsewhere },
-      correct: { output: smartGoodDecision() }, reverify: { output: elsewhere } });
+    const { result, kinds } = await run({ understand: { output: smartReading() }, decide: [{ output: tools }, { output: smartGoodDecision() }], verify: { output: unlisted },
+      correct: { output: smartGoodDecision() }, reverify: { output: unlisted } });
     expect(kinds).toEqual(["understand", "decide", "decide", "verify", "correct", "reverify"]);
     expect(result.outcome).toBe("handoff");
     expect(result.reasons).not.toContain("correction:narrowed");

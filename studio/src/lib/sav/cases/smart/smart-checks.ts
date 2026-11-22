@@ -5,7 +5,7 @@ import {
 } from "../../other-platform";
 import { requestsCredential } from "../decision-validator";
 import type { SmartCheckCode, SmartDecision, SmartReading } from "./smart-contract";
-import { smartRepeatCodes, smartSimilarity, type SmartCaseMemory } from "./smart-memory";
+import { smartRepeatCodes, type SmartCaseMemory } from "./smart-memory";
 import { SAV_SMART_RESOURCES } from "./smart-prompt";
 import type { SmartAcademyEvidence } from "./smart-tools";
 
@@ -407,57 +407,4 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
     codes.add("instruction_followed"); factProblems.push({ code: "instruction_followed", sentence: sentence.slice(0, 300) });
   }
   return { ok: codes.size === 0, codes: [...codes], factProblems };
-}
-
-/*
- * v18 (bench 22/11, sujet-05, pareil-06, linkedin-03: a generic handoff after the counter-read refused a few phrases of a reply whose steps came from
- * the right card). The counter-read already judged EVERY sentence of the reply and named only these passages: removing the sentences that hold them
- * cannot add a claim. The server removes them (whole sentences, never a rewording), drops the facts written on them and renumbers the steps.
- * Null when it cannot be done safely: not a reply, a passage not found in the reply, more than half of the sentences in cause, or an answered need
- * left without a card fact. The caller still runs every server check on the result; no model call.
- */
-export function smartDropPassages(decision: SmartDecision, passages: readonly string[]): SmartDecision | null {
-  const reply = decision.reply ?? "";
-  const key = (value: string) => fold(normalizeSavEvidenceText(value)).replace(/[«»"“”]/g, "").replace(/\s+/g, " ").trim();
-  const wanted = passages.map(key).filter(Boolean);
-  if (decision.outcome !== "reply" || !reply.trim() || !wanted.length || wanted.length !== passages.length) return null;
-  if (wanted.some(passage => !key(reply).includes(passage))) return null;
-  const inCause = (sentence: string) => { const own = key(sentence); return Boolean(own) && wanted.some(passage => own.includes(passage) || passage.includes(own)); };
-  let total = 0, dropped = 0;
-  const droppedSentences: string[] = [];
-  const lines = reply.split("\n").map(line => {
-    if (!line.trim()) return line;
-    // A list marker (« 2. », « - ») stays with its line, never read as a sentence of its own.
-    const marker = line.match(/^\s*(?:\d+[.)]|[-*•])\s+/)?.[0] ?? "";
-    const parts = line.slice(marker.length).split(/(?<=[.!?…])\s+/).filter(part => part.trim());
-    total += parts.length;
-    const kept = parts.filter(part => { const out = inCause(part); if (out) { dropped += 1; droppedSentences.push(part); } return !out; });
-    return kept.length ? `${marker}${kept.join(" ")}` : null;
-  }).filter((line): line is string => line !== null);
-  // Every passage must have gone with its sentences; at most half of the reply removed.
-  if (!dropped || dropped * 2 > total || wanted.some(passage => key(lines.join("\n")).includes(passage))) return null;
-  // PR #341 review: an introduction left orphan (« Voici les étapes : » with no list or step after it) is never sent.
-  const listItem = /^\s*(?:\d+[.)]|[-*•])\s+/;
-  const filled = lines.filter(line => line.trim());
-  if (filled.some((line, index) => line.trim().endsWith(":") && !listItem.test(filled[index + 1] ?? ""))) return null;
-  let step = 0;
-  const renumbered = lines.map(line => {
-    const match = line.match(/^(\s*)\d+([.)])\s+/);
-    if (!match) { if (line.trim()) step = 0; return line; }
-    step += 1;
-    return `${match[1]}${step}${match[2]} ${line.slice(match[0].length)}`;
-  }).join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  const facts = decision.facts.filter(fact => !fact.sentence.trim() || !droppedSentences.some(sentence => {
-    const own = key(sentence), written = key(fact.sentence);
-    return own.includes(written) || written.includes(own);
-  }));
-  // An answered need keeps a card fact still written in the remaining reply (its excerpt or its sentence, word for word or close).
-  const remaining = sentencesOf(renumbered), remainingKey = key(renumbered);
-  const written = (value: string | null) => Boolean(value?.trim()) && (remainingKey.includes(key(value!)) || remaining.some(sentence => smartSimilarity(sentence, value!) >= 0.5));
-  const grounded = (needId: string) => facts.some(fact => fact.needId === needId && (fact.type === "fait_limova" || fact.type === "fait_temporaire")
-    && (written(fact.sentence) || written(fact.excerpt)));
-  if (decision.coverage.some(row => row.status === "answered" && !grounded(row.needId))) return null;
-  // PR #341 review: a need asked of the customer keeps its question (a sentence ending with « ? ») in the remaining reply.
-  if (decision.coverage.some(row => row.status === "asked") && !remaining.some(sentence => sentence.trim().endsWith("?"))) return null;
-  return { ...decision, reply: renumbered, facts };
 }
