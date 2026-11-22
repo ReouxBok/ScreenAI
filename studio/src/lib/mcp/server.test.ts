@@ -80,9 +80,9 @@ it("SAV-24 refuses browsers: cross-origin requests and preflights", async () => 
   expect(preflight.status).toBe(403); expect(preflight.headers.get("access-control-allow-origin")).toBeNull();
 });
 it("SAV-24 lists read tools only while writes are off; with writes on, write tools carry write annotations", async () => {
-  const read = ["get_agent_pause", "get_budget", "get_diagnostics", "get_dossier", "list_dossiers", "list_v2_cases", "v2_daily_report", "whoami"];
+  const read = ["get_agent_pause", "get_budget", "get_diagnostics", "get_dossier", "get_fiche", "list_dossiers", "list_v2_cases", "search_fiches", "v2_daily_report", "whoami"];
   const write = ["classify_invalid_source_other", "classify_other", "close_handled_outside", "continue_dossier", "reconcile_effect", "reconcile_identification", "reconcile_note",
-    "record_choice", "release_hold", "request_reinvestigation", "set_agent_pause"];
+    "propose_fiche", "propose_fiche_update", "publish_fiche", "record_choice", "release_hold", "request_reinvestigation", "set_agent_pause"];
   const list = async (flags: Record<string, string>) => ((await (await rpc("tools/list", {}, { env: flags })).json()) as { result: { tools: { name: string; annotations: { readOnlyHint: boolean; destructiveHint: boolean } }[] } }).result.tools;
   const off = await list(env);
   expect(off.map(t => t.name).sort()).toEqual(read);

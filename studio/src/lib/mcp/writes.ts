@@ -74,12 +74,17 @@ async function priorWrite(key: string, staffId: string, hash: string): Promise<S
     if (row) {
       const m = row.technicalMetadata;
       return m.outcome === "refused" ? refused(String(m.code), "Refus déjà rendu pour cette même demande.")
-        : m.outcome === "uncertain" ? uncertain() : alreadyDone("Demande déjà traitée avec cette clé.", { code: m.code });
+        : m.outcome === "uncertain" ? uncertain() : alreadyDone("Demande déjà traitée avec cette clé.", { code: m.code, ...receiptIds(m) });
     }
     if (Date.now() - claim.createdAt.getTime() >= STUDIO_MCP_CLAIM.staleMs) return uncertain();
     if (waited >= STUDIO_MCP_CLAIM.waitMs) return refused("SAV_MCP_WRITE_IN_PROGRESS", "Une demande avec cette clé est encore en cours : réessayer avec la même clé plus tard.");
     await new Promise(resolve => setTimeout(resolve, STUDIO_MCP_CLAIM.pollMs));
   }
+}
+/** Opt-in ids (never content) a tool recorded with its receipt, given back on a same-key retry. */
+const RECEIPT_ID_PREFIX = "receipt_";
+function receiptIds(m: Record<string, unknown>) {
+  return Object.fromEntries(Object.entries(m).filter(([name]) => name.startsWith(RECEIPT_ID_PREFIX)).map(([name, value]) => [name.slice(RECEIPT_ID_PREFIX.length), value]));
 }
 /** Serialized across instances by a transaction-scoped database lock on the key; the claim is
  * committed before any console function runs. Null when this call owns the key. */
@@ -98,7 +103,7 @@ async function claimWrite(key: string, context: StudioMcpContext, tool: string, 
 type Claim = () => Promise<StudioMcpResult | null>;
 export function studioMcpWrite<T extends z.ZodRawShape>(name: string, title: string, description: string, shape: T,
   run: (context: StudioMcpContext, input: z.infer<z.ZodObject<T>>, claim: Claim) => Promise<StudioMcpResult>,
-  options: { idempotent?: boolean; authorize?: () => Promise<unknown> } = {}): StudioMcpTool {
+  options: { idempotent?: boolean; authorize?: () => Promise<unknown>; receipt?: (result: StudioMcpResult) => Record<string, string | number | null> | undefined } = {}): StudioMcpTool {
   const input = z.object(shape).strict();
   return { name, title, description, write: true, input, async run(context: StudioMcpContext, raw: never) {
     const values = raw as z.infer<z.ZodObject<T>> & { idempotencyKey?: string; threadId?: string; handling?: { kind: string; ticketId?: string } };
@@ -122,7 +127,8 @@ export function studioMcpWrite<T extends z.ZodRawShape>(name: string, title: str
       await requireDb().insert(auditLogs).values({ actorEmail: context.staff.email, ...WRITE_AUDIT, entityId: key ?? randomUUID(),
         technicalMetadata: { channel: "mcp", tool: name, staffId: context.staff.id, payloadHash: hash, outcome: result.outcome, code: result.code, threadId: values.threadId ?? null,
           // Orientation (17/11): the attested follow-up kind (and ticket), never the operator's free text.
-          ...(values.handling ? { handlingKind: values.handling.kind, handlingTicketId: values.handling.ticketId ?? null } : {}) } });
+          ...(values.handling ? { handlingKind: values.handling.kind, handlingTicketId: values.handling.ticketId ?? null } : {}),
+          ...(options.receipt && result.outcome !== "refused" ? Object.fromEntries(Object.entries(options.receipt(result) ?? {}).map(([name, value]) => [`${RECEIPT_ID_PREFIX}${name}`, value])) : {}) } });
     } catch { console.error("studio_mcp_write_receipt_failed", { tool: name, outcome: result.outcome }); }
     // Cache refresh only: once the action is settled it can never turn the result into a failure.
     if (result.outcome !== "refused" && values.threadId) {
