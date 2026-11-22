@@ -1,5 +1,5 @@
 import { savReplyFooter } from "../../reply-format";
-import { smartDropPassages, smartRepairFactSources, smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
+import { smartRepairFactSources, smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
 import {
   parseSmartOutput, SAV_SMART_VERIFY_CODES, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchema,
   type SmartCallKind, type SmartCheckCode, type SmartDecision, type SmartReading, type SmartTeamNote, type SmartTurnOutcome, type SmartVerdict,
@@ -339,26 +339,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   checks.first = first.codes; verdicts.first = first.verdict;
   if (first.failed === "deadline") return end("interrupted", [...reasons, "verify:deadline"]);
   if (first.failed) return handoff([...reasons, first.failed, ...first.codes.map(code => `check:${code}`)], "panne");
-  /*
-   * v18 (bench 22/11, sujet-05, pareil-06, linkedin-03: « Relire le dernier mail… », `unsure`, after a refusal of a few phrases of a reply built on the
-   * right card). Root cause: a turn that used one tool pass had made 6 calls at the reverify, so the narrowing correction (2 calls) no longer fit in
-   * the 7, and the reverify's refusal of one phrase ended in the generic handoff. When the counter-read refuses ONLY unlisted_claim / source_mismatch
-   * with the passages named, the server drops those sentences (`smartDropPassages`: no rewording, no model call), re-runs every server check, and
-   * sends the rest. Any other problem, a passage it cannot find, or an answered need left without its card fact: the flow below, as before.
-   */
-  const DROPPABLE = new Set<string>(["unlisted_claim", "source_mismatch"]);
-  const dropPassages = (result: Awaited<ReturnType<typeof review>>, current: SmartDecision): SmartDecision | null => {
-    if (result.failed || result.unknownCodes || gate.mustHandOff || current.outcome !== "reply") return null;
-    const problems = result.verdict?.problems ?? [];
-    if (!problems.length || !problems.every(problem => DROPPABLE.has(problem.code) && problem.sentence.trim()) || !result.codes.every(code => GROUNDING_CODES.has(code))) return null;
-    const trimmed = smartDropPassages(current, problems.map(problem => problem.sentence));
-    return trimmed && smartServerChecks({ decision: trimmed, reading: reading!, customerText, sources, academy, memory: memoryBefore }).ok ? trimmed : null;
-  };
-  const sendDropped = (trimmed: SmartDecision) => { decision = trimmed; reasons.push("correction:passages_dropped"); return accepted(trimmed); };
-
   if (!refused(first)) return accepted(decision);
-  const firstDrop = dropPassages(first, decision);
-  if (firstDrop) return sendDropped(firstDrop);
 
   // 4 bis. One correction, with every problem found (server codes and the counter-read's). No tool any more.
   // SAV-122: a fact-level problem (invalid source, excerpt not found, card not retrieved, third-party fact) is named, one
@@ -381,8 +362,6 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   // model gets ONE narrowing correction: answer only what the cards carry word for word, or ask the customer one precise question. Any safety
   // problem (link, secret, promise, account action, sensitive topic, other platform, instruction) still hands over at once, as before.
   const modelCalls = () => calls.length;
-  // v18: the reverify named only unsupported passages: drop them and send the rest (0 call), before spending the narrowing correction.
-  if (refused(second)) { const secondDrop = dropPassages(second, decision); if (secondDrop) return sendDropped(secondDrop); }
   if (!second.failed && refused(second) && smartGroundingOnly(second) && sources.some(card => card.needIds.length > 0)
     && modelCalls() + 2 <= SAV_SMART_MAX_MODEL_CALLS && !gate.mustHandOff) {
     const namedSecond = (code: SmartCheckCode) => [...new Set(second.factProblems.filter(row => row.code === code && row.sentence.trim()).map(row => row.sentence))].slice(0, 10);
@@ -398,7 +377,6 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     second = await review(decision, "reverify");
     checks.second = second.codes; verdicts.second = second.verdict;
     if (second.failed === "deadline") return end("interrupted", [...reasons, "reverify:deadline"]);
-    if (refused(second)) { const narrowDrop = dropPassages(second, decision); if (narrowDrop) return sendDropped(narrowDrop); }
   }
   if (second.failed || refused(second)) {
     return handoff([...reasons, "refused_after_correction", ...(second.failed ? [second.failed] : []), ...second.codes.map(code => `check:${code}`),
