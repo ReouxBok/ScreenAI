@@ -26,7 +26,9 @@ test.describe('Extension — loading and bootstrap', () => {
       expect.arrayContaining(['activeTab', 'sidePanel', 'storage', 'scripting', 'webNavigation'])
     );
     expect(manifest.permissions).not.toContain('tabs');
-    expect(manifest.permissions).not.toContain('cookies');
+    // TEAM-729 added `cookies` for « Envoyer ma session à Limova » (docs/PRIVACY.md);
+    // TEAM-731's recorder adds nothing.
+    expect([...manifest.permissions].sort()).toEqual(['activeTab', 'alarms', 'cookies', 'scripting', 'sidePanel', 'storage', 'tabGroups', 'webNavigation']);
   });
 
   test('host permissions are limited to the Limova app and proxy', async ({ serviceWorker }) => {

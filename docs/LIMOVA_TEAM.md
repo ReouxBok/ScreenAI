@@ -39,6 +39,23 @@ Contrat : `docs/login-vault.md` du dépôt team-backend (`browser.v1+vault`, `br
 - **« Envoyer ma session à Limova ».** Dans le panneau, site de l’onglet courant proposé, modifiable ; le service worker le ramène au domaine enregistrable, l’écran de consentement nomme ce domaine, puis `chrome.cookies.getAll({ domain })` et `POST /devices/me/session-profiles` (300 cookies et 256 Kio au plus, LinkedIn et Limova refusés).
 - **`import_sessions`.** Réservé à Limova Desktop : l’extension répond toujours `cancelled`, les cookies sont déjà dans Chrome.
 
+## « Montrer à Limova » (TEAM-731)
+
+Contrat : `docs/procedure-recording-format.md` (team-backend), `limova.recording.v1`, et les modèles serveur `app/schemas/procedure_recording.py`, qui font foi.
+
+| Fichier | Rôle |
+|---|---|
+| `recorder.js` | Cycle de vie (démarrer, pause, arrêter, relire, envoyer), navigations et leurs causes, onglets numérotés, `wait`, `observed`, envoi et erreurs (413, 422, 401, 404). |
+| `page-recorder.js` | Fonctions injectées dans le monde isolé : écouteurs en phase de capture, une saisie par champ, valeurs secrètes jamais transmises, `observed` 600 ms à 3 s après l’action. |
+| `recording-redaction.js` | Les règles de masquage, en un seul endroit (Luhn, jetons, codes, libellés). |
+| `recording-format.js` | Construction du JSON, contrôle des limites du serveur, réduction sous 512 Ko, valeurs qui changent devinées, libellés des étapes. |
+
+- Démarrage : « Montrer à Limova » dans la carte Limova Team, puis « Dans cet onglet » (l’onglet rejoint le groupe) ou « Dans un nouvel onglet ». Refusé sur LinkedIn, le tableau de bord, les pages `chrome://`.
+- Pendant l’enregistrement, les appels de l’agent attendent (comme « Prendre la main ») ; ils reprennent à « Arrêter ».
+- Le bouton est masqué quand le serveur répond 404 (`procedures_enabled` désactivé) : à la connexion, le panneau envoie un corps vide à l’adresse d’envoi (404 : désactivé ; 400 ou 422 : activé).
+- Pas de narration vocale en v1 : `narration` n’est pas envoyée.
+- Pas d’indicateur dans la page : il faudrait ajouter un élément au DOM, visible et modifiable par la page, qui fausserait aussi `dom_changed`. Le panneau, le titre du groupe et le badge suffisent.
+
 ## Environnements
 
 - Version publique (`npm run build`) : production uniquement, aucun choix affiché.

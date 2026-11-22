@@ -16,7 +16,8 @@
 // in editable areas is cut out of the page text. URLs are origin + pathname only.
 
 export function pageSnapshot(options) {
-  const KIT_VERSION = 1;
+  // 2: descriptor fields for recordings and read_page (TEAM-731).
+  const KIT_VERSION = 2;
 
   function buildKit() {
     const SENSITIVE_HINT = /(pass(?:word|wd|code|phrase)?\b|mot[ -]de[ -]passe|contrase|\bpin\b|\bcvv\d?\b|\bcvc\d?\b|\bcvn\b|security code|code de s[ée]curit|card.?num|num[ée]ro de carte|carte bancaire|credit.?card|\bcc.?num|\biban\b|\botp\b|one.?time|code de v[ée]rification|verification code|\b2fa\b|\bmfa\b|code (?:re[çc]u|sms)|\bsecret\b|api.?key|\btoken\b)/i;
@@ -243,10 +244,172 @@ export function pageSnapshot(options) {
       };
     }
 
+    // ------------------------------------------------------------------ descriptors
+    // TEAM-731 (docs/procedure-recording-format.md « target »): an element described the
+    // way a person finds it again. Never a selector, an XPath, coordinates or a DOM
+    // index, and never a field's value. Same limits as the server's TargetDescriptor.
+
+    function labelOf(el) {
+      const labelledBy = el.getAttribute('aria-labelledby');
+      if (labelledBy) {
+        const text = clean(labelledBy.split(/\s+/).map(id => textWithoutControls(document.getElementById(id))).join(' '));
+        if (text) return clean(text, 200);
+      }
+      const labels = el.labels ? [...el.labels] : [];
+      return clean(labels.map(textWithoutControls).join(' '), 200);
+    }
+
+    // Ids frameworks make up (`:r1f:`, `ember123`, hashes, long digit runs) change at
+    // every build or render: useless, even misleading, to find the element again.
+    function stableId(id) {
+      const value = String(id || '');
+      if (!value || value.length > 60) return '';
+      if (/\d{4,}/.test(value) || /[:]/.test(value) || /[0-9a-f]{8,}/i.test(value)) return '';
+      if (/^(?:ember|ext-gen|yui_|react-|mui-|radix-|headlessui-|downshift-|rc_select_|rc-tabs-|__next|j_id|ctl\d)/i.test(value)) return '';
+      if (/^[a-z]{0,3}\d+$/i.test(value)) return '';
+      return value;
+    }
+
+    function landmarkOf(el) {
+      const dialog = el.closest?.('dialog, [role="dialog"], [role="alertdialog"]');
+      if (dialog) return 'dialog';
+      const pairs = [
+        ['nav, [role="navigation"]', 'navigation'],
+        ['[role="search"]', 'search'],
+        ['main, [role="main"]', 'main'],
+        ['aside, [role="complementary"]', 'complementary'],
+        ['header, [role="banner"]', 'banner'],
+        ['footer, [role="contentinfo"]', 'contentinfo']
+      ];
+      for (const [selector, name] of pairs) {
+        if (el.closest?.(selector)) return name;
+      }
+      return '';
+    }
+
+    function headingText(node) {
+      return clean(textWithoutControls(node), 300);
+    }
+
+    // The closest heading, legend, column header or card title; in a table row, the
+    // row's first cell (the « Modifier » of the third line names that line).
+    function nearbyOf(el) {
+      const row = el.closest?.('tr, [role="row"]');
+      if (row) {
+        const first = row.querySelector('th, td, [role="cell"], [role="gridcell"], [role="rowheader"]');
+        if (first && !first.contains(el)) {
+          const text = headingText(first);
+          if (text) return text;
+        }
+      }
+      const fieldset = el.closest?.('fieldset');
+      const legend = fieldset?.querySelector('legend');
+      if (legend && !legend.contains(el) && headingText(legend)) return headingText(legend);
+      const HEADINGS = 'h1, h2, h3, h4, h5, h6, [role="heading"], legend, caption';
+      let node = el.parentElement;
+      for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+        const found = [...node.querySelectorAll(HEADINGS)]
+          .filter(heading => !heading.contains(el) && (heading.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING));
+        const nearest = found.at(-1);
+        if (nearest && headingText(nearest)) return headingText(nearest);
+      }
+      return '';
+    }
+
+    function testIdOf(el) {
+      for (const attribute of ['data-testid', 'data-test-id', 'data-test', 'data-qa', 'data-cy']) {
+        const value = el.getAttribute(attribute);
+        if (value) return clean(value, 100);
+      }
+      return '';
+    }
+
+    function hintsOf(el) {
+      const hints = {};
+      if (el instanceof HTMLInputElement) hints.input_type = clean(inputType(el), 30);
+      const name = el.getAttribute('name');
+      if (name && (el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement || el instanceof HTMLButtonElement)) {
+        hints.input_name = clean(name, 100);
+      }
+      const autocomplete = (el.getAttribute('autocomplete') || '').trim().toLowerCase();
+      if (autocomplete && autocomplete !== 'on' && autocomplete !== 'off') hints.autocomplete = clean(autocomplete, 60);
+      const testid = testIdOf(el);
+      if (testid) hints.testid = testid;
+      const id = stableId(el.id);
+      if (id) hints.id_attr = id;
+      const href = safeHref(el);
+      if (href) hints.href_path = href.slice(0, 500);
+      const landmark = landmarkOf(el);
+      if (landmark) hints.landmark = landmark;
+      return hints;
+    }
+
+    function formRefOf(form) {
+      if (!form) return null;
+      const info = formInfo(form);
+      const heading = form.querySelector('h1, h2, h3, h4, legend');
+      const name = clean(form.getAttribute('aria-label') || (form.getAttribute('aria-labelledby') && labelOf(form))
+        || form.getAttribute('name') || (heading ? textWithoutControls(heading) : ''), 100);
+      const ref = {};
+      if (name) ref.name = name;
+      if (info?.action_origin) ref.action_origin = info.action_origin;
+      if (info?.method) ref.method = info.method;
+      return Object.keys(ref).length ? ref : null;
+    }
+
+    // The fields read_page adds next to each element (browser.record.v1).
+    function descriptorFields(el) {
+      const out = {};
+      const isField = el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement || el.isContentEditable;
+      if (isField) {
+        const label = labelOf(el);
+        if (label) out.label = label;
+        const placeholder = clean(el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '', 200);
+        if (placeholder) out.placeholder = placeholder;
+      }
+      const nearby = nearbyOf(el);
+      if (nearby) out.nearby = nearby;
+      const hints = hintsOf(el);
+      if (Object.keys(hints).length) out.hints = hints;
+      return out;
+    }
+
+    // A recording `target`: role, name, tag, text, label, placeholder, nearby, hints,
+    // form and ordinal (its rank among same-role, same-name elements, from 0).
+    function targetOf(el) {
+      const role = roleOf(el);
+      const name = nameOf(el);
+      const target = { role: clean(role, 40), name: clean(name, 200), tag: el.tagName.toLowerCase().slice(0, 20) };
+      const isField = el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement || el.isContentEditable;
+      if (!isField) {
+        const text = clean(visibleText(el), 200);
+        if (text && normalize(text) !== normalize(name)) target.text = text;
+      }
+      Object.assign(target, descriptorFields(el));
+      const form = formRefOf(formOf(el));
+      if (form) target.form = form;
+      if (name) {
+        let ordinal = 0;
+        let counted = 0;
+        const wanted = normalize(name);
+        for (const other of document.querySelectorAll('a[href], button, input, select, textarea, summary, [role], [contenteditable]:not([contenteditable="false"])')) {
+          if (other === el) break;
+          if (counted++ > 3000) { ordinal = null; break; }
+          if (roleOf(other) === role && normalize(nameOf(other)) === wanted && isRendered(other)) ordinal += 1;
+        }
+        if (ordinal !== null) target.ordinal = Math.min(ordinal, 500);
+      }
+      for (const key of Object.keys(target)) {
+        if (target[key] === '' || target[key] === null) delete target[key];
+      }
+      return target;
+    }
+
     return {
       version: KIT_VERSION,
       clean, normalize, isRendered, isDisabled, isEditable, isSensitive, fieldState, nameOf, roleOf,
-      formOf, formInfo, submitsForm, safeHref, inViewport, pagePath, describe, inputType
+      formOf, formInfo, submitsForm, safeHref, inViewport, pagePath, describe, inputType,
+      labelOf, nearbyOf, hintsOf, descriptorFields, targetOf, stableId, landmarkOf, visibleText
     };
   }
 
@@ -255,6 +418,9 @@ export function pageSnapshot(options) {
     kit = buildKit();
     globalThis.__limovaBrowserKit = kit;
   }
+
+  // The recorder (page-recorder.js) only needs the kit in this document.
+  if (options?.installOnly === true) return { ok: true, kit: kit.version };
 
   const productKey = String(options?.productKey || '');
   const snapshotId = String(options?.snapshotId || '');
@@ -318,7 +484,9 @@ export function pageSnapshot(options) {
       disabled: item.info.disabled,
       submits: item.info.submits,
       href: item.info.href,
-      sensitive: item.info.sensitive
+      sensitive: item.info.sensitive,
+      // browser.record.v1: label, placeholder, nearby, hints. Never a value.
+      ...kit.descriptorFields(item.el)
     };
     if (item.info.editable || item.info.is_select || item.info.is_checkable) entry.state = kit.fieldState(item.el);
     if (item.info.is_checkable) entry.checked = item.el.checked === true;

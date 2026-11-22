@@ -16,6 +16,12 @@
 // (`TEAM_LOGIN_SUBMITTED`, `TEAM_LOGIN_FIELD_GONE`) are the only TEAM_* messages
 // accepted from a web page; every other one must come from the extension's own pages.
 //
+// TEAM-731: « Montrer à Limova » (recorder.js) records a task in the person's own
+// Chrome and uploads it once as a `limova.recording.v1`. Its page recorder's three
+// messages (`TEAM_RECORD_EVENT`, `TEAM_RECORD_OBSERVED`, `TEAM_RECORD_PING`) are, with
+// the login watcher's two, the only TEAM_* messages accepted from a web page, and only
+// for a tab being recorded.
+//
 // TEAM-726: user builds connect to production only. The environment is the build's
 // (build-config.js); the choice is only offered, and only accepted, when the developer
 // toggle is on.
@@ -31,6 +37,7 @@ import { DEVELOPER_TOGGLE_KEY, TEAM_BUILD } from './build-config.js';
 import { COOKIES_CAPABILITY, createVaultKeyPair } from './vault.js';
 import { createLoginOffers, TEAM_PAGE_MESSAGE_TYPES } from './login-offers.js';
 import { exportSession, isBlockedSite, siteOf } from './session-export.js';
+import { createRecorder, RECORDER_PAGE_MESSAGE_TYPES } from './recorder.js';
 
 export const RECONNECT_ALARM = 'limova-team-reconnect';
 export const HOLDS_SESSION_KEY = 'limova_socket_holds_v1';
@@ -42,7 +49,11 @@ export const TEAM_MESSAGE_TYPES = Object.freeze([
   'TEAM_APPROVAL_GET', 'TEAM_APPROVAL_DECIDE',
   // TEAM-729
   'TEAM_LOGIN_OFFER_GET', 'TEAM_LOGIN_OFFER_DECIDE', 'TEAM_VAULT_SET_PREFS', 'TEAM_SESSION_SUGGEST',
-  'TEAM_SESSION_EXPORT', ...TEAM_PAGE_MESSAGE_TYPES
+  'TEAM_SESSION_EXPORT', ...TEAM_PAGE_MESSAGE_TYPES,
+  // TEAM-731
+  'TEAM_RECORD_START', 'TEAM_RECORD_PAUSE', 'TEAM_RECORD_RESUME', 'TEAM_RECORD_STOP', 'TEAM_RECORD_GET',
+  'TEAM_RECORD_EDIT', 'TEAM_RECORD_TITLE', 'TEAM_RECORD_UPLOAD', 'TEAM_RECORD_DISCARD',
+  ...RECORDER_PAGE_MESSAGE_TYPES
 ]);
 
 export function isTeamMessage(type) {
@@ -52,6 +63,13 @@ export function isTeamMessage(type) {
 // The only TEAM_* messages a web page's (isolated-world) watcher may send.
 export function isTeamPageMessage(type) {
   return TEAM_PAGE_MESSAGE_TYPES.includes(type);
+}
+
+// The recorder's page messages (TEAM-731): from any http(s) top frame, since people
+// record on local and intranet sites too; the recorder only accepts them from a tab
+// it is recording, for the current recording id.
+export function isTeamRecorderPageMessage(type) {
+  return RECORDER_PAGE_MESSAGE_TYPES.includes(type);
 }
 
 const PAIRING_ERRORS = {
@@ -86,6 +104,28 @@ export function createTeamService({
   });
   const links = new Map();
   const activity = [];
+  const recorder = createRecorder({
+    chromeApi,
+    fetchImpl,
+    timers,
+    now,
+    browserFor: productId => links.get(productId)?.browser || null,
+    connectionFor: productId => {
+      const link = links.get(productId);
+      const env = link ? getEnvironment(link.productId, link.connection.environment) : null;
+      return env ? { api: env.api, dashboard: env.dashboard, token: link.connection.device_token } : null;
+    },
+    // The person drives while recording: hold the agent's calls, as « Prendre la main ».
+    takeOver: productId => {
+      const controller = links.get(productId)?.controller;
+      if (!controller || controller.getState().control === 'owner') return false;
+      controller.takeOver();
+      return true;
+    },
+    handBack: productId => links.get(productId)?.controller.handBack(),
+    onRevoked: productId => { forget(productId); },
+    onChange: () => refreshIndicator()
+  });
   const loginOffers = createLoginOffers({
     chromeApi,
     fetchImpl,
@@ -178,7 +218,10 @@ export function createTeamService({
           } : null
         };
       }),
-      activity: [...activity].reverse()
+      activity: [...activity].reverse(),
+      // Counts and status only: the steps and their values go to the panel on
+      // TEAM_RECORD_GET, never in this broadcast.
+      recorder: recorder.summary()
     };
   }
 
@@ -197,8 +240,12 @@ export function createTeamService({
       if (link.controller.getState().control === 'owner') owner = owner || link.product;
       if (link.controller.counts().running > 0) busy = busy || link.product;
     }
-    const text = owner ? '⏸' : busy ? 'IA' : '';
-    const color = (owner || busy)?.color;
+    // « REC » while « Montrer à Limova » records (grey while paused); it wins over the
+    // take-over the recording itself starts.
+    const recording = recorder.summary();
+    const recordingBadge = recording.status === 'recording' || recording.status === 'paused';
+    const text = recordingBadge ? 'REC' : owner ? '⏸' : busy ? 'IA' : '';
+    const color = recordingBadge ? (recording.status === 'paused' ? '#6B7280' : '#DC2626') : (owner || busy)?.color;
     Promise.resolve(chromeApi.action?.setBadgeText?.({ text })).catch(() => {});
     if (color) {
       Promise.resolve(chromeApi.action?.setBadgeBackgroundColor?.({ color })).catch(() => {});
@@ -270,6 +317,7 @@ export function createTeamService({
         if (status === 'online' && !link.ownerFetched) {
           link.ownerFetched = true;
           refreshOwner(link);
+          recorder.probe(product.id).catch(() => {});
         }
         scheduleBroadcast();
       },
@@ -315,6 +363,11 @@ export function createTeamService({
       loginOffers.windowClosed(windowId);
     });
     loginOffers.attach();
+    const nav = chromeApi.webNavigation;
+    nav?.onCommitted?.addListener?.(details => recorder.onCommitted(details));
+    nav?.onHistoryStateUpdated?.addListener?.(details => recorder.onHistoryStateUpdated(details));
+    nav?.onDOMContentLoaded?.addListener?.(details => recorder.onDomReady(details));
+    chromeApi.tabs?.onCreated?.addListener?.(tab => recorder.onTabCreated(tab));
     chromeApi.alarms?.onAlarm?.addListener?.(alarm => {
       if (alarm?.name === RECONNECT_ALARM) ensureAll().catch(() => {});
     });
@@ -355,6 +408,7 @@ export function createTeamService({
     await (initialized || init());
     // The login watcher in a web page: its own checks (top frame, origin from Chrome).
     if (isTeamPageMessage(request.type)) return loginOffers.handlePageMessage(request, sender);
+    if (isTeamRecorderPageMessage(request.type)) return recorder.handlePageMessage(request, sender);
     // Everything else comes from the extension's own pages, never from a web page.
     if (sender?.tab && !fromExtensionPage(sender)) return { ok: false, error: 'unknown_message' };
     const productId = typeof request.productId === 'string' ? request.productId : 'limova_team';
@@ -502,10 +556,39 @@ export function createTeamService({
         return outcome;
       }
 
+      // ------------------------------------------------ « Montrer à Limova » (TEAM-731)
+      case 'TEAM_RECORD_START':
+        return recorder.start({
+          productId,
+          tabId: Number.isInteger(request.tabId) ? request.tabId : null,
+          newTab: request.newTab === true
+        });
+      case 'TEAM_RECORD_PAUSE':
+        return recorder.pause();
+      case 'TEAM_RECORD_RESUME':
+        return recorder.resume();
+      case 'TEAM_RECORD_STOP':
+        return recorder.stop();
+      case 'TEAM_RECORD_GET':
+        return { ok: true, summary: recorder.summary(), review: recorder.review() };
+      case 'TEAM_RECORD_EDIT':
+        return recorder.edit({
+          key: String(request.key || ''),
+          remove: request.remove === true,
+          candidate_parameter: typeof request.candidate_parameter === 'boolean' ? request.candidate_parameter : undefined,
+          parameter_name: typeof request.parameter_name === 'string' ? request.parameter_name : undefined
+        });
+      case 'TEAM_RECORD_TITLE':
+        return recorder.setTitle(request.title);
+      case 'TEAM_RECORD_UPLOAD':
+        return recorder.upload();
+      case 'TEAM_RECORD_DISCARD':
+        return recorder.discard();
+
       default:
         return { ok: false, error: 'unknown_message' };
     }
   }
 
-  return { init, ensureAll, handleMessage, panelState, links, approvals, store, loginOffers };
+  return { init, ensureAll, handleMessage, panelState, links, approvals, store, loginOffers, recorder };
 }

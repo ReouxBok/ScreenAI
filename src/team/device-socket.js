@@ -35,7 +35,9 @@
 import { VAULT_CAPABILITY } from './vault.js';
 
 export const DEVICE_SUBPROTOCOL = 'limova-device.v1';
-export const CAPABILITIES = Object.freeze(['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1']);
+// browser.record.v1 (TEAM-731): this app uploads recordings and adds the descriptor
+// fields (label, placeholder, nearby, hints) to read_page elements.
+export const CAPABILITIES = Object.freeze(['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1', 'browser.record.v1']);
 export const PING_INTERVAL_MS = 25_000;
 export const RESULT_CACHE_MS = 10 * 60_000;
 export const BACKOFF_MIN_MS = 1_000;

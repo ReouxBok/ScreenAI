@@ -69,3 +69,26 @@
 .team-error { color: #9A2F22; }
 .team-ok { color: #246648; }
 .team-check input:focus-visible { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 2px; }
+
+/* TEAM-731: « Montrer à Limova ». */
+.team-record { display: grid; gap: 8px; padding-top: 4px; border-top: 1px dashed var(--color-gray-200); }
+.team-record-holder { position: sticky; top: -28px; z-index: 2; }
+.team-record-holder[hidden], .team-record-review[hidden] { display: none; }
+.team-record-bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 10px; background: #FEF2F2; border: 1px solid #FECACA; font-size: 12px; }
+.team-record-bar.is-paused { background: var(--color-gray-100); border-color: var(--color-gray-200); }
+.team-record-dot { width: 9px; height: 9px; border-radius: 50%; background: #DC2626; animation: team-pulse 1.4s ease-in-out infinite; }
+.team-record-bar.is-paused .team-record-dot { background: #6B7280; animation: none; }
+.team-record-text { flex: 1; font-weight: 600; }
+.team-record-sent { font-size: 12px; color: #246648; }
+.team-record-error { font-size: 12px; color: #9A2F22; }
+.team-record-review { display: grid; gap: 10px; border: 1px solid var(--color-gray-200); border-radius: 12px; padding: 14px; background: #fff; }
+.team-record-steps { display: grid; gap: 6px; padding-left: 20px; max-height: 360px; overflow: auto; }
+.team-record-step { font-size: 12px; display: grid; gap: 4px; padding: 6px 0; border-bottom: 1px solid var(--color-gray-100); }
+.team-record-step-head { display: flex; gap: 8px; align-items: flex-start; }
+.team-record-step-label { flex: 1; }
+.team-record-delete { border: 0; background: transparent; color: var(--color-gray-500); font-size: 16px; line-height: 1; cursor: pointer; padding: 0 4px; }
+.team-record-value { color: var(--color-gray-600); font-family: ui-monospace, Menlo, monospace; font-size: 11px; word-break: break-word; }
+.team-record-value.is-masked { font-family: var(--font-family); font-style: italic; }
+.team-record-param { padding: 6px 8px; font-size: 12px; }
+.team-record-delete:focus-visible { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { .team-record-dot { animation: none; } }

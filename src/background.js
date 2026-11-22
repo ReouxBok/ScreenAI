@@ -8,7 +8,7 @@ import { createAnalytics } from './utils/analytics.js';
 import { buildSystemPrompt } from './prompts/system-prompt.js';
 import { searchKB } from './knowledge-base/kb-search.js';
 import { createOnboardingPlan, advanceStep } from './prompts/onboarding-plan.js';
-import { createTeamService, isTeamMessage, isTeamPageMessage } from './team/team-service.js';
+import { createTeamService, isTeamMessage, isTeamPageMessage, isTeamRecorderPageMessage } from './team/team-service.js';
 
 // ============================================================================
 // Config
@@ -835,6 +835,9 @@ function isTrustedMessageSource(request, sender) {
   // Limova Team's login watcher (TEAM-729), injected in a tab's isolated world: only its
   // two messages, only from an https top frame. team-service checks the rest.
   if (isTeamPageMessage(request.type)) return Boolean(sender.tab) && sender.frameId === 0 && /^https:\/\//.test(String(sender.url || ''));
+  // « Montrer à Limova »'s page recorder (TEAM-731): http(s) top frames; the recorder
+  // only accepts a tab it is recording, for the current recording id.
+  if (isTeamRecorderPageMessage(request.type)) return Boolean(sender.tab) && sender.frameId === 0 && /^https?:\/\//.test(String(sender.url || ''));
   if (!CONTENT_SCRIPT_MESSAGE_TYPES.has(request.type)) return false;
   if (isLimovaUrl(pageUrl)) return true;
   return EXTERNAL_SITE_MESSAGE_TYPES.has(request.type) && isExternalSiteUrl(pageUrl);

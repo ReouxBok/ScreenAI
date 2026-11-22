@@ -64,7 +64,7 @@ describe('DeviceSocket', () => {
     expect(ws.sent[0]).toEqual({
       type: 'hello',
       app_version: '2.2.63',
-      capabilities: ['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1'],
+      capabilities: ['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1', 'browser.record.v1'],
       autonomy: 'approve_for_me',
       paused: false,
       control: 'agent',
@@ -274,7 +274,7 @@ describe('DeviceSocket: login vault (TEAM-729)', () => {
     const { ws, socket } = await openVault();
     const hello = ws.sent[0];
     expect(hello.type).toBe('hello');
-    expect(hello.capabilities).toEqual(['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1', 'browser.v1+cookies', 'browser.v1+vault']);
+    expect(hello.capabilities).toEqual(['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1', 'browser.record.v1', 'browser.v1+cookies', 'browser.v1+vault']);
     expect(Object.keys(hello.vault_key).sort()).toEqual(['crv', 'kty', 'x', 'y']);
     expect(hello.vault_key).toEqual(expect.objectContaining({ kty: 'EC', crv: 'P-256' }));
     expect(socket.vaultKey.privateKey.extractable).toBe(false);

@@ -58,6 +58,24 @@ const TEXT_LIMITS = { min: 500, max: 20000, fallback: 8000 };
 const INCLUDED_TEXT_LIMITS = { min: 500, max: 20000, fallback: 4000 };
 const ELEMENT_LIMITS = { min: 1, max: 400, fallback: 200 };
 
+const HINT_LIMITS = { input_type: 30, input_name: 100, autocomplete: 60, testid: 100, id_attr: 100, href_path: 500, landmark: 60 };
+
+// Keep only the descriptor fields of the server's TargetDescriptor, cut to its limits.
+export function descriptorFieldsOf(item) {
+  const out = {};
+  for (const [key, max] of [['label', 200], ['placeholder', 200], ['nearby', 300]]) {
+    if (typeof item?.[key] === 'string' && item[key]) out[key] = item[key].slice(0, max);
+  }
+  if (item?.hints && typeof item.hints === 'object') {
+    const hints = {};
+    for (const [key, max] of Object.entries(HINT_LIMITS)) {
+      if (typeof item.hints[key] === 'string' && item.hints[key]) hints[key] = item.hints[key].slice(0, max);
+    }
+    if (Object.keys(hints).length) out.hints = hints;
+  }
+  return out;
+}
+
 export function toolError(code, message) {
   return { ok: false, error: { code, message: message || code } };
 }
@@ -198,13 +216,21 @@ export function createBrowserEngine({
       }
     }
 
+    // While « Montrer à Limova » records, the group says so (TEAM-731).
+    let recordingTitle = null;
+
     async function setGroupTitle(busy) {
       const groupId = await currentGroupId();
       if (groupId === null) return;
       await chromeApi.tabGroups.update(groupId, {
-        title: busy ? product.groupBusyTitle : product.groupTitle,
+        title: recordingTitle || (busy ? product.groupBusyTitle : product.groupTitle),
         color: product.groupColor
       }).catch(() => {});
+    }
+
+    async function setRecordingTitle(title) {
+      recordingTitle = title || null;
+      await setGroupTitle(false);
     }
 
     async function addToGroup(tabId, busy = false) {
@@ -374,6 +400,9 @@ export function createBrowserEngine({
         if (item.href) entry.href = item.href;
         entry.in_viewport = Boolean(item.in_viewport);
         if (item.disabled) entry.disabled = true;
+        // browser.record.v1 (TEAM-731): the same descriptor fields a recording's target
+        // carries, so replays compare like with like. Never a value.
+        Object.assign(entry, descriptorFieldsOf(item));
         const hint = riskHint({ name: item.name, role: item.role, submits: item.submits, form: formsById.get(item.form) });
         if (hint) entry.risk_hint = hint;
         return entry;
@@ -1010,6 +1039,10 @@ export function createBrowserEngine({
       fillSecret,
       shareableTabs,
       adoptTab,
+      // TEAM-731: the person's click on « Montrer à Limova » is the consent to bring
+      // this tab (or a new tab) into the group; the recorder checks the site itself.
+      joinGroup: (tabId, busy = false) => addToGroup(tabId, busy),
+      setRecordingTitle,
       setGroupTitle,
       currentGroupId,
       runRead(tool, args, options) {
