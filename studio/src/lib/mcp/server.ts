@@ -6,6 +6,7 @@ import { studioMcpConfig } from "./config";
 import { resolveStudioMcpUser, StudioMcpAuthError } from "./identity";
 import { studioMcpTools, type StudioMcpContext, type StudioMcpResult, type StudioMcpTool } from "./tools";
 import { studioMcpPauseReadTool, studioMcpWriteTools } from "./writes";
+import { studioMcpKnowledgeReadTools, studioMcpKnowledgeWriteTools } from "./knowledge";
 
 const json = { "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" };
 /** Per staff member and instance: enough for an agent, bounded against a loop. */
@@ -36,7 +37,7 @@ async function call(tool: StudioMcpTool, context: StudioMcpContext, input: unkno
 }
 export function createStudioMcpServer(context: StudioMcpContext, options: { writes: boolean }) {
   const server = new McpServer({ name: "studio-limova-sav", version: "1.0.0" });
-  for (const tool of [...studioMcpTools, studioMcpPauseReadTool, ...studioMcpWriteTools].filter(t => options.writes || !t.write)) {
+  for (const tool of [...studioMcpTools, studioMcpPauseReadTool, ...studioMcpKnowledgeReadTools, ...studioMcpWriteTools, ...studioMcpKnowledgeWriteTools].filter(t => options.writes || !t.write)) {
     server.registerTool(tool.name, { title: tool.title, description: tool.description, inputSchema: tool.input,
       annotations: { readOnlyHint: !tool.write, destructiveHint: tool.write, idempotentHint: !tool.write, openWorldHint: false } },
     async (input: unknown) => {
