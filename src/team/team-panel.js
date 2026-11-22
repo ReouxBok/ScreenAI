@@ -272,6 +272,8 @@
       actions.append(button(tr('teamTakeOver'), 'team-secondary', () => send({ type: 'TEAM_TAKE_OVER', productId: product.id })));
     }
     card.append(actions);
+    const recorderBox = renderRecorder(product);
+    if (recorderBox) card.append(recorderBox);
     card.append(renderVault(product, connection));
     card.append(button(tr('teamDisconnect'), 'team-link-danger', async () => {
       if (!window.confirm(tr('teamDisconnectConfirm'))) return;
@@ -285,6 +287,28 @@
   function renderBanner() {
     const banner = $('teamBanner');
     if (!banner) return;
+    const recording = recorderSummary();
+    if (recording.status === 'recording' || recording.status === 'paused') {
+      // Charly's view too shows « Limova regarde · Pause · Arrêter » while recording.
+      banner.hidden = false;
+      banner.style.setProperty('--product', '#DC2626');
+      $('teamBannerText').textContent = `${tr(recording.status === 'paused' ? 'teamRecordPaused' : 'teamRecordWatching')} · ${recording.steps} ${tr('teamRecordStepsUnit')}`;
+      const control = $('teamBannerControl');
+      control.textContent = tr(recording.status === 'paused' ? 'teamRecordResume' : 'teamRecordPause');
+      control.onclick = () => send({ type: recording.status === 'paused' ? 'TEAM_RECORD_RESUME' : 'TEAM_RECORD_PAUSE' }).then(refresh);
+      const stop = $('teamBannerStop');
+      if (stop) {
+        stop.textContent = tr('teamRecordStop');
+        stop.onclick = () => send({ type: 'TEAM_RECORD_STOP' }).then(refresh);
+      }
+      return;
+    }
+    // One handler at a time: « Arrêter » the recording above, « Tout arrêter » here.
+    const stopButton = $('teamBannerStop');
+    if (stopButton) {
+      stopButton.textContent = tr('teamStopAll');
+      stopButton.onclick = () => send({ type: 'TEAM_STOP_ALL' });
+    }
     const active = (state?.products || []).find(product => product.connection
       && (product.connection.control === 'owner' || product.connection.running > 0 || product.connection.held > 0));
     if (!active) {
@@ -318,6 +342,165 @@
     }
   }
 
+  // ------------------------------------------------ « Montrer à Limova » (TEAM-731)
+
+  let recordChoice = false;
+  let recordFeedback = '';
+  let reviewSignature = '';
+
+  function recorderSummary() {
+    return state?.recorder || { status: 'idle', procedures: {} };
+  }
+
+  async function startRecording(product, newTab) {
+    recordChoice = false;
+    let tabId = null;
+    if (!newTab) {
+      const [tab] = await Promise.resolve(chrome.tabs?.query?.({ active: true, lastFocusedWindow: true })).catch(() => []) || [];
+      tabId = Number.isInteger(tab?.id) ? tab.id : null;
+    }
+    const response = await send({ type: 'TEAM_RECORD_START', productId: product.id, ...(newTab ? { newTab: true } : { tabId }) });
+    recordFeedback = response?.ok ? '' : (response?.error === 'blocked_site' || response?.error === 'page_unavailable'
+      ? tr('teamRecordBlocked') : response?.message || tr('teamRecordStartFailed'));
+    refresh();
+  }
+
+  // The card's part: the button, or the live controls while recording.
+  function renderRecorder(product) {
+    const summary = recorderSummary();
+    if (summary.procedures?.[product.id] === 'off') return null;
+    const box = el('section', 'team-record');
+    box.dataset.recorder = product.id;
+    const mine = summary.product === product.id;
+    if (mine && (summary.status === 'recording' || summary.status === 'paused')) {
+      box.append(recordControls(summary, product.id));
+      return box;
+    }
+    if (mine && (summary.status === 'review' || summary.status === 'uploading')) {
+      box.append(el('p', 'team-muted', tr('teamRecordReviewHint')));
+      return box;
+    }
+    if (summary.last_result && !recordFeedback) box.append(el('p', 'team-record-sent', tr('teamRecordSent')));
+    if (recordFeedback) box.append(el('p', 'team-record-error', recordFeedback));
+    if (!recordChoice) {
+      box.append(button(tr('teamRecordShow'), 'team-secondary team-record-show', () => { recordChoice = true; recordFeedback = ''; render(); }));
+      return box;
+    }
+    box.append(el('p', 'team-muted', tr('teamRecordHint')));
+    const choices = el('div', 'team-actions');
+    choices.append(
+      button(tr('teamRecordHere'), 'team-primary', () => startRecording(product, false)),
+      button(tr('teamRecordNewTab'), 'team-secondary', () => startRecording(product, true))
+    );
+    box.append(choices);
+    return box;
+  }
+
+  // « Limova regarde · Pause · Arrêter ».
+  function recordControls(summary, productId) {
+    const bar = el('div', `team-record-bar${summary.status === 'paused' ? ' is-paused' : ''}`);
+    bar.setAttribute('role', 'status');
+    bar.append(el('span', 'team-record-dot'));
+    const count = `${summary.steps} ${tr('teamRecordStepsUnit')}`;
+    bar.append(el('span', 'team-record-text', `${tr(summary.status === 'paused' ? 'teamRecordPaused' : 'teamRecordWatching')} · ${count}`));
+    bar.append(button(tr(summary.status === 'paused' ? 'teamRecordResume' : 'teamRecordPause'), 'team-banner-btn',
+      () => send({ type: summary.status === 'paused' ? 'TEAM_RECORD_RESUME' : 'TEAM_RECORD_PAUSE', productId }).then(refresh)));
+    bar.append(button(tr('teamRecordStop'), 'team-banner-btn danger', () => send({ type: 'TEAM_RECORD_STOP', productId }).then(refresh)));
+    return bar;
+  }
+
+  function renderRecordBar() {
+    const holder = $('teamRecordBar');
+    const summary = recorderSummary();
+    const live = summary.status === 'recording' || summary.status === 'paused';
+    if (holder) {
+      holder.hidden = !live;
+      holder.replaceChildren(...(live ? [recordControls(summary, summary.product)] : []));
+    }
+    return live;
+  }
+
+  async function renderReview() {
+    const holder = $('teamRecordReview');
+    if (!holder) return;
+    const summary = recorderSummary();
+    if (summary.status !== 'review' && summary.status !== 'uploading') {
+      holder.hidden = true;
+      holder.replaceChildren();
+      reviewSignature = '';
+      return;
+    }
+    const response = await send({ type: 'TEAM_RECORD_GET' });
+    const review = response?.review;
+    if (!review) return;
+    // Redraw only when the list itself changed: typing a title must keep its caret.
+    const signature = JSON.stringify([review.status, review.error, review.limit, review.steps.map(step => [step.key, step.candidate_parameter])]);
+    if (signature === reviewSignature) return;
+    reviewSignature = signature;
+    holder.hidden = false;
+    const uploading = review.status === 'uploading';
+    const parts = [el('h3', '', tr('teamRecordReviewTitle'))];
+    if (review.limit) parts.push(el('p', 'team-muted', tr(review.limit === 'steps' ? 'teamRecordLimitSteps' : 'teamRecordLimitDuration')));
+    const title = el('input', 'team-select');
+    title.id = 'teamRecordTitle';
+    title.type = 'text';
+    title.maxLength = 120;
+    title.placeholder = tr('teamRecordTitlePlaceholder');
+    title.value = review.title || '';
+    title.addEventListener('input', () => send({ type: 'TEAM_RECORD_TITLE', title: title.value }));
+    parts.push(labelled(tr('teamRecordTitleLabel'), title));
+    const list = el('ol', 'team-record-steps');
+    if (!review.steps.length) list.append(el('li', 'team-muted', tr('teamRecordEmpty')));
+    for (const step of review.steps) {
+      const row = el('li', 'team-record-step');
+      row.dataset.key = step.key;
+      const head = el('div', 'team-record-step-head');
+      head.append(el('span', 'team-record-step-label', step.label));
+      head.append(button('×', 'team-record-delete', () => send({ type: 'TEAM_RECORD_EDIT', key: step.key, remove: true }).then(renderReview)));
+      head.lastChild.setAttribute('aria-label', tr('teamRecordDelete'));
+      row.append(head);
+      if (step.redacted) row.append(el('span', 'team-record-value is-masked', tr('teamRecordMasked')));
+      else if (step.value !== null && step.value !== undefined) row.append(el('span', 'team-record-value', step.value));
+      if (step.can_parameter) {
+        const toggle = el('label', 'team-toggle');
+        const box = el('input');
+        box.type = 'checkbox';
+        box.checked = step.candidate_parameter;
+        box.addEventListener('change', () => send({ type: 'TEAM_RECORD_EDIT', key: step.key, candidate_parameter: box.checked }).then(renderReview));
+        toggle.append(box, el('span', '', tr('teamRecordChanges')));
+        row.append(toggle);
+        if (step.candidate_parameter) {
+          const name = el('input', 'team-select team-record-param');
+          name.id = `teamRecordParam-${step.key}`;
+          name.type = 'text';
+          name.maxLength = 60;
+          name.placeholder = tr('teamRecordParamName');
+          name.value = step.parameter_name || '';
+          name.addEventListener('input', () => send({ type: 'TEAM_RECORD_EDIT', key: step.key, parameter_name: name.value }));
+          row.append(name);
+        }
+      }
+      list.append(row);
+    }
+    parts.push(list);
+    if (review.error) parts.push(el('p', 'team-record-error', review.error.message));
+    const actions = el('div', 'team-actions');
+    const sendButton = button(tr(uploading ? 'teamRecordSending' : 'teamRecordSend'), 'team-primary', async () => {
+      sendButton.disabled = true;
+      await send({ type: 'TEAM_RECORD_UPLOAD' });
+      reviewSignature = '';
+      refresh();
+    });
+    sendButton.disabled = uploading || !review.steps.length;
+    actions.append(sendButton, button(tr('teamRecordDiscard'), 'team-secondary', async () => {
+      if (!window.confirm(tr('teamRecordDiscardConfirm'))) return;
+      await send({ type: 'TEAM_RECORD_DISCARD' });
+      refresh();
+    }));
+    parts.push(actions);
+    holder.replaceChildren(...parts);
+  }
+
   function render() {
     const container = $('teamProducts');
     if (container && state) {
@@ -338,6 +521,8 @@
     if (stopAll) stopAll.hidden = !anyConnected;
     renderBanner();
     renderActivity();
+    renderRecordBar();
+    renderReview();
   }
 
   function openPanel(mode = 'overlay') {
@@ -397,7 +582,8 @@
     $('teamPanelClose')?.addEventListener('click', () => { $('teamPanel').hidden = true; });
     const stopAll = () => send({ type: 'TEAM_STOP_ALL' });
     $('teamStopAll')?.addEventListener('click', stopAll);
-    $('teamBannerStop')?.addEventListener('click', stopAll);
+    const bannerStop = $('teamBannerStop');
+    if (bannerStop && !bannerStop.onclick) bannerStop.onclick = stopAll;
     // Language changes re-run applyTranslations; re-render the dynamic parts too.
     document.querySelectorAll('.lang-option').forEach(option => option.addEventListener('click', () => setTimeout(render, 0)));
     chrome.runtime.onMessage.addListener(message => {
