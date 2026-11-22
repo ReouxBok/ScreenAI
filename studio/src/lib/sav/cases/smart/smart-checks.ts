@@ -370,11 +370,16 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   // those under the Academy resource passed). An Academy result's link to another site stays refused: Academy results are untrusted data.
   const academyText = (input.academy ?? []).map(row => row.text).join("\n");
   const officialLimova = (url: string) => { const host = hostOf(url).replace(/^www\./, ""); return host === "limova.ai" || host.endsWith(".limova.ai"); };
-  const cardLinks = linksOf(allCardText), academyUrls = linksOf(academyText).urls.filter(officialLimova);
-  const allowedUrls = [...SAV_SMART_RESOURCES.map(row => row.url), ...cardLinks.urls, ...academyUrls].map(url => url.toLowerCase());
-  const allowedHosts = new Set([...allowedUrls.map(hostOf), ...cardLinks.domains].filter(Boolean).map(host => host.replace(/^www\./, "")));
+  // PR #340 review: an Academy link is matched EXACTLY (same host, same path; trailing slash, query and fragment ignored), never as a prefix, so an
+  // Academy result giving a host root (« https://limova.ai ») does not open every page of that host.
+  const exactKey = (url: string) => { try { const parsed = new URL(url); return `${parsed.host.toLowerCase().replace(/^www\./, "")}${parsed.pathname.replace(/\/+$/, "").toLowerCase()}`; } catch { return null; } };
+  const cardLinks = linksOf(allCardText), academyKeys = new Set(linksOf(academyText).urls.filter(officialLimova).map(exactKey).filter((key): key is string => Boolean(key)));
+  const allowedUrls = [...SAV_SMART_RESOURCES.map(row => row.url), ...cardLinks.urls].map(url => url.toLowerCase());
+  const allowedHosts = new Set([...allowedUrls.map(hostOf), ...[...academyKeys].map(key => key.split("/")[0]!), ...cardLinks.domains].filter(Boolean).map(host => host.replace(/^www\./, "")));
   const { urls, domains } = linksOf(reply);
-  if (urls.some(url => !allowedUrls.some(allowed => url.toLowerCase() === allowed || url.toLowerCase().startsWith(`${allowed.replace(/\/$/, "")}/`)))) codes.add("link_not_allowed");
+  const linkAllowed = (url: string) => allowedUrls.some(allowed => url.toLowerCase() === allowed || url.toLowerCase().startsWith(`${allowed.replace(/\/$/, "")}/`))
+    || academyKeys.has(exactKey(url) ?? "");
+  if (urls.some(url => !linkAllowed(url))) codes.add("link_not_allowed");
   if (domains.some(domain => !allowedHosts.has(domain))) codes.add("link_not_allowed");
 
   // Other platforms: an invitation or a praise is refused even when the customer named it; a name is allowed only from the customer or a cited card.

@@ -129,6 +129,14 @@ describe("5. liens : la même règle que le prompt (fiche, résultat Academy, re
     expect(check(`${SMART_GOOD_REPLY} Le guide : https://bienvenue.limova.ai/guides/autre-page`, { academy })).toContain("link_not_allowed");
     // An Academy result is untrusted data: its link to another site than Limova stays refused (smart-loop.test.ts: the Zapier sign-up link).
     expect(check(`${SMART_GOOD_REPLY} La vidéo : https://videos.exemple-tiers.invalid/gmail`, { academy })).toContain("link_not_allowed");
+    // Exact match: trailing slash, query and fragment ignored.
+    expect(check(`${SMART_GOOD_REPLY} Le guide : https://bienvenue.limova.ai/guides/connexion-gmail/?etape=2#haut`, { academy })).toEqual([]);
+  });
+  it("revue #340 : une racine d'hôte donnée par l'Academy n'ouvre pas toutes les pages de cet hôte", () => {
+    const academy = [{ callId: "t1", needId: "n1", text: "Plus d'informations sur https://limova.ai" }];
+    expect(check(`${SMART_GOOD_REPLY} Voir https://limova.ai/invented-page`, { academy })).toContain("link_not_allowed");
+    expect(check(`${SMART_GOOD_REPLY} Voir limova.ai/invented-page`, { academy })).toContain("link_not_allowed");
+    expect(check(`${SMART_GOOD_REPLY} Voir https://limova.ai/`, { academy })).toEqual([]);
   });
   it("un lien sans https écrit dans une fiche fournie est admis tel quel, pas une autre page du même hôte", () => {
     const card = { ...SMART_TEST_CARD, content: `${SMART_TEST_CARD.content} Aide : aide.exemple-limova.fr/connexion` };
