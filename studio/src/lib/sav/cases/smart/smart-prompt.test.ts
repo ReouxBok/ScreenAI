@@ -8,7 +8,7 @@ import { smartGoodDecision, smartReading } from "./smart-test-doubles";
 
 describe("prompt figé (lot B)", () => {
   it("révision et empreinte figées ensemble ; toute modification du texte fait échouer ce test", () => {
-    expect(SAV_SMART_PROMPT_REVISION).toBe("sav-smart-prompt-2026-11-22.v17");
+    expect(SAV_SMART_PROMPT_REVISION).toBe("sav-smart-prompt-2026-11-22.v18");
     expect(smartPromptSha256()).toBe(SAV_SMART_PROMPT_SHA256);
     expect(smartPromptPinned()).toBe(true);
   });
@@ -16,7 +16,7 @@ describe("prompt figé (lot B)", () => {
     const bytes = smartPromptBytes();
     expect(bytes.decide).toBeLessThanOrEqual(SAV_SMART_PROMPT_MAX_BYTES);
     expect(bytes.correct).toBeLessThanOrEqual(SAV_SMART_PROMPT_MAX_BYTES);
-    expect(bytes).toEqual({ decide: 8432, understand: 4805, verify: 3919, correct: 8996 });
+    expect(bytes).toEqual({ decide: 8442, understand: 4805, verify: 3919, correct: 8966 });
   });
   it("porte les grandes règles d'Ugo (section 4)", () => {
     const decide = smartDecidePrompt();
@@ -41,7 +41,9 @@ describe("prompt figé (lot B)", () => {
     expect(understand).toContain("C'est toi qui en juges, pas un mot");
     expect(decide).toContain("s'il est très énervé ou menace (résilier, mauvais avis, avocat, « c'est inadmissible, 3e relance » : raison upset)");
     expect(decide).toContain("« où trouver ma facture ? » ou « le prix d'une intégration » : une simple mention");
-    expect(decide).toContain("demande l'URL de la conversation (barre d'adresse) et des captures ; insiste si besoin.");
+    expect(decide).toContain("demande l'URL de la conversation (barre d'adresse) et des captures.");
+    // v18: a question already asked (askedBefore) is not asked again, even unanswered.
+    expect(decide).toContain("askedBefore : questions déjà posées ; même sans réponse, ne les repose pas");
     expect(decide).toContain("la tâche marche-t-elle en direct dans le chat ?");
     expect(decide).toContain("Charly Max : demande le numéro de téléphone du client.");
     expect(decide).toContain("un jeton (token API)");

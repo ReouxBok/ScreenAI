@@ -80,6 +80,13 @@ export function smartProgressGate(memory: SmartCaseMemory, maxExchanges = SAV_SM
   return { mustHandOff: capped, reason: capped ? "max_exchanges" : null, noProgressLastTurn: memory.progress.length > 0 && memory.progress.at(-1) === false, exchange };
 }
 
+/*
+ * v18 (bench 22/11, multi-progres-05, resolu-04: « URL + capture » asked again). The questions already asked on this case, answered or not, given
+ * to decide as `askedBefore` so the MODEL chooses not to ask them again (answer with the cards, or hand over). No new refusal (Ugo, 22/11: fewer
+ * handoffs and questions, never more): `question_repeated` below is unchanged.
+ */
+export const smartAskedBefore = (memory: SmartCaseMemory) => memory.questions.map(row => row.text.slice(0, 300));
+
 /** The two repetition refusals, on a decision against the memory. */
 export function smartRepeatCodes(memory: SmartCaseMemory, decision: SmartDecision): SmartCheckCode[] {
   const codes: SmartCheckCode[] = [];
