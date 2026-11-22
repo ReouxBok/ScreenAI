@@ -54,10 +54,13 @@ export function createSavBenchSearchAgent(context: Readonly<{
   network: (url: string, init: RequestInit) => Promise<Response>; env: Readonly<Record<string, string | undefined>>;
   embed: SmartEmbedPort; knowledge: (embed: SmartEmbedPort, now: Date) => SmartKnowledgePort; academy?: readonly AcademyTool[];
   conversation: SavBenchConversation; record: SmartBenchSearchRecord;
+  /** `search` (default) or `real` (the same turn, judged by the real judge, `smart-bench-real-judge.ts`). */
+  name?: "search" | "real";
 }>): SavBenchAgent {
+  const name = context.name ?? "search";
   let memory: SmartCaseMemory = smartEmptyMemory();
   return {
-    name: "search", revision: `search:${SAV_SMART_PROMPT_REVISION}:${smartPromptSha256().slice(0, 12)}:${context.env.SAV_V2_MODEL ?? "?"}`,
+    name, revision: `${name}:${SAV_SMART_PROMPT_REVISION}:${smartPromptSha256().slice(0, 12)}:${context.env.SAV_V2_MODEL ?? "?"}`,
     async respond(input) {
       const now = new Date(input.now), searches: SmartBenchSearchCall[] = [];
       const model = smartGeminiModel({ env: () => context.env, now: () => now, network: context.network, timeoutMs: 60_000 });
