@@ -51,6 +51,19 @@ describe("2. relecture qui refuse seulement des passages sans source : on les re
     expect(smartDropPassages(decision({ reply: "Bonjour. Cliquez ici. Puis là." }), ["Cliquez ici.", "Puis là."])).toBeNull();
     expect(smartDropPassages(decision({ outcome: "ask" }), [INDESIRABLES])).toBeNull();
   });
+  it("revue PR #341 : un besoin « asked » garde une phrase en « ? » ; sinon null (chemin existant)", () => {
+    const reply = "Bonjour,\n\nUtilisez l'adresse e-mail de votre invitation. Cliquez sur Paramètres avancés.\n\nQuel message s'affiche ?\n\nBelle journée.";
+    const asked = [{ needId: "n1", status: "answered" }, { needId: "n2", status: "asked" }];
+    expect(smartDropPassages(decision({ reply, coverage: asked }), ["Quel message s'affiche ?"])).toBeNull();
+    expect(smartDropPassages(decision({ reply, coverage: asked }), ["Cliquez sur Paramètres avancés."])?.reply).toContain("Quel message s'affiche ?");
+    expect(smartDropPassages(decision({ reply }), ["Quel message s'affiche ?"])).not.toBeNull();
+  });
+  it("revue PR #341 : une introduction « … : » laissée sans étape ni liste après elle → null ; suivie d'une étape restante → retrait accepté", () => {
+    const orphan = "Bonjour,\n\nUtilisez l'adresse e-mail de votre invitation. Voici la suite :\n1. Cliquez sur Paramètres avancés.\n\nBelle journée.";
+    expect(smartDropPassages(decision({ reply: orphan }), ["Cliquez sur Paramètres avancés."])).toBeNull();
+    const kept = "Bonjour,\n\nVoici les étapes :\n1. Cliquez sur Paramètres avancés.\n2. Utilisez l'adresse e-mail de votre invitation.\n\nBelle journée.";
+    expect(smartDropPassages(decision({ reply: kept }), ["Cliquez sur Paramètres avancés."])?.reply).toBe("Bonjour,\n\nVoici les étapes :\n1. Utilisez l'adresse e-mail de votre invitation.\n\nBelle journée.");
+  });
   it("1re relecture : unlisted_claim sur une phrase → réponse envoyée sans elle, 3 appels, pas de correction", async () => {
     const { result, kinds } = await run({ understand: { output: smartReading() }, decide: { output: smartGoodDecision() }, verify: { output: refuse(INDESIRABLES) } });
     expect(kinds).toEqual(["understand", "decide", "verify"]);

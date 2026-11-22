@@ -436,6 +436,10 @@ export function smartDropPassages(decision: SmartDecision, passages: readonly st
   }).filter((line): line is string => line !== null);
   // Every passage must have gone with its sentences; at most half of the reply removed.
   if (!dropped || dropped * 2 > total || wanted.some(passage => key(lines.join("\n")).includes(passage))) return null;
+  // PR #341 review: an introduction left orphan (« Voici les étapes : » with no list or step after it) is never sent.
+  const listItem = /^\s*(?:\d+[.)]|[-*•])\s+/;
+  const filled = lines.filter(line => line.trim());
+  if (filled.some((line, index) => line.trim().endsWith(":") && !listItem.test(filled[index + 1] ?? ""))) return null;
   let step = 0;
   const renumbered = lines.map(line => {
     const match = line.match(/^(\s*)\d+([.)])\s+/);
@@ -453,5 +457,7 @@ export function smartDropPassages(decision: SmartDecision, passages: readonly st
   const grounded = (needId: string) => facts.some(fact => fact.needId === needId && (fact.type === "fait_limova" || fact.type === "fait_temporaire")
     && (written(fact.sentence) || written(fact.excerpt)));
   if (decision.coverage.some(row => row.status === "answered" && !grounded(row.needId))) return null;
+  // PR #341 review: a need asked of the customer keeps its question (a sentence ending with « ? ») in the remaining reply.
+  if (decision.coverage.some(row => row.status === "asked") && !remaining.some(sentence => sentence.trim().endsWith("?"))) return null;
   return { ...decision, reply: renumbered, facts };
 }

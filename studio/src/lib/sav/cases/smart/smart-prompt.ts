@@ -20,7 +20,7 @@ import { SAV_SMART_RESOURCES as SMART_RESOURCE_LIST } from "./tools/resources";
 
 export const SAV_SMART_PROMPT_REVISION = "sav-smart-prompt-2026-11-22.v18";
 /** sha256 of `smartPromptFingerprintSource()`. Pinned by `smart-prompt.test.ts`; change it only with the revision. */
-export const SAV_SMART_PROMPT_SHA256 = "5ad56087b4a8af08c626d998b7fe87907bbe9d1f17a7c4765b6b1eaf7aadb90d";
+export const SAV_SMART_PROMPT_SHA256 = "f3979b8b1943a76407b79e83c7a4f8e80026cc7e062f6522a2ef4b49f24c8976";
 /** The fixed decide prompt's ceiling (ARCHITECTURE 3: « 9 000 octets au plus »). */
 export const SAV_SMART_PROMPT_MAX_BYTES = 9_000;
 
@@ -149,7 +149,7 @@ FORMAT DE SORTIE : un objet JSON
 non_conforme exige au moins un problème. Sans problème réel : conforme et problems vide.`;
 
 /** The instruction appended to the decide call for its ONE correction. */
-export const SAV_SMART_CORRECTION_INSTRUCTION = "CORRECTION : ta décision précédente (previousDecision) est refusée (voir problems). Plus d'outil : action \"final\", calls vide, une decision complète qui corrige chaque phrase en cause et garde tout le reste. unlisted_claim ou source_mismatch : retire seulement le passage nommé, sans le reformuler ; garde les étapes que les extraits portent. Besoin resté sans réponse : UNE question précise hors askedBefore. Handoff si rien d'utile ne reste. narrow à true : seulement ce que les extraits portent mot pour mot.";
+export const SAV_SMART_CORRECTION_INSTRUCTION = "CORRECTION : ta décision précédente (previousDecision) est refusée (voir problems). Plus d'outil : action \"final\", calls vide, une decision complète qui corrige chaque phrase en cause et garde tout le reste. unlisted_claim ou source_mismatch : retire seulement le passage nommé, sans le reformuler ; garde les étapes que les extraits portent. Besoin resté sans réponse : UNE question précise hors askedBefore, sans deviner. Handoff si rien d'utile ne reste. narrow à true : seulement ce que les extraits portent mot pour mot.";
 
 export const smartDecidePrompt = () => DECIDE;
 export const smartUnderstandPrompt = () => UNDERSTAND;

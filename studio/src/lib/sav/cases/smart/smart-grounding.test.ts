@@ -47,7 +47,7 @@ describe("2. correction : retirer le passage sans source, garder les étapes por
   it("la consigne de correction le dit, y compris en resserrement (narrow)", () => {
     // v18: keep everything useful; drop only the named passage; a handoff only when nothing useful is left.
     expect(SAV_SMART_CORRECTION_INSTRUCTION).toContain("garde tout le reste. unlisted_claim ou source_mismatch : retire seulement le passage nommé, sans le reformuler ; garde les étapes que les extraits portent.");
-    expect(SAV_SMART_CORRECTION_INSTRUCTION).toContain("Besoin resté sans réponse : UNE question précise hors askedBefore. Handoff si rien d'utile ne reste.");
+    expect(SAV_SMART_CORRECTION_INSTRUCTION).toContain("Besoin resté sans réponse : UNE question précise hors askedBefore, sans deviner. Handoff si rien d'utile ne reste.");
     expect(SAV_SMART_CORRECTION_INSTRUCTION).toContain("narrow à true : seulement ce que les extraits portent mot pour mot.");
     expect(smartCorrectionPrompt().endsWith(SAV_SMART_CORRECTION_INSTRUCTION)).toBe(true);
   });
