@@ -180,9 +180,11 @@ describe("contrôles serveur, relecture et une correction", () => {
       correct: { output: smartGoodDecision() }, reverify: { output: reserved } });
     expect(result.checks.first).toEqual(["excerpt_not_found"]);
     expect(result.checks.second).toEqual([]);
+    // PR #339 review: an unknown counter-read code (read as unlisted_claim by the contract) never opens the narrowing correction.
     expect(calls.map(call => call.kind)).toEqual(["understand", "decide", "verify", "correct", "reverify"]);
     expect(result.outcome).toBe("handoff");
     expect(result.reasons).toEqual(expect.arrayContaining(["refused_after_correction", "verify:unlisted_claim"]));
+    expect(result.reasons).not.toContain("correction:narrowed");
     expect(result.replyWithFooter).toBeNull();
   });
   it("témoin : « conforme » avec une liste de problèmes vide (ou absente) reste une réponse, sans correction", async () => {

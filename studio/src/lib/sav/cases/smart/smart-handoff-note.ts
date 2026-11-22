@@ -32,9 +32,27 @@ export function renderSmartTeamNote(note: SmartTeamNote): string {
 
 export type SmartFallbackReason = typeof SAV_SMART_FALLBACK_REASONS[number];
 
-/** The server's note when the model could not write one: everything the memory and the reading know, nothing invented. */
+/*
+ * Bench 22/11 (a training question whose note carried the OVH facts of the previous topic): the note describes the CURRENT need only. When this mail
+ * was read with its needs, a memory item (fact, trial, hypothesis) is kept only when it shares a significant word with a current need: its own
+ * text, or the earlier need it belonged to. Need ids restart at n1 on every mail, so the id alone proves nothing. No reading: the memory as before.
+ */
+const GENERIC = new Set(["limova", "assistant", "assistants", "charly", "comment", "faire", "veut", "voudrait", "souhaite", "client", "probleme", "marche",
+  "fonctionne", "besoin", "demande", "pour", "avec", "dans", "votre", "notre", "cette", "quoi", "plus", "aide", "aider"]);
+const topicWords = (value: string) => new Set(value.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase().split(/[^\p{L}\p{N}]+/u)
+  .filter(word => word.length > 3 && !GENERIC.has(word)));
+export function smartCurrentTopic(reading: SmartReading | null, memory: SmartCaseMemory): (needId: string, text: string) => boolean {
+  if (!reading?.needs.length) return () => true;
+  const current = new Set(reading.needs.flatMap(need => [...topicWords(`${need.ask} ${need.theme ?? ""} ${need.search ?? ""}`)]));
+  const shares = (value: string) => [...topicWords(value)].some(word => current.has(word));
+  return (needId, text) => shares(text) || shares(memory.needs.find(need => need.id === needId)?.ask ?? "");
+}
+
+/** The server's note when the model could not write one: everything the memory and the reading know about the current need, nothing invented. */
 export function smartFallbackNote(input: Readonly<{ reason: SmartTeamNote["raison"]; reading: SmartReading | null; memory: SmartCaseMemory; modelNote?: SmartTeamNote | null }>): SmartTeamNote {
-  const { memory, reading } = input;
+  const { reading } = input, topic = smartCurrentTopic(reading, input.memory);
+  const memory = { ...input.memory, facts: input.memory.facts.filter(row => topic(row.needId, row.text)), trials: input.memory.trials.filter(row => topic(row.needId, row.what)),
+    hypotheses: input.memory.hypotheses.filter(row => topic(row.needId, row.text)) };
   const needs = reading?.needs.length ? reading.needs.map(need => need.ask) : memory.needs.map(need => need.ask);
   const model = input.modelNote ?? null;
   const next = model?.prochaineVerification?.trim() || (input.reason === "pas_de_progres" || input.reason === "trop_d_echanges"

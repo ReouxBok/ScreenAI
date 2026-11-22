@@ -26,6 +26,35 @@ export const SAV_OTHER_PLATFORM_THIRD_PARTIES = Object.freeze([
   "canva", "lemlist", "waalaxy", "zoho", "odoo", "axonaut", "pennylane", "intercom", "zendesk", "crisp", "tidio", "manychat", "systeme.io", "kajabi", "podia", "agicap",
 ]);
 
+/*
+ * Bench 22/11 (Ugo's rule): naming another app, a connected tool, an integration, the customer's CRM or mail host is FINE. A fault is ONLY sending the
+ * customer to a Limova COMPETITOR (another AI assistant or SaaS that would replace Limova) or conceding that a competitor is better.
+ * `COMPETITORS`: known tools that would replace Limova (AI assistants, AI voice agents, prospecting or chatbot SaaS). Fictional names stay out.
+ * `CONNECTED`: mail hosts and tools the customer connects to Limova; they are never a redirection unless the sentence says to replace Limova.
+ */
+export const SAV_OTHER_PLATFORM_COMPETITORS = Object.freeze([
+  "yonos", "vapi", "retell", "bland", "chatgpt", "openai", "copilot", "gemini", "perplexity", "jasper", "waalaxy", "lemlist", "manychat", "tidio",
+]);
+export const SAV_OTHER_PLATFORM_CONNECTED = Object.freeze([
+  "ovh", "ionos", "gandi", "o2switch", "hostinger", "gmail", "google", "outlook", "office 365", "microsoft", "yahoo", "icloud", "orange", "free", "sfr", "laposte",
+  "hubspot", "salesforce", "pipedrive", "calendly", "notion", "whatsapp", "whatsapp business", "google sheets", "google agenda", "google calendar", "slack", "teams",
+]);
+/*
+ * The sentence frames the other tool as a REPLACEMENT of Limova: leaving Limova, « un autre outil », an alternative or a competitor, « Limova ne le fait
+ * pas », « si cela manque dans Limova ». Read on folded text.
+ */
+const SUBSTITUTION: readonly RegExp[] = [
+  /\b(?:remplac\w* limova|a la place de limova|au lieu de limova|plutot que limova|quitt\w* limova|sans limova)\b/,
+  /\b(?:un|une|d'un|d'une|l')\s?autre (?:outil|service|plateforme|logiciel|solution|application|createur|hebergeur|prestataire|fournisseur|chatbot|editeur|assistant|ia)\b/,
+  /\b(?:alternati(?:f|ve|ves|fs)|concurren\w*)\b/,
+  /\blimova (?:ne|n')\s?(?:\S+ ){0,3}?(?:pas|plus|jamais)\b/,
+  /\b(?:manque|manquent|absente?s?|indisponibles?) (?:dans|sur|chez|de|a) limova\b/,
+];
+/** A favourable comparison: conceding that the other tool is better. */
+const COMPARATIVE = /\b(?:plus (?:simple|pratique|adapte|facile|complet|performant|interessant|efficace)|meilleure?s?|vaut (?:le coup|mieux|la peine))\b/;
+export const savOtherPlatformSubstitutes = (foldedSentence: string) => SUBSTITUTION.some(pattern => pattern.test(foldedSentence));
+export const savOtherPlatformCompares = (foldedSentence: string) => COMPARATIVE.test(foldedSentence);
+
 /** Limova's own words: a sentence that names them is about Limova (« inscrivez-vous au webinaire Limova », « créez votre compte sur l'Academy »). */
 export const SAV_OTHER_PLATFORM_LIMOVA = /\b(?:limova|webinaires?|academy|charly)\b/;
 

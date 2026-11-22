@@ -1,7 +1,7 @@
 import { normalizeSavEvidenceText, savEvidenceContains } from "../../evidence-text";
 import {
-  SAV_OTHER_PLATFORM_LIMOVA, SAV_OTHER_PLATFORM_THIRD_PARTIES, savOtherPlatformClauses, savOtherPlatformCustomerTools, savOtherPlatformEndorses, savOtherPlatformOrients,
-  savOtherPlatformRedirect,
+  SAV_OTHER_PLATFORM_COMPETITORS, SAV_OTHER_PLATFORM_CONNECTED, SAV_OTHER_PLATFORM_LIMOVA, SAV_OTHER_PLATFORM_THIRD_PARTIES, savOtherPlatformClauses,
+  savOtherPlatformCompares, savOtherPlatformCustomerTools, savOtherPlatformEndorses, savOtherPlatformOrients, savOtherPlatformRedirect, savOtherPlatformSubstitutes,
 } from "../../other-platform";
 import { requestsCredential } from "../decision-validator";
 import type { SmartCheckCode, SmartDecision, SmartReading } from "./smart-contract";
@@ -16,11 +16,12 @@ import type { SmartAcademyEvidence } from "./smart-tools";
  *   facts      each card fact cites a card retrieved FOR THAT NEED (id + version) and its excerpt is in the card
  *              word for word; a customer fact's excerpt is in the customer's own text; a fact about another vendor has no source in this scope;
  *   links      every link or domain of the reply comes from the resources or from a card given for the mail;
- *   platform   a sentence inviting to sign up / switch / use another product, or praising a named third party, is refused even without a link
- *              and even when the customer named it (Ugo: « Yonos fait des agents téléphoniques, inscrivez-vous » is never acceptable);
- *              a known third-party name absent from the customer's words and from the cited cards is refused;
+ *   platform   a sentence sending the customer to a Limova COMPETITOR (recommended, praised, signed up for, compared favourably), or framing another
+ *              tool as a replacement of Limova, is refused even without a link and even when the customer named it (Ugo: « Yonos fait des agents
+ *              téléphoniques, inscrivez-vous » is never acceptable); a mail host, a connected integration or a cited card's name is no redirection
+ *              (bench 22/11); a known third-party name absent from the customer's words and from the cited cards is refused (`third_party_named`);
  *   secret     the existing V2 tripwire (`requestsCredential`) on the reply;
- *   promise    a delay, a price, a gift or a future feature that no cited card carries;
+ *   promise    a delay, a price, a gift or a future feature that no card given for the mail carries;
  *   account    a claim that an action was done on the account;
  *   commitment the reply COMMITS to a sensitive action on the account, or gives the customer the procedure to cancel their subscription or
  *              contract (N2, 20/11, and its review): « nous allons annuler / rembourser / supprimer », « je vous
@@ -63,24 +64,44 @@ const cardText = (source: SmartSource) => [source.title, source.content, ...sour
 export const SAV_SMART_THIRD_PARTIES = SAV_OTHER_PLATFORM_THIRD_PARTIES;
 const THIRD_PARTY = new RegExp(String.raw`(?<![\p{L}\p{N}])(${SAV_SMART_THIRD_PARTIES.map(name => name.replace(/[.]/g, "\\.")).join("|")})(?![\p{L}\p{N}])`, "gu");
 
-// A sentence that invites to switch or use another product, no name needed (a sign-up is judged per clause by the named tool: PORTE 1J).
-const SWITCH = /\b(?:je vous (?:recommande|conseille|suggere|propose) (?:d'utiliser|de passer (?:par|chez|sur)|de vous tourner vers|l'outil|la plateforme|le service|l'application|le logiciel|un autre|une autre|plutot)|utilisez plutot|tournez-vous vers|optez pour|passez (?:plutot )?(?:par|chez) (?:un|une) (?:autre|outil|service|prestataire|plateforme)|(?:un|une) (?:autre )?(?:outil|service|prestataire|logiciel|plateforme|solution|application) (?:externe |tierce? )?(?:comme|tel(?:le)? que|du type)|(?:outil|plateforme|solution|logiciel|service) (?:alternati(?:f|ve)|concurrente?))\b/;
+// A sentence that invites to switch to another product, no name needed (bench 22/11: « je vous recommande l'application… » / « un outil comme… » are gone,
+// they caught connected integrations; a sign-up is judged per clause by the named tool: PORTE 1J).
+const SWITCH = /\b(?:je vous (?:recommande|conseille|suggere|propose) (?:de vous tourner vers|un autre|une autre|plutot)|utilisez plutot|tournez-vous vers|passez (?:plutot )?(?:par|chez) (?:un|une) (?:autre|outil|service|prestataire|plateforme)|(?:outil|plateforme|solution|logiciel|service) (?:alternati(?:f|ve)|concurrente?))\b/;
 // SAV-122: « fait » alone is no praise (« votre site fait avec Yonos » describes the customer's tool); « Yonos fait des agents » still is.
 const PRAISE = /\b(?:(?:propose(?:nt)?|offre(?:nt)?|permet(?:tent)?|dispose(?:nt)?|gere(?:nt)?|integre(?:nt)?|fournit|fournissent)\b|(?:fait|font) (?:aussi |egalement |deja |tres bien |mieux |des |du |de l'|de la |ca |cela ))/;
+const namesIn = (names: readonly string[], folded: string) => names.filter(name => new RegExp(String.raw`(?<![\p{L}\p{N}])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\p{L}\p{N}])`, "u").test(folded));
 
 /*
- * SAV-122 (bench 21/11: autreoutil-01, autreoutil-05, plateforme-02): OUR reply sends the customer to another tool or platform. Per sentence:
- * a sign-up elsewhere (the bench's patterns, Limova's own excepted), an invitation to switch, advice to go and use another tool (no name
- * needed), or a named third party (known list, or a tool the customer wrote himself) praised, compared favourably or recommended. Naming the
- * customer's tool to connect it to Limova, or answering a customer who names one, passes. Never reads the inbound mail as a filter.
+ * OUR reply sends the customer to a Limova COMPETITOR (bench 22/11, Ugo's rule: naming another app, a connected tool, an integration, the customer's
+ * CRM or mail host is fine; the fault is only a redirection to a tool that would replace Limova, or conceding that a competitor is better). Per sentence:
+ *   - substitution framing (« à la place de Limova », « un autre outil », « Limova ne le fait pas », alternative, competitor): every named tool counts,
+ *     except a name of the cited card; a generic invitation to switch counts with or without a name;
+ *   - a favourable comparison (« plus simple », « meilleur »): every named tool counts except a mail host, a connected tool or a cited card's name;
+ *   - otherwise: only a known competitor (or a list name nobody brought into the case) recommended, praised or signed up for; a name of the cited card,
+ *     of the customer's message or a mail host / connected integration never fires (OVH and `imap.ovh.net`, Calendly with its card).
+ * Unknown competitors the customer names (a fictional « Botario » recommended without comparison) are left to the counter-read (`other_platform`).
+ * Never reads the inbound mail as a filter: the customer's text only tells which names he brought.
  */
-export function smartOtherPlatformSentences(reply: string, customerText: string): string[] {
-  const names = [...new Set([...SAV_OTHER_PLATFORM_THIRD_PARTIES, ...savOtherPlatformCustomerTools(customerText, fold)])];
-  const known = new RegExp(String.raw`(?<![\p{L}\p{N}])(${names.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})(?![\p{L}\p{N}])`, "u");
+export function smartOtherPlatformSentences(reply: string, customerText: string, citedCardText = ""): string[] {
+  const customer = fold(customerText), cards = fold(citedCardText);
+  const customerTools = savOtherPlatformCustomerTools(customerText, fold);
+  const all = [...new Set([...SAV_OTHER_PLATFORM_THIRD_PARTIES, ...SAV_OTHER_PLATFORM_COMPETITORS, ...customerTools])];
+  const fromCards = new Set(namesIn(all, cards)), connected = new Set<string>(SAV_OTHER_PLATFORM_CONNECTED), competitors = new Set<string>(SAV_OTHER_PLATFORM_COMPETITORS);
+  const fromCustomer = new Set([...customerTools, ...namesIn(all, customer)]);
+  const exempt = [...fromCards, ...connected, ...[...fromCustomer].filter(name => !competitors.has(name))];
   return sentencesOf(reply).filter(sentence => {
+    const folded = fold(sentence), substitutes = savOtherPlatformSubstitutes(folded), compares = savOtherPlatformCompares(folded);
+    const names = substitutes ? all.filter(name => !fromCards.has(name))
+      : compares ? all.filter(name => !fromCards.has(name) && !connected.has(name))
+      : all.filter(name => !fromCards.has(name) && !connected.has(name) && (competitors.has(name) || !fromCustomer.has(name)));
+    // A generic invitation to switch: refused, unless the sentence is about Limova or a tool the case legitimately names, without substitution framing.
+    const generic = SWITCH.test(folded) || savOtherPlatformRedirect(folded);
+    const anchored = SAV_OTHER_PLATFORM_LIMOVA.test(folded) || namesIn(exempt, folded).length > 0;
+    if (generic && (substitutes || !anchored)) return true;
+    if (!names.length) return false;
+    const known = new RegExp(String.raw`(?<![\p{L}\p{N}])(${names.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})(?![\p{L}\p{N}])`, "u");
     // PORTE 1J: per clause, the named third party decides; a « Limova » word elsewhere in the sentence exempts nothing.
-    const folded = fold(sentence);
-    return SWITCH.test(folded) || savOtherPlatformRedirect(folded) || savOtherPlatformOrients(folded, names) || savOtherPlatformEndorses(folded, names)
+    return savOtherPlatformOrients(folded, names) || savOtherPlatformEndorses(folded, names)
       || savOtherPlatformClauses(folded).some(clause => known.test(clause) && PRAISE.test(clause) && !SAV_OTHER_PLATFORM_LIMOVA.test(clause));
   });
 }
@@ -162,10 +183,21 @@ const INTEGRATIONS_MENU = /\b(?:dans|depuis|via) (?:le |vos |les )?(?:menu |ongl
 // « mais », « puis », « ou », « et », « ; » and parentheses (a leading « Dans les intégrations de Limova, » stays with the choice that follows it); every other part is judged
 // by the shared per-clause rule (« Dans les intégrations de Limova, si le connecteur manque, optez pour Wix… » refuses).
 const integrationParts = (folded: string) => folded.split(/[;()]|\b(?:si|mais|puis|ou|et)\b/).map(row => row.trim()).filter(Boolean);
+/*
+ * PR #339 review (send gate aligned on the 22/11 rule): « Je vous recommande d'utiliser Calendly » or « Connectez Calendly dans Intégrations » passed the
+ * agent's check but were cancelled here. The mail hosts and connected tools (`SAV_OTHER_PLATFORM_CONNECTED`) are no longer names this gate orients or
+ * endorses on, UNLESS the sentence frames the tool as a replacement of Limova (`savOtherPlatformSubstitutes`: « à la place de Limova », « un autre
+ * outil »...), where every named tool counts again. A generic redirection (`savOtherPlatformRedirect`, « à la place de Limova » included) is still
+ * refused with no name at all.
+ */
+const SEND_GATE_ALL = [...new Set([...SAV_OTHER_PLATFORM_THIRD_PARTIES, ...SAV_OTHER_PLATFORM_COMPETITORS])];
+const SEND_GATE_NAMES = SEND_GATE_ALL.filter(name => !(SAV_OTHER_PLATFORM_CONNECTED as readonly string[]).includes(name));
 export const smartOtherPlatformInvite = (reply: string) => sentencesOf(reply).some(sentence => {
   const folded = fold(sentence);
-  if (savOtherPlatformRedirect(folded) || savOtherPlatformEndorses(folded, SAV_OTHER_PLATFORM_THIRD_PARTIES)) return true;
-  return integrationParts(folded).some(part => !INTEGRATIONS_MENU.test(part) && savOtherPlatformOrients(part, SAV_OTHER_PLATFORM_THIRD_PARTIES));
+  if (savOtherPlatformRedirect(folded)) return true;
+  if (savOtherPlatformSubstitutes(folded)) return savOtherPlatformEndorses(folded, SEND_GATE_ALL) || savOtherPlatformOrients(folded, SEND_GATE_ALL);
+  if (savOtherPlatformEndorses(folded, SEND_GATE_NAMES)) return true;
+  return integrationParts(folded).some(part => !INTEGRATIONS_MENU.test(part) && savOtherPlatformOrients(part, SEND_GATE_NAMES));
 });
 
 const URL_RE = /\bhttps?:\/\/[^\s<>"')\]]+/giu;
@@ -330,15 +362,20 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
 
   // Other platforms: an invitation or a praise is refused even when the customer named it; a name is allowed only from the customer or a cited card.
   const customer = fold(input.customerText);
-  if (smartOtherPlatformSentences(reply, input.customerText).length) codes.add("other_platform_recommended");
+  const citedCardText = [...cited.values()].map(source => cardText(source)).join("\n");
+  if (smartOtherPlatformSentences(reply, input.customerText, citedCardText).length) codes.add("other_platform_recommended");
   for (const sentence of sentencesOf(reply)) {
     for (const name of [...fold(sentence).matchAll(THIRD_PARTY)].map(match => match[1]!)) if (!customer.includes(name) && !citedText.includes(name)) codes.add("third_party_named");
   }
 
   if (reply && requestsCredential(reply)) codes.add("credential_request");
+  // Bench 22/11 (Calendly reply refused with its card cited): a promise is sourced by ANY card given for this mail or a cited Academy result, not only
+  // by a card a fact cites (the statement is often written as advice or carried by another fact of the same card); spacing is ignored (« 15 € » / « 15€ »).
+  const squash = (value: string) => value.replace(/\s+/g, "");
+  const promiseSupport = squash([citedText, fold(allCardText)].join("\n"));
   for (const pattern of PROMISES) {
     const match = foldedReply.match(new RegExp(pattern.source, "g")) ?? [];
-    if (match.some(hit => !citedText.includes(hit))) { codes.add("promise_unsourced"); break; }
+    if (match.some(hit => !promiseSupport.includes(squash(hit)))) { codes.add("promise_unsourced"); break; }
   }
   if (ACCOUNT_ACTION.test(foldedReply) || (decision.outcome !== "handoff" && HANDOFF_CLAIM.test(foldedReply))) codes.add("account_action_claimed");
   if (reply && smartSensitiveCommitment(reply)) codes.add("sensitive_commitment");

@@ -79,6 +79,14 @@ export function smartModelWithFeedback(model: SmartModelPort, feedback: CaseInve
 }
 
 const cut = (value: string, max: number) => value.trim().slice(0, max);
+/** The team note of a thank-you / confirmation mail without request (PR #339 review). Fixed words, the brain's proposed courtesy text when there is one. */
+export const SMART_COURTESY_NEED = "Message de remerciement / confirmation, aucune demande.";
+export const smartCourtesyNote = (proposed: string | null): SmartTeamNote => ({
+  raison: "other", besoin: SMART_COURTESY_NEED,
+  compris: proposed ? cut(`Réponse de courtoisie proposée par l'assistant (non envoyée) : ${proposed}`, 800) : "Aucune réponse proposée par l'assistant.",
+  verifie: [], essaye: [], hypotheses: [],
+  prochaineVerification: "Rien à traiter : clore le dossier ou répondre par une formule de politesse.", ditAuClient: null,
+});
 const HANDOFF_REASON: Readonly<Record<string, Extract<CaseDecisionProposal["nextAction"], { kind: "handoff" }>["reason"]>> = {
   wants_human: "explicit_human_request", sensitive: "sensitive_request", no_source: "knowledge_missing", pas_de_progres: "repeated_failure", trop_d_echanges: "repeated_failure",
 };
@@ -120,6 +128,10 @@ export function smartProposalFromTurn(result: SmartTurnResult, request: Pick<Cas
   const noteReason = (result.teamNote?.raison && HANDOFF_REASON[result.teamNote.raison]) || "diagnosis_out_of_tools";
   if (result.outcome !== "reply" && result.outcome !== "ask") return handoff(noteReason);
   const text = decision?.reply?.trim();
+  // PR #339 review: a thank-you or a confirmation without request (the brain's courtesy reply, `understand:no_need`) still goes to the team in production (the
+  // circuit has no closing outcome, Ugo decides later between closing silently, a polite reply or the team), but its note says what it is, never « aucune
+  // fiche retrouvée ». The proposed courtesy text is given to the team, not sent.
+  if (result.reasons.includes("understand:no_need") && !result.reading?.needs.length) return handoff("diagnosis_out_of_tools", smartCourtesyNote(text ?? null));
   if (!decision || !text || !open.length || decision.coverage.some(row => row.status === "handed")) return handoff(noteReason);
   const understanding = { requests: open.map(row => ({ id: row.id, summary: cut(caseRequestSearchText(row) || "Demande du client", 600) || "Demande du client", family: row.family, status: "open" as const })), newFacts: [] };
   /*
