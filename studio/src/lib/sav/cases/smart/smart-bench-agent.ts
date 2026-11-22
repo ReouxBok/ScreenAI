@@ -50,11 +50,13 @@ export function smartBenchTurnCodes(result: SmartTurnResult): string[] {
 /** The bench outcome of a turn. Sensitive → `equipe_sensible`, never a reply; a failure is never an answer. */
 export function smartBenchTurn(result: SmartTurnResult): SavBenchAgentTurn {
   const codes = smartBenchTurnCodes(result), citations = [...new Set((result.decision?.facts ?? []).flatMap(fact => fact.cardId ? [fact.cardId] : []))];
+  // The team's note (diagnostic of the fictional self-test's failed turns, `sav_smart_bench_turn_detail`); never read by the judge or the checks.
+  const note = result.teamNoteText ? { handoffNote: result.teamNoteText } : {};
   switch (result.outcome) {
-    case "team_sensitive": return { outcome: "equipe_sensible", reply: null, citations: [], codes };
-    case "handoff": return { outcome: "passer_la_main", reply: null, citations, codes };
-    case "reply": return { outcome: "repondre", reply: result.replyWithFooter, citations, codes };
-    case "ask": return { outcome: "demander", reply: result.replyWithFooter, citations, codes };
+    case "team_sensitive": return { outcome: "equipe_sensible", reply: null, citations: [], codes, ...note };
+    case "handoff": return { outcome: "passer_la_main", reply: null, citations, codes, ...note };
+    case "reply": return { outcome: "repondre", reply: result.replyWithFooter, citations, codes, ...note };
+    case "ask": return { outcome: "demander", reply: result.replyWithFooter, citations, codes, ...note };
     default: return { outcome: "passer_la_main", reply: null, citations: [], codes, failure: `${result.outcome}:${result.reasons.find(reason => !reason.startsWith("hint:")) ?? result.reasons[0] ?? "unknown"}` };
   }
 }
