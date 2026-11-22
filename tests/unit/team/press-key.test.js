@@ -110,6 +110,8 @@ describe('press_key in the page', () => {
     press('Space', { name: 'J’accepte' });
     expect(document.getElementById('cgv').checked).toBe(true);
     const note = document.getElementById('note');
+    // An already focused field keeps its caret.
+    note.focus();
     note.setSelectionRange(2, 2);
     press('Space', { name: 'Note' });
     expect(note.value).toBe('ab cd');
@@ -129,6 +131,11 @@ describe('press_key in the page', () => {
     press('Backspace', { name: 'Note' });
     expect(note.value).toBe('');
     expect(inputs).toEqual(['deleteContentBackward', 'deleteContentForward', 'deleteContentBackward']);
+    // A field the key focuses itself gets its caret at the end, like a click there.
+    const msg = document.getElementById('msg');
+    msg.setSelectionRange(0, 0);
+    press('Backspace', { name: 'Message' });
+    expect(msg.value).toBe('Bonjou');
     for (const key of ['Backspace', 'Delete', 'Space']) {
       expect(press(key, { name: 'Mot de passe' })).toEqual({ ok: false, code: 'sensitive_field' });
     }
@@ -195,5 +202,9 @@ describe('file inputs in read_page (browser.v2+upload)', () => {
     expect(kit.fileInputFor(document.getElementById('pick')).id).toBe('photos');
     expect(kit.fileInputFor(document.querySelector('.dropzone')).id).toBe('dz');
     expect(kit.uploadTargetOf(document.body).kind).toBe('drop');
+    // A drop area next to another field's input is still a drop area.
+    document.body.insertAdjacentHTML('beforeend', '<button id="b2">Parcourir</button><input type="file" id="f2" style="display:none"><div id="zone2" role="button">Déposez ici</div>');
+    expect(kit.fileInputFor(document.getElementById('b2')).id).toBe('f2');
+    expect(kit.fileInputFor(document.getElementById('zone2'))).toBeNull();
   });
 });

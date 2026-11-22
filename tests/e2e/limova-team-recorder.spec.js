@@ -102,7 +102,7 @@ async function captureUploads(serviceWorker) {
 }
 
 test('records a small form into a limova.recording.v1 with secrets redacted', async ({ context, serviceWorker }) => {
-  test.setTimeout(60_000);
+  test.setTimeout(Math.max(60_000, test.info().timeout));
   const extensionId = new URL(serviceWorker.url()).host;
   await pair(serviceWorker);
 
@@ -187,7 +187,7 @@ test('records a small form into a limova.recording.v1 with secrets redacted', as
 });
 
 test('records in a cross-origin frame, a hidden file input and keys (TEAM-751)', async ({ context, serviceWorker }) => {
-  test.setTimeout(90_000);
+  test.setTimeout(Math.max(90_000, test.info().timeout));
   const extensionId = new URL(serviceWorker.url()).host;
   await pair(serviceWorker);
   const panel = await context.newPage();

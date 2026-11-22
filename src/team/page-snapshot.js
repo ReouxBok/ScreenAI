@@ -280,7 +280,9 @@ export function pageSnapshot(options) {
 
     // The file input an upload names: the input itself, a label's control, a single file
     // input inside the element, its aria-controls, a file input right next to it, or
-    // the only file input among its siblings. Null: the element may be a drop area.
+    // the only file input among its siblings. A neighbour only counts when it has no
+    // other opener: a drop area next to another field's input is not that field.
+    // Null: the element may be a drop area.
     function fileInputFor(el) {
       if (isFileInput(el)) return el;
       if (el instanceof HTMLLabelElement && isFileInput(el.control)) return el.control;
@@ -290,11 +292,15 @@ export function pageSnapshot(options) {
         const node = document.getElementById(id);
         if (isFileInput(node)) return node;
       }
+      const owned = input => {
+        const opener = fileOpenerOf(input);
+        return !opener || opener === el;
+      };
       for (const sibling of [el.nextElementSibling, el.previousElementSibling]) {
-        if (isFileInput(sibling)) return sibling;
+        if (isFileInput(sibling) && owned(sibling)) return sibling;
       }
       const siblings = el.parentElement ? [...el.parentElement.children].filter(isFileInput) : [];
-      return siblings.length === 1 ? siblings[0] : null;
+      return siblings.length === 1 && owned(siblings[0]) ? siblings[0] : null;
     }
 
     function uploadTargetOf(el) {

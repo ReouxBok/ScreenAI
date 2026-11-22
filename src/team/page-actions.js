@@ -476,7 +476,16 @@ export function performPageAction(options) {
     }
     if (!focusedOnly) {
       target.scrollIntoView?.({ block: 'center', inline: 'nearest' });
-      if (deepActive() !== target && typeof target.focus === 'function') target.focus({ preventScroll: true });
+      if (deepActive() !== target && typeof target.focus === 'function') {
+        target.focus({ preventScroll: true });
+        // A field focused by a script gets its caret at the start; a person who clicks
+        // into it to edit lands at the end of the text. A field already focused keeps
+        // its caret and selection (earlier keys may have set them).
+        if (textControl(target) && hasSelection(target)) {
+          const length = String(target.value || '').length;
+          target.setSelectionRange(length, length);
+        }
+      }
     }
     startWatch();
     const init = {
