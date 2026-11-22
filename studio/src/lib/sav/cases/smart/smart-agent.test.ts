@@ -180,9 +180,10 @@ describe("contrôles serveur, relecture et une correction", () => {
       correct: { output: smartGoodDecision() }, reverify: { output: reserved } });
     expect(result.checks.first).toEqual(["excerpt_not_found"]);
     expect(result.checks.second).toEqual([]);
-    expect(calls.map(call => call.kind)).toEqual(["understand", "decide", "verify", "correct", "reverify"]);
+    // Bench 22/11: a reverify refusal on grounding only (an unknown code reads as unlisted_claim) gets ONE narrowing correction within the 7 calls.
+    expect(calls.map(call => call.kind)).toEqual(["understand", "decide", "verify", "correct", "reverify", "correct", "reverify"]);
     expect(result.outcome).toBe("handoff");
-    expect(result.reasons).toEqual(expect.arrayContaining(["refused_after_correction", "verify:unlisted_claim"]));
+    expect(result.reasons).toEqual(expect.arrayContaining(["correction:narrowed", "refused_after_correction", "verify:unlisted_claim"]));
     expect(result.replyWithFooter).toBeNull();
   });
   it("témoin : « conforme » avec une liste de problèmes vide (ou absente) reste une réponse, sans correction", async () => {

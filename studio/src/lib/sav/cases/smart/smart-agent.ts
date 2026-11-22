@@ -36,6 +36,9 @@ import type { AcademyTool } from "./tools/academy";
  * Every handoff carries a structured note: the model's, or the server's fallback composed from the memory (failure, budget, no progress).
  * Calls: 3 in the common case (understand, decide, verify); 7 at most (understand, 3 decide passes, verify, correct, reverify). A failed or
  * out-of-time call stops the turn (`failed` / `interrupted`), never a reply.
+ * Bench 22/11, inside the same 7: an unreadable decide answer gets one new attempt (it takes a decide pass); a reverify that still refuses on
+ * grounding only gets one narrowing correction and counter-read when the calls already made leave room for both; a mail without need gets a
+ * courtesy reply (no search, no tool).
  */
 
 export type SmartThreadMessage = Readonly<{ from: "customer" | "support"; at: string; text: string }>;
@@ -114,6 +117,15 @@ const mergeSources = (given: readonly SmartSource[], found: readonly SmartSource
 const cardView = (card: SmartSource) => ({ cardId: card.cardId, version: card.version, title: card.title, content: card.content, steps: card.steps, needIds: card.needIds,
   ...(card.validUntil ? { validUntil: card.validUntil } : {}) });
 
+/*
+ * The problems a narrowing correction may fix (bench 22/11): grounding and coverage only. Anything else (links, secrets, promises, account actions,
+ * sensitive topics, other platforms, instructions, repetitions) is a safety or progress refusal and hands over as before.
+ */
+const GROUNDING_CODES = new Set<string>(["fact_source_invalid", "excerpt_not_found", "card_not_retrieved_for_need", "third_party_fact_unsourced", "need_not_covered",
+  "coverage_invalid", "reply_missing", "source_mismatch", "unlisted_claim", "need_forgotten"]);
+const smartGroundingOnly = (result: Readonly<{ codes: readonly string[]; verdict: SmartVerdict | null }>) =>
+  [...result.codes, ...(result.verdict?.problems ?? []).map(problem => problem.code)].every(code => GROUNDING_CODES.has(code));
+
 /** One turn. Never throws for a model failure: the result says where and why it stopped. */
 export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts): Promise<SmartTurnResult> {
   const calls: SmartCallRecord[] = [], steps: SmartStepRecord[] = [];
@@ -181,16 +193,21 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   if (reading.wantsHuman) return handoff([...hints, "understand:wants_human"], "wants_human");
   // N2 (Ugo, 20/11): a very upset or threatening customer (cancel, bad review, lawyer) goes to the team, judged by the model, never by a word list.
   if (reading.upset) return handoff([...hints, "understand:upset"], "upset");
-  if (!reading.needs.length) return handoff([...hints, "understand:no_need"], "unsure");
+  // Bench 22/11 (« C'est fait… Merci ! », « je l'ai invité. Bonne journée ! »): a mail with no need (a thank-you, a confirmation) is no longer handed
+  // over. The model writes a short courtesy reply (`noNeed: true`, no card, no tool, no fact), checked and counter-read like any reply; the progress
+  // rule does not apply (closing a case is not going round in circles). The contract has no « close without reply » outcome: a reply it is.
+  const courtesy = !reading.needs.length;
 
   // 2. Search: the existing search, through the port; expired temporary cards are never given.
-  const found = await ports.knowledge(reading.needs);
+  const found = courtesy ? { status: "ok" as const, sources: [], codes: [] } : await ports.knowledge(reading.needs);
   sources = found.sources.filter(source => !source.validUntil || source.validUntil >= ports.today);
   const reasons: string[] = [...hints, ...found.codes.map(code => `knowledge:${code}`)];
   if (found.status !== "ok") reasons.push("knowledge:unavailable");
+  if (courtesy) reasons.push("understand:no_need");
 
   // 3. The bounded decide loop.
-  const gate = smartProgressGate(memoryBefore, ports.maxExchanges ?? SAV_SMART_DEFAULT_MAX_EXCHANGES);
+  const rawGate = smartProgressGate(memoryBefore, ports.maxExchanges ?? SAV_SMART_DEFAULT_MAX_EXCHANGES);
+  const gate = courtesy ? { ...rawGate, mustHandOff: false, noProgressLastTurn: false } : rawGate;
   if (gate.mustHandOff) reasons.push(`progress:${gate.reason}`);
   const tools = createSmartToolRunner({ knowledge: ports.knowledge, academy: ports.academy ?? [], customerText, needIds: reading.needs.map(need => need.id), today: ports.today, given: sources });
   const catalogue = smartToolCatalogue(ports.academy ?? []);
@@ -203,12 +220,12 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     const toolResults = results.flatMap(round => compactOld && round.pass < pass - 1
       ? round.outcomes.map(row => ({ id: row.id, tool: row.tool, status: row.status, summary: `t${round.pass}: ${row.status}${row.code ? ` (${row.code})` : ""}` }))
       : round.outcomes.map(row => row.result));
-    const last = pass >= SAV_SMART_MAX_DECIDE_PASSES || tools.used() >= SAV_SMART_TOOL_LIMITS.maxCallsPerMail;
+    const last = courtesy || pass >= SAV_SMART_MAX_DECIDE_PASSES || tools.used() >= SAV_SMART_TOOL_LIMITS.maxCallsPerMail;
     return {
       customer: { ...customer, thread }, needs: reading!.needs, resources, memory: memoryView,
       exchange: gate.exchange, mustHandOff: gate.mustHandOff, noProgressLastTurn: gate.noProgressLastTurn,
       cards: allCards.map(cardView), needsWithoutCard: reading!.needs.filter(need => !allCards.some(card => card.needIds.includes(need.id))).map(need => need.id),
-      tools: last ? [] : catalogue, lastStep: last,
+      tools: last ? [] : catalogue, lastStep: last, ...(courtesy ? { noNeed: true } : {}),
       ...(toolResults.length ? { toolResultsNote: SAV_SMART_TOOL_RESULTS_NOTE, toolResults } : {}),
     };
   };
@@ -221,19 +238,27 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     return fits(pass);
   };
 
-  let lastPayload: ReturnType<typeof payloadOf> | null = null;
+  let lastPayload: ReturnType<typeof payloadOf> | null = null, jsonRetried = false, firstPass = 1;
   for (let pass = 1; pass <= SAV_SMART_MAX_DECIDE_PASSES && !decision; pass += 1) {
     if (!reduce(pass)) return handoff([...reasons, "decide:input_too_large"], "budget_epuise");
     lastPayload = payloadOf(pass);
     const decided = await call("decide", smartDecidePrompt(), lastPayload, 0.3);
     if (decided.status === "failed") {
       if (decided.problem === "deadline") return end("interrupted", [...reasons, "decide:deadline"]);
-      return pass === 1 ? end("failed", [...reasons, `decide:${decided.problem}`]) : handoff([...reasons, `decide:${decided.problem}`], "panne");
+      // Bench 22/11 (« ça marche pas »: `decide:output_json_invalid:unbalanced`, then a crash): ONE new attempt of an unreadable answer, taken
+      // from the decide passes (never above `SAV_SMART_MAX_MODEL_CALLS`, nor the shadow's or the bench's reservation). Not on the last pass.
+      if (decided.problem.startsWith("output_json_invalid") && !jsonRetried && pass < SAV_SMART_MAX_DECIDE_PASSES) {
+        jsonRetried = true; if (pass === firstPass) firstPass = pass + 1;
+        steps.push({ pass, kind: "decide", action: "invalid" }); reasons.push(`decide:${decided.problem}`, "decide:json_retry");
+        continue;
+      }
+      // The retry of a first pass is still a first pass: its failure stays technical (`failed`, replayed later), as before.
+      return pass === firstPass ? end("failed", [...reasons, `decide:${decided.problem}`]) : handoff([...reasons, `decide:${decided.problem}`], "panne");
     }
     const step = parseSmartOutput(smartStepSchema, decided.output);
     if (!step.ok) {
       steps.push({ pass, kind: "decide", action: "invalid" });
-      return pass === 1 ? end("failed", [...reasons, "decide:output_invalid"]) : handoff([...reasons, "decide:output_invalid"], "panne");
+      return pass === firstPass ? end("failed", [...reasons, "decide:output_invalid"]) : handoff([...reasons, "decide:output_invalid"], "panne");
     }
     steps.push({ pass, kind: "decide", action: step.value.action });
     if (step.value.action === "final") { decision = step.value.decision; break; }
@@ -259,7 +284,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   decision = bind(decision);
   if (gate.mustHandOff && decision.outcome !== "handoff") decision = forceHandoff(decision, "trop_d_echanges");
   const tentative = smartMergeMemory({ memory: memoryBefore, decision, reading, latestCustomerText, recordOwn: false });
-  if (decision.outcome !== "handoff" && smartNoProgressTwice(memoryBefore, tentative.progressed)) {
+  if (!courtesy && decision.outcome !== "handoff" && smartNoProgressTwice(memoryBefore, tentative.progressed)) {
     decision = forceHandoff(decision, "pas_de_progres");
     reasons.push("progress:no_progress");
   }
@@ -307,9 +332,30 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const parsedFix = parseSmartOutput(smartDecisionSchema, output && typeof output === "object" && "decision" in output ? output.decision : output);
   if (!parsedFix.ok) return handoff([...reasons, "correct:output_invalid", "refused_once"], "panne");
   decision = gate.mustHandOff && parsedFix.value.outcome !== "handoff" ? forceHandoff(parsedFix.value, "trop_d_echanges") : bind(parsedFix.value);
-  const second = await review(decision, "reverify");
+  let second = await review(decision, "reverify");
   checks.second = second.codes; verdicts.second = second.verdict;
   if (second.failed === "deadline") return end("interrupted", [...reasons, "reverify:deadline"]);
+  // Bench 22/11 (`refused_after_correction` with the right card: fact_source_invalid, need_forgotten, unlisted_claim): when the reverify still refuses
+  // ONLY on grounding or coverage, a card was found for a need, and the call budget leaves room for one more correction and its counter-read, the
+  // model gets ONE narrowing correction: answer only what the cards carry word for word, or ask the customer one precise question. Any safety
+  // problem (link, secret, promise, account action, sensitive topic, other platform, instruction) still hands over at once, as before.
+  const modelCalls = () => calls.length;
+  if (!second.failed && refused(second) && smartGroundingOnly(second) && sources.some(card => card.needIds.length > 0)
+    && modelCalls() + 2 <= SAV_SMART_MAX_MODEL_CALLS && !gate.mustHandOff) {
+    const namedSecond = (code: SmartCheckCode) => [...new Set(second.factProblems.filter(row => row.code === code && row.sentence.trim()).map(row => row.sentence))].slice(0, 10);
+    const narrowProblems = [...second.codes.flatMap(code => namedSecond(code).length ? namedSecond(code).map(sentence => ({ code, sentence })) : [{ code, sentence: "" }]),
+      ...(second.verdict?.problems ?? [])];
+    reasons.push("correction:narrowed");
+    const narrowed = await call("correct", smartCorrectionPrompt(), { ...lastPayload, tools: [], lastStep: true, previousDecision: decision, problems: narrowProblems, narrow: true }, 0.3);
+    if (narrowed.status === "failed") return narrowed.problem === "deadline" ? end("interrupted", [...reasons, "correct:deadline"]) : handoff([...reasons, `correct:${narrowed.problem}`, "refused_after_correction"], "panne");
+    const narrowOutput = smartUnwrapOutput(narrowed.output) as { decision?: unknown } | null;
+    const parsedNarrow = parseSmartOutput(smartDecisionSchema, narrowOutput && typeof narrowOutput === "object" && "decision" in narrowOutput ? narrowOutput.decision : narrowOutput);
+    if (!parsedNarrow.ok) return handoff([...reasons, "correct:output_invalid", "refused_after_correction"], "panne");
+    decision = bind(parsedNarrow.value);
+    second = await review(decision, "reverify");
+    checks.second = second.codes; verdicts.second = second.verdict;
+    if (second.failed === "deadline") return end("interrupted", [...reasons, "reverify:deadline"]);
+  }
   if (second.failed || refused(second)) {
     return handoff([...reasons, "refused_after_correction", ...(second.failed ? [second.failed] : []), ...second.codes.map(code => `check:${code}`),
       ...(second.verdict?.problems ?? []).map(problem => `verify:${problem.code}`)], "unsure");

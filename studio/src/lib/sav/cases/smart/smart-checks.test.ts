@@ -18,13 +18,16 @@ describe("contrôles serveur sans modèle (lot D3)", () => {
     expect(check(`${SMART_GOOD_REPLY} Guide : https://aide.limova.ai/autre`)).toContain("link_not_allowed");
     expect(check(`${SMART_GOOD_REPLY} Rendez-vous sur wix.com.`)).toContain("link_not_allowed");
   });
-  it("autre plateforme : invitation, recommandation ou éloge refusés même nommée par le client ; un outil du client cité pour le relier à Limova passe", () => {
-    const customer = "Je veux relier Limova à mon site Wix.";
-    expect(check(`${SMART_GOOD_REPLY} Je vous recommande d'utiliser Wix pour cela.`, { customer })).toContain("other_platform_recommended");
-    expect(check(`${SMART_GOOD_REPLY} Wix propose déjà un assistant vocal.`, { customer })).toContain("other_platform_recommended");
+  it("autre plateforme : un CONCURRENT recommandé, vanté ou proposé à l'inscription est refusé même nommé par le client ; un outil du client cité pour le relier à Limova passe", () => {
+    const customer = "Je veux relier Limova à mon site Wix. Un ami me parle de ChatGPT.";
+    expect(check(`${SMART_GOOD_REPLY} Je vous recommande d'utiliser ChatGPT pour cela.`, { customer })).toContain("other_platform_recommended");
+    expect(check(`${SMART_GOOD_REPLY} ChatGPT propose déjà un assistant vocal.`, { customer })).toContain("other_platform_recommended");
     // PORTE 1J (orchestrator): a clause WITHOUT a named third party is never refused for a sign-up (« chez eux » names no tool): left to the counter-read.
     expect(check(`${SMART_GOOD_REPLY} Créez un compte chez eux.`, { customer })).not.toContain("other_platform_recommended");
-    expect(check(`${SMART_GOOD_REPLY} Créez un compte chez Wix.`, { customer })).toContain("other_platform_recommended");
+    expect(check(`${SMART_GOOD_REPLY} Créez un compte chez ChatGPT.`, { customer })).toContain("other_platform_recommended");
+    // Bench 22/11 (Ugo): the customer's own site builder is no competitor; replacing Limova with it still is.
+    expect(check(`${SMART_GOOD_REPLY} Dans votre éditeur Wix, utilisez le bloc « Code HTML ».`, { customer })).not.toContain("other_platform_recommended");
+    expect(check(`${SMART_GOOD_REPLY} Utilisez Wix à la place de Limova.`, { customer })).toContain("other_platform_recommended");
     expect(check(`${SMART_GOOD_REPLY} Utilisez plutôt un outil comme celui-ci.`)).toContain("other_platform_recommended");
     expect(check(`${SMART_GOOD_REPLY} Pour votre site Wix, je transmets la question à l'équipe.`, { customer })).toEqual([]);
     expect(check(`${SMART_GOOD_REPLY} Inscrivez-vous au prochain webinaire Limova.`)).toEqual([]);
