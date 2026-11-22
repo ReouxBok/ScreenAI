@@ -12,10 +12,16 @@
 // decided by the server from the autonomy level. Sensitive fields, blocked sites,
 // pause and take-over are still enforced elsewhere, at every level.
 //
+// TEAM-751: `browser.press_key` is a write, except Enter and Space on an element, which
+// are judged like what they do (Enter in a form field like `browser.submit` on that
+// form, Enter or Space on a button or link like `browser.click` on it). `browser.upload`
+// is a write (an account settings page stays `account`); `upload` is the server's
+// reason for a file from the Mac, which this extension never sends.
+//
 // Everything here is pure and runs in the service worker; the page only reports facts
 // about the element (name, form, type), never a decision.
 
-export const RISK_REASONS = Object.freeze(['send', 'pay', 'publish', 'delete', 'account', 'external_form']);
+export const RISK_REASONS = Object.freeze(['send', 'pay', 'publish', 'delete', 'account', 'external_form', 'upload']);
 // The only reason the extension itself still asks the person (TEAM-726).
 export const OWNER_APPROVAL_REASONS = Object.freeze(['pay']);
 export const HINT_REASONS = Object.freeze(['send', 'pay', 'publish', 'delete', 'account']);
@@ -26,15 +32,22 @@ export const READ_TOOLS = Object.freeze([
 ]);
 export const ACTION_TOOLS = Object.freeze([
   'browser.click', 'browser.fill', 'browser.select', 'browser.submit', 'browser.download',
-  'browser.batch'
+  'browser.batch', 'browser.press_key', 'browser.upload'
 ]);
+// `browser.press_key` (TEAM-751): these keys only. Typing text is `browser.fill`.
+export const PRESS_KEYS = Object.freeze([
+  'Enter', 'Tab', 'Escape', 'Space', 'Backspace', 'Delete', 'ArrowUp', 'ArrowDown',
+  'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'
+]);
+// Keys that activate the element they are pressed on: the server must know which.
+export const ACTIVATING_KEYS = Object.freeze(['Enter', 'Space']);
 export const ACCESS_TOOLS = Object.freeze(['browser.request_tab']);
 // TEAM-729: types a saved login, sealed by the server for this device (docs/login-vault.md).
 export const VAULT_TOOLS = Object.freeze(['browser.fill_secret']);
 export const BROWSER_TOOLS = Object.freeze([...READ_TOOLS, ...ACTION_TOOLS, ...ACCESS_TOOLS, ...VAULT_TOOLS]);
 
 // Higher wins when two readings disagree.
-const REASON_SEVERITY = { account: 6, pay: 6, delete: 5, send: 4, publish: 4, external_form: 3 };
+const REASON_SEVERITY = { account: 6, pay: 6, delete: 5, send: 4, publish: 4, upload: 3, external_form: 3 };
 
 export function toolKind(tool) {
   if (READ_TOOLS.includes(tool)) return 'read';
@@ -121,6 +134,10 @@ export function classifyAction(tool, element = {}) {
   if (tool === 'browser.download') {
     return { risk: 'write', reason: null };
   }
+  if (tool === 'browser.upload') {
+    // A chat attachment is a write; on an account settings page it stays `account`.
+    return ACCOUNT_PATH.test(page.path || '') ? { risk: 'risky', reason: 'account' } : { risk: 'write', reason: null };
+  }
   const nameReason = reasonFromName(element.name);
   if (tool === 'browser.submit') {
     const form = element.form || {};
@@ -139,6 +156,30 @@ export function classifyAction(tool, element = {}) {
     element.role === 'button' || submitsForm ? pathReason : null
   );
   return reason ? { risk: 'risky', reason } : { risk: 'write', reason: null };
+}
+
+const KEY_CLICK_ROLES = ['button', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'tab', 'switch', 'checkbox', 'radio'];
+
+/**
+ * The extension's reading of `browser.press_key` (and of a batch's `key` step).
+ * @param {string} key one of PRESS_KEYS
+ * @param {object|null} element the live element the key is pressed on, or null
+ * @returns {{risk: 'write'|'risky', reason: string|null}}
+ */
+export function classifyKey(key, element) {
+  if (!element || !ACTIVATING_KEYS.includes(key)) return { risk: 'write', reason: null };
+  const clicks = KEY_CLICK_ROLES.includes(element.role) || ['button', 'a', 'summary'].includes(element.tag) || element.submits;
+  if (key === 'Enter' && element.editable && !element.multiline && (element.in_form || element.form)) {
+    // Enter in a form field submits its form.
+    return classifyAction('browser.submit', element);
+  }
+  if (key === 'Enter' && element.editable && element.multiline) {
+    // A message composer sends on Enter: read its name (« Envoyer un message »).
+    const reason = reasonFromName(element.name);
+    return reason ? { risk: 'risky', reason } : { risk: 'write', reason: null };
+  }
+  if (clicks) return classifyAction('browser.click', element);
+  return { risk: 'write', reason: null };
 }
 
 /**
@@ -200,8 +241,17 @@ const VERBS = {
   'browser.select': 'choisir une option dans',
   'browser.submit': 'envoyer le formulaire',
   'browser.download': 'télécharger',
-  'browser.batch': 'agir sur'
+  'browser.batch': 'agir sur',
+  'browser.press_key': 'appuyer sur une touche dans',
+  'browser.upload': 'déposer des fichiers dans'
 };
+
+// The French name of a key, for the activity list and the approval window.
+export const KEY_LABELS = Object.freeze({
+  Enter: 'Entrée', Tab: 'Tab', Escape: 'Échap', Space: 'Espace', Backspace: 'Retour arrière', Delete: 'Suppr',
+  ArrowUp: 'Flèche haut', ArrowDown: 'Flèche bas', ArrowLeft: 'Flèche gauche', ArrowRight: 'Flèche droite',
+  Home: 'Début', End: 'Fin', PageUp: 'Page précédente', PageDown: 'Page suivante'
+});
 
 // The approval window only opens for a payment now (TEAM-726).
 export const PAY_REASON_TEXT = 'Cette action peut déclencher un paiement. Limova attend votre accord avant de payer.';
@@ -234,6 +284,15 @@ export function activityLabel(tool, args = {}, targetName = '') {
     case 'browser.submit': return `Envoi de ${quoted(name, 40)}`;
     case 'browser.download': return `Téléchargement de ${quoted(name, 40)}`;
     case 'browser.batch': return `Remplissage de la page (${Number(args.steps?.length) || 0} étapes)`;
+    case 'browser.press_key': {
+      const key = `${args.shift === true ? 'Maj+' : ''}${KEY_LABELS[args.key] || 'Touche'}`;
+      return name ? `Touche ${key} dans ${quoted(name, 40)}` : `Touche ${key}`;
+    }
+    // A count, never the files' names.
+    case 'browser.upload': {
+      const count = Array.isArray(args.files) ? args.files.length : 0;
+      return `Envoi de ${count} fichier${count > 1 ? 's' : ''}${name ? ` dans ${quoted(name, 40)}` : ''}`;
+    }
     case 'browser.request_tab': return 'Demande d’accès à un onglet';
     // Never the login's label or username: only that a saved login was used.
     case 'browser.fill_secret': return 'Connexion avec un identifiant enregistré';

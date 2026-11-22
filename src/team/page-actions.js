@@ -10,17 +10,43 @@
 // the page did not navigate, that the element is still there, visible and enabled, and
 // that its name is still the one the service worker approved. It then starts a
 // MutationObserver so `collectPageVerification` can say whether the page changed.
+//
+// TEAM-751 adds two actions:
+// - `key` (`browser.press_key`). A key event a script creates (`isTrusted: false`) has
+//   no default action: a synthetic Tab moves no focus, a synthetic Backspace deletes
+//   nothing. So the page gets keydown, keypress (Enter, Space) and keyup, as a person's
+//   key would, and when it did not cancel them the action performs what the browser
+//   would have done (move the focus, submit, click, edit the text, pick the next option,
+//   scroll, close a dialog). Without an element the key goes to the focused element.
+// - `upload` (`browser.upload`). The files come as base64 and become `File`s in a
+//   `DataTransfer`, assigned to the file input (`input` and `change` follow), or dropped
+//   on a drop area (`dragenter`, `dragover`, `drop`). Nothing of them is kept here.
 
 export function performPageAction(options) {
   const kit = globalThis.__limovaBrowserKit;
+  const action = options?.action;
+  // A key without an element goes to whatever has the focus in this frame.
+  const focusedOnly = action === 'key' && !options?.elementId;
   const map = globalThis.__limovaBrowserMaps?.[String(options?.productKey || '')];
-  if (!kit || !map || map.snapshotId !== options?.snapshotId || map.path !== kit.pagePath()) {
+  if (!kit) return { ok: false, code: 'stale_snapshot' };
+  if (!focusedOnly && (!map || map.snapshotId !== options?.snapshotId || map.path !== kit.pagePath())) {
     return { ok: false, code: 'stale_snapshot' };
   }
-  const el = map.elements.get(String(options?.elementId || ''));
-  if (!el || !el.isConnected || !kit.isRendered(el) || kit.isDisabled(el)) return { ok: false, code: 'element_not_found' };
-  if (kit.normalize(kit.nameOf(el)) !== kit.normalize(options?.expectName)) return { ok: false, code: 'stale_snapshot' };
-  const action = options?.action;
+  function deepActive() {
+    let node = document.activeElement;
+    while (node && node.shadowRoot && node.shadowRoot.activeElement) node = node.shadowRoot.activeElement;
+    return node;
+  }
+  let el;
+  if (focusedOnly) {
+    el = deepActive() || document.body || document.documentElement;
+  } else {
+    el = map.elements.get(String(options?.elementId || ''));
+    // A hidden file input is reachable through its label or button (TEAM-751).
+    const shown = el && (action === 'upload' && kit.isFileInput(el) ? kit.fileReachable(el) : kit.isRendered(el));
+    if (!el || !el.isConnected || !shown || kit.isDisabled(el)) return { ok: false, code: 'element_not_found' };
+    if (kit.normalize(kit.nameOf(el)) !== kit.normalize(options?.expectName)) return { ok: false, code: 'stale_snapshot' };
+  }
 
   function startWatch() {
     const previous = globalThis.__limovaBrowserWatch;
@@ -74,7 +100,461 @@ export function performPageAction(options) {
     target.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
+  // ------------------------------------------------------------------ keys (TEAM-751)
+
+  const KEYS = {
+    Enter: { key: 'Enter', code: 'Enter', keyCode: 13 },
+    Tab: { key: 'Tab', code: 'Tab', keyCode: 9 },
+    Escape: { key: 'Escape', code: 'Escape', keyCode: 27 },
+    // The DOM calls the space bar ' ' (KeyboardEvent.key) and 'Space' (code).
+    Space: { key: ' ', code: 'Space', keyCode: 32 },
+    Backspace: { key: 'Backspace', code: 'Backspace', keyCode: 8 },
+    Delete: { key: 'Delete', code: 'Delete', keyCode: 46 },
+    ArrowUp: { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38 },
+    ArrowDown: { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 },
+    ArrowLeft: { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 },
+    ArrowRight: { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
+    Home: { key: 'Home', code: 'Home', keyCode: 36 },
+    End: { key: 'End', code: 'End', keyCode: 35 },
+    PageUp: { key: 'PageUp', code: 'PageUp', keyCode: 33 },
+    PageDown: { key: 'PageDown', code: 'PageDown', keyCode: 34 }
+  };
+  const NO_SELECTION_TYPES = ['email', 'number', 'date', 'datetime-local', 'month', 'week', 'time', 'color', 'range'];
+
+  function textControl(node) {
+    return node instanceof HTMLTextAreaElement || (node instanceof HTMLInputElement && kit.isEditable(node));
+  }
+
+  function editableRootOf(node) {
+    if (!node?.isContentEditable) return null;
+    let root = node;
+    while (root.parentElement && root.parentElement.isContentEditable) root = root.parentElement;
+    return root;
+  }
+
+  function hasSelection(node) {
+    if (node instanceof HTMLInputElement && NO_SELECTION_TYPES.includes(kit.inputType(node))) return false;
+    try { return typeof node.selectionStart === 'number'; } catch (_) { return false; }
+  }
+
+  function setNativeValue(node, value) {
+    const proto = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(node, value); else node.value = value;
+  }
+
+  function inputEvent(node, type, inputType, data) {
+    const Ctor = typeof InputEvent === 'function' ? InputEvent : Event;
+    return node.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: type === 'beforeinput', composed: true, inputType, data }));
+  }
+
+  // Replace [start, end) of a text field with `text`, the way typing does: beforeinput
+  // (the page may refuse), the change, then input.
+  function editText(node, text, start, end, inputType) {
+    if (node.readOnly) return false;
+    if (!inputEvent(node, 'beforeinput', inputType, text || null)) return false;
+    if (hasSelection(node)) {
+      if (text && node.maxLength > 0 && node.value.length - (end - start) + text.length > node.maxLength) return false;
+      node.setRangeText(text, start, end, 'end');
+    } else {
+      // email, number…: no caret to read, so edit at the end.
+      const value = String(node.value || '');
+      const next = text ? value + text : value.slice(0, Math.max(0, value.length - (end - start)));
+      if (text && node.maxLength > 0 && next.length > node.maxLength) return false;
+      setNativeValue(node, next);
+    }
+    inputEvent(node, 'input', inputType, text || null);
+    return true;
+  }
+
+  function caretRange(node) {
+    if (!hasSelection(node)) {
+      const length = String(node.value || '').length;
+      return { start: length, end: length };
+    }
+    return { start: node.selectionStart, end: node.selectionEnd };
+  }
+
+  function moveCaret(node, to, extend) {
+    if (!hasSelection(node)) return;
+    const length = node.value.length;
+    const position = Math.max(0, Math.min(length, to));
+    if (!extend) {
+      node.setSelectionRange(position, position);
+      return;
+    }
+    const anchor = node.selectionDirection === 'backward' ? node.selectionEnd : node.selectionStart;
+    if (position < anchor) node.setSelectionRange(position, anchor, 'backward');
+    else node.setSelectionRange(anchor, position, 'forward');
+  }
+
+  function focusPoint(node) {
+    if (!hasSelection(node)) return 0;
+    return node.selectionDirection === 'backward' ? node.selectionStart : node.selectionEnd;
+  }
+
+  function modifySelection(extend, direction, granularity) {
+    const selection = document.getSelection?.();
+    if (selection && typeof selection.modify === 'function') selection.modify(extend ? 'extend' : 'move', direction, granularity);
+  }
+
+  function scrollerOf(node) {
+    for (let current = node instanceof Element ? node : null; current && current !== document.body && current !== document.documentElement; current = current.parentElement) {
+      const style = getComputedStyle(current);
+      const scrollsY = /(auto|scroll|overlay)/.test(style.overflowY || '') && current.scrollHeight > current.clientHeight + 1;
+      const scrollsX = /(auto|scroll|overlay)/.test(style.overflowX || '') && current.scrollWidth > current.clientWidth + 1;
+      if (scrollsY || scrollsX) return current;
+    }
+    return null;
+  }
+
+  function scrollBy(node, dx, dy) {
+    const box = scrollerOf(node);
+    if (box) box.scrollBy({ left: dx, top: dy, behavior: 'instant' });
+    else window.scrollBy({ left: dx, top: dy, behavior: 'instant' });
+  }
+
+  function scrollEdge(node, toEnd) {
+    const box = scrollerOf(node);
+    if (box) box.scrollTo({ top: toEnd ? box.scrollHeight : 0, behavior: 'instant' });
+    else window.scrollTo({ top: toEnd ? (document.scrollingElement || document.documentElement).scrollHeight : 0, behavior: 'instant' });
+  }
+
+  function viewportOf(node) {
+    const box = scrollerOf(node);
+    return box ? box.clientHeight : innerHeight;
+  }
+
+  function radioGroup(node) {
+    if (!(node instanceof HTMLInputElement) || kit.inputType(node) !== 'radio' || !node.name) return null;
+    const scope = node.form || node.getRootNode?.() || document;
+    return [...scope.querySelectorAll('input[type="radio"]')]
+      .filter(radio => radio.name === node.name && (radio.form || null) === (node.form || null) && !kit.isDisabled(radio) && kit.isRendered(radio));
+  }
+
+  function stepRadio(node, forward) {
+    const group = radioGroup(node);
+    if (!group || group.length < 2) return false;
+    const index = group.indexOf(node);
+    const next = group[(index + (forward ? 1 : group.length - 1)) % group.length];
+    next.focus({ preventScroll: true });
+    // A click checks it and fires input and change, as the arrow key would.
+    next.click();
+    return true;
+  }
+
+  function stepSelect(node, how) {
+    if (!(node instanceof HTMLSelectElement) || node.multiple) return false;
+    const options = [...node.options];
+    const enabled = options.map((option, index) => ({ option, index })).filter(item => !item.option.disabled);
+    if (!enabled.length) return false;
+    let target;
+    if (how === 'first') target = enabled[0];
+    else if (how === 'last') target = enabled.at(-1);
+    else if (how === 'next') target = enabled.find(item => item.index > node.selectedIndex);
+    else target = [...enabled].reverse().find(item => item.index < node.selectedIndex);
+    if (!target || target.index === node.selectedIndex) return false;
+    node.selectedIndex = target.index;
+    node.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    node.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }
+
+  // Tab order: shown, enabled, tabindex >= 0; positive tabindex first (ascending), then
+  // document order; one radio per group; inside an open modal dialog when there is one.
+  // Frames are skipped: Limova acts in each frame by its own ids.
+  function tabbables(current) {
+    let scope = document;
+    try {
+      const modal = [...document.querySelectorAll('dialog[open]')].filter(node => node.matches(':modal')).at(-1);
+      if (modal) scope = modal;
+    } catch (_) { /* no :modal support */ }
+    const nodes = scope.querySelectorAll('a[href], area[href], button, input, select, textarea, summary, [tabindex], [contenteditable]:not([contenteditable="false"])');
+    const list = [];
+    const radios = new Map();
+    for (const node of nodes) {
+      if (node instanceof HTMLInputElement && kit.inputType(node) === 'hidden') continue;
+      if (node.isContentEditable && node.parentElement?.isContentEditable) continue;
+      if (node.tabIndex < 0 || node.disabled || node.closest?.('[inert]')) continue;
+      if (!kit.isRendered(node)) continue;
+      if (node instanceof HTMLInputElement && kit.inputType(node) === 'radio' && node.name) {
+        const key = `${node.form ? 'form' : 'doc'}:${node.name}`;
+        const chosen = radios.get(key);
+        if (!chosen) {
+          radios.set(key, node);
+          list.push(node);
+        } else if ((node.checked || node === current) && !chosen.checked && chosen !== current) {
+          list[list.indexOf(chosen)] = node;
+          radios.set(key, node);
+        }
+        continue;
+      }
+      list.push(node);
+    }
+    const positive = list.filter(node => node.tabIndex > 0).sort((a, b) => a.tabIndex - b.tabIndex);
+    return [...positive, ...list.filter(node => node.tabIndex === 0)];
+  }
+
+  function moveFocus(current, backwards) {
+    const order = tabbables(current);
+    if (!order.length) return null;
+    let index = order.indexOf(current);
+    if (index < 0) {
+      // Not tabbable itself (the body, a div): continue from where it sits in the page.
+      const after = order.findIndex(node => current && current !== document.body
+        && (current.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING));
+      index = backwards ? (after < 0 ? order.length : after) : (after < 0 ? -1 : after - 1);
+    }
+    const next = order[(index + (backwards ? -1 : 1) + order.length) % order.length];
+    next.focus();
+    if (next instanceof HTMLInputElement && hasSelection(next)) next.select();
+    return next;
+  }
+
+  function defaultButton(form) {
+    for (const control of form.elements) {
+      if (kit.submitsForm(control)) return control;
+    }
+    return null;
+  }
+
+  // What a browser does with Enter in a form field: click the default button, or
+  // submit when the form has none and only one field that blocks implicit submission.
+  function implicitSubmit(field) {
+    const form = field.form;
+    if (!form) return false;
+    const button = defaultButton(form);
+    if (button) {
+      if (!kit.isDisabled(button)) button.click();
+      return true;
+    }
+    const blocking = [...form.elements].filter(control => control instanceof HTMLInputElement
+      && ['text', 'search', 'url', 'tel', 'email', 'password', 'date', 'month', 'week', 'time', 'datetime-local', 'number'].includes(kit.inputType(control)));
+    if (blocking.length > 1) return false;
+    if (typeof form.requestSubmit === 'function') form.requestSubmit(); else form.submit();
+    return true;
+  }
+
+  function enterActivates(node) {
+    if (node instanceof HTMLButtonElement || node instanceof HTMLAnchorElement || node instanceof HTMLElement && node.tagName === 'SUMMARY') return true;
+    if (node instanceof HTMLInputElement && ['submit', 'button', 'reset', 'image'].includes(kit.inputType(node))) return true;
+    return ['button', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option'].includes((node.getAttribute?.('role') || '').trim());
+  }
+
+  function spaceActivates(node) {
+    if (node instanceof HTMLButtonElement || node instanceof HTMLElement && node.tagName === 'SUMMARY') return true;
+    if (node instanceof HTMLInputElement && ['submit', 'button', 'reset', 'image', 'checkbox', 'radio'].includes(kit.inputType(node))) return true;
+    return ['button', 'checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio'].includes((node.getAttribute?.('role') || '').trim());
+  }
+
+  function closeDialog(node) {
+    let dialog = null;
+    try {
+      dialog = [...document.querySelectorAll('dialog[open]')].filter(item => item.matches(':modal')).at(-1) || null;
+    } catch (_) { dialog = null; }
+    dialog = dialog || node?.closest?.('dialog[open]') || null;
+    if (dialog) {
+      if (dialog.dispatchEvent(new Event('cancel', { cancelable: true }))) dialog.close();
+      return true;
+    }
+    try {
+      const popover = [...document.querySelectorAll('[popover]')].filter(item => item.matches(':popover-open')
+        && (item.getAttribute('popover') || 'auto') !== 'manual').at(-1);
+      if (popover) {
+        popover.hidePopover();
+        return true;
+      }
+    } catch (_) { /* no popover support */ }
+    return false;
+  }
+
+  function focusedFacts() {
+    const node = deepActive();
+    if (!node || node === document.body || node === document.documentElement) return null;
+    return { role: kit.roleOf(node), name: kit.clean(kit.nameOf(node), 120) };
+  }
+
+  // The browser's own action for the key, run only when the page did not cancel it.
+  function keyDefault(node, key, shift) {
+    const field = textControl(node) ? node : null;
+    const rich = field ? null : editableRootOf(node);
+    switch (key) {
+      case 'Tab':
+        moveFocus(node, shift);
+        return;
+      case 'Enter':
+        if (node instanceof HTMLTextAreaElement) {
+          const { start, end } = caretRange(node);
+          editText(node, '\n', start, end, 'insertLineBreak');
+        } else if (rich) {
+          if (!document.execCommand?.('insertParagraph')) document.execCommand?.('insertLineBreak');
+        } else if (field) {
+          implicitSubmit(field);
+        } else if (enterActivates(node)) {
+          node.click();
+        }
+        return;
+      case 'Space':
+        if (field) {
+          const { start, end } = caretRange(field);
+          editText(field, ' ', start, end, 'insertText');
+        } else if (rich) {
+          document.execCommand?.('insertText', false, ' ');
+        }
+        // A button or a checkbox is clicked after keyup (below), as a browser does.
+        return;
+      case 'Backspace':
+      case 'Delete': {
+        const backward = key === 'Backspace';
+        if (field) {
+          const { start, end } = caretRange(field);
+          const value = String(field.value || '');
+          if (start !== end) {
+            editText(field, '', start, end, backward ? 'deleteContentBackward' : 'deleteContentForward');
+          } else if (backward && start > 0) {
+            const width = start > 1 && /[\uDC00-\uDFFF]/.test(value[start - 1]) && /[\uD800-\uDBFF]/.test(value[start - 2]) ? 2 : 1;
+            editText(field, '', start - width, start, 'deleteContentBackward');
+          } else if (!backward && end < value.length && hasSelection(field)) {
+            const width = /[\uD800-\uDBFF]/.test(value[end]) && /[\uDC00-\uDFFF]/.test(value[end + 1] || '') ? 2 : 1;
+            editText(field, '', end, end + width, 'deleteContentForward');
+          }
+        } else if (rich) {
+          document.execCommand?.(backward ? 'delete' : 'forwardDelete');
+        }
+        return;
+      }
+      case 'ArrowUp':
+      case 'ArrowDown': {
+        const down = key === 'ArrowDown';
+        if (node instanceof HTMLSelectElement) stepSelect(node, down ? 'next' : 'previous');
+        else if (radioGroup(node)) stepRadio(node, down);
+        else if (field) moveCaret(field, down ? field.value.length : 0, shift);
+        else if (rich) modifySelection(shift, down ? 'forward' : 'backward', 'line');
+        else scrollBy(node, 0, down ? 40 : -40);
+        return;
+      }
+      case 'ArrowLeft':
+      case 'ArrowRight': {
+        const right = key === 'ArrowRight';
+        if (node instanceof HTMLSelectElement) return;
+        if (radioGroup(node)) stepRadio(node, right);
+        else if (field) {
+          const { start, end } = caretRange(field);
+          if (!shift && start !== end) moveCaret(field, right ? end : start, false);
+          else moveCaret(field, focusPoint(field) + (right ? 1 : -1), shift);
+        } else if (rich) modifySelection(shift, right ? 'forward' : 'backward', 'character');
+        else scrollBy(node, right ? 40 : -40, 0);
+        return;
+      }
+      case 'Home':
+      case 'End':
+      case 'PageUp':
+      case 'PageDown': {
+        const toEnd = key === 'End' || key === 'PageDown';
+        if (node instanceof HTMLSelectElement) {
+          if (key === 'Home' || key === 'End') stepSelect(node, toEnd ? 'last' : 'first');
+        } else if (field) moveCaret(field, toEnd ? field.value.length : 0, shift);
+        else if (rich) modifySelection(shift, toEnd ? 'forward' : 'backward', key.startsWith('Page') ? 'documentboundary' : 'lineboundary');
+        else if (key === 'Home' || key === 'End') scrollEdge(node, toEnd);
+        else scrollBy(node, 0, (toEnd ? 1 : -1) * viewportOf(node));
+        return;
+      }
+      case 'Escape':
+        closeDialog(node);
+        return;
+      default:
+    }
+  }
+
+  function pressKey(target) {
+    const spec = KEYS[options?.key];
+    if (!spec) return { ok: false, code: 'invalid_args', message: 'Touche inconnue.' };
+    const shift = options?.shift === true;
+    // Deleting or typing a space edits the field: never in a password, card or code field.
+    if (['Backspace', 'Delete', 'Space'].includes(options.key) && kit.isSensitive(target)) {
+      return { ok: false, code: 'sensitive_field' };
+    }
+    if (!focusedOnly) {
+      target.scrollIntoView?.({ block: 'center', inline: 'nearest' });
+      if (deepActive() !== target && typeof target.focus === 'function') target.focus({ preventScroll: true });
+    }
+    startWatch();
+    const init = {
+      key: spec.key, code: spec.code, keyCode: spec.keyCode, which: spec.keyCode,
+      shiftKey: shift, bubbles: true, cancelable: true, composed: true
+    };
+    let cancelled = !target.dispatchEvent(new KeyboardEvent('keydown', init));
+    if (options.key === 'Enter' || options.key === 'Space') {
+      if (!target.dispatchEvent(new KeyboardEvent('keypress', { ...init, charCode: spec.keyCode }))) cancelled = true;
+    }
+    if (!cancelled && target.isConnected) keyDefault(target, options.key, shift);
+    // keyup goes where the focus is now (after a Tab, the next field), as with a real key.
+    const upTarget = deepActive() && deepActive() !== document.body ? deepActive() : target;
+    const upCancelled = !upTarget.dispatchEvent(new KeyboardEvent('keyup', init));
+    if (options.key === 'Space' && !cancelled && !upCancelled && target.isConnected && spaceActivates(target)
+      && !textControl(target) && !editableRootOf(target)) {
+      target.click();
+    }
+    const fieldNode = textControl(target) || editableRootOf(target) ? target : null;
+    return {
+      ok: true,
+      cancelled,
+      focused: focusedFacts(),
+      field_state: fieldNode && fieldNode.isConnected ? kit.fieldState(fieldNode) : null
+    };
+  }
+
+  // ------------------------------------------------------------------ files (TEAM-751)
+
+  function uploadFiles(target) {
+    const list = Array.isArray(options?.files) ? options.files : [];
+    if (!list.length || list.length > 10) return { ok: false, code: 'invalid_args', message: 'Entre 1 et 10 fichiers.' };
+    const input = kit.fileInputFor(target);
+    if (input && (kit.isDisabled(input) || !input.isConnected)) return { ok: false, code: 'element_not_found' };
+    if (input && list.length > 1 && !input.multiple) {
+      return { ok: false, code: 'invalid_args', message: 'Ce champ n’accepte qu’un seul fichier.' };
+    }
+    const transfer = new DataTransfer();
+    for (const item of list) {
+      const binary = atob(String(item?.data || ''));
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+      transfer.items.add(new File([bytes], String(item?.name || 'fichier'), { type: String(item?.mime || '') }));
+      // The base64 copy is not needed any more.
+      if (item && typeof item === 'object') item.data = null;
+    }
+    const held = [...transfer.files].map(file => ({ name: file.name, size: file.size }));
+    if (input) {
+      startWatch();
+      input.files = transfer.files;
+      input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      const now = [...(input.files || [])].map(file => ({ name: file.name, size: file.size }));
+      return { ok: true, files: now, field_state: now.length ? 'filled' : 'empty' };
+    }
+    // A drop area: it says it takes files by cancelling dragenter or dragover.
+    const rect = target.getBoundingClientRect();
+    const point = { clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
+    const drag = type => {
+      const event = new DragEvent(type, { bubbles: true, cancelable: true, composed: true, dataTransfer: transfer, ...point });
+      target.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    startWatch();
+    const entered = drag('dragenter');
+    const over = drag('dragover');
+    if (!entered && !over) {
+      drag('dragleave');
+      return { ok: false, code: 'invalid_args', message: 'Cet élément ne prend pas de fichiers : ni champ de fichier, ni zone de dépôt.' };
+    }
+    drag('drop');
+    return { ok: true, files: held, field_state: null };
+  }
+
   try {
+    if (action === 'key') return pressKey(el);
+    if (action === 'upload') return uploadFiles(el);
+
     if (action === 'click' || action === 'download') {
       startWatch();
       clickElement(el);
@@ -425,4 +905,41 @@ export function fillSecretInPage(options) {
     for (const role of ORDER) values[role] = null;
   }
   return { ok: true, filled };
+}
+
+// `browser.press_key` without an element (TEAM-751): which frame has the focus? Run in
+// every frame; each says its own index chain and whether its focused element is a child
+// frame (and which), so the service worker follows the chain from the top. Nothing of
+// the page is read but the focused element's tag.
+export function probeFocus(options) {
+  const path = [];
+  let win = window;
+  for (let depth = 0; depth < 12 && win !== win.parent; depth += 1) {
+    const parent = win.parent;
+    let index = -1;
+    try {
+      for (let i = 0; i < parent.length; i += 1) {
+        if (parent[i] === win) { index = i; break; }
+      }
+    } catch (_) { return { ok: true, path: null, child: null }; }
+    if (index < 0) return { ok: true, path: null, child: null };
+    path.unshift(index);
+    win = parent;
+  }
+  // A frame on a blocked site is never looked into.
+  let host = '';
+  try { host = new URL(self.origin && self.origin !== 'null' ? self.origin : location.href).hostname.toLowerCase(); } catch (_) { host = ''; }
+  if ((Array.isArray(options?.blockedHosts) ? options.blockedHosts : []).some(suffix => host === suffix || host.endsWith(`.${suffix}`))) {
+    return { ok: true, path, child: null, blocked: true };
+  }
+  const active = document.activeElement;
+  let child = null;
+  if (active && (active.tagName === 'IFRAME' || active.tagName === 'FRAME')) {
+    for (let i = 0; i < window.frames.length; i += 1) {
+      try {
+        if (window.frames[i] === active.contentWindow) { child = i; break; }
+      } catch (_) { /* ignore */ }
+    }
+  }
+  return { ok: true, path, child };
 }

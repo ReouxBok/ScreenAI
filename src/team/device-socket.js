@@ -15,6 +15,14 @@
 //
 // `browser.v2` (TEAM-726) tells the server this app returns `data.page` on
 // `include_page`, runs `browser.batch`, and only asks the person before paying.
+// TEAM-751 adds `browser.v2+keys` (`browser.press_key`, `key` batch steps),
+// `browser.v2+upload` (`browser.upload`, file inputs in read_page) and
+// `browser.v2+frames` (read_page reads child frames, frame-scoped ids `fr2.e12`).
+//
+// Server features (TEAM-731): every `ready` carries `features` ({procedures,
+// login_vault}, both always there); an older server sends none. `onReady` hands them
+// (or null) to the service on every `ready`, so a deploy that switches one is seen at
+// the next reconnect.
 //
 // TEAM-729 (docs/login-vault.md): with a `vault` key factory, every socket gets a fresh
 // ECDH P-256 key pair when it opens (vault.js). The private key is non-extractable and
@@ -37,7 +45,10 @@ import { VAULT_CAPABILITY } from './vault.js';
 export const DEVICE_SUBPROTOCOL = 'limova-device.v1';
 // browser.record.v1 (TEAM-731): this app uploads recordings and adds the descriptor
 // fields (label, placeholder, nearby, hints) to read_page elements.
-export const CAPABILITIES = Object.freeze(['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1', 'browser.record.v1']);
+export const CAPABILITIES = Object.freeze([
+  'browser.v1', 'browser.v2', 'browser.v2+keys', 'browser.v2+upload', 'browser.v2+frames',
+  'autonomy.v1', 'browser_control.v1', 'browser.record.v1'
+]);
 export const PING_INTERVAL_MS = 25_000;
 export const RESULT_CACHE_MS = 10 * 60_000;
 export const BACKOFF_MIN_MS = 1_000;
@@ -58,6 +69,16 @@ export function backoffDelay(attempt, random = Math.random) {
   const ceiling = Math.min(BACKOFF_MAX_MS, BACKOFF_MIN_MS * 2 ** Math.max(0, attempt));
   // « Equal jitter »: half fixed, half random, so many browsers never reconnect in lockstep.
   return Math.round(ceiling / 2 + random() * (ceiling / 2));
+}
+
+/**
+ * The server features of a `ready` message, or null for an older server that sends none.
+ * @param {unknown} raw `ready.features`
+ * @returns {{procedures: boolean, login_vault: boolean}|null}
+ */
+export function readFeatures(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  return { procedures: raw.procedures === true, login_vault: raw.login_vault === true };
 }
 
 function normalizeResult(callId, result) {
@@ -81,10 +102,11 @@ export class DeviceSocket {
    * @param {(status: string, info?: object) => void} [options.onStatus]
    * @param {() => void} [options.onRevoked] 4401: forget the connection
    * @param {(hold: {until: number, reason: string} | null) => void} [options.onHold]
+   * @param {(ready: {deviceId: string|null, features: {procedures: boolean, login_vault: boolean}|null}) => void} [options.onReady]
    */
   constructor({
     url, getToken, getState, appVersion, handlers,
-    onStatus = () => {}, onRevoked = () => {}, onHold = () => {},
+    onStatus = () => {}, onRevoked = () => {}, onHold = () => {}, onReady = () => {},
     WebSocketImpl = globalThis.WebSocket,
     timers = globalThis,
     now = () => Date.now(),
@@ -102,6 +124,8 @@ export class DeviceSocket {
     this.onStatus = onStatus;
     this.onRevoked = onRevoked;
     this.onHold = onHold;
+    this.onReady = onReady;
+    this.features = null;
     this.WebSocketImpl = WebSocketImpl;
     this.timers = timers;
     this.now = now;
@@ -346,6 +370,8 @@ export class DeviceSocket {
         this.attempt = 0;
         if (this.hold) this.setHold(null);
         this.deviceId = typeof message.device_id === 'string' ? message.device_id : this.deviceId;
+        this.features = readFeatures(message.features);
+        try { this.onReady({ deviceId: this.deviceId, features: this.features }); } catch { /* never break the socket */ }
         this.setStatus('online');
         return;
       case 'pong':

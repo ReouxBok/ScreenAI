@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  DeviceSocket, backoffDelay, BACKOFF_MAX_MS, DISABLED_RETRY_MS, PING_INTERVAL_MS, RESULT_CACHE_MS
+  DeviceSocket, backoffDelay, BACKOFF_MAX_MS, DISABLED_RETRY_MS, PING_INTERVAL_MS, readFeatures, RESULT_CACHE_MS
 } from '../../../src/team/device-socket.js';
 
 class FakeWebSocket {
@@ -64,12 +64,33 @@ describe('DeviceSocket', () => {
     expect(ws.sent[0]).toEqual({
       type: 'hello',
       app_version: '2.2.63',
-      capabilities: ['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1', 'browser.record.v1'],
+      capabilities: ['browser.v1', 'browser.v2', 'browser.v2+keys', 'browser.v2+upload', 'browser.v2+frames', 'autonomy.v1', 'browser_control.v1', 'browser.record.v1'],
       autonomy: 'approve_for_me',
       paused: false,
       control: 'agent',
       roots: []
     });
+  });
+
+  it('hands the server features of every ready to onReady, null for an older server (TEAM-731)', () => {
+    const onReady = vi.fn();
+    const { socket } = make({ onReady });
+    socket.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.open();
+    ws.receive({ type: 'ready', device_id: 'd-1', features: { procedures: true, login_vault: false } });
+    expect(onReady).toHaveBeenLastCalledWith({ deviceId: 'd-1', features: { procedures: true, login_vault: false } });
+    expect(socket.features).toEqual({ procedures: true, login_vault: false });
+    // A reconnect reads them again: a deploy may have switched one.
+    ws.serverClose(1011);
+    vi.advanceTimersByTime(BACKOFF_MAX_MS);
+    const next = FakeWebSocket.instances.at(-1);
+    next.open();
+    next.receive({ type: 'ready', device_id: 'd-1' });
+    expect(onReady).toHaveBeenLastCalledWith({ deviceId: 'd-1', features: null });
+    expect(onReady).toHaveBeenCalledTimes(2);
+    expect(readFeatures({ procedures: 'yes', login_vault: true })).toEqual({ procedures: false, login_vault: true });
+    expect(readFeatures([])).toBeNull();
   });
 
   it('pings every 25 s and sends state on demand', () => {
@@ -274,7 +295,7 @@ describe('DeviceSocket: login vault (TEAM-729)', () => {
     const { ws, socket } = await openVault();
     const hello = ws.sent[0];
     expect(hello.type).toBe('hello');
-    expect(hello.capabilities).toEqual(['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1', 'browser.record.v1', 'browser.v1+cookies', 'browser.v1+vault']);
+    expect(hello.capabilities).toEqual(['browser.v1', 'browser.v2', 'browser.v2+keys', 'browser.v2+upload', 'browser.v2+frames', 'autonomy.v1', 'browser_control.v1', 'browser.record.v1', 'browser.v1+cookies', 'browser.v1+vault']);
     expect(Object.keys(hello.vault_key).sort()).toEqual(['crv', 'kty', 'x', 'y']);
     expect(hello.vault_key).toEqual(expect.objectContaining({ kty: 'EC', crv: 'P-256' }));
     expect(socket.vaultKey.privateKey.extractable).toBe(false);
