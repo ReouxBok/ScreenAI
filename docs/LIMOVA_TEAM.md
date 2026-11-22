@@ -17,6 +17,9 @@ L’extension se connecte à Limova Team comme un appareil, à côté de Limova 
 | `approvals.js`, `approval.html/.js` | Petite fenêtre « Autoriser » / « Refuser », et choix d’un onglet pour `browser.request_tab`. |
 | `team-panel.js/.css` | Section « Connexions » du panneau latéral, bandeau d’activité. |
 | `team-service.js` | Assemblage dans le service worker, badge, alarme de reconnexion. |
+| `vault.js` | TEAM-729 : clé ECDH P-256 par connexion (non exportable, en mémoire), ouverture du scellé de `browser.fill_secret`. |
+| `login-offers.js`, `page-login-watch.js`, `save-login.html/.js` | TEAM-729 : repérer une connexion réussie, demander « Enregistrer cette connexion pour Limova ? », l’envoyer après « Enregistrer ». |
+| `session-export.js` | TEAM-729 : « Envoyer ma session à Limova », un site à la fois, après consentement. |
 
 ## `browser.v2` (TEAM-726)
 
@@ -25,6 +28,16 @@ L’extension se connecte à Limova Team comme un appareil, à côté de Limova 
 - Aucune fenêtre d’accord, à aucun niveau d’autonomie, sauf pour payer. Champs sensibles, sites bloqués, pause, prise de main et « Tout arrêter » restent appliqués. `set_autonomy` s’applique tout de suite ; une nouvelle connexion démarre en « Accès complet ».
 - `include_page: true` sur `open_tab`, `navigate`, `scroll`, `click`, `fill`, `select`, `submit`, `download` et `batch` renvoie `data.page` (4000 caractères et 200 éléments par défaut).
 - `browser.batch` : 1 à 20 étapes `fill` / `select` / `check` / `click` sur un même instantané, toutes vérifiées avant la première, arrêt à la première erreur, et une navigation termine le lot (`stale_snapshot` pour la suite).
+
+## Connexions enregistrées et sessions (TEAM-729)
+
+Contrat : `docs/login-vault.md` du dépôt team-backend (`browser.v1+vault`, `browser.v1+cookies`), derrière `login_vault_enabled` côté serveur.
+
+- **Clé du coffre.** À chaque ouverture de la connexion, une nouvelle paire ECDH P-256 (WebCrypto, clé privée non exportable, en mémoire seulement, oubliée à la fermeture). Le `hello` annonce `browser.v1+vault` et `browser.v1+cookies` et porte `vault_key` (`kty`, `crv`, `x`, `y`).
+- **`browser.fill_secret`.** Ouverture : ECDH → HKDF-SHA256 (sel = `call_id`, info = `limova-vault-fill.v1`) → AES-256-GCM avec l’AAD `limova-vault-fill.v1|<call_id>|<device_id>` (`device_id` du `ready`). Puis, dans l’ordre : groupe, pause et prise de main ; scellé (`secret_unreadable` pour un autre appel, un autre appareil ou une expiration) ; origine réelle de l’onglet, lue dans Chrome puis dans la page, égale à `args.origin` et à l’une des origines scellées (`origin_mismatch`) ; identifiants de l’instantané (`stale_snapshot`, `element_not_found`) et nature des champs (`invalid_args`) ; destination du formulaire, `formaction` compris (`origin_mismatch`). Chaque champ est revérifié juste avant d’être tapé, car les scripts de la page s’exécutent pendant les événements du champ précédent. Réponse : `ActionResult`, `filled`, `page` si demandé, jamais une valeur. `browser.fill` et `browser.batch` refusent toujours les champs sensibles.
+- **Proposer d’enregistrer.** Observateur injecté dans le monde isolé des onglets du groupe (et des autres onglets si la case « Proposer aussi d’enregistrer mes connexions dans mes onglets » est cochée). Connexion réussie = navigation ou disparition du champ dans les 10 s, sans retour du formulaire. Pas sur `http:`, les sites bloqués, un formulaire d’inscription, juste après un remplissage par Limova ni sur la liste « Jamais pour ce site ». `GET /devices/me/login-secrets?origin=` choisit entre « Enregistrer cette connexion pour Limova ? » et « Mettre à jour la connexion enregistrée ? » (un 404 coupe la proposition 10 minutes) ; la fenêtre ne reçoit qu’un identifiant opaque ; « Enregistrer » envoie `POST /devices/me/login-secrets`. Mot de passe en mémoire deux minutes au plus. Après « Pas maintenant », le site n’est plus proposé pendant 10 minutes.
+- **« Envoyer ma session à Limova ».** Dans le panneau, site de l’onglet courant proposé, modifiable ; le service worker le ramène au domaine enregistrable, l’écran de consentement nomme ce domaine, puis `chrome.cookies.getAll({ domain })` et `POST /devices/me/session-profiles` (300 cookies et 256 Kio au plus, LinkedIn et Limova refusés).
+- **`import_sessions`.** Réservé à Limova Desktop : l’extension répond toujours `cancelled`, les cookies sont déjà dans Chrome.
 
 ## Environnements
 

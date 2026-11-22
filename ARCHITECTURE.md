@@ -50,6 +50,7 @@ L’extension est aussi un « appareil navigateur » de Limova Team : l’agent 
 
 ```text
 Panneau « Connexions » ── TEAM_* ──► team-service.js ── une connexion par produit
+                                       ├─ vault.js (clé par socket), login-offers.js, session-export.js
                                        │
              connections.js (jeton lmd_, autonomie, pause) ── chrome.storage.local
              device-socket.js ── wss://api.team.limova.ai/api/v1/devices/me/socket
@@ -69,12 +70,13 @@ Panneau « Connexions » ── TEAM_* ──► team-service.js ── une conn
 - **`browser.v2` (TEAM-726) : plus de fenêtre d’accord, sauf pour payer.** Les actions s’exécutent quel que soit le niveau d’autonomie ; les confirmations voulues par la personne se font dans le chat, décidées par le serveur à partir de ce niveau. Seul un paiement (`pay`, lu par le serveur ou par l’extension) ouvre la petite fenêtre Chrome (`approval.html`, qui ne reçoit qu’un identifiant opaque dans son URL). `set_autonomy` s’applique tout de suite, sans fenêtre ; une nouvelle connexion démarre en « Accès complet ». « Prendre la main », « Rendre la main » et « Tout arrêter » sont dans le panneau ; le badge affiche « IA » pendant une action et « ⏸ » pendant une prise de main.
 - **Moins d’étapes** : `include_page: true` sur les actions renvoie la carte de page (`data.page`, même contenu que `read_page`) une fois la page stabilisée, et `browser.batch` enchaîne jusqu’à 20 saisies, choix, cases et clics sur un même instantané, vérifiés avant le premier. Les attentes suivent les événements de l’onglet et le calme du DOM plutôt que des délais fixes (plafond de 20 s pour une navigation).
 - **Accueil** : le panneau demande d’abord « Limova » (Charly, inchangé) ou « Limova Team » (un bouton « Se connecter »). Les versions publiques ne parlent qu’à la production ; une version de test pour la préproduction se construit avec `LIMOVA_TEAM_ENV=staging npm run build`, et le réglage développeur `limova_team_developer_v1` affiche le choix d’environnement.
+- **Connexions enregistrées (TEAM-729)** : chaque connexion WebSocket crée sa clé ECDH P-256 non exportable (`vault.js`), annonce `browser.v1+vault` et `browser.v1+cookies` et envoie sa clé publique dans le `hello`. `browser.fill_secret` ouvre le scellé du serveur, vérifie l’origine réelle de l’onglet, les champs et la destination du formulaire, tape la connexion puis l’oublie (`browser-engine.js`, `fillSecretInPage` dans `page-actions.js`) ; c’est le seul chemin qui tape dans un champ sensible. `login-offers.js` et `page-login-watch.js` repèrent une connexion réussie et la proposent à l’enregistrement dans `save-login.html` (identifiant opaque dans l’URL) ; `session-export.js` envoie les cookies d’un site après consentement (permission `cookies`). Détails : `docs/LIMOVA_TEAM.md`.
 - **Captures** : onglet mis au premier plan, `captureVisibleTab`, champs masqués et repères `#eN` dessinés par `renderSilentVisualCapture` (partagé avec Charly) dans un `OffscreenCanvas`, au plus 1,5 Mo, jamais stockés.
 
 ## Sécurité et confidentialité
 
 - Consentement IA affirmatif et distinct.
-- Permissions et hôtes limités au fonctionnement déclaré ; aucune permission supplémentaire ajoutée en 2.2.44. TEAM-724 ajoute `tabGroups` (le groupe d’onglets de Limova Team) et `alarms` (reconnexion après un redémarrage du service worker), et Chrome 116 au minimum ; aucun hôte nouveau.
+- Permissions et hôtes limités au fonctionnement déclaré ; aucune permission supplémentaire ajoutée en 2.2.44. TEAM-724 ajoute `tabGroups` (le groupe d’onglets de Limova Team) et `alarms` (reconnexion après un redémarrage du service worker), et Chrome 116 au minimum ; aucun hôte nouveau. TEAM-729 ajoute `cookies`, utilisé seulement par « Envoyer ma session à Limova », site par site, après consentement, jamais par Charly.
 - CSP sans script inline, `unsafe-eval` ou code distant.
 - Clés Gemini uniquement sur le proxy.
 - Payloads JSON bornés, rate limiting, idempotence et identifiants de requête.
