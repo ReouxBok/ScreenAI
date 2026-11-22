@@ -12,6 +12,12 @@
 // Team » shows the Team home: one « Se connecter » button (no environment choice in
 // user builds), then who is connected, online or not, pause, « Tout arrêter » and
 // « Déconnecter ». People already signed in to Charly never see the picker.
+//
+// TEAM-729: a connected card also shows « Connexions enregistrées »: the opt-in
+// « Proposer aussi d’enregistrer mes connexions dans mes onglets » (off by default), the
+// « Jamais pour ces sites » list, and « Envoyer ma session à Limova » for one site at a
+// time, behind a consent screen naming that site. The panel never sees a password or a
+// cookie: it sends the site, the service worker reads and sends the cookies.
 (function teamPanel() {
   const HOME_KEY = 'limova_home_product_v1';
   const $ = id => document.getElementById(id);
@@ -32,6 +38,16 @@
   ];
   let state = null;
   let feedback = '';
+  // « Envoyer ma session à Limova »: kept across re-renders (TEAM_STATE redraws the cards).
+  const session = { site: null, consent: null, busy: false, message: '', kind: '' };
+  const SESSION_ERRORS = {
+    invalid_site: 'teamSessionInvalid',
+    blocked_site: 'teamSessionBlocked',
+    no_cookies: 'teamSessionEmpty',
+    too_many: 'teamSessionTooLarge',
+    too_large: 'teamSessionTooLarge',
+    disabled: 'teamSessionDisabled'
+  };
 
   function send(message) {
     try {
@@ -67,6 +83,121 @@
     const wrap = el('label', 'team-field');
     wrap.append(el('span', 'team-field-label', labelText), control);
     return wrap;
+  }
+
+  function fill(text, values) {
+    return Object.entries(values).reduce((out, [key, value]) => out.split(`{${key}}`).join(String(value)), text);
+  }
+
+  async function suggestSite() {
+    if (session.site !== null) return;
+    session.site = '';
+    const response = await send({ type: 'TEAM_SESSION_SUGGEST' });
+    if (!session.site && typeof response?.site === 'string') {
+      session.site = response.site;
+      render();
+    }
+  }
+
+  async function exportSession(productId) {
+    const site = session.consent;
+    session.busy = true;
+    session.message = tr('teamSessionSending');
+    session.kind = '';
+    render();
+    const response = await send({ type: 'TEAM_SESSION_EXPORT', productId, site, consent: true });
+    session.busy = false;
+    session.consent = null;
+    if (response?.ok) {
+      session.message = fill(tr('teamSessionSent'), { site, count: Number(response.count) || 0 });
+      session.kind = 'ok';
+    } else {
+      session.message = tr(SESSION_ERRORS[response?.error] || 'teamSessionFailed');
+      session.kind = 'error';
+    }
+    render();
+  }
+
+  function renderVault(product, connection) {
+    const box = el('section', 'team-vault');
+    box.append(el('h4', 'team-vault-title', tr('teamVaultTitle')));
+    const vault = connection.vault || { offer_in_own_tabs: false, never_origins: [] };
+
+    const toggle = el('label', 'team-check');
+    const input = el('input');
+    input.type = 'checkbox';
+    input.id = `teamVaultOwnTabs-${product.id}`;
+    input.checked = vault.offer_in_own_tabs === true;
+    input.addEventListener('change', () => send({ type: 'TEAM_VAULT_SET_PREFS', productId: product.id, offer_in_own_tabs: input.checked }));
+    toggle.append(input, el('span', '', tr('teamVaultOwnTabs')));
+    box.append(toggle, el('p', 'team-muted', tr('teamVaultHint')));
+
+    if (vault.never_origins?.length) {
+      box.append(el('p', 'team-field-label', tr('teamVaultNever')));
+      const list = el('ul', 'team-never');
+      for (const origin of vault.never_origins) {
+        const row = el('li');
+        row.append(el('span', '', origin), button(tr('teamVaultNeverRemove'), 'team-link-muted', () => (
+          send({ type: 'TEAM_VAULT_SET_PREFS', productId: product.id, remove_never: origin })
+        )));
+        list.append(row);
+      }
+      box.append(list);
+    }
+
+    box.append(el('h4', 'team-vault-title', tr('teamSessionTitle')));
+    if (session.consent) {
+      const consent = el('div', 'team-consent');
+      consent.setAttribute('role', 'group');
+      consent.append(el('p', '', fill(tr('teamSessionConsent'), { site: session.consent })));
+      const actions = el('div', 'team-actions');
+      const confirm = button(tr('teamSessionConfirm'), 'team-primary', () => exportSession(product.id));
+      confirm.id = `teamSessionConfirm-${product.id}`;
+      confirm.disabled = session.busy;
+      const cancel = button(tr('teamSessionCancel'), 'team-secondary', () => {
+        session.consent = null;
+        session.message = '';
+        render();
+      });
+      cancel.disabled = session.busy;
+      actions.append(cancel, confirm);
+      consent.append(actions);
+      box.append(consent);
+    } else {
+      box.append(el('p', 'team-muted', tr('teamSessionHint')));
+      const site = el('input', 'team-select');
+      site.id = `teamSessionSite-${product.id}`;
+      site.type = 'text';
+      site.placeholder = 'free.fr';
+      site.autocomplete = 'off';
+      site.spellcheck = false;
+      site.value = session.site || '';
+      site.addEventListener('input', () => { session.site = site.value; });
+      box.append(labelled(tr('teamSessionSite'), site));
+      const start = button(tr('teamSessionStart'), 'team-secondary', async () => {
+        // The service worker turns what was typed into the registrable domain whose
+        // cookies it would read; the consent screen names exactly that site.
+        const response = await send({ type: 'TEAM_SESSION_SUGGEST', input: String(session.site || '') });
+        if (!response?.ok || typeof response.site !== 'string') {
+          session.message = tr(response?.error === 'blocked_site' ? 'teamSessionBlocked' : 'teamSessionInvalid');
+          session.kind = 'error';
+          render();
+          return;
+        }
+        session.site = response.site;
+        session.consent = response.site;
+        session.message = '';
+        render();
+      });
+      start.id = `teamSessionStart-${product.id}`;
+      box.append(start);
+    }
+    if (session.message) {
+      const note = el('p', `team-muted${session.kind === 'error' ? ' team-error' : session.kind === 'ok' ? ' team-ok' : ''}`, session.message);
+      note.setAttribute('role', 'status');
+      box.append(note);
+    }
+    return box;
   }
 
   function renderCard(product) {
@@ -141,6 +272,7 @@
       actions.append(button(tr('teamTakeOver'), 'team-secondary', () => send({ type: 'TEAM_TAKE_OVER', productId: product.id })));
     }
     card.append(actions);
+    card.append(renderVault(product, connection));
     card.append(button(tr('teamDisconnect'), 'team-link-danger', async () => {
       if (!window.confirm(tr('teamDisconnectConfirm'))) return;
       await send({ type: 'TEAM_DISCONNECT', productId: product.id });
@@ -189,7 +321,15 @@
   function render() {
     const container = $('teamProducts');
     if (container && state) {
+      // Redraws must not steal the caret from the field the person is typing in.
+      const focusedId = document.activeElement?.id || '';
       container.replaceChildren(...state.products.map(renderCard));
+      const again = focusedId ? document.getElementById(focusedId) : null;
+      if (again && container.contains(again)) {
+        again.focus();
+        if (typeof again.setSelectionRange === 'function' && again.type === 'text') again.setSelectionRange(again.value.length, again.value.length);
+      }
+      if (state.products.some(product => product.connection)) suggestSite();
     }
     const note = $('teamFeedback');
     if (note) note.textContent = feedback;

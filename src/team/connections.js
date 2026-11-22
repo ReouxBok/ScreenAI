@@ -104,6 +104,13 @@ export function deviceAuthHeader(connection) {
   return `Device ${connection.device_token}`;
 }
 
+// The reason of an API error: the backend's envelope is
+// {"error": {"class", "message", "traceId", "code"?}} (TEAM-729 vault routes).
+export function apiErrorCode(body) {
+  const code = body?.error?.code;
+  return typeof code === 'string' && /^[a-z_]{1,40}$/.test(code) ? code : null;
+}
+
 /**
  * Revoke a connection on the server, then forget it locally.
  * The local copy is forgotten even when the network call fails: the person asked to

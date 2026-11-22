@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Enregistrer cette connexion pour Limova ?</title>
+  <link rel="stylesheet" href="team-pages.css">
+</head>
+<body class="approval">
+  <main class="card" aria-labelledby="title">
+    <div class="product"><span class="dot" aria-hidden="true"></span><span id="productLabel">Limova Team</span></div>
+    <h1 id="title">Chargement…</h1>
+    <p id="intro">Limova pourra se connecter à ce site pour toi, sans jamais voir le mot de passe.</p>
+    <dl>
+      <div><dt>Site</dt><dd id="site"></dd></div>
+    </dl>
+    <label class="field" for="username">
+      <span>Identifiant</span>
+      <input id="username" type="text" autocomplete="off" spellcheck="false" maxlength="320">
+    </label>
+    <p class="countdown" id="status" role="status" aria-live="polite"></p>
+    <div class="actions">
+      <button type="button" class="secondary" id="later">Pas maintenant</button>
+      <button type="button" class="primary" id="save" disabled>Enregistrer</button>
+    </div>
+    <button type="button" class="link" id="never">Jamais pour ce site</button>
+  </main>
+  <script src="save-login.js"></script>
+</body>
+</html>

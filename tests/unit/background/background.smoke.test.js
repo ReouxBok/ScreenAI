@@ -156,6 +156,16 @@ describe('background.js — onMessage router', () => {
       .toEqual({ error: 'Unauthorized message source' });
   });
 
+  it('accepts only the Limova Team login watcher\'s two messages from other sites\' top frames (TEAM-729)', async () => {
+    const web = { id: chromeMock.runtime.id, url: 'https://subscribe.free.fr/login', frameId: 0, tab: { id: 43, url: 'https://subscribe.free.fr/login' } };
+    const rejected = { error: 'Unauthorized message source' };
+    expect(await dispatch({ type: 'TEAM_LOGIN_SUBMITTED', seq: 1, username: 'u', password: 'p' }, web)).not.toEqual(rejected);
+    expect(await dispatch({ type: 'TEAM_LOGIN_SUBMITTED', seq: 1 }, { ...web, frameId: 2 })).toEqual(rejected);
+    expect(await dispatch({ type: 'TEAM_LOGIN_SUBMITTED', seq: 1 }, { ...web, url: 'http://subscribe.free.fr/login' })).toEqual(rejected);
+    expect(await dispatch({ type: 'TEAM_SESSION_EXPORT', site: 'free.fr', consent: true }, web)).toEqual(rejected);
+    expect(await dispatch({ type: 'TEAM_GET_STATE' }, web)).toEqual(rejected);
+  });
+
   it('GET_SETTINGS returns hasApiKey: true (keys are server-side)', async () => {
     const result = await dispatch({ type: 'GET_SETTINGS' });
     expect(result).toEqual({ hasApiKey: true, autonomyMode: 'balanced' });

@@ -17,6 +17,12 @@
 // checked before the first one runs. Waits follow the tab's events and DOM quiet
 // rather than fixed delays; a navigation still gets at most 20 s.
 //
+// `browser.fill_secret` (TEAM-729, docs/login-vault.md): `fillSecret` opens a login the
+// server sealed for this socket's key (vault.js), checks the group, the seal, the LIVE
+// origin, the elements and the password form's target, types the values with
+// `fillSecretInPage`, and answers `filled` flags. It is the only path that types into a
+// sensitive field; `browser.fill` and `browser.batch` keep refusing them.
+//
 // Approvals and autonomy are not decided here (see team-controller.js). For actions the
 // engine splits the work in two: `prepareAction` checks everything and reads the live
 // element (so the controller can judge risk and ask the person), then `executeAction`
@@ -28,7 +34,8 @@
 import { classifyUrl, domainOf, safeFavicon, safeUrl } from './products.js';
 import { classifyAction, riskHint, strictestOf, targetMatches } from './risk.js';
 import { inspectPageElement, pageSnapshot, preparePageCapture } from './page-snapshot.js';
-import { collectPageVerification, performPageAction, scrollPage } from './page-actions.js';
+import { collectPageVerification, fillSecretInPage, performPageAction, scrollPage } from './page-actions.js';
+import { openSeal } from './vault.js';
 
 export const GROUPS_SESSION_KEY = 'limova_tab_groups_v1';
 export const SCREENSHOT_MAX_BASE64 = 1_500_000;
@@ -71,6 +78,44 @@ function boundedInt(value, { min, max, fallback }) {
 
 function isCancelled(signal) {
   return Boolean(signal?.aborted);
+}
+
+function originOf(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+const SECRET_FIELDS = ['username', 'password', 'otp'];
+const SECRET_MASK = '••••••';
+
+/**
+ * Replace every occurrence of a secret in the strings of an answer (TEAM-729). A page
+ * may echo what was typed (« show password », a badly made error message); the answer
+ * goes to the model, so a secret must never ride along. Short strings are skipped: a
+ * 3-character « secret » would mask ordinary words.
+ */
+export function scrubSecrets(value, secrets) {
+  const list = secrets.filter(secret => typeof secret === 'string' && secret.length >= 4);
+  if (!list.length) return value;
+  const scrub = node => {
+    if (typeof node === 'string') {
+      let out = node;
+      for (const secret of list) if (out.includes(secret)) out = out.split(secret).join(SECRET_MASK);
+      return out;
+    }
+    if (Array.isArray(node)) return node.map(scrub);
+    if (node && typeof node === 'object') {
+      const out = {};
+      for (const [key, item] of Object.entries(node)) out[key] = scrub(item);
+      return out;
+    }
+    return node;
+  };
+  return scrub(value);
 }
 
 /**
@@ -809,6 +854,123 @@ export function createBrowserEngine({
       }), tab.id, plan.page, signal);
     }
 
+    // ---------------------------------------------------------------- vault (TEAM-729)
+
+    /**
+     * `browser.fill_secret`: open the sealed login, check, in this order, the group, the
+     * seal, the LIVE origin, the elements and the password form's target, then type.
+     * docs/login-vault.md « What the device checks ». The plaintext lives in this
+     * function's locals and the injected call's arguments only, and is dropped before
+     * the answer is built; the answer carries `filled` flags, never a value.
+     * @param {object} args the call's args (tab_id, snapshot_id, origin, fields, sealed, include_page)
+     * @param {{callId: string, vault: {privateKey: CryptoKey, deviceId: string}|null, signal?: AbortSignal, busy?: boolean}} context
+     */
+    async function fillSecret(args, { callId, vault, signal, busy } = {}) {
+      const page = pageOptions(args);
+      if (page.error) return page.error;
+      if (!isTabId(args.tab_id)) return toolError('invalid_args', 'tab_id must be a tab number');
+      if (typeof args.snapshot_id !== 'string' || !args.snapshot_id) return toolError('invalid_args', 'snapshot_id is required');
+      if (typeof args.origin !== 'string' || !originOf(args.origin) || originOf(args.origin) !== args.origin) {
+        return toolError('invalid_args', 'origin must be a bare origin such as https://example.com');
+      }
+      const fields = args.fields && typeof args.fields === 'object' && !Array.isArray(args.fields) ? args.fields : null;
+      const wanted = fields ? SECRET_FIELDS.filter(role => fields[role] !== undefined && fields[role] !== null) : [];
+      if (!wanted.length) return toolError('invalid_args', 'fields needs username, password or otp');
+      if (wanted.some(role => typeof fields[role] !== 'string' || !/^e\d{1,4}$/.test(fields[role]))) {
+        return toolError('invalid_args', 'field ids must look like e12');
+      }
+      if (new Set(wanted.map(role => fields[role])).size !== wanted.length) return toolError('invalid_args', 'each field needs its own element');
+
+      // 1. The tab is in this product's group (pause and take-over: the controller).
+      const { tab, error } = await groupTab(args.tab_id);
+      if (error) return error;
+
+      // 2. The seal opens, is this call's and this device's, and has not expired.
+      const opened = await openSeal({
+        sealed: args.sealed, callId, deviceId: vault?.deviceId, privateKey: vault?.privateKey, now: now()
+      });
+      if (!opened.ok) return toolError('secret_unreadable', 'The saved login could not be opened on this device.');
+      const secret = opened.payload;
+      const drop = () => { for (const role of SECRET_FIELDS) secret[role] = null; };
+      if (wanted.some(role => typeof secret[role] !== 'string' || !secret[role])) {
+        drop();
+        return toolError('secret_unreadable', 'The saved login does not hold every asked field.');
+      }
+      const secrets = wanted.filter(role => role !== 'username').map(role => secret[role]);
+
+      try {
+        // 3. The live top-frame origin, from Chrome now, not from the snapshot.
+        const live = await chromeApi.tabs.get(tab.id).catch(() => null);
+        if (!live) return toolError('tab_not_found', 'This tab was closed.');
+        const liveOrigin = originOf(live.url || '');
+        const pendingOrigin = live.pendingUrl ? originOf(live.pendingUrl) : liveOrigin;
+        if (!liveOrigin || !liveOrigin.startsWith('https://') || liveOrigin !== args.origin
+          || pendingOrigin !== liveOrigin || !secret.origins.includes(liveOrigin)) {
+          return toolError('origin_mismatch', 'This page is not the saved login’s site.');
+        }
+        const unavailable = pageError(live);
+        if (unavailable) return unavailable;
+
+        // 4. The ids come from the latest read of this tab.
+        const known = latestSnapshots.get(tab.id);
+        if (known && known !== args.snapshot_id) return toolError('stale_snapshot', 'These ids come from an older read. Read the page again.');
+        if (isCancelled(signal)) return toolError('paused', 'Stopped.');
+
+        // 3 to 5 again, in the page, right before typing (see fillSecretInPage).
+        const newTabs = watchNewTabs(tab.id);
+        const before = { url: live.url || '' };
+        const values = {};
+        for (const role of wanted) values[role] = secret[role];
+        const run = await execute(tab.id, fillSecretInPage, {
+          productKey,
+          snapshotId: args.snapshot_id,
+          expectedOrigin: args.origin,
+          origins: secret.origins,
+          site: secret.site,
+          fields: Object.fromEntries(wanted.map(role => [role, fields[role]])),
+          values
+        });
+        for (const role of wanted) values[role] = null;
+        drop();
+        if (!run.ok || !run.result) {
+          newTabs.stop();
+          return toolError('page_unavailable', 'Chrome cannot act on this page.');
+        }
+        const filled = {
+          username: run.result.filled?.username === true,
+          password: run.result.filled?.password === true,
+          otp: run.result.filled?.otp === true
+        };
+        if (!run.result.ok) {
+          newTabs.stop();
+          const code = run.result.code || 'internal';
+          const messages = {
+            origin_mismatch: 'This page is not the saved login’s site, or its form sends elsewhere.',
+            stale_snapshot: 'Read the page again.',
+            element_not_found: 'A field is gone, hidden, disabled or read-only.',
+            invalid_args: 'A field is not of the right kind (password, username or code).'
+          };
+          return toolError(code, messages[code] || code);
+        }
+        const outcome = await verify(tab.id, before, {
+          elementId: wanted.includes('password') ? fields.password : fields[wanted[0]], signal, newTabs, busy
+        });
+        newTabs.stop();
+        if (outcome.verification.url_changed) latestSnapshots.delete(tab.id);
+        const result = await attachPage(ok({
+          tab: outcome.tab || toTab(live),
+          done: true,
+          verification: outcome.verification,
+          snapshot_stale: outcome.snapshot_stale,
+          filled
+        }), tab.id, page, signal);
+        return scrubSecrets(result, secrets);
+      } finally {
+        drop();
+        secrets.length = 0;
+      }
+    }
+
     // ---------------------------------------------------------------- access
 
     // The person's own tabs they may share (never LinkedIn, Limova or chrome:// pages).
@@ -845,6 +1007,7 @@ export function createBrowserEngine({
       scroll,
       prepareAction,
       executeAction,
+      fillSecret,
       shareableTabs,
       adoptTab,
       setGroupTitle,

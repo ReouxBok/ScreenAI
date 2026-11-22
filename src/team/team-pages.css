@@ -34,3 +34,8 @@ button:disabled { opacity: .5; cursor: default; }
 button:focus-visible, .tabs label:focus-within { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 2px; }
 .status-ok { color: #246648; }
 .status-error { color: #B42318; }
+/* TEAM-729: « Enregistrer cette connexion pour Limova ? » window. */
+.field { display: grid; gap: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.field input { font: 400 14px var(--font); text-transform: none; letter-spacing: normal; color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; }
+.field input:focus-visible { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 1px; }
+button.link { flex: none; align-self: center; background: transparent; color: var(--muted); font-weight: 600; font-size: 12px; padding: 4px 6px; }

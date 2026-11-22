@@ -16,12 +16,23 @@
 // `browser.v2` (TEAM-726) tells the server this app returns `data.page` on
 // `include_page`, runs `browser.batch`, and only asks the person before paying.
 //
+// TEAM-729 (docs/login-vault.md): with a `vault` key factory, every socket gets a fresh
+// ECDH P-256 key pair when it opens (vault.js). The private key is non-extractable and
+// held in memory for that socket only; it is dropped when the socket closes or stops.
+// `hello` then carries `browser.v1+vault` and `vault_key` (the public JWK: kty, crv, x,
+// y). If the key cannot be made, `hello` goes out without them and the agent cannot
+// fill. A call's `ctx.vault()` returns that socket's key and the device id from `ready`,
+// or null once the socket is gone. `import_sessions` is answered `cancelled`: in Chrome
+// the person's cookies are already there, there is nothing to import.
+//
 // Results are cached by call_id for 10 minutes: a repeated call_id gets the same
 // answer without running again. A call is only answered on the socket it arrived on
 // (or the socket that last repeated it), as the server only accepts that.
 //
 // Everything Chrome-specific is injected, so tests drive it with a fake WebSocket and
 // fake timers.
+
+import { VAULT_CAPABILITY } from './vault.js';
 
 export const DEVICE_SUBPROTOCOL = 'limova-device.v1';
 export const CAPABILITIES = Object.freeze(['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1']);
@@ -38,7 +49,7 @@ const OPEN = 1;
 const KNOWN_ERROR_CODES = new Set([
   'denied_by_owner', 'paused', 'approval_timeout', 'invalid_args', 'too_large', 'unsupported', 'internal',
   'not_found', 'taken_over', 'not_in_group', 'tab_not_found', 'stale_snapshot', 'element_not_found',
-  'sensitive_field', 'blocked_site', 'page_unavailable'
+  'sensitive_field', 'blocked_site', 'page_unavailable', 'origin_mismatch', 'secret_unreadable'
 ]);
 
 export function backoffDelay(attempt, random = Math.random) {
@@ -61,7 +72,10 @@ export class DeviceSocket {
    * @param {() => string} options.getToken the connection's lmd_ token
    * @param {() => object} options.getState {autonomy, paused, control}
    * @param {string} options.appVersion
-   * @param {object} options.handlers {onCall(call, ctx), onSetAutonomy(msg), onBrowserControl(msg)}
+   * @param {object} options.handlers {onCall(call, ctx), onSetAutonomy(msg), onBrowserControl(msg), onImportSessions?(msg)}
+   * @param {{createKeyPair: () => Promise<{privateKey: CryptoKey, publicJwk: object}>}} [options.vault] TEAM-729
+   * @param {string[]} [options.extraCapabilities] e.g. browser.v1+cookies
+   * @param {() => string|null} [options.getDeviceId] the paired device id, if `ready` carries none
    * @param {(status: string, info?: object) => void} [options.onStatus]
    * @param {() => void} [options.onRevoked] 4401: forget the connection
    * @param {(hold: {until: number, reason: string} | null) => void} [options.onHold]
@@ -73,7 +87,10 @@ export class DeviceSocket {
     timers = globalThis,
     now = () => Date.now(),
     random = Math.random,
-    hold = null
+    hold = null,
+    vault = null,
+    extraCapabilities = [],
+    getDeviceId = () => null
   }) {
     this.url = url;
     this.getToken = getToken;
@@ -96,6 +113,11 @@ export class DeviceSocket {
     this.stopped = false;
     this.hold = hold && Number.isFinite(hold.until) ? hold : null;
     this.deviceId = null;
+    this.vault = vault && typeof vault.createKeyPair === 'function' ? vault : null;
+    // {ws, privateKey, publicJwk} of the open socket only.
+    this.vaultKey = null;
+    this.extraCapabilities = Array.isArray(extraCapabilities) ? extraCapabilities.filter(item => typeof item === 'string') : [];
+    this.getDeviceId = getDeviceId;
     this.results = new Map();
     this.inflight = new Map();
   }
@@ -133,6 +155,7 @@ export class DeviceSocket {
     this.stopped = true;
     this.clearReconnect();
     this.clearPing();
+    this.vaultKey = null;
     const ws = this.ws;
     this.ws = null;
     if (ws) {
@@ -156,8 +179,22 @@ export class DeviceSocket {
     ws.onopen = () => {
       if (this.ws !== ws) return;
       this.lastMessageAt = this.now();
-      this.sendOn(ws, this.helloMessage());
-      this.startPing(ws);
+      if (!this.vault) {
+        this.sendOn(ws, this.helloMessage());
+        this.startPing(ws);
+        return;
+      }
+      // A new socket, a new key: never reuse the previous socket's.
+      this.vaultKey = null;
+      Promise.resolve()
+        .then(() => this.vault.createKeyPair())
+        .then(pair => (pair?.privateKey && pair?.publicJwk ? pair : null), () => null)
+        .then(pair => {
+          if (this.ws !== ws) return;
+          this.vaultKey = pair ? { ws, privateKey: pair.privateKey, publicJwk: pair.publicJwk } : null;
+          this.sendOn(ws, this.helloMessage(this.vaultKey));
+          this.startPing(ws);
+        });
     };
     ws.onmessage = event => {
       if (this.ws !== ws) return;
@@ -174,17 +211,34 @@ export class DeviceSocket {
     ws.onclose = event => this.handleClose(ws, Number(event?.code) || 1006);
   }
 
-  helloMessage() {
+  helloMessage(vaultKey = null) {
     const state = this.getState();
-    return {
+    const capabilities = [...CAPABILITIES, ...this.extraCapabilities];
+    if (vaultKey) capabilities.push(VAULT_CAPABILITY);
+    const hello = {
       type: 'hello',
       app_version: this.appVersion,
-      capabilities: [...CAPABILITIES],
+      capabilities,
       autonomy: state.autonomy,
       paused: Boolean(state.paused),
       control: state.control === 'owner' ? 'owner' : 'agent',
       roots: []
     };
+    if (vaultKey) {
+      const { kty, crv, x, y } = vaultKey.publicJwk;
+      hello.vault_key = { kty, crv, x, y };
+    }
+    return hello;
+  }
+
+  // The key and device id a call that arrived on `ws` may use, or null once that socket
+  // closed or was replaced (its key is gone with it).
+  vaultFor(ws) {
+    const key = this.vaultKey;
+    if (!key || key.ws !== ws || this.ws !== ws || ws.readyState !== OPEN) return null;
+    const deviceId = this.deviceId || this.getDeviceId?.() || null;
+    if (!deviceId) return null;
+    return { privateKey: key.privateKey, deviceId };
   }
 
   stateMessage() {
@@ -250,6 +304,7 @@ export class DeviceSocket {
   handleClose(ws, code) {
     if (this.ws !== ws) return;
     this.ws = null;
+    this.vaultKey = null;
     this.clearPing();
     if (this.stopped) return;
     if (code === 4401) {
@@ -302,6 +357,13 @@ export class DeviceSocket {
       case 'browser_control':
         this.handleRequest(ws, message, 'browser_control_result', () => this.handlers.onBrowserControl(message));
         return;
+      case 'import_sessions':
+        // TEAM-729: Limova Desktop imports cookies into its own panel; in Chrome they are
+        // already there, so nothing is read and the answer is always « cancelled ».
+        this.handleRequest(ws, message, 'import_sessions_result', () => (
+          this.handlers.onImportSessions ? this.handlers.onImportSessions(message) : { status: 'cancelled', sites: [] }
+        ));
+        return;
       default:
         // Unknown types are ignored, so the server can add messages safely.
     }
@@ -340,6 +402,9 @@ export class DeviceSocket {
     const ctx = {
       progress: status => this.sendOn(entry.ws, { type: 'progress', call_id: callId, status })
     };
+    // Only a socket that advertised the vault can fill; the key is the one of the socket
+    // the call arrived on, read when the fill runs (a held call may outlive it).
+    if (this.vault) ctx.vault = () => this.vaultFor(ws);
     const call = {
       call_id: callId,
       tool: typeof message.tool === 'string' ? message.tool : '',

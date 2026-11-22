@@ -18,6 +18,13 @@
 // - « Tout arrêter » cancels running and held calls (`paused`), closes open approval
 //   windows as refused, sets paused and sends `state`.
 //
+// `browser.fill_secret` (TEAM-729) follows the same pause and take-over rules, never
+// opens a window (the person chose to save that login for Limova), and runs only on a
+// socket that advertised `browser.v1+vault`: `ctx.vault()` hands the engine that
+// socket's in-memory key, or null once the socket closed (`secret_unreadable`).
+// A successful fill is reported with `onVaultFill`, so the offer to save (login-offers.js)
+// does not ask to save the login Limova just typed.
+//
 // `set_autonomy` applies at once, in both directions, without a window (TEAM-726: only
 // the signed-in owner can send it, and the level now only drives the chat's
 // confirmations). It sends `state` before answering and never resumes a paused app.
@@ -52,7 +59,8 @@ export function createTeamController({
   now = () => Date.now(),
   onStateChange = () => {},
   onBusyChange = () => {},
-  onActivity = () => {}
+  onActivity = () => {},
+  onVaultFill = () => {}
 }) {
   const state = {
     autonomy: isAutonomyLevel(initial.autonomy) ? initial.autonomy : DEFAULT_AUTONOMY,
@@ -116,6 +124,14 @@ export function createTeamController({
     if (kind === 'read') {
       const result = await browser.runRead(call.tool, args, { signal, busy: true });
       record(call, result);
+      return result;
+    }
+
+    if (kind === 'vault') {
+      if (typeof ctx.vault !== 'function') return toolError('unsupported', 'This browser does not fill saved logins.');
+      const result = await browser.fillSecret(args, { callId: call.call_id, vault: ctx.vault(), signal, busy: true });
+      record(call, result);
+      if (result?.ok) onVaultFill({ tabId: args.tab_id, origin: args.origin });
       return result;
     }
 
