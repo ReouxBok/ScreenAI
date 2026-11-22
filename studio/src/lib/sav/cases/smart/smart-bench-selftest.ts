@@ -6,8 +6,8 @@ import { decryptSavPayload } from "../../crypto";
 import { createSavBenchCurrentAgent, createSavBenchCurrentModel } from "../../bench/bench-agent-current";
 import { SAV_BENCH_CORPUS, SAV_BENCH_CORPUS_REVISION } from "../../bench/bench-corpus";
 import { createSavBenchGeminiJudge, SAV_BENCH_JUDGE_REVISION, type SavBenchJudge } from "../../bench/bench-judge";
-import { runSavBench, savBenchMetrics, type SavBenchConversationRow, type SavBenchTurnRow } from "../../bench/bench-run";
-import type { SavBenchAgent, SavBenchConversation } from "../../bench/bench-types";
+import { runSavBench, savBenchCardsOf, savBenchMetrics, type SavBenchConversationRow, type SavBenchTurnRow } from "../../bench/bench-run";
+import { SAV_BENCH_CRITERIA, savBenchNormalize, type SavBenchAgent, type SavBenchConversation } from "../../bench/bench-types";
 import { buildSavBenchVariants, SAV_BENCH_VARIANTS_REVISION } from "../../bench/bench-variants";
 import { resolveCaseV2GeminiKey, SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
 import { readCaseV2TransportPolicy } from "../investigation-v2-spend";
@@ -270,11 +270,18 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
       // Academy (off unless `SAV_V2_SMART_ACADEMY=on`) is a free public read: it does not go through the meter.
       ? createSavBenchAgent({ dryRun: false, network: meter, env, academy: getAcademyTools() })
       : createSavBenchCurrentAgent({ model: createSavBenchCurrentModel({ env, network: meter, dryRun: false }), revision: `v2-decision:${model}` }));
+    // The failed turns' detail (`sav_smart_bench_turn_detail`): what the agent received and gave back on each turn, captured here only.
+    const captures = new Map<number, SmartBenchTurnCapture>();
+    const played: SavBenchAgent = { name: agent.name, revision: agent.revision, respond: async input => {
+      const turn = await agent.respond(input);
+      captures.set(input.turn, { customerMessage: input.messages.at(-1)?.text ?? "", citations: turn.citations, handoffNote: turn.handoffNote ?? null });
+      return turn;
+    } };
     const judge = agentName === "search" ? smartBenchNoJudge : deps.judge?.(meter) ?? createSavBenchGeminiJudge({ network: meter, model, key: key.ok ? key.key : "", maxOutputTokens, maxInputBytes: inputCap });
     const startedAt = clock();
     let stored: SmartBenchStored;
     try {
-      const report = await runSavBench({ conversations: [conversation], agent, judge, passes: 1, stopOnSensitiveAdmitted: true, shouldStop: () => meterStop });
+      const report = await runSavBench({ conversations: [conversation], agent: played, judge, passes: 1, stopOnSensitiveAdmitted: true, shouldStop: () => meterStop });
       stored = { runId: config.runId, agent: agentName, agentRevision: agent.revision, pass, set: config.set, judgeRevision: SAV_BENCH_JUDGE_REVISION, corpusRevision, model,
         codeSha: env.VERCEL_GIT_COMMIT_SHA?.slice(0, 40) ?? null, conversationId: conversation.id, costMicroUsd: cost, calls, durationMs: clock() - startedAt,
         stopped: meterStop ?? report.stopped?.reason ?? null, conversation: report.conversations[0] ?? null, turns: report.turns };
@@ -288,6 +295,13 @@ async function runSmartBenchSelfTestPassUnsafe(deps: SmartBenchSelfTestDeps, con
     await settleSmartItem({ prefix: SAV_SMART_BENCH_SELFTEST_PREFIX, scope: config.runId, item, costMicroUsd: cost, status: "done", now: deps.now(), result: stored });
     // One line per conversation, codes and numbers only (fictional corpus ids, no reply text): the judge's verdict readable from the logs.
     try { log("sav_smart_bench_conversation", smartBenchConversationLine(stored)); } catch { /* the log never fails the pass */ }
+    // Failed turns only, judged agents only (search has no judge): the reply text and the judge's words, to tell a real fault from a false
+    // positive. Safe because the conversation is one of the bundled FICTIONAL ones (guarded again in `smartBenchTurnDetailLine`).
+    if (agentName !== "search") for (const row of stored.turns) {
+      if (row.verdict.passed) continue;
+      try { const line = smartBenchTurnDetailLine(stored, row, conversation, captures.get(row.turn)); if (line) log("sav_smart_bench_turn_detail", line); }
+      catch { /* the log never fails the pass */ }
+    }
     // Search only: the record of every search (fictional needs, real cards by short id and title), the material of the retrieval analysis.
     if (agentName === "search") try { log("sav_smart_bench_search", { runId: config.runId, pass, ...record }); } catch { /* never fails the pass */ }
     ran += 1;
@@ -364,6 +378,79 @@ export function smartBenchConversationLine(stored: SmartBenchStored) {
     passed: stored.conversation?.passed ?? false, endedBy: stored.conversation?.endedBy ?? null, turnsPlayed: stored.conversation?.turnsPlayed ?? 0,
     failedTurns: stored.turns.filter(row => !row.verdict.passed).map(turnFailure), stopped: stored.stopped, costMicroUsd: stored.costMicroUsd, calls: stored.calls };
 }
+/*
+ * `sav_smart_bench_turn_detail` (22/11): ONE line per FAILED turn of the self-test, with the texts the per-conversation line never carries (the
+ * customer's message, the reply, the question, the team's note, the judge's justifications, the forbidden pattern's matched snippet). Last
+ * night's 9 « serious » turns (8 `faits_sources`, 1 `PWD_ASKED_2`) could not be told from false positives without them.
+ * PRIVACY: only the bench's bundled FICTIONAL conversations may reach this line. The guard is by identity: the conversation must be one of the
+ * self-test corpus or variants objects built at module load (never a row read from the database, a shadow case or a real mail); anything else
+ * returns null and nothing is logged. Every text is truncated and the whole line kept under 6 000 bytes.
+ */
+const SMART_BENCH_FICTIONAL = new Set<SavBenchConversation>([...SAV_SMART_BENCH_SELFTEST_CORPUS, ...SAV_SMART_BENCH_SELFTEST_VARIANTS]);
+export const smartBenchFictional = (conversation: SavBenchConversation) => SMART_BENCH_FICTIONAL.has(conversation);
+export type SmartBenchTurnCapture = Readonly<{ customerMessage: string; citations: readonly string[]; handoffNote: string | null }>;
+export const SMART_BENCH_TURN_DETAIL_MAX_BYTES = 6_000;
+const SMART_BENCH_TURN_DETAIL_LIMITS = { customerMessage: 800, reply: 2_500, question: 600, handoffNote: 800, explanation: 1_200, detail: 200 };
+const clip = (value: string | null | undefined, max: number): string | null => value == null ? null : value.length <= max ? value : `${value.slice(0, Math.max(0, max - 1))}…`;
+
+/** The part of the reply a forbidden pattern matched (read on the normalized reply, as the check does), with some context, ≤ 160 chars. */
+export function smartBenchForbiddenSnippet(reply: string, source: string, max = 160): string | null {
+  const normalized = savBenchNormalize(reply);
+  let match: RegExpExecArray | null;
+  try { match = new RegExp(source, "iu").exec(normalized); } catch { return null; }
+  if (!match) return null;
+  // Same length: the offsets hold on the original reply (accents kept); otherwise the normalized text is shown.
+  const text = normalized.length === reply.length ? reply : normalized, pad = Math.max(0, Math.floor((max - match[0].length) / 2));
+  const start = Math.max(0, match.index - pad);
+  return clip(text.slice(start, Math.min(text.length, match.index + match[0].length + pad)), max);
+}
+/** The questions of an « ask » turn: the reply's sentences with a question mark. */
+const smartBenchQuestion = (reply: string | null) => {
+  const questions = (reply ?? "").split(/(?<=[.!?\n])\s+/).filter(sentence => sentence.includes("?")).map(sentence => sentence.trim());
+  return questions.length ? questions.join(" ") : null;
+};
+
+export function smartBenchTurnDetailLine(stored: SmartBenchStored, row: SavBenchTurnRow, conversation: SavBenchConversation, capture: SmartBenchTurnCapture | undefined) {
+  if (!smartBenchFictional(conversation) || conversation.id !== row.conversationId) return null;
+  const cards = new Map(savBenchCardsOf(conversation).map(card => [card.id, card.title]));
+  const failed = SAV_BENCH_CRITERIA.filter(criterion => row.verdict.criteria[criterion].final === "echec");
+  const build = (limits: typeof SMART_BENCH_TURN_DETAIL_LIMITS) => {
+    const judge = row.judge === null ? { status: "non_appele" as const }
+      : row.judge.status === "failed" ? { status: "failed" as const, problem: row.judge.problem.slice(0, 80) }
+      : { status: "ok" as const, verdicts: Object.fromEntries(SAV_BENCH_CRITERIA.map(criterion => [criterion, (row.judge as Extract<typeof row.judge, { status: "ok" }>).verdicts[criterion].verdict])),
+        // The judge's own justification of every criterion that did not end « ok » (its words, even where it said « ok » and a check fired).
+        explanation: clip(SAV_BENCH_CRITERIA.filter(criterion => row.verdict.criteria[criterion].final !== "ok")
+          .map(criterion => `${criterion}: ${(row.judge as Extract<typeof row.judge, { status: "ok" }>).verdicts[criterion].justification}`).join(" | ") || null, limits.explanation) };
+    return {
+      runId: stored.runId, pass: stored.pass ?? 1, agent: stored.agent, conversationId: row.conversationId, family: row.family, turn: row.turn,
+      expectedOutcomes: row.expected, outcome: row.outcome, failed, failure: row.failure,
+      checks: row.checks.slice(0, 10).map(hit => ({ code: hit.code, criterion: hit.criterion, ...(hit.label ? { label: hit.label } : {}), detail: clip(hit.detail, limits.detail) })),
+      codes: [...row.codes, ...row.checks.flatMap(hit => hit.label ? [`bench:${hit.label}`] : [])].filter(code => /^[a-z0-9_:.>-]{1,80}$/.test(code)).slice(0, 20),
+      customerMessage: clip(capture?.customerMessage ?? null, limits.customerMessage),
+      reply: clip(row.reply, limits.reply),
+      question: row.outcome === "demander" ? clip(smartBenchQuestion(row.reply), limits.question) : null,
+      handoffNote: clip(capture?.handoffNote ?? null, limits.handoffNote),
+      judge,
+      forbiddenMatches: row.checks.filter(hit => hit.code === "forbidden_pattern").slice(0, 5)
+        .map(hit => ({ pattern: hit.label ?? "forbidden_pattern", source: hit.detail.slice(0, 120), snippet: row.reply ? smartBenchForbiddenSnippet(row.reply, hit.detail) : null })),
+      citedCards: (capture?.citations ?? []).slice(0, 10).map(id => ({ id: id.slice(0, 80), title: clip(cards.get(id) ?? null, 120) })),
+    };
+  };
+  // Under the byte cap: the longest texts shrink first (reply, note, customer message, explanation, question, check details).
+  const limits = { ...SMART_BENCH_TURN_DETAIL_LIMITS };
+  let line = build(limits);
+  for (const key of ["reply", "handoffNote", "customerMessage", "explanation", "question", "detail"] as const) {
+    const excess = Buffer.byteLength(JSON.stringify(line), "utf8") - SMART_BENCH_TURN_DETAIL_MAX_BYTES;
+    if (excess <= 0) break;
+    const length = key === "explanation" ? (line.judge.status === "ok" ? line.judge.explanation?.length ?? 0 : 0)
+      : key === "detail" ? Math.max(0, ...line.checks.map(hit => hit.detail?.length ?? 0)) : line[key]?.length ?? 0;
+    if (!length) continue;
+    limits[key] = Math.max(key === "detail" ? 40 : 120, Math.min(limits[key], length) - excess - 16);
+    line = build(limits);
+  }
+  return line;
+}
+
 /** The run's report as one log line: metrics per agent, the comparison, and at most 150 failed turns per agent (the count says if cut). */
 export function smartBenchReportLine(runId: string, report: ReturnType<typeof aggregateSmartBenchSelfTest>) {
   const side = (agent: ReturnType<typeof aggregateSmartBenchSelfTest>["current"]) => ({

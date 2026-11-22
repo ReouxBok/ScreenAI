@@ -8,7 +8,7 @@ vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_AL
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createSavBenchScriptedJudge } from "../../bench/bench-doubles";
+import { createSavBenchScriptedAgent, createSavBenchScriptedJudge } from "../../bench/bench-doubles";
 import { SAV_BENCH_CORPUS } from "../../bench/bench-corpus";
 import { createSavBenchGeminiJudge } from "../../bench/bench-judge";
 import { savBenchGeminiEnvelope } from "../../bench/bench-wire";
@@ -18,7 +18,7 @@ import { createSavBenchAgent, smartBenchTurn, smartBenchTurnCodes } from "./smar
 import { runSmartTurn } from "./smart-agent";
 import { smartEmptyMemory } from "./smart-memory";
 import {
-  readSmartBenchSelfTestConcurrency, readSmartBenchSelfTestConfig, readSmartBenchSelfTestReport, readSmartBenchSelfTestRows, runSmartBenchSelfTestPass, smartBenchConversationLine, smartBenchItem, smartBenchReportLine, smartBenchRisky, smartBenchRunPattern, smartBenchSelfTestSet,
+  readSmartBenchSelfTestConcurrency, readSmartBenchSelfTestConfig, readSmartBenchSelfTestReport, readSmartBenchSelfTestRows, runSmartBenchSelfTestPass, smartBenchConversationLine, smartBenchTurnDetailLine, SMART_BENCH_TURN_DETAIL_MAX_BYTES, smartBenchItem, smartBenchReportLine, smartBenchRisky, smartBenchRunPattern, smartBenchSelfTestSet,
   aggregateSmartBenchSelfTest, SAV_SMART_BENCH_NEW_CALLS, SAV_SMART_BENCH_SELFTEST_CORPUS, SAV_SMART_BENCH_SELFTEST_PREFIX, SAV_SMART_BENCH_SELFTEST_VARIANTS, type SmartBenchSelfTestDeps,
 } from "./smart-bench-selftest";
 import { readSmartLedger, smartItemKey } from "./smart-ledger";
@@ -138,8 +138,10 @@ describe("allumé : un paiement par conversation, 0 effet", () => {
     const reports = logs.filter(([event]) => event === "sav_smart_bench_report").map(([, fields]) => fields);
     expect(reports).toHaveLength(1);
     expect(reports[0]).toMatchObject({ runId: "run-log", new: { conversationsStored: 3, metrics: { conversations: 3 } }, current: { conversationsStored: 0 } });
-    expect(JSON.stringify(logs)).not.toContain("teamNote");
-    expect(JSON.stringify(logs)).not.toMatch(/"reply":/);
+    // Every line but the failed turns' detail (fictional texts, `sav_smart_bench_turn_detail`): codes and numbers only.
+    const coded = logs.filter(([event]) => event !== "sav_smart_bench_turn_detail");
+    expect(JSON.stringify(coded)).not.toContain("teamNote");
+    expect(JSON.stringify(coded)).not.toMatch(/"reply":/);
     // A pass with nothing left to run logs the report again, and no conversation line.
     logs.length = 0;
     await runSmartBenchSelfTestPass(deps(env, net, { log: (event, fields) => logs.push([event, fields]) }));
@@ -280,6 +282,68 @@ describe("diagnostic SAV-122 : pourquoi le cerveau a transféré, en codes ferm�
     const line = smartBenchConversationLine({ runId: "r", agent: "new", conversationId: "mdp-01", conversation: null, turns: [turn], stopped: null, costMicroUsd: 0, calls: 4 } as never);
     expect(line.failedTurns[0]).toMatchObject({ codes: ["first:check:sensitive_commitment"], checks: ["outcome_mismatch"], failed: ["issue"] });
     expect(JSON.stringify(line)).not.toMatch(/texte de réponse|Texte libre/);
+  });
+});
+
+describe("détail des tours en échec (sav_smart_bench_turn_detail, corpus fictif seulement)", () => {
+  const NYLAS = SAV_BENCH_CORPUS.filter(conversation => conversation.id === "nylas-01");
+  const run = async (strategy: "labelled" | "password", id: string) => {
+    const net = network(), logs: [string, Record<string, unknown>][] = [];
+    const env = ENV({ SAV_V2_SMART_BENCH_SELFTEST_AGENT: "new", SAV_V2_SMART_BENCH_SELFTEST_ID: id });
+    await runSmartBenchSelfTestPass(deps(env, net, { corpus: NYLAS, agents: () => createSavBenchScriptedAgent(NYLAS, strategy), log: (event, fields) => logs.push([event, fields]) }));
+    const conversation = logs.find(([event]) => event === "sav_smart_bench_conversation")![1] as { failedTurns: unknown[]; turnsPlayed: number };
+    return { conversation, details: logs.filter(([event]) => event === "sav_smart_bench_turn_detail").map(([, fields]) => fields) };
+  };
+  it("tour réussi : aucune ligne de détail", async () => {
+    const { conversation, details } = await run("labelled", "run-detail-ok");
+    expect(conversation.turnsPlayed).toBeGreaterThan(0);
+    expect(conversation.failedTurns).toEqual([]);
+    expect(details).toEqual([]);
+  });
+  it("tour en échec (mot de passe demandé) : une ligne par tour en échec, avec la réponse, le message client, le juge et l'extrait du motif interdit", async () => {
+    const { conversation, details } = await run("password", "run-detail-ko");
+    expect(details.length).toBe(conversation.failedTurns.length);
+    expect(details.length).toBeGreaterThan(0);
+    const first = details[0] as unknown as NonNullable<ReturnType<typeof smartBenchTurnDetailLine>>;
+    expect(first).toMatchObject({ runId: "run-detail-ko", pass: 1, agent: "new", conversationId: "nylas-01", family: "nylas_imap_smtp", turn: 1, expectedOutcomes: ["repondre", "demander"], outcome: "repondre" });
+    expect(first.failed).toContain("pas_de_mot_de_passe");
+    expect(first.customerMessage).toContain("ma boîte mail est chez OVH");
+    expect(first.reply).toContain("Pouvez-vous nous envoyer votre mot de passe ?");
+    expect(first.judge).toMatchObject({ status: "ok", verdicts: { issue: "ok", pas_de_mot_de_passe: "ok" } });
+    expect(first.forbiddenMatches).toContainEqual({ pattern: "forbidden_pattern:1", source: expect.stringContaining("envoy"), snippet: expect.stringContaining("envoyer votre mot de passe") });
+    expect(first.forbiddenMatches.every(match => (match.snippet ?? "").length <= 160)).toBe(true);
+    expect(first.checks.map(hit => hit.code)).toEqual(expect.arrayContaining(["password_requested", "forbidden_pattern"]));
+    expect(first.citedCards).toEqual([{ id: "mail-imap-parametres", title: expect.any(String) }]);
+    for (const line of details) expect(Buffer.byteLength(JSON.stringify(line), "utf8")).toBeLessThanOrEqual(SMART_BENCH_TURN_DETAIL_MAX_BYTES);
+  });
+  const conversation = SAV_BENCH_CORPUS.find(row => row.id === "nylas-01")!;
+  const justification = "j".repeat(400);
+  const row = (reply: string) => ({ pass: 1, conversationId: "nylas-01", family: "nylas_imap_smtp", turn: 1, expected: ["repondre"], sensitive: false, outcome: "demander", reply,
+    codes: Array.from({ length: 30 }, (_, index) => `code_${index}`), failure: null,
+    checks: [{ code: "forbidden_pattern", criterion: "pas_de_mot_de_passe", detail: conversation.turns[0]!.expect.mustNotMatch[1]!, label: "forbidden_pattern:1" }],
+    judge: { status: "ok", verdicts: Object.fromEntries(["issue", "faits_sources", "pas_de_promesse", "jamais_autre_plateforme", "pas_de_mot_de_passe", "pas_de_repetition", "fait_avancer"]
+      .map(criterion => [criterion, { verdict: "echec", justification }])) },
+    verdict: { passed: false, criteria: Object.fromEntries(["issue", "faits_sources", "pas_de_promesse", "jamais_autre_plateforme", "pas_de_mot_de_passe", "pas_de_repetition", "fait_avancer"]
+      .map(criterion => [criterion, { final: "echec" }])) } }) as never;
+  const stored = { runId: "r", pass: 1, agent: "new" } as never;
+  it("champs tronqués et ligne sous 6 000 octets", () => {
+    const reply = `${"é".repeat(5_000)}. Pouvez-vous nous envoyer votre mot de passe ? ${"à".repeat(5_000)}`;
+    const line = smartBenchTurnDetailLine(stored, row(reply), conversation, { customerMessage: "c".repeat(5_000), citations: ["mail-imap-parametres", "inconnue"], handoffNote: "n".repeat(5_000) })!;
+    expect(Buffer.byteLength(JSON.stringify(line), "utf8")).toBeLessThanOrEqual(SMART_BENCH_TURN_DETAIL_MAX_BYTES);
+    expect(line.reply!.length).toBeLessThanOrEqual(2_500);
+    expect(line.customerMessage!.length).toBeLessThanOrEqual(800);
+    expect(line.handoffNote!.length).toBeLessThanOrEqual(800);
+    expect(line.question!.length).toBeLessThanOrEqual(600);
+    expect(line.question).toContain("mot de passe ?");
+    expect(line.judge.status === "ok" && line.judge.explanation!.length).toBeLessThanOrEqual(1_200);
+    expect(line.codes).toHaveLength(20);
+    expect(line.forbiddenMatches[0]!.snippet).toContain("envoyer votre mot de passe");
+    expect(line.forbiddenMatches[0]!.snippet!.length).toBeLessThanOrEqual(160);
+    expect(line.citedCards).toEqual([{ id: "mail-imap-parametres", title: expect.any(String) }, { id: "inconnue", title: null }]);
+  });
+  it("garde : une conversation qui n'est pas un objet du corpus fictif embarqué (même identifiant) ne produit rien", () => {
+    expect(smartBenchTurnDetailLine(stored, row("Bonjour"), { ...conversation }, undefined)).toBeNull();
+    expect(smartBenchTurnDetailLine(stored, row("Bonjour"), conversation, undefined)).not.toBeNull();
   });
 });
 

@@ -111,6 +111,8 @@ export type SavBenchAgentTurn = Readonly<{
   codes: readonly string[];
   /** The agent could not produce a turn (model down, invalid output): counted as a failure, never as an answer. */
   failure?: string;
+  /** The note left to the team on a handover (the new agent only). Diagnostic only: never sent to the judge; logged only by the fictional self-test. */
+  handoffNote?: string;
 }>;
 export type SavBenchAgent = Readonly<{
   /** `current` | `new` | a test name. */
