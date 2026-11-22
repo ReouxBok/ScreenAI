@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  buildRecording, byteSize, cleanTarget, cleanUrl, fitRecording, guessParameter, MAX_RECORDING_BYTES, stepLabel, validateRecording, wireStep
-} from '../../../src/team/recording-format.js';
+  buildRecording, byteSize, cleanTarget, cleanUrl, fitRecording, guessParameter, MAX_RECORDING_BYTES, stepLabel, validateRecording, wireStep, withLegacyKeys } from '../../../src/team/recording-format.js';
 
 const START = Date.parse('2026-11-22T18:00:00Z');
 const ID = '6f0a4c1e-6b8e-4d7e-9c55-0d3f2a9b1e11';
@@ -148,5 +147,29 @@ describe('limova.recording.v1 format', () => {
     expect(stepLabel({ kind: 'check', checked: false, target: { name: 'Newsletter' } })).toBe('Décoche « Newsletter »');
     expect(stepLabel({ kind: 'key', key: 'Enter' })).toBe('Touche Entrée');
     expect(stepLabel({ kind: 'wait', ms: 2400 })).toBe('Attente de 2 s');
+  });
+
+  it('takes every key of browser.press_key in a key step, and a child frame in a target (TEAM-751)', () => {
+    const at = 1_800_000_000_000;
+    const recording = buildRecording({
+      recordingId: '6f0a4c1e-6b8e-4d7e-9c55-0d3f2a9b1e11', startedAt: at, endedAt: at + 5000, appVersion: '2.2.63', locale: 'fr-FR',
+      steps: [
+        { kind: 'key', key: 'ArrowDown', at: at + 100, target: { role: 'combobox', name: 'Ville', frame: { origin: 'https://js.stripe.com', name: 'Carte', path: [1, 0] } } },
+        { kind: 'key', key: 'Enter', at: at + 200 },
+        { kind: 'key', key: 'F5', at: at + 300 },
+        { kind: 'key', key: 'Space', at: at + 400, target: { role: 'option', name: 'Lyon' } },
+        { kind: 'fill', value: 'x', at: at + 500, target: { name: 'Nom', frame: { origin: 'javascript:alert(1)', path: [0, 1, 2, 3, 4, 5] } } }
+      ]
+    });
+    expect(recording.steps.map(step => step.key || step.kind)).toEqual(['ArrowDown', 'Enter', 'Space', 'fill']);
+    expect(recording.steps[0].target.frame).toEqual({ origin: 'https://js.stripe.com', name: 'Carte', path: [1, 0] });
+    // A frame reference that is not one is dropped, never sent half-made.
+    expect(recording.steps[3].target.frame).toBeUndefined();
+    expect(validateRecording(recording)).toEqual([]);
+    expect(stepLabel(recording.steps[0])).toBe('Touche Flèche bas dans « Ville »');
+
+    const legacy = withLegacyKeys(recording);
+    expect(legacy.dropped).toBe(2);
+    expect(legacy.recording.steps.map(step => [step.id, step.key || step.kind])).toEqual([['s1', 'Enter'], ['s2', 'fill']]);
   });
 });

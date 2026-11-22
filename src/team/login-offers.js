@@ -15,6 +15,9 @@
 //   the tab navigates (and the new page, on the same origin, shows no password field)
 //   or the field goes away with no other one showing. Not within 2 minutes of a
 //   `browser.fill_secret` fill on that tab and origin (already saved).
+// - SERVER FEATURE. A server whose `ready` says `features.login_vault: false` gets no
+//   offer at all: the password is not even held (an older server, without `features`,
+//   is asked as before and its 404 decides).
 // - ASKING. `GET /devices/me/login-secrets?origin=` first: a 404 means the vault is off
 //   for this workspace, so nothing is asked (and nothing asked for 10 minutes); a
 //   username already saved words the prompt « Mettre à jour la connexion enregistrée ? ».
@@ -227,6 +230,7 @@ export function createLoginOffers({
     if (!tab || offerableOrigin(tab.url || '') !== origin) return { ok: true };
     const target = await productForTab(tab, origin);
     if (!target) return { ok: true };
+    if (target.link.features?.login_vault === false) return { ok: true };
     dropPending(tabId);
     const entry = {
       tabId,
@@ -312,7 +316,8 @@ export function createLoginOffers({
       entry.password = null;
       return;
     }
-    if ((featureOff.get(entry.productId) || 0) > now() || (dismissed.get(`${entry.productId}\n${entry.origin}`) || 0) > now()) {
+    if (link.features?.login_vault === false || (featureOff.get(entry.productId) || 0) > now()
+      || (dismissed.get(`${entry.productId}\n${entry.origin}`) || 0) > now()) {
       entry.password = null;
       return;
     }

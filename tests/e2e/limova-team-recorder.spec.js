@@ -49,22 +49,34 @@ const test = base.extend({
   }
 });
 
+// TEAM-751: a page with a hidden file input and a cross-origin frame (localhost vs 127.0.0.1).
+const framed = other => `<!doctype html><html><head><title>Commande</title></head><body>
+  <h2>Commande</h2>
+  <label for="proof">Justificatif</label><input id="proof" type="file" style="display:none">
+  <iframe src="${other}/cadre" title="Livraison" style="width:400px;height:200px"></iframe>
+</body></html>`;
+const FRAME = `<!doctype html><html><head><title>Livraison</title></head><body>
+  <label for="city">Ville</label><input id="city" name="city" role="combobox" aria-autocomplete="list">
+</body></html>`;
+
 let server;
 let SITE;
+let OTHER;
 test.beforeAll(async () => {
   server = http.createServer((request, response) => {
     response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    if (request.url.startsWith('/commande')) return response.end(framed(OTHER));
+    if (request.url.startsWith('/cadre')) return response.end(FRAME);
     response.end(request.url.startsWith('/merci') ? THANKS : FORM);
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   SITE = `http://127.0.0.1:${server.address().port}`;
+  OTHER = `http://localhost:${server.address().port}`;
 });
 test.afterAll(async () => { await new Promise(resolve => server.close(resolve)); });
 
-test('records a small form into a limova.recording.v1 with secrets redacted', async ({ context, serviceWorker }) => {
-  test.setTimeout(60_000);
-  const extensionId = new URL(serviceWorker.url()).host;
-  // A paired connection, as after « Se connecter ».
+// A paired connection, as after « Se connecter ».
+async function pair(serviceWorker) {
   await serviceWorker.evaluate(async () => {
     await chrome.storage.local.set({ limova_home_product_v1: 'limova_team', limova_connections_v1: { version: 1, connections: { limova_team: {
       product: 'limova_team', environment: 'production', device_id: '3f8b2c1e-0000-4000-8000-000000000001',
@@ -72,6 +84,27 @@ test('records a small form into a limova.recording.v1 with secrets redacted', as
       autonomy: 'full_access', paused: false } } } });
     await chrome.alarms.create('limova-team-reconnect', { when: Date.now() + 10 });
   });
+}
+
+// Replace the worker's fetch so the upload is captured, never sent.
+async function captureUploads(serviceWorker) {
+  await serviceWorker.evaluate(() => {
+    globalThis.__uploads = [];
+    const real = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      if (String(url).endsWith('/api/v1/devices/me/recordings')) {
+        globalThis.__uploads.push({ url: String(url), auth: init.headers.Authorization, body: init.body });
+        return new Response(JSON.stringify({ recording_id: JSON.parse(init.body).recording_id, procedure_id: 'p1', status: 'compiling', redacted: 0, duplicate: false }), { status: 201 });
+      }
+      return real(url, init);
+    };
+  });
+}
+
+test('records a small form into a limova.recording.v1 with secrets redacted', async ({ context, serviceWorker }) => {
+  test.setTimeout(60_000);
+  const extensionId = new URL(serviceWorker.url()).host;
+  await pair(serviceWorker);
 
   const panel = await context.newPage();
   await panel.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
@@ -116,17 +149,7 @@ test('records a small form into a limova.recording.v1 with secrets redacted', as
 
   // The person names the task and marks the client as changing, then sends.
   await panel.locator('#teamRecordTitle').fill('Créer une facture');
-  await serviceWorker.evaluate(() => {
-    globalThis.__uploads = [];
-    const real = globalThis.fetch;
-    globalThis.fetch = async (url, init) => {
-      if (String(url).endsWith('/api/v1/devices/me/recordings')) {
-        globalThis.__uploads.push({ url: String(url), auth: init.headers.Authorization, body: init.body });
-        return new Response(JSON.stringify({ recording_id: JSON.parse(init.body).recording_id, procedure_id: 'p1', status: 'compiling', redacted: 0, duplicate: false }), { status: 201 });
-      }
-      return real(url, init);
-    };
-  });
+  await captureUploads(serviceWorker);
   await panel.locator('#teamRecordReview').getByRole('button', { name: /Envoyer à Limova|Send to Limova/ }).click();
   // « Former Limova » opens (the dashboard host is unreachable here, so read Chrome's tab URL).
   await expect.poll(() => serviceWorker.evaluate(async () => (await chrome.tabs.query({})).map(tab => tab.pendingUrl || tab.url)))
@@ -161,4 +184,54 @@ test('records a small form into a limova.recording.v1 with secrets redacted', as
   const ts = steps.map(step => step.t);
   expect([...ts].sort((a, b) => a - b)).toEqual(ts);
   expect(await serviceWorker.evaluate(() => chrome.action.getBadgeText({}))).not.toBe('REC');
+});
+
+test('records in a cross-origin frame, a hidden file input and keys (TEAM-751)', async ({ context, serviceWorker }) => {
+  test.setTimeout(90_000);
+  const extensionId = new URL(serviceWorker.url()).host;
+  await pair(serviceWorker);
+  const panel = await context.newPage();
+  await panel.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
+  await expect(panel.locator('[data-product="limova_team"]')).toContainText('Limova Team');
+
+  const site = await context.newPage();
+  await site.goto(`${SITE}/commande`);
+  const frame = site.frameLocator('iframe');
+  await frame.locator('#city').waitFor();
+  const tabId = await panel.evaluate(async url => (await chrome.tabs.query({})).find(tab => (tab.url || '').startsWith(url))?.id, SITE);
+  const started = await panel.evaluate(id => chrome.runtime.sendMessage({ type: 'TEAM_RECORD_START', productId: 'limova_team', tabId: id }), tabId);
+  expect(started.ok).toBe(true);
+  await site.waitForTimeout(500);
+
+  // The person picks a file behind the label, types a city in the frame, picks an
+  // option with ArrowDown, closes the list with Escape and leaves the field with Tab.
+  await site.locator('#proof').setInputFiles({ name: 'facture.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 secret bytes') });
+  await frame.locator('#city').click();
+  await site.keyboard.type('Lyon');
+  await site.keyboard.press('ArrowLeft');
+  await site.keyboard.press('ArrowDown');
+  await site.keyboard.press('Escape');
+  await site.keyboard.press('Tab');
+  await site.waitForTimeout(3800);
+
+  expect((await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'TEAM_RECORD_STOP' }))).ok).toBe(true);
+  await captureUploads(serviceWorker);
+  const uploaded = await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'TEAM_RECORD_UPLOAD' }));
+  expect(uploaded.ok).toBe(true);
+  const [upload] = await serviceWorker.evaluate(() => globalThis.__uploads);
+  expect(upload.body).not.toContain('secret bytes');
+  const steps = JSON.parse(upload.body).steps;
+  const port = new URL(SITE).port;
+  // The field's value is final when ArrowDown picks an option: the fill comes first.
+  expect(steps.map(step => step.key || step.kind)).toEqual(['navigate', 'upload', 'fill', 'ArrowDown', 'Escape', 'Tab']);
+  expect(steps[1]).toEqual(expect.objectContaining({
+    files: [{ name: 'facture.pdf', mime: 'application/pdf', size: 21 }],
+    target: expect.objectContaining({ name: 'Justificatif' })
+  }));
+  expect(steps[1].target.frame).toBeUndefined();
+  const inFrame = { origin: `http://localhost:${port}`, name: 'Livraison', path: [0] };
+  expect(steps[2]).toEqual(expect.objectContaining({ value: 'Lyon', target: expect.objectContaining({ name: 'Ville', frame: inFrame }) }));
+  expect(steps[3].target).toEqual(expect.objectContaining({ name: 'Ville', frame: inFrame }));
+  // A frame step's page is the tab's page, not the frame's.
+  expect(steps[2].page.url).toBe(`${SITE}/commande`);
 });

@@ -5,6 +5,8 @@
 // memory in its own shape; this module turns them into the wire format, checks them
 // against the server's limits before uploading (so a 422 is a bug, not the normal
 // path), and cuts a recording over 512 KB (narration first, then steps from the end).
+// TEAM-751: `key` steps take every key `browser.press_key` presses (KEY_STEP_KEYS), and
+// a target in a child frame carries `frame: {origin, name, path}`.
 // Pure: no Chrome API, no storage.
 
 import { maskText } from './recording-redaction.js';
@@ -18,6 +20,13 @@ export const MAX_NARRATION_CHARS = 20_000;
 export const MAX_VALUE_CHARS = 5_000;
 export const STEP_KINDS = Object.freeze(['navigate', 'click', 'fill', 'select', 'check', 'key', 'upload', 'download', 'wait']);
 export const NAVIGATE_CAUSES = Object.freeze(['typed', 'link', 'redirect', 'history', 'reload', 'script']);
+// TEAM-751: the keys a `key` step may hold (the keys of `browser.press_key`).
+export const KEY_STEP_KEYS = Object.freeze([
+  'Enter', 'Escape', 'Tab', 'Space', 'Backspace', 'Delete', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'Home', 'End', 'PageUp', 'PageDown'
+]);
+// What a server from before TEAM-751 accepts in a `key` step.
+export const LEGACY_KEY_STEP_KEYS = Object.freeze(['Enter', 'Escape', 'Tab']);
 const ELEMENT_KINDS = ['click', 'fill', 'select', 'check', 'upload', 'download'];
 const HINT_LIMITS = { input_type: 30, input_name: 100, autocomplete: 60, testid: 100, id_attr: 100, href_path: 500, landmark: 60 };
 
@@ -62,6 +71,7 @@ export function cleanTarget(raw = {}) {
   }) : undefined;
   const ordinal = Number.isInteger(raw?.ordinal) && raw.ordinal >= 0 ? Math.min(raw.ordinal, 500) : undefined;
   return compact({
+    frame: cleanFrame(raw?.frame),
     role: cut(raw?.role, 40),
     name: cut(raw?.name, 200),
     tag: cut(raw?.tag, 20),
@@ -72,6 +82,20 @@ export function cleanTarget(raw = {}) {
     hints,
     form,
     ordinal
+  });
+}
+
+// A child frame's reference (TEAM-751): `path` (1 to 5 indexes), its origin and name.
+// Absent for the top frame.
+export function cleanFrame(raw) {
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.path)) return undefined;
+  const path = raw.path.filter(index => Number.isInteger(index) && index >= 0 && index < 1000);
+  if (!path.length || path.length !== raw.path.length || path.length > 5) return undefined;
+  const origin = cleanUrl(typeof raw.origin === 'string' ? `${raw.origin}/` : '');
+  return compact({
+    origin: origin ? new URL(origin).origin : undefined,
+    name: cut(maskText(typeof raw.name === 'string' ? raw.name : ''), 100),
+    path
   });
 }
 
@@ -174,7 +198,7 @@ export function wireStep(step, { id, t }) {
       out.checked = step.checked === true;
       break;
     case 'key':
-      if (!['Enter', 'Escape', 'Tab'].includes(step.key)) return null;
+      if (!KEY_STEP_KEYS.includes(step.key)) return null;
       out.key = step.key;
       break;
     case 'upload':
@@ -288,6 +312,24 @@ export function validateRecording(recording) {
 }
 
 /**
+ * The same recording for a server from before TEAM-751, whose `key` steps only take
+ * Enter, Escape and Tab: the other key steps are left out and the ids renumbered.
+ * @returns {{recording: object, dropped: number}}
+ */
+export function withLegacyKeys(recording) {
+  const steps = [];
+  let dropped = 0;
+  for (const step of recording.steps || []) {
+    if (step.kind === 'key' && !LEGACY_KEY_STEP_KEYS.includes(step.key)) {
+      dropped += 1;
+      continue;
+    }
+    steps.push({ ...step, id: `s${steps.length + 1}` });
+  }
+  return { recording: { ...recording, steps }, dropped };
+}
+
+/**
  * Fit a recording under the byte limit: narration first, then steps from the end.
  * @returns {{recording: object, cut: {narration: number, steps: number}}}
  */
@@ -363,7 +405,15 @@ export function stepLabel(step) {
     case 'fill': return `Saisie dans ${quoted(targetName(step.target))}`;
     case 'select': return `Choix ${quoted(step.option, 40)} dans ${quoted(targetName(step.target))}`;
     case 'check': return `${step.checked ? 'Coche' : 'Décoche'} ${quoted(targetName(step.target))}`;
-    case 'key': return `Touche ${{ Enter: 'Entrée', Escape: 'Échap', Tab: 'Tab' }[step.key] || step.key}`;
+    case 'key': {
+      const names = {
+        Enter: 'Entrée', Escape: 'Échap', Tab: 'Tab', Space: 'Espace', Backspace: 'Retour arrière', Delete: 'Suppr',
+        ArrowUp: 'Flèche haut', ArrowDown: 'Flèche bas', ArrowLeft: 'Flèche gauche', ArrowRight: 'Flèche droite',
+        Home: 'Début', End: 'Fin', PageUp: 'Page précédente', PageDown: 'Page suivante'
+      };
+      const on = step.target ? ` dans ${quoted(targetName(step.target))}` : '';
+      return `Touche ${names[step.key] || step.key}${on}`;
+    }
     case 'upload': return `Envoi de ${(step.files || []).map(file => quoted(file.name, 40)).join(', ') || 'fichiers'}`;
     case 'download': return `Téléchargement de ${quoted(step.file?.name || targetName(step.target))}`;
     case 'wait': return `Attente de ${Math.max(1, Math.round((step.ms || 0) / 1000))} s`;

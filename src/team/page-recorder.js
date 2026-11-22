@@ -1,8 +1,9 @@
 // page-recorder.js — Functions injected in a recorded tab (TEAM-731, « Montrer à Limova »).
 //
 // docs/procedure-recording-format.md. Like page-snapshot.js, each function is passed to
-// chrome.scripting.executeScript and runs in the extension's ISOLATED world of the top
-// frame; each is SELF-CONTAINED. They rely on the page kit that
+// chrome.scripting.executeScript and runs in the extension's ISOLATED world of each
+// frame of the recorded tab (child frames too since TEAM-751, where every target gets
+// `frame: {origin, name, path}`); each is SELF-CONTAINED. They rely on the page kit that
 // `pageSnapshot({installOnly: true})` installs just before (descriptors, names, the
 // sensitive-field rule), so recorded targets and read_page elements are described by
 // the same code.
@@ -18,9 +19,16 @@
 //   final value (never one per key press). A field that is plainly secret (password,
 //   card, one-time code, the read_page `sensitive` rule) never sends its value at all;
 //   the service worker applies the full redaction rules to the rest;
-// - key: Enter and Escape pressed for their effect (Tab only moves between fields and
-//   is not recorded);
-// - upload: file names, types and sizes, never their bytes.
+// - key (TEAM-751): a key pressed for its effect, never typing. Enter (in a text area
+//   or an editable area only when the page took it, as a composer's « send »), Escape
+//   and Tab always; ArrowUp/ArrowDown in a field only when it is a combobox or an
+//   autocomplete (they pick an option); Space, arrows, Home/End, PageUp/PageDown,
+//   Backspace/Delete only outside a text field (a chip deleted, a custom widget),
+//   and on the page itself only when the page took the key (a plain scroll is noise).
+//   Keys that land on a button, a link, a checkbox or a select are left out: their
+//   click, check or choice is recorded instead. Ctrl/⌘/Alt shortcuts never count;
+// - upload: file names, types and sizes, never their bytes, from a file input (even
+//   one hidden behind a styled button) or a drop area.
 // About 600 ms to 3 s after each action it reports what changed (`TEAM_RECORD_OBSERVED`:
 // DOM changed, new alerts/toasts, URL path, title). Events the page fires itself
 // (`isTrusted` false) are ignored: only what the person did is recorded. While paused
@@ -28,8 +36,7 @@
 
 export function startPageRecorder(options) {
   const kit = globalThis.__limovaBrowserKit;
-  if (!kit || typeof kit.targetOf !== 'function') return { ok: false, code: 'no_kit' };
-  if (window.top !== window) return { ok: false, code: 'not_top_frame' };
+  if (!kit || typeof kit.targetOf !== 'function' || typeof kit.framePath !== 'function') return { ok: false, code: 'no_kit' };
   const recordingId = String(options?.recordingId || '');
   if (!recordingId) return { ok: false, code: 'invalid_args' };
   const existing = globalThis.__limovaRecorder;
@@ -51,6 +58,23 @@ export function startPageRecorder(options) {
     '[role="treeitem"]', '[role="gridcell"]', '[role="combobox"]'
   ].join(', ');
   const acceptUntrusted = options?.acceptUntrusted === true;
+  const KEYS = new Set(['Enter', 'Escape', 'Tab', ' ', 'Backspace', 'Delete', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown']);
+
+  // TEAM-751: where this frame sits, for every target recorded in it (absent at the top).
+  // Its name is the frame's own name when that is a stable word, else its title.
+  function frameRef() {
+    if (window.top === window) return null;
+    const path = kit.framePath();
+    if (!Array.isArray(path) || !path.length || path.length > 5) return null;
+    const own = String(window.name || '');
+    const name = own && own.length <= 100 && kit.stableId(own) ? own : kit.clean(document.title, 100);
+    return { origin: kit.frameOrigin(), ...(name ? { name } : {}), path };
+  }
+  const frame = frameRef();
+  function targetOf(el) {
+    const target = kit.targetOf(el);
+    return frame ? { ...target, frame } : target;
+  }
 
   const state = {
     recordingId,
@@ -162,7 +186,7 @@ export function startPageRecorder(options) {
     const secret = secretKind(el);
     const event = {
       kind: 'fill',
-      target: kit.targetOf(el),
+      target: targetOf(el),
       ...(secret ? { value_withheld: true, secret_kind: secret } : { value: fieldValue(el).slice(0, 5000) }),
       sensitive: Boolean(secret) || kit.isSensitive(el)
     };
@@ -259,13 +283,13 @@ export function startPageRecorder(options) {
       state.dirty.delete(el);
       const labels = [...el.selectedOptions].map(option => kit.clean(option.label || option.text, 200)).filter(Boolean);
       if (!labels.length) return;
-      emit({ kind: 'select', target: kit.targetOf(el), option: labels.join(', ').slice(0, 200) });
+      emit({ kind: 'select', target: targetOf(el), option: labels.join(', ').slice(0, 200) });
       return;
     }
     if (el instanceof HTMLInputElement) {
       const type = (el.getAttribute('type') || 'text').toLowerCase();
       if (type === 'checkbox' || type === 'radio') {
-        emit({ kind: 'check', target: kit.targetOf(el), checked: el.checked === true });
+        emit({ kind: 'check', target: targetOf(el), checked: el.checked === true });
         return;
       }
       if (type === 'file') {
@@ -274,7 +298,7 @@ export function startPageRecorder(options) {
           ...(file.type ? { mime: String(file.type).slice(0, 120) } : {}),
           ...(Number.isFinite(file.size) ? { size: file.size } : {})
         }));
-        if (files.length) emit({ kind: 'upload', target: kit.targetOf(el), files });
+        if (files.length) emit({ kind: 'upload', target: targetOf(el), files });
       }
     }
   });
@@ -287,25 +311,91 @@ export function startPageRecorder(options) {
     }));
     if (!files.length) return;
     const zone = originalTarget(event).closest?.('[aria-label], [role], label, form, section, div') || originalTarget(event);
-    emit({ kind: 'upload', target: kit.targetOf(zone), files });
+    emit({ kind: 'upload', target: targetOf(zone), files });
   });
 
+  // A field that picks among options with the arrow keys (combobox, autocomplete, datalist).
+  function picksOptions(field) {
+    if (!(field instanceof Element)) return false;
+    const role = (field.getAttribute('role') || '').trim();
+    if (role === 'combobox' || role === 'listbox') return true;
+    if (field.hasAttribute('aria-autocomplete') || field.hasAttribute('aria-activedescendant')) return true;
+    if (field instanceof HTMLInputElement && field.getAttribute('list')) return true;
+    const popup = (field.getAttribute('aria-haspopup') || '').trim();
+    return popup === 'listbox' || popup === 'true' && field.hasAttribute('aria-expanded');
+  }
+
+  function inputTypeOf(node) {
+    return node instanceof HTMLInputElement ? (node.getAttribute('type') || 'text').toLowerCase() : '';
+  }
+
+  // Enter and Space on these click them: the click (or check) is what gets recorded.
+  function clickedByKey(node) {
+    if (!(node instanceof Element)) return false;
+    if (node.closest('button, a[href], summary, select, [role="button"], [role="link"]')) return true;
+    return ['submit', 'button', 'reset', 'image', 'checkbox', 'radio', 'file'].includes(inputTypeOf(node));
+  }
+
+  // Arrows, Home and End in these change a choice: the select or check is recorded.
+  function choiceByKey(node) {
+    return node instanceof HTMLSelectElement || inputTypeOf(node) === 'radio';
+  }
+
+  function emitKey(key, focused) {
+    const onPage = !(focused instanceof Element) || focused === document.body || focused === document.documentElement;
+    emit({ kind: 'key', key, ...(onPage ? {} : { target: targetOf(focused) }) });
+  }
+
   on(document, 'keydown', event => {
-    if (event.key !== 'Enter' && event.key !== 'Escape') return;
-    if (event.isComposing) return;
+    if (!KEYS.has(event.key) || event.isComposing) return;
+    // Shortcuts (Ctrl/⌘/Alt) are never part of a task's steps.
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    const key = event.key === ' ' ? 'Space' : event.key;
     const focused = originalTarget(event);
-    if (event.key === 'Enter') {
-      // Enter in a text area types a new line; on a button or link it clicks (recorded as a click).
-      if (focused instanceof HTMLTextAreaElement || focused?.isContentEditable) return;
-      if (focused instanceof Element && focused.closest('button, a[href], [role="button"], [role="link"], summary, select')) return;
-      const field = editableRoot(focused);
+    const field = editableRoot(focused);
+    const multiline = field instanceof HTMLTextAreaElement || Boolean(field?.isContentEditable);
+    const onPage = !(focused instanceof Element) || focused === document.body || focused === document.documentElement;
+    // Whether the page took the key is only known once its own listeners ran.
+    const ifTaken = () => setTimeout(() => {
+      if (event.defaultPrevented && globalThis.__limovaRecorder === state && !state.paused) emitKey(key, focused);
+    }, 0);
+    if (key === 'Escape' || key === 'Tab') {
+      emitKey(key, focused);
+      return;
+    }
+    if (key === 'Enter') {
+      if (clickedByKey(focused)) return;
+      if (multiline) {
+        // A new line is part of the text; a composer that sends on Enter cancels it.
+        if (!event.shiftKey) {
+          const flushed = flush(field);
+          if (flushed) emit(flushed, { watch: false });
+          ifTaken();
+        }
+        return;
+      }
       if (field) {
         const flushed = flush(field);
         if (flushed) emit(flushed, { watch: false });
       }
+      emitKey(key, focused);
+      return;
     }
-    const target = focused instanceof Element && focused !== document.body && focused !== document.documentElement ? kit.targetOf(focused) : undefined;
-    emit({ kind: 'key', key: event.key, ...(target ? { target } : {}) });
+    if (field) {
+      // Typing and moving the caret are already in the field's final value.
+      if ((key === 'ArrowUp' || key === 'ArrowDown') && !multiline && picksOptions(field)) {
+        const flushed = flush(field);
+        if (flushed) emit(flushed, { watch: false });
+        emitKey(key, focused);
+      }
+      return;
+    }
+    if (key === 'Space' ? clickedByKey(focused) : choiceByKey(focused)) return;
+    if (onPage) {
+      ifTaken();
+      return;
+    }
+    emitKey(key, focused);
   });
 
   on(document, 'click', event => {
@@ -325,11 +415,11 @@ export function startPageRecorder(options) {
     if (el.isContentEditable) return;
     const role = el.getAttribute('role') || '';
     if (role === 'option') {
-      emit({ kind: 'select', target: kit.targetOf(ownerOfOption(el)), option: kit.clean(kit.nameOf(el), 200) || '?' });
+      emit({ kind: 'select', target: targetOf(ownerOfOption(el)), option: kit.clean(kit.nameOf(el), 200) || '?' });
       return;
     }
     if (['checkbox', 'switch', 'radio', 'menuitemcheckbox', 'menuitemradio'].includes(role)) {
-      const target = kit.targetOf(el);
+      const target = targetOf(el);
       setTimeout(() => emit({ kind: 'check', target, checked: el.getAttribute('aria-checked') === 'true' }), 0);
       return;
     }
@@ -337,10 +427,10 @@ export function startPageRecorder(options) {
     if (kit.submitsForm(el)) emitFlushed(kit.formOf(el));
     const file = downloadFile(el);
     if (file) {
-      emit({ kind: 'download', target: kit.targetOf(el), file });
+      emit({ kind: 'download', target: targetOf(el), file });
       return;
     }
-    emit({ kind: 'click', target: kit.targetOf(el) });
+    emit({ kind: 'click', target: targetOf(el) });
   });
 
   const onPageHide = () => emitFlushed(null);

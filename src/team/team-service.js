@@ -22,6 +22,12 @@
 // the login watcher's two, the only TEAM_* messages accepted from a web page, and only
 // for a tab being recorded.
 //
+// Server features (TEAM-731, `ready.features`): on every `ready` the link keeps
+// `{procedures, login_vault}`. `procedures` shows or hides « Montrer à Limova » (the
+// recorder's old empty-upload probe only runs for an older server that sends no
+// `features`); `login_vault` false stops the offer to save a login before it holds any
+// password.
+//
 // TEAM-726: user builds connect to production only. The environment is the build's
 // (build-config.js); the choice is only offered, and only accepted, when the developer
 // toggle is on.
@@ -65,9 +71,10 @@ export function isTeamPageMessage(type) {
   return TEAM_PAGE_MESSAGE_TYPES.includes(type);
 }
 
-// The recorder's page messages (TEAM-731): from any http(s) top frame, since people
-// record on local and intranet sites too; the recorder only accepts them from a tab
-// it is recording, for the current recording id.
+// The recorder's page messages (TEAM-731): from any http(s) frame (child frames too
+// since TEAM-751), since people record on local and intranet sites too; the recorder
+// only accepts them from a tab it is recording, for the current recording id, and
+// never from a frame on a blocked site.
 export function isTeamRecorderPageMessage(type) {
   return RECORDER_PAGE_MESSAGE_TYPES.includes(type);
 }
@@ -288,7 +295,7 @@ export function createTeamService({
     const env = getEnvironment(connection.product, connection.environment);
     if (!product || !env) return null;
     const browser = engine.forProduct(product);
-    const link = { productId: product.id, product, connection, browser, status: 'connecting', email: null, ownerFetched: false };
+    const link = { productId: product.id, product, connection, browser, status: 'connecting', email: null, ownerFetched: false, features: null };
     const controller = createTeamController({
       product,
       initial: connection,
@@ -317,8 +324,14 @@ export function createTeamService({
         if (status === 'online' && !link.ownerFetched) {
           link.ownerFetched = true;
           refreshOwner(link);
-          recorder.probe(product.id).catch(() => {});
         }
+        scheduleBroadcast();
+      },
+      // Read on every `ready`: a deploy can switch a feature between two connections.
+      onReady: ({ features }) => {
+        link.features = features;
+        if (features) recorder.setFeatures(product.id, features);
+        else recorder.probe(product.id).catch(() => {});
         scheduleBroadcast();
       },
       onRevoked: () => { forget(product.id); },
