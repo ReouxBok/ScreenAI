@@ -57,6 +57,18 @@ Contrat : `docs/login-vault.md` du dépôt team-backend. Tout est derrière le r
 
 **Permission `cookies`.** Ajoutée pour « Envoyer ma session à Limova » uniquement : elle n’est utilisée que par `src/team/session-export.js`, sur action explicite et consentement pour un site donné, et les cookies ne vont qu’à Limova Team. Charly ne lit ni n’écrit aucun cookie. L’accès aux sites lui-même vient de l’autorisation d’hôte existante (`<all_urls>`).
 
+### « Montrer à Limova » : enregistrer une tâche (TEAM-731)
+
+Rien n’est enregistré tant que la personne n’a pas cliqué « Montrer à Limova » puis choisi l’onglet. Pendant l’enregistrement, le panneau affiche « Limova regarde · Pause · Arrêter », le groupe d’onglets s’appelle « Limova Team · Limova regarde » et l’icône affiche « REC ». En pause, rien n’est capturé.
+
+Ce qui est enregistré, dans les onglets de l’enregistrement seulement : les pages ouvertes (origine et chemin, jamais la query string ni le fragment) et la façon d’y arriver ; les clics sur des éléments interactifs, décrits par leur rôle, leur nom visible, leur libellé, leur placeholder, le titre voisin et quelques attributs stables (`name`, `data-testid`, `id` non généré, lien) ; la valeur finale de chaque champ rempli ; l’option choisie dans une liste ; l’état d’une case ; les touches Entrée et Échap ; le nom, le type et la taille des fichiers choisis ou téléchargés, jamais leur contenu ; les messages affichés après une action (alertes, confirmations). Jamais : la frappe touche par touche, les captures d’écran, l’audio, les sélecteurs, les coordonnées.
+
+Masqué sur l’appareil avant tout envoi : la valeur de tout champ mot de passe, carte, code à usage unique ou secret (par son type, son `autocomplete`, son libellé, ou la règle « sensible » de `browser.read_page`), et toute valeur qui ressemble à un numéro de carte (contrôle de Luhn), une clé ou un jeton (`sk-…`, `ghp_…`, `xoxb-…`, `AKIA…`, JWT, chaîne aléatoire de 32 caractères ou plus) ou un code de 4 à 8 chiffres dans un champ de code. Ces valeurs sont remplacées par leur seule nature (`{"redacted": "password"}`…). Dans les messages et les titres, les numéros de carte et les « code 482913 » deviennent « [masqué] ». Les champs dont la nature est évidente (mot de passe, carte, code) ne transmettent même pas leur valeur au service worker.
+
+Conservation : l’enregistrement reste dans la mémoire du service worker, jamais dans `chrome.storage` ni dans les journaux. Il disparaît à l’envoi, à « Abandonner », ou si Chrome arrête l’extension.
+
+Envoi : une seule fois, quand la personne clique « Envoyer à Limova » après avoir relu la liste des étapes (elle peut en supprimer, nommer la tâche et marquer les valeurs qui changent). Destination : `POST https://api.team.limova.ai/api/v1/devices/me/recordings` avec le jeton de l’appareil. Pour savoir s’il doit afficher le bouton, le panneau envoie à la connexion une requête vide à la même adresse ; elle ne contient aucune donnée.
+
 ## Cookies et statistiques d’utilisation
 
 L’extension n’écrit aucun cookie. Elle ne lit les cookies d’un site que lorsque la personne choisit « Envoyer ma session à Limova » pour ce site précis dans le panneau Limova Team et confirme l’écran de consentement ; ils sont alors envoyés uniquement à Limova Team (voir « Connexions enregistrées et sessions » ci-dessus). Charly ne lit jamais de cookie.
