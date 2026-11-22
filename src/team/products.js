@@ -117,6 +117,12 @@ export function isBlockedHost(hostname) {
   return listProducts().some(product => product.ownHosts.some(own => hostMatches(host, own)));
 }
 
+// The host suffixes isBlockedHost refuses, for the page functions that must check a
+// frame's own host themselves (TEAM-751: a blocked frame is never read).
+export function blockedHostSuffixes() {
+  return [...ALWAYS_BLOCKED_HOSTS, ...listProducts().flatMap(product => product.ownHosts)];
+}
+
 /**
  * Classify a URL the agent asks to open or a page it wants to act on.
  * @returns {{ok: true, url: URL} | {ok: false, code: string}}

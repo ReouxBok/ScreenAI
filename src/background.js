@@ -835,9 +835,14 @@ function isTrustedMessageSource(request, sender) {
   // Limova Team's login watcher (TEAM-729), injected in a tab's isolated world: only its
   // two messages, only from an https top frame. team-service checks the rest.
   if (isTeamPageMessage(request.type)) return Boolean(sender.tab) && sender.frameId === 0 && /^https:\/\//.test(String(sender.url || ''));
-  // « Montrer à Limova »'s page recorder (TEAM-731): http(s) top frames; the recorder
-  // only accepts a tab it is recording, for the current recording id.
-  if (isTeamRecorderPageMessage(request.type)) return Boolean(sender.tab) && sender.frameId === 0 && /^https?:\/\//.test(String(sender.url || ''));
+  // « Montrer à Limova »'s page recorder (TEAM-731): http(s) frames of a tab (child frames
+  // too since TEAM-751); the recorder only accepts a tab it is recording, for the current
+  // recording id, and never a frame on a blocked site.
+  // An editor's about:blank / about:srcdoc frame counts with its http(s) origin.
+  if (isTeamRecorderPageMessage(request.type)) {
+    return Boolean(sender.tab) && Number.isInteger(sender.frameId) && (/^https?:\/\//.test(String(sender.url || ''))
+      || (sender.frameId !== 0 && /^about:(?:blank|srcdoc)$/.test(String(sender.url || '')) && /^https?:\/\//.test(String(sender.origin || ''))));
+  }
   if (!CONTENT_SCRIPT_MESSAGE_TYPES.has(request.type)) return false;
   if (isLimovaUrl(pageUrl)) return true;
   return EXTERNAL_SITE_MESSAGE_TYPES.has(request.type) && isExternalSiteUrl(pageUrl);
@@ -2685,10 +2690,11 @@ async function renderSilentVisualCapture(dataUrl, preparation) {
     context.textAlign = 'center';
     context.font = `700 ${Math.max(10, Math.round(10 * scaleY))}px sans-serif`;
     for (const marker of preparation.markers.slice(0, 80)) {
-      const label = typeof marker.label === 'string' && /^#e\d{1,4}$/.test(marker.label)
+      // `#fr1.e3`: an element of a child frame (Limova Team, TEAM-751).
+      const label = typeof marker.label === 'string' && /^#(?:fr\d{1,2}\.)?e\d{1,4}$/.test(marker.label)
         ? marker.label
         : `#${Number(marker.id)}`;
-      if (!/^#e?\d+$/.test(label)) continue;
+      if (!/^#(?:(?:fr\d{1,2}\.)?e)?\d+$/.test(label)) continue;
       const left = Math.max(2, Number(marker.left) * scaleX);
       const top = Math.max(2, Number(marker.top) * scaleY);
       const width = Math.max(24, context.measureText(label).width + 10 * scaleX);

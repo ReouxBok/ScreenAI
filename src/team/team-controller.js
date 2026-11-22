@@ -25,6 +25,10 @@
 // A successful fill is reported with `onVaultFill`, so the offer to save (login-offers.js)
 // does not ask to save the login Limova just typed.
 //
+// `browser.press_key` and `browser.upload` (TEAM-751) are actions like the others: the
+// engine reads them (Enter on « Payer » is `pay`), and only a payment waits for the
+// owner. A key pressed on the focused element names no element (`plan.element` null).
+//
 // `set_autonomy` applies at once, in both directions, without a window (TEAM-726: only
 // the signed-in owner can send it, and the level now only drives the chat's
 // confirmations). It sends `state` before answering and never resumes a paused app.
@@ -160,36 +164,40 @@ export function createTeamController({
       return prepared.error;
     }
     const { plan } = prepared;
-    // A batch carries the strictest reading of its steps; a single action is read here.
-    const local = plan.local || classifyAction(call.tool, plan.element);
+    // The engine reads each action (a batch: the strictest of its steps).
+    const local = plan.local || classifyAction(call.tool, plan.element || {});
+    const targetName = plan.element?.name || '';
     const risk = stricterRisk({ risk: args.risk, reason: args.risk_reason }, local);
     if (needsOwnerApproval(risk)) {
       const lines = [];
       if (call.tool === 'browser.fill') lines.push({ label: 'Texte', text: previewValue(args.value) });
       if (call.tool === 'browser.select') lines.push({ label: 'Choix', text: previewValue(args.option) });
+      if (call.tool === 'browser.press_key') lines.push({ label: 'Touche', text: activityLabel(call.tool, args, '') });
       if (plan.kind === 'batch') {
         lines.push({
           label: 'Étapes',
-          text: plan.steps.map((step, index) => `${index + 1}. ${activityLabel(`browser.${step.action === 'check' ? 'click' : step.action}`, {}, step.element.name)}`).join('\n')
+          text: plan.steps.map((step, index) => `${index + 1}. ${step.action === 'key'
+            ? activityLabel('browser.press_key', step, step.element?.name || '')
+            : activityLabel(`browser.${step.action === 'check' ? 'click' : step.action}`, {}, step.element.name)}`).join('\n')
         });
       }
       const outcome = await ask({
         kind: 'action',
-        title: approvalTitle(product.label, call.tool, plan.element.name, plan.domain),
+        title: approvalTitle(product.label, call.tool, targetName, plan.domain),
         domain: plan.domain,
-        target: plan.element.name,
+        target: targetName,
         reason: PAY_REASON_TEXT,
         lines
       }, call, ctx, signal);
       if (outcome.decision !== 'approve') {
         const error = outcomeError(outcome.decision);
-        record(call, error, plan.element.name);
+        record(call, error, targetName);
         return error;
       }
       if (state.paused || signal.aborted) return toolError('paused', 'Paused by the person.');
     }
     const result = await browser.executeAction(plan, { signal, busy: true });
-    record(call, result, plan.element.name);
+    record(call, result, targetName);
     return result;
   }
 

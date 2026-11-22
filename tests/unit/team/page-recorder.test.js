@@ -138,14 +138,63 @@ describe('page recorder (isolated world)', () => {
     expect(events()).toEqual([]);
   });
 
-  it('records Enter after flushing the field, and Escape; never typing keys', () => {
+  it('records Enter after flushing the field, Escape and Tab; never typing keys', () => {
     const client = document.getElementById('client');
     type(client, 'Globex');
     fire(client, 'keydown', { key: 'g' });
     fire(client, 'keydown', { key: 'Enter' });
     fire(client, 'keydown', { key: 'Escape' });
     fire(client, 'keydown', { key: 'Tab' });
-    expect(events().map(event => [event.kind, event.key || event.value])).toEqual([['fill', 'Globex'], ['key', 'Enter'], ['key', 'Escape']]);
+    expect(events().map(event => [event.kind, event.key || event.value])).toEqual([['fill', 'Globex'], ['key', 'Enter'], ['key', 'Escape'], ['key', 'Tab']]);
+  });
+
+  it('records keys for their effect, never typing or caret moves inside a field (TEAM-751)', async () => {
+    document.body.insertAdjacentHTML('beforeend', `
+      <label for="city">Ville</label><input id="city" role="combobox" aria-autocomplete="list" aria-expanded="true">
+      <span id="chip" role="button" tabindex="0">Paris ×</span>
+      <div id="grid" tabindex="0" role="grid" aria-label="Tableau">cellules</div>
+      <label for="notes">Notes</label><textarea id="notes"></textarea>
+      <div id="composer" contenteditable="true" aria-label="Message"></div>`);
+    const client = document.getElementById('client');
+    for (const key of ['ArrowLeft', 'ArrowRight', 'Home', 'End', 'Backspace', 'Delete', ' ', 'ArrowDown', 'PageDown']) fire(client, 'keydown', { key });
+    expect(events()).toEqual([]);
+    // In a combobox, ArrowDown picks an option.
+    fire(document.getElementById('city'), 'keydown', { key: 'ArrowDown' });
+    // Backspace deletes a chip; arrows move in a grid.
+    fire(document.getElementById('chip'), 'keydown', { key: 'Backspace' });
+    fire(document.getElementById('grid'), 'keydown', { key: 'ArrowRight' });
+    // Keys that click or choose are recorded as that click or choice.
+    fire(document.querySelector('button[type="submit"]'), 'keydown', { key: ' ' });
+    fire(document.getElementById('vat'), 'keydown', { key: 'ArrowDown' });
+    // Shortcuts never count.
+    fire(document.getElementById('city'), 'keydown', { key: 'Enter', ctrlKey: true });
+    expect(events().map(event => [event.key, event.target?.name])).toEqual([
+      ['ArrowDown', 'Ville'], ['Backspace', 'Paris ×'], ['ArrowRight', 'Tableau']
+    ]);
+
+    // On the page itself, only a key the page took (a plain scroll is noise).
+    sent.length = 0;
+    fire(document.body, 'keydown', { key: 'PageDown' });
+    document.addEventListener('keydown', event => event.preventDefault(), { once: true });
+    fire(document.body, 'keydown', { key: 'ArrowDown' });
+    // Enter in a text area is a new line; in a composer that cancels it, a « send ».
+    fire(document.getElementById('notes'), 'keydown', { key: 'Enter' });
+    document.addEventListener('keydown', event => event.preventDefault(), { once: true });
+    fire(document.getElementById('composer'), 'keydown', { key: 'Enter' });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    expect(events().map(event => [event.key, event.target?.name ?? null])).toEqual([['ArrowDown', null], ['Enter', 'Message']]);
+  });
+
+  it('records a file chosen in a hidden input under its label, names only (TEAM-751)', () => {
+    document.body.insertAdjacentHTML('beforeend', '<label for="proof">Justificatif</label><input id="proof" type="file" style="display:none">');
+    const input = document.getElementById('proof');
+    Object.defineProperty(input, 'files', { configurable: true, value: [{ name: 'facture.pdf', type: 'application/pdf', size: 1200 }] });
+    fire(input, 'change');
+    expect(events()).toEqual([expect.objectContaining({
+      kind: 'upload',
+      target: expect.objectContaining({ name: 'Justificatif', hints: expect.objectContaining({ input_type: 'file' }) }),
+      files: [{ name: 'facture.pdf', mime: 'application/pdf', size: 1200 }]
+    })]);
   });
 
   it('flushes fields typed before a pause, then records nothing while paused', () => {

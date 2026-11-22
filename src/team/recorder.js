@@ -26,11 +26,22 @@
 //
 // While recording, the person drives: agent calls for this product are held as with
 // « Prendre la main », and handed back at « Arrêter ».
+//
+// TEAM-751: the page recorder runs in every frame of a recorded tab (not frames on a
+// blocked site), and a frame that loads later gets it too. A step from a child frame
+// says the tab's page in `page` and its frame in `target.frame`. Keys: every key of
+// `browser.press_key` the page recorder keeps (see page-recorder.js); a server from
+// before TEAM-751 refuses all but Enter, Escape and Tab with a 422, so the upload then
+// tries once more without the others.
+//
+// Is « Former Limova » on? The socket's `ready.features.procedures` says so on every
+// `ready` (`setFeatures`); only an older server, without `features`, is still asked
+// with an empty upload (`probe`: 404 means off).
 
 import { classifyUrl } from './products.js';
 import {
-  buildRecording, cleanTarget, cleanUrl, fitRecording, guessParameter, MAX_DURATION_MS, MAX_RECORDING_BYTES,
-  MAX_STEPS, stepLabel, validateRecording
+  buildRecording, cleanTarget, cleanUrl, fitRecording, guessParameter, KEY_STEP_KEYS, LEGACY_KEY_STEP_KEYS,
+  MAX_DURATION_MS, MAX_RECORDING_BYTES, MAX_STEPS, stepLabel, validateRecording, withLegacyKeys
 } from './recording-format.js';
 import { fieldSecretKind, maskText, redactFillValue } from './recording-redaction.js';
 import { pageSnapshot } from './page-snapshot.js';
@@ -109,19 +120,44 @@ export function createRecorder({
   const active = () => Boolean(current && (current.status === 'recording' || current.status === 'paused'));
   const changed = () => onChange(summary());
 
-  async function inject(tabId) {
+  // A child frame is recorded unless it is on a blocked site; an editor's about:blank
+  // frame counts with its page.
+  function recordableFrame(url) {
+    const verdict = classifyUrl(url || '');
+    return verdict.ok || (/^about:(?:blank|srcdoc)$/.test(String(url || '')));
+  }
+
+  // The frames of a tab to record in: the top frame and every recordable child frame.
+  async function framesOf(tabId) {
+    const frames = await Promise.resolve(chromeApi.webNavigation?.getAllFrames?.({ tabId })).catch(() => null);
+    if (!Array.isArray(frames)) return [0];
+    const blocked = new Set();
+    const ids = [0];
+    for (const frame of [...frames].sort((a, b) => a.frameId - b.frameId)) {
+      if (frame.frameId === 0) continue;
+      if (blocked.has(frame.parentFrameId) || !recordableFrame(frame.url)) {
+        blocked.add(frame.frameId);
+        continue;
+      }
+      ids.push(frame.frameId);
+    }
+    return ids;
+  }
+
+  async function inject(tabId, frameIds = null) {
     if (!active()) return false;
     const tab = await chromeApi.tabs.get(tabId).catch(() => null);
     if (!tab || !classifyUrl(tab.url || '').ok) return false;
+    const targets = frameIds || await framesOf(tabId);
     try {
-      await chromeApi.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: 'ISOLATED', func: pageSnapshot, args: [{ installOnly: true }] });
+      await chromeApi.scripting.executeScript({ target: { tabId, frameIds: targets }, world: 'ISOLATED', func: pageSnapshot, args: [{ installOnly: true }] });
       const results = await chromeApi.scripting.executeScript({
-        target: { tabId, frameIds: [0] },
+        target: { tabId, frameIds: targets },
         world: 'ISOLATED',
         func: startPageRecorder,
         args: [{ recordingId: current.id, paused: current.status === 'paused' }]
       });
-      return Boolean(results?.[0]?.result?.ok);
+      return Boolean((results || []).some(item => item?.result?.ok));
     } catch {
       return false;
     }
@@ -131,8 +167,11 @@ export function createRecorder({
     const events = [];
     for (const tabId of current.tabs.keys()) {
       try {
-        const results = await chromeApi.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: 'ISOLATED', func, args: [args] });
-        for (const event of results?.[0]?.result?.events || []) events.push({ tabId, event });
+        const results = await chromeApi.scripting.executeScript({ target: { tabId, allFrames: true }, world: 'ISOLATED', func, args: [args] });
+        for (const item of results || []) {
+          const frameId = Number.isInteger(item?.frameId) ? item.frameId : 0;
+          for (const event of item?.result?.events || []) events.push({ tabId, frameId, event });
+        }
       } catch {
         // Closed tab, or a page Chrome does not let us script: nothing to collect.
       }
@@ -150,7 +189,8 @@ export function createRecorder({
 
   function push(step) {
     if (current.steps.filter(item => !item.deleted).length >= MAX_STEPS) return false;
-    step.key = `k${keyCounter += 1}`;
+    // The review list's own id. Not `key`: a key step's `key` is the key pressed.
+    step.ref = `k${keyCounter += 1}`;
     current.steps.push(step);
     if (current.steps.filter(item => !item.deleted).length >= MAX_STEPS) {
       current.limit = 'steps';
@@ -177,8 +217,13 @@ export function createRecorder({
     };
   }
 
-  function watchObservation(tabId, seq, step) {
-    const id = `${tabId}:${seq}`;
+  // Each frame's recorder numbers its own events: the frame is part of the key.
+  function observationKey(tabId, frameId, seq) {
+    return `${tabId}:${frameId || 0}:${seq}`;
+  }
+
+  function watchObservation(tabId, seq, step, frameId = 0) {
+    const id = observationKey(tabId, frameId, seq);
     const timer = timers.setTimeout(async () => {
       // The page went away before reporting (it navigated): read the tab instead.
       const tab = await chromeApi.tabs.get(tabId).catch(() => null);
@@ -214,10 +259,15 @@ export function createRecorder({
     push({ kind: 'navigate', url, cause, tab: current.tabs.get(tabId), tabId, at: now() });
   }
 
-  function addEvent(tabId, event) {
+  function addEvent(tabId, event, frameId = 0) {
     if (!current || !event || typeof event !== 'object') return;
     const at = now();
     const tab = current.tabs.get(tabId);
+    if (frameId !== 0) {
+      // A child frame cannot see the tab's address: the step's page is the tab's.
+      const top = lastNavigation(tabId);
+      event = { ...event, page: top ? { url: top.url } : undefined };
+    }
     const previous = current.steps.filter(step => !step.deleted).at(-1);
     // The person waited for the page before going on (a long load, a spinner).
     const lateChange = Number(event.last_change_at);
@@ -258,7 +308,7 @@ export function createRecorder({
         step = { ...base, kind: 'check', target, checked: event.checked === true };
         break;
       case 'key':
-        if (!['Enter', 'Escape'].includes(event.key)) return;
+        if (!KEY_STEP_KEYS.includes(event.key)) return;
         step = { ...base, kind: 'key', key: event.key, ...(target ? { target } : {}) };
         break;
       case 'upload':
@@ -276,7 +326,7 @@ export function createRecorder({
     }
     if (!push(step)) return;
     if (['click', 'select', 'check', 'key', 'upload', 'download'].includes(step.kind) && Number.isInteger(event.seq)) {
-      watchObservation(tabId, event.seq, step);
+      watchObservation(tabId, event.seq, step, frameId);
     }
   }
 
@@ -338,7 +388,7 @@ export function createRecorder({
     if (!active()) return { ok: false, error: 'not_recording' };
     if (paused && current.status === 'recording') {
       // What was typed before the pause still counts.
-      for (const { tabId, event } of await runInTabs(pausePageRecorder, { recordingId: current.id, paused: true })) addEvent(tabId, event);
+      for (const { tabId, frameId, event } of await runInTabs(pausePageRecorder, { recordingId: current.id, paused: true })) addEvent(tabId, event, frameId);
       current.status = 'paused';
     } else if (!paused && current.status === 'paused') {
       current.status = 'recording';
@@ -352,7 +402,7 @@ export function createRecorder({
     if (!active()) return { ok: false, error: 'not_recording' };
     const wasRecording = current.status === 'recording';
     const events = await runInTabs(stopPageRecorder, { recordingId: current.id, flush: wasRecording });
-    if (wasRecording) for (const { tabId, event } of events) addEvent(tabId, event);
+    if (wasRecording) for (const { tabId, frameId, event } of events) addEvent(tabId, event, frameId);
     for (const id of [...current.pending.keys()]) finishObservation(id, null);
     timers.clearTimeout(current.limitTimer);
     current.status = 'review';
@@ -386,7 +436,7 @@ export function createRecorder({
     return current.steps.filter(step => !step.deleted).map(step => {
       const redacted = step.kind === 'fill' && step.value && typeof step.value === 'object' ? step.value.redacted : null;
       return {
-        key: step.key,
+        key: step.ref,
         kind: step.kind,
         label: stepLabel(step),
         tab: step.tab,
@@ -401,7 +451,7 @@ export function createRecorder({
 
   function edit({ key, remove, candidate_parameter: candidate, parameter_name: name }) {
     if (current?.status !== 'review') return { ok: false, error: 'not_reviewing' };
-    const step = current.steps.find(item => item.key === key && !item.deleted);
+    const step = current.steps.find(item => item.ref === key && !item.deleted);
     if (!step) return { ok: false, error: 'not_found' };
     if (remove === true) step.deleted = true;
     if (typeof candidate === 'boolean' && (step.kind === 'select' || (step.kind === 'fill' && typeof step.value === 'string'))) {
@@ -469,6 +519,14 @@ export function createRecorder({
     const problems = validateRecording(recording);
     if (problems.length) return fail('invalid', `${UPLOAD_MESSAGES.invalid} (${problems[0]})`);
     let answer = await post(link, recording);
+    if (answer.status === 422 && recording.steps.some(step => step.kind === 'key' && !LEGACY_KEY_STEP_KEYS.includes(step.key))) {
+      // A server from before TEAM-751 takes Enter, Escape and Tab only.
+      const legacy = withLegacyKeys(recording);
+      if (legacy.recording.steps.length) {
+        recording = legacy.recording;
+        answer = await post(link, recording);
+      }
+    }
     for (let attempt = 0; answer.status === 413 && attempt < UPLOAD_RETRIES_ON_413; attempt += 1) {
       // The server counts bytes its own way: cut more, narration first, then steps.
       ({ recording, cut } = fitRecording(recording, Math.floor(MAX_RECORDING_BYTES * (0.85 ** (attempt + 1)))));
@@ -492,7 +550,9 @@ export function createRecorder({
     }
     if (answer.status === 413) return fail('too_large');
     if (answer.status === 422 || answer.status === 400) {
-      const detail = typeof answer.json?.detail === 'string' ? answer.json.detail.slice(0, 300) : '';
+      // `detail` (FastAPI) or the server's `{"error": {"class", "message"}}`.
+      const raw = typeof answer.json?.detail === 'string' ? answer.json.detail : answer.json?.error?.message;
+      const detail = typeof raw === 'string' ? raw.slice(0, 300) : '';
       return fail('invalid', detail || UPLOAD_MESSAGES.invalid);
     }
     if (answer.status === 401) {
@@ -509,9 +569,17 @@ export function createRecorder({
     return fail('server');
   }
 
-  // Is « Former Limova » open for this connection? There is no flag in the protocol, so
-  // ask the upload route with an empty body: 404 means off, 400/422 means on (an empty
-  // body is never stored).
+  // The server's `ready.features` (TEAM-731), on every `ready`: the answer, no probe.
+  function setFeatures(productId, features) {
+    if (!features || typeof features.procedures !== 'boolean') return;
+    const verdict = features.procedures ? 'on' : 'off';
+    if (procedures.get(productId) === verdict) return;
+    procedures.set(productId, verdict);
+    changed();
+  }
+
+  // Is « Former Limova » open for a server without `ready.features`? Ask the upload route
+  // with an empty body: 404 means off, 400/422 means on (an empty body is never stored).
   async function probe(productId) {
     if (procedures.has(productId)) return procedures.get(productId);
     const link = connectionFor(productId);
@@ -541,8 +609,13 @@ export function createRecorder({
   }
 
   function onDomReady(details) {
-    if (!active() || details?.frameId !== 0 || !current.tabs.has(details.tabId)) return;
-    inject(details.tabId);
+    if (!active() || !Number.isInteger(details?.frameId) || !current.tabs.has(details.tabId)) return;
+    if (details.frameId === 0) {
+      inject(details.tabId);
+      return;
+    }
+    // A frame that loads while recording (TEAM-751): only that frame, if recordable.
+    if (recordableFrame(details.url)) inject(details.tabId, [details.frameId]);
   }
 
   function onTabCreated(tab) {
@@ -560,14 +633,19 @@ export function createRecorder({
   function handlePageMessage(request, sender) {
     if (!active() || request?.recording_id !== current.id) return { ok: false, recording: false };
     const tabId = sender?.tab?.id;
-    if (sender?.frameId !== 0 || !current.tabs.has(tabId)) return { ok: false, recording: false };
+    const frameId = sender?.frameId;
+    if (!Number.isInteger(frameId) || !current.tabs.has(tabId)) return { ok: false, recording: false };
+    // A child frame (TEAM-751): never one on a blocked site.
+    const frameUrl = /^about:/.test(String(sender?.url || '')) ? `${sender?.origin || ''}/` : sender?.url;
+    if (frameId !== 0 && !classifyUrl(frameUrl || '').ok) return { ok: false, recording: false };
     const paused = current.status === 'paused';
     if (request.type === 'TEAM_RECORD_PING' || paused) return { ok: true, recording: true, paused };
-    if (request.type === 'TEAM_RECORD_EVENT') addEvent(tabId, request.event);
+    if (request.type === 'TEAM_RECORD_EVENT') addEvent(tabId, request.event, frameId);
     if (request.type === 'TEAM_RECORD_OBSERVED' && request.observed && Number.isInteger(request.observed.seq)) {
-      finishObservation(`${tabId}:${request.observed.seq}`, {
-        url: request.observed.url,
-        title: maskText(String(request.observed.title || '')).slice(0, 200),
+      finishObservation(observationKey(tabId, frameId, request.observed.seq), {
+        // A frame's own address is not the tab's: only the tab's navigations change `url`.
+        url: frameId === 0 ? request.observed.url : undefined,
+        title: frameId === 0 ? maskText(String(request.observed.title || '')).slice(0, 200) : undefined,
         dom_changed: request.observed.dom_changed === true,
         messages: Array.isArray(request.observed.messages) ? request.observed.messages.map(text => String(text).slice(0, 200)) : []
       });
@@ -600,7 +678,7 @@ export function createRecorder({
   }
 
   return {
-    start, pause: () => setPaused(true), resume: () => setPaused(false), stop, discard, edit, setTitle, upload, probe,
+    start, pause: () => setPaused(true), resume: () => setPaused(false), stop, discard, edit, setTitle, upload, probe, setFeatures,
     summary, review, payload: () => (current ? payload() : null), isRecording,
     handlePageMessage, onCommitted, onHistoryStateUpdated, onDomReady, onTabCreated,
     _internal: () => current

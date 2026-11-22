@@ -1,9 +1,10 @@
 // page-snapshot.js — Functions injected in a tab to read it (TEAM-724, `browser.read_page`).
 //
 // Each exported function is passed to chrome.scripting.executeScript({func}) and runs in
-// the extension's ISOLATED world of the tab's top frame. Chrome serialises the function
-// source, so every function here is SELF-CONTAINED: it must not use anything from this
-// module's scope.
+// the extension's ISOLATED world of one frame of the tab: the top frame, or (TEAM-751,
+// `browser.v2+frames`) a child frame the service worker targets by its documentId.
+// Chrome serialises the function source, so every function here is SELF-CONTAINED: it
+// must not use anything from this module's scope.
 //
 // The page map (element ids e1, e2… -> live elements) lives in that isolated world
 // (`globalThis.__limovaBrowserMaps`), which persists per document and per extension.
@@ -11,13 +12,22 @@
 // move an id onto another element. A new read_page replaces the map; a navigation drops
 // the isolated world, so an older snapshot_id answers `stale_snapshot`.
 //
+// Each frame keeps its own map in its own isolated world, with plain ids (`e3`); the
+// service worker adds the frame prefix (`fr2.e3`) and remembers which frame and which
+// document each prefix names, so a frame that navigated answers `stale_snapshot`.
+//
+// File inputs (TEAM-751, `browser.v2+upload`) are listed even when the page hides them
+// behind a styled label or button, named after that label or button.
+//
 // Privacy: field values are never returned. A field only reports `state` (empty, filled
-// or sensitive); a select its chosen option label; a checkbox its `checked`. Text typed
-// in editable areas is cut out of the page text. URLs are origin + pathname only.
+// or sensitive); a select its chosen option label; a checkbox its `checked`; a file
+// input how many files it holds, never their names. Text typed in editable areas is cut
+// out of the page text. URLs are origin + pathname only.
 
 export function pageSnapshot(options) {
   // 2: descriptor fields for recordings and read_page (TEAM-731).
-  const KIT_VERSION = 2;
+  // 3: file inputs and their openers, frame paths (TEAM-751).
+  const KIT_VERSION = 3;
 
   function buildKit() {
     const SENSITIVE_HINT = /(pass(?:word|wd|code|phrase)?\b|mot[ -]de[ -]passe|contrase|\bpin\b|\bcvv\d?\b|\bcvc\d?\b|\bcvn\b|security code|code de s[ée]curit|card.?num|num[ée]ro de carte|carte bancaire|credit.?card|\bcc.?num|\biban\b|\botp\b|one.?time|code de v[ée]rification|verification code|\b2fa\b|\bmfa\b|code (?:re[çc]u|sms)|\bsecret\b|api.?key|\btoken\b)/i;
@@ -122,6 +132,17 @@ export function pageSnapshot(options) {
         const labels = el.labels ? [...el.labels] : [];
         const labelText = clean(labels.map(textWithoutControls).join(' '));
         if (labelText) return clean(labelText, 120);
+        if (type === 'file') {
+          // A hidden file input is named after the button the person clicks (TEAM-751).
+          const opener = fileOpenerOf(el);
+          const openerName = opener ? nameOf(opener) : '';
+          if (openerName) return openerName;
+          if (clean(el.getAttribute('title'))) return clean(el.getAttribute('title'), 120);
+          // A drop area's own words (« Glissez vos fichiers ici »), when they are short.
+          const around = el.parentElement && !isRendered(el) ? clean(textWithoutControls(el.parentElement)) : '';
+          if (around && around.length <= 80) return around;
+          return clean(el.getAttribute('name') || 'Choisir un fichier', 120);
+        }
         const fallback = el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name') || '';
         return clean(fallback, 120);
       }
@@ -219,10 +240,115 @@ export function pageSnapshot(options) {
       return `${location.origin}${location.pathname}`;
     }
 
+    // ------------------------------------------------------------------ file inputs (TEAM-751)
+
+    function isFileInput(el) {
+      return el instanceof HTMLInputElement && inputType(el) === 'file';
+    }
+
+    function opensFiles(node) {
+      if (!(node instanceof Element) || isFileInput(node)) return false;
+      if (node instanceof HTMLLabelElement || node instanceof HTMLButtonElement || node instanceof HTMLAnchorElement) return true;
+      return ['button', 'link'].includes((node.getAttribute('role') || '').trim());
+    }
+
+    // The visible control a person clicks to open a hidden file input: its label, a
+    // button whose aria-controls names it, the button right next to it, or a button-like
+    // parent. Null when there is none, or none is shown.
+    function fileOpenerOf(input) {
+      const candidates = input.labels ? [...input.labels] : [];
+      if (input.id) {
+        for (const node of document.querySelectorAll('[aria-controls]')) {
+          if ((node.getAttribute('aria-controls') || '').split(/\s+/).includes(input.id)) candidates.push(node);
+        }
+      }
+      for (const sibling of [input.previousElementSibling, input.nextElementSibling]) {
+        if (opensFiles(sibling)) candidates.push(sibling);
+      }
+      if (opensFiles(input.parentElement)) candidates.push(input.parentElement);
+      return candidates.find(node => isRendered(node)) || null;
+    }
+
+    // A file input is listed when the person can reach it: shown, behind a shown opener,
+    // or hidden inside a shown container (a drop area keeps its input display: none).
+    function fileReachable(input) {
+      if (isRendered(input)) return true;
+      if (fileOpenerOf(input)) return true;
+      const parent = input.parentElement;
+      return Boolean(parent && isRendered(parent));
+    }
+
+    // The file input an upload names: the input itself, a label's control, a single file
+    // input inside the element, its aria-controls, a file input right next to it, or
+    // the only file input among its siblings. A neighbour only counts when it has no
+    // other opener: a drop area next to another field's input is not that field.
+    // Null: the element may be a drop area.
+    function fileInputFor(el) {
+      if (isFileInput(el)) return el;
+      if (el instanceof HTMLLabelElement && isFileInput(el.control)) return el.control;
+      const nested = [...(el.querySelectorAll?.('input') || [])].filter(isFileInput);
+      if (nested.length === 1) return nested[0];
+      for (const id of (el.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean)) {
+        const node = document.getElementById(id);
+        if (isFileInput(node)) return node;
+      }
+      const owned = input => {
+        const opener = fileOpenerOf(input);
+        return !opener || opener === el;
+      };
+      for (const sibling of [el.nextElementSibling, el.previousElementSibling]) {
+        if (isFileInput(sibling) && owned(sibling)) return sibling;
+      }
+      const siblings = el.parentElement ? [...el.parentElement.children].filter(isFileInput) : [];
+      return siblings.length === 1 && owned(siblings[0]) ? siblings[0] : null;
+    }
+
+    function uploadTargetOf(el) {
+      const input = fileInputFor(el);
+      if (!input) return { kind: 'drop', accept: '', multiple: true, disabled: false };
+      return {
+        kind: 'input',
+        accept: clean(input.getAttribute('accept') || '', 200),
+        multiple: input.multiple === true,
+        disabled: isDisabled(input)
+      };
+    }
+
+    // ------------------------------------------------------------------ frames (TEAM-751)
+
+    // This frame's index chain from the top frame (`[]` for the top frame), the way
+    // read_page's `frames[].path` and a recording's `target.frame.path` say it. Indexes
+    // are positions in the parent's window.frames, readable even across origins.
+    function framePath() {
+      const path = [];
+      let win = window;
+      for (let depth = 0; depth < 12 && win !== win.parent; depth += 1) {
+        const parent = win.parent;
+        let index = -1;
+        try {
+          for (let i = 0; i < parent.length; i += 1) {
+            if (parent[i] === win) { index = i; break; }
+          }
+        } catch (_) { return null; }
+        if (index < 0) return null;
+        path.unshift(index);
+        win = parent;
+      }
+      return path;
+    }
+
+    function frameOrigin() {
+      const origin = typeof self.origin === 'string' ? self.origin : location.origin;
+      return origin && origin !== 'null' ? origin : location.origin;
+    }
+
     function describe(el) {
       const name = nameOf(el);
       const form = formOf(el);
-      const rect = el.getBoundingClientRect();
+      const file = isFileInput(el);
+      // A hidden file input is placed where its opener (or its parent) is.
+      const placed = file && !isRendered(el) ? (fileOpenerOf(el) || el.parentElement || el) : el;
+      const rect = placed.getBoundingClientRect();
       return {
         name,
         role: roleOf(el),
@@ -233,7 +359,9 @@ export function pageSnapshot(options) {
         is_checkable: el instanceof HTMLInputElement && CHECKABLE_TYPES.includes(inputType(el)),
         sensitive: isSensitive(el, name),
         disabled: isDisabled(el),
-        rendered: isRendered(el),
+        rendered: file ? fileReachable(el) : isRendered(el),
+        is_file: file,
+        multiline: el instanceof HTMLTextAreaElement || Boolean(el.isContentEditable),
         submits: submitsForm(el),
         is_form: el instanceof HTMLFormElement,
         in_form: Boolean(form),
@@ -409,7 +537,8 @@ export function pageSnapshot(options) {
       version: KIT_VERSION,
       clean, normalize, isRendered, isDisabled, isEditable, isSensitive, fieldState, nameOf, roleOf,
       formOf, formInfo, submitsForm, safeHref, inViewport, pagePath, describe, inputType,
-      labelOf, nearbyOf, hintsOf, descriptorFields, targetOf, stableId, landmarkOf, visibleText
+      labelOf, nearbyOf, hintsOf, descriptorFields, targetOf, stableId, landmarkOf, visibleText,
+      isFileInput, fileOpenerOf, fileReachable, fileInputFor, uploadTargetOf, framePath, frameOrigin
     };
   }
 
@@ -424,8 +553,15 @@ export function pageSnapshot(options) {
 
   const productKey = String(options?.productKey || '');
   const snapshotId = String(options?.snapshotId || '');
-  const maxText = Math.max(500, Math.min(20000, Number(options?.maxText) || 8000));
-  const maxElements = Math.max(1, Math.min(400, Number(options?.maxElements) || 200));
+  // A child frame (TEAM-751) gets what the frames before it left of the budgets, which
+  // may be nothing at all.
+  const inFrame = options?.frame === true;
+  const maxText = inFrame
+    ? Math.max(0, Math.min(20000, Math.floor(Number(options?.maxText) || 0)))
+    : Math.max(500, Math.min(20000, Number(options?.maxText) || 8000));
+  const maxElements = inFrame
+    ? Math.max(0, Math.min(400, Math.floor(Number(options?.maxElements) || 0)))
+    : Math.max(1, Math.min(400, Number(options?.maxElements) || 200));
   if (!productKey || !snapshotId) return { ok: false, code: 'invalid_args' };
   if (!document.documentElement) return { ok: false, code: 'page_unavailable' };
 
@@ -445,7 +581,8 @@ export function pageSnapshot(options) {
     seen.add(el);
     if (el instanceof HTMLInputElement && kit.inputType(el) === 'hidden') continue;
     if (el.isContentEditable && el.parentElement?.isContentEditable) continue;
-    if (!kit.isRendered(el)) continue;
+    // A file input hidden behind its label or button still counts (TEAM-751).
+    if (kit.isFileInput(el) ? !kit.fileReachable(el) : !kit.isRendered(el)) continue;
     const info = kit.describe(el);
     if (!info.name && !info.editable && !info.is_select && !info.is_checkable) continue;
     candidates.push({ el, info });
@@ -490,6 +627,14 @@ export function pageSnapshot(options) {
     };
     if (item.info.editable || item.info.is_select || item.info.is_checkable) entry.state = kit.fieldState(item.el);
     if (item.info.is_checkable) entry.checked = item.el.checked === true;
+    if (item.info.is_file) {
+      // How many files, never their names (TEAM-751).
+      const count = item.el.files ? item.el.files.length : 0;
+      entry.state = count ? 'filled' : 'empty';
+      entry.files = count;
+      entry.accept = kit.clean(item.el.getAttribute('accept') || '', 200);
+      entry.multiple = item.el.multiple === true;
+    }
     if (item.info.is_select && !item.info.sensitive) {
       const option = item.el.selectedOptions?.[0];
       entry.selected = option ? kit.clean(option.label || option.text, 80) : null;
@@ -518,6 +663,7 @@ export function pageSnapshot(options) {
   text = text.replace(/\r/g, '').split('\n').map(line => line.replace(/[ \t ]+/g, ' ').trim()).filter(Boolean).join('\n');
   const textTruncated = text.length > maxText;
   if (textTruncated) text = text.slice(0, maxText);
+  const path = kit.framePath();
 
   // 3. Text hidden from people that reads like instructions to an assistant.
   const INSTRUCTION = /(ignore[sz]? (?:all |any |the )?(?:previous|prior|above|earlier|preceding) (?:instructions|prompts?|messages)|ignore (?:tes|les|toutes les|vos) (?:instructions|consignes)|oublie (?:tes|les|toutes les) (?:instructions|consignes)|disregard (?:all |the |any )?(?:previous |prior |above )?(?:instructions|rules)|new instructions|nouvelles (?:instructions|consignes)|you are now|tu es maintenant|vous etes maintenant|vous êtes maintenant|system prompt|prompt syst[eè]me|\bassistant\s*:|\bsystem\s*:|as an ai (?:assistant|agent|model)|en tant qu.(?:ia|assistant)|(?:send|forward|email|envoie|envoyez|transf[eè]re|transmets)\b.{0,80}(?:to|à|a)\s+\S+@\S+|reveal (?:your|the) (?:instructions|prompt|secrets?)|r[ée]v[eè]le (?:tes|vos|les) (?:instructions|secrets?))/i;
@@ -560,6 +706,8 @@ export function pageSnapshot(options) {
     ok: true,
     url: kit.pagePath(),
     title: kit.clean(document.title, 300),
+    origin: kit.frameOrigin(),
+    path,
     elements,
     forms,
     text,
@@ -581,10 +729,89 @@ export function inspectPageElement(options) {
   if (!el || !el.isConnected) return { ok: false, code: 'element_not_found' };
   const info = kit.describe(el);
   if (!info.rendered || info.disabled) return { ok: false, code: 'element_not_found' };
+  // `browser.upload` (TEAM-751): the file input this element opens, or a drop area.
+  if (options?.upload === true) info.upload = kit.uploadTargetOf(el);
   return {
     ok: true,
     element: info,
-    page: { origin: location.origin, path: location.pathname, title: kit.clean(document.title, 300) }
+    page: { origin: kit.frameOrigin(), path: location.pathname, title: kit.clean(document.title, 300) }
+  };
+}
+
+// TEAM-751 (`browser.v2+frames`): where this frame sits, run in every frame before a
+// read. It reads no page content: its index chain from the top, its origin, and, for
+// each child frame, the frame element's title or name, whether it is shown and its
+// content box in this frame's viewport (to place the child's elements and masks).
+// A frame whose host is in `blockedHosts` returns its index chain and nothing else.
+export function probeFrame(options) {
+  function pathOf() {
+    const path = [];
+    let win = window;
+    for (let depth = 0; depth < 12 && win !== win.parent; depth += 1) {
+      const parent = win.parent;
+      let index = -1;
+      try {
+        for (let i = 0; i < parent.length; i += 1) {
+          if (parent[i] === win) { index = i; break; }
+        }
+      } catch (_) { return null; }
+      if (index < 0) return null;
+      path.unshift(index);
+      win = parent;
+    }
+    return path;
+  }
+  const path = pathOf();
+  const origin = typeof self.origin === 'string' && self.origin !== 'null' ? self.origin : location.origin;
+  // A frame on a blocked site (LinkedIn, Limova itself) says where it is, nothing more.
+  let host = '';
+  try { host = new URL(origin).hostname.toLowerCase(); } catch (_) { host = String(location.hostname || '').toLowerCase(); }
+  const blocked = (Array.isArray(options?.blockedHosts) ? options.blockedHosts : [])
+    .some(suffix => host === suffix || host.endsWith(`.${suffix}`));
+  if (blocked) return { ok: true, path, blocked: true };
+  function clean(text, max) {
+    const value = String(text ?? '').replace(/\s+/g, ' ').trim();
+    return max && value.length > max ? value.slice(0, max) : value;
+  }
+  const holders = [...document.querySelectorAll('iframe, frame')];
+  const children = [];
+  for (let index = 0; index < window.frames.length && index < 100; index += 1) {
+    const win = window.frames[index];
+    const holder = holders.find(node => {
+      try { return node.contentWindow === win; } catch (_) { return false; }
+    }) || null;
+    const child = { index, title: '', rendered: false, rect: null, src_origin: null };
+    if (holder) {
+      child.title = clean(holder.getAttribute('title') || holder.getAttribute('name') || '', 100);
+      const box = holder.getBoundingClientRect();
+      const shown = typeof holder.checkVisibility === 'function'
+        ? holder.checkVisibility({ checkVisibilityCSS: true })
+        : getComputedStyle(holder).visibility !== 'hidden' && getComputedStyle(holder).display !== 'none';
+      child.rendered = Boolean(shown && box.width > 1 && box.height > 1);
+      const style = getComputedStyle(holder);
+      const padLeft = parseFloat(style.paddingLeft) || 0;
+      const padTop = parseFloat(style.paddingTop) || 0;
+      const left = box.left + (holder.clientLeft || 0) + padLeft;
+      const top = box.top + (holder.clientTop || 0) + padTop;
+      const width = Math.max(0, (holder.clientWidth || box.width) - padLeft - (parseFloat(style.paddingRight) || 0));
+      const height = Math.max(0, (holder.clientHeight || box.height) - padTop - (parseFloat(style.paddingBottom) || 0));
+      child.rect = { left, top, width, height };
+      try {
+        const src = holder.getAttribute('src');
+        if (src) {
+          const url = new URL(src, location.href);
+          if (url.protocol === 'http:' || url.protocol === 'https:') child.src_origin = url.origin;
+        }
+      } catch (_) { /* no usable src */ }
+    }
+    children.push(child);
+  }
+  return {
+    ok: true,
+    path,
+    origin,
+    viewport: { width: innerWidth, height: innerHeight },
+    children
   };
 }
 
@@ -626,7 +853,9 @@ export function preparePageCapture(options) {
       if (!el.isConnected || !shown(el)) continue;
       const rect = rectOf(el);
       if (!rect) continue;
-      markers.push({ id: Number(id.slice(1)), label: `#${id}`, left: Math.max(0, rect.left), top: Math.max(0, rect.top - 14) });
+      // A child frame's labels carry its prefix (`#fr1.e3`, TEAM-751).
+      const prefix = typeof options?.labelPrefix === 'string' && /^fr\d{1,2}\.$/.test(options.labelPrefix) ? options.labelPrefix : '';
+      markers.push({ id: Number(id.slice(1)), label: `#${prefix}${id}`, left: Math.max(0, rect.left), top: Math.max(0, rect.top - 14) });
     }
   }
   return { ok: true, viewportWidth, viewportHeight, masks, markers, maskedCount: masks.length, markerCount: markers.length };

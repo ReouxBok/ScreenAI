@@ -316,7 +316,7 @@ describe('browser engine: actions', () => {
       const result = await browser.executeAction(prepared.plan);
       const page = result.data.page;
       expect(page.snapshot_id).not.toBe(snapshot);
-      expect(Object.keys(page).sort()).toEqual(['elements', 'elements_truncated', 'forms', 'snapshot_id', 'suspicious', 'tab', 'text', 'text_truncated']);
+      expect(Object.keys(page).sort()).toEqual(['elements', 'elements_truncated', 'forms', 'frames', 'snapshot_id', 'suspicious', 'tab', 'text', 'text_truncated']);
       expect(globalThis.__limovaBrowserMaps.limova_team.snapshotId).toBe(page.snapshot_id);
       // The new snapshot replaces the old one.
       const old = await browser.prepareAction('browser.click', { tab_id: 812, snapshot_id: snapshot, element_id: id('Envoyer'), target: 'Envoyer' });

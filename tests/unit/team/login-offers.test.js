@@ -149,6 +149,18 @@ describe('login offers', () => {
     expect(ctx.fetchImpl.mock.calls.length).toBe(calls);
   });
 
+  it('holds no password and asks nothing when the server says login_vault is off (ready.features)', async () => {
+    const ctx = setup();
+    ctx.link.features = { procedures: true, login_vault: false };
+    await submitAndNavigate(ctx);
+    expect(ctx.fetchImpl).not.toHaveBeenCalled();
+    expect(ctx.chromeApi.windows.create).not.toHaveBeenCalled();
+    // An older server (no features) is asked as before.
+    ctx.link.features = null;
+    await submitAndNavigate(ctx);
+    expect(ctx.chromeApi.windows.create).toHaveBeenCalledTimes(1);
+  });
+
   it('never watches the person\'s own tabs unless they opted in', async () => {
     const ctx = setup({ groupId: -1 });
     await submitAndNavigate(ctx);

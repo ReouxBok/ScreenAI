@@ -130,7 +130,10 @@ describe('recorder (service worker)', () => {
     expect(recorder.handlePageMessage({ type: 'TEAM_RECORD_PING', recording_id: RECORDING_ID }, sender())).toEqual({ ok: true, recording: true, paused: false });
     expect(recorder.handlePageMessage({ type: 'TEAM_RECORD_EVENT', recording_id: 'other', event: {} }, sender()).recording).toBe(false);
     expect(recorder.handlePageMessage({ type: 'TEAM_RECORD_EVENT', recording_id: RECORDING_ID, event: {} }, sender(7)).recording).toBe(false);
-    expect(recorder.handlePageMessage({ type: 'TEAM_RECORD_EVENT', recording_id: RECORDING_ID, event: {} }, { ...sender(), frameId: 3 }).recording).toBe(false);
+    // A child frame of the recorded tab counts (TEAM-751), never one on a blocked site.
+    expect(recorder.handlePageMessage({ type: 'TEAM_RECORD_PING', recording_id: RECORDING_ID }, { ...sender(), frameId: 3, url: 'https://js.stripe.com/v3/' }).recording).toBe(true);
+    expect(recorder.handlePageMessage({ type: 'TEAM_RECORD_EVENT', recording_id: RECORDING_ID, event: {} }, { ...sender(), frameId: 3, url: 'https://www.linkedin.com/embed' }).recording).toBe(false);
+    expect(recorder.handlePageMessage({ type: 'TEAM_RECORD_EVENT', recording_id: RECORDING_ID, event: {} }, { ...sender(), frameId: 3, url: 'chrome-extension://abc/x.html' }).recording).toBe(false);
   });
 
   it('redacts fill values on capture and keeps one step per field', async () => {
@@ -293,5 +296,66 @@ describe('recorder (service worker)', () => {
     await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000);
     expect(long.recorder.summary()).toEqual(expect.objectContaining({ status: 'review', limit: 'duration' }));
     expect(validateRecording(long.recorder.payload())).toEqual([]);
+  });
+
+  it('reads ready.features instead of probing, and re-reads them on every ready (TEAM-731)', async () => {
+    const ctx = setup();
+    ctx.recorder.setFeatures('limova_team', { procedures: false, login_vault: false });
+    expect(ctx.recorder.summary().procedures.limova_team).toBe('off');
+    expect((await ctx.recorder.start({ productId: 'limova_team', tabId: 812 })).error).toBe('disabled');
+    // The probe answers from what the server said, without a request.
+    expect(await ctx.recorder.probe('limova_team')).toBe('off');
+    expect(ctx.fetchMock).not.toHaveBeenCalled();
+    ctx.recorder.setFeatures('limova_team', { procedures: true, login_vault: false });
+    expect((await ctx.recorder.start({ productId: 'limova_team', tabId: 812 })).ok).toBe(true);
+  });
+
+  it('records child-frame steps with the tab\'s page and the frame in the target (TEAM-751)', async () => {
+    const ctx = setup();
+    await ctx.recorder.start({ productId: 'limova_team', tabId: 812 });
+    const frameSender = { ...ctx.sender(), frameId: 4, url: 'https://js.stripe.com/v3/elements' };
+    const frame = { origin: 'https://js.stripe.com', name: 'Carte', path: [0] };
+    ctx.recorder.handlePageMessage({ type: 'TEAM_RECORD_EVENT', recording_id: RECORDING_ID, event: {
+      seq: 1, kind: 'click', target: { role: 'button', name: 'Payer', frame }, page: { url: 'https://js.stripe.com/v3/elements', title: 'Stripe' }
+    } }, frameSender);
+    // The frame's own address is no outcome of the click.
+    ctx.recorder.handlePageMessage({ type: 'TEAM_RECORD_OBSERVED', recording_id: RECORDING_ID, observed: {
+      seq: 1, url: 'https://js.stripe.com/v3/other', title: 'Stripe', dom_changed: true, messages: ['Paiement accepté']
+    } }, frameSender);
+    ctx.event({ seq: 1, kind: 'key', key: 'ArrowDown', target: { role: 'combobox', name: 'Ville' }, page });
+    ctx.event({ seq: 2, kind: 'key', key: 'F5', page });
+    const steps = ctx.recorder.payload().steps;
+    expect(steps.map(step => step.key || step.kind)).toEqual(['navigate', 'click', 'ArrowDown']);
+    expect(steps[1].page).toEqual({ url: 'https://app.example.com/invoices' });
+    expect(steps[1].target.frame).toEqual(frame);
+    expect(steps[1].observed).toEqual(expect.objectContaining({ dom_changed: true, messages: ['Paiement accepté'], url_changed: false }));
+    expect(JSON.stringify(steps)).not.toContain('js.stripe.com/v3');
+  });
+
+  it('sends again without the new keys to a server that only takes Enter, Escape and Tab', async () => {
+    const bodies = [];
+    const fetchImpl = vi.fn(async (url, init) => {
+      const body = JSON.parse(init.body);
+      bodies.push(body);
+      return body.steps.some(step => step.kind === 'key' && step.key === 'ArrowDown')
+        ? { status: 422, json: async () => ({ error: { class: 'validation', message: 'Enregistrement invalide : steps.2.key' } }) }
+        : { status: 201, json: async () => ({ recording_id: RECORDING_ID, procedure_id: 'p9' }) };
+    });
+    const ctx = setup({ fetchImpl });
+    await ctx.recorder.start({ productId: 'limova_team', tabId: 812 });
+    ctx.event({ seq: 1, kind: 'key', key: 'ArrowDown', target: { role: 'combobox', name: 'Ville' }, page });
+    ctx.event({ seq: 2, kind: 'key', key: 'Enter', target: { role: 'combobox', name: 'Ville' }, page });
+    await ctx.recorder.stop();
+    expect((await ctx.recorder.upload()).ok).toBe(true);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1].steps.map(step => step.key || step.kind)).toEqual(['navigate', 'Enter']);
+  });
+
+  it('shows the server\'s error message of a 422', async () => {
+    const ctx = setup({ fetchImpl: vi.fn(async () => ({ status: 422, json: async () => ({ error: { class: 'validation', message: 'Enregistrement invalide : steps.1.click' } }) })) });
+    await ctx.recorder.start({ productId: 'limova_team', tabId: 812 });
+    ctx.event({ seq: 1, kind: 'click', target: { role: 'button', name: 'OK' }, page });
+    await ctx.recorder.stop();
+    expect((await ctx.recorder.upload()).message).toBe('Enregistrement invalide : steps.1.click');
   });
 });
