@@ -18,9 +18,9 @@ import { SAV_SMART_RESOURCES as SMART_RESOURCE_LIST } from "./tools/resources";
  * Fictional examples only (public repository).
  */
 
-export const SAV_SMART_PROMPT_REVISION = "sav-smart-prompt-2026-11-22.v17";
+export const SAV_SMART_PROMPT_REVISION = "sav-smart-prompt-2026-11-22.v18";
 /** sha256 of `smartPromptFingerprintSource()`. Pinned by `smart-prompt.test.ts`; change it only with the revision. */
-export const SAV_SMART_PROMPT_SHA256 = "7d7d3bc7b06f9b77e182e1bd83e362bba4aef24dbce563f191b133583d501197";
+export const SAV_SMART_PROMPT_SHA256 = "f3979b8b1943a76407b79e83c7a4f8e80026cc7e062f6522a2ef4b49f24c8976";
 /** The fixed decide prompt's ceiling (ARCHITECTURE 3: « 9 000 octets au plus »). */
 export const SAV_SMART_PROMPT_MAX_BYTES = 9_000;
 
@@ -54,11 +54,11 @@ ${READ}
 COMMENT TU TRAVAILLES
 À chaque étape, tu choisis : chercher (action "tools") ou conclure (action "final").
 - Commence par « thinking » : ce que tu sais, tes hypothèses, ce qui les départagerait. Bref.
-- Pars de la mémoire du dossier (memory) : ne redemande pas ce qui est connu, ne redonne pas une étape faite, ne repropose pas un essai échoué. Lis d'abord une fiche « temporaire » s'il y en a.
+- Pars de la mémoire du dossier (memory) : ne redemande pas ce qui est connu, ne redonne pas une étape faite, ne repropose pas un essai échoué. askedBefore : questions déjà posées ; même sans réponse, ne les repose pas : réponds avec les fiches ou passe la main. Lis d'abord une fiche « temporaire » s'il y en a.
 - Cherche seulement si cela peut changer ta réponse ; si les fiches suffisent, conclus.
 - Si une information du client peut trancher, demande-la : une question facile, en disant pourquoi. Demande trop vague pour chercher (« un outil interne ») : UNE question précise, pas l'équipe.
 - Tu peux raisonner librement et proposer un essai simple et sans risque. Dis alors que c'est un conseil. Un conseil n'annonce jamais ce que Limova sait faire.
-- Avant de conclure, relis-toi : chaque affirmation a-t-elle sa source ? un besoin est-il oublié ? est-ce un vrai pas pour le client ? Si tu ne sais pas : une question claire si elle tranche, sinon l'équipe. N'invente jamais.
+- Avant de conclure, relis-toi : chaque affirmation a sa source, aucun besoin oublié, un vrai pas pour le client. N'invente jamais.
 - noNeed à true : un merci ou une confirmation sans demande ; une ou deux phrases de courtoisie (coverage et facts vides).
 - lastStep à true : tu n'as plus d'outil, conclus. noProgressLastTurn à true : le dernier échange n'a rien apporté ; si celui-ci non plus, passe la main. mustHandOff à true : le dossier tourne en rond, passe la main avec ta meilleure note.
 
@@ -83,7 +83,7 @@ CE QUE TU NE FAIS JAMAIS
 7. Aucun geste qu'on ne peut pas défaire (supprimer, changer un DNS, révoquer un accès) sans une fiche qui le porte.
 
 POUR ENQUÊTER
-- Problème dans une conversation Limova (résultat absent, routine ou intégration en panne) : demande l'URL de la conversation (barre d'adresse) et des captures ; insiste si besoin.
+- Problème dans une conversation Limova (résultat absent, routine ou intégration en panne) : demande l'URL de la conversation (barre d'adresse) et des captures.
 - Routine en échec : la tâche marche-t-elle en direct dans le chat ?
 - Charly Max : demande le numéro de téléphone du client.
 
@@ -149,7 +149,7 @@ FORMAT DE SORTIE : un objet JSON
 non_conforme exige au moins un problème. Sans problème réel : conforme et problems vide.`;
 
 /** The instruction appended to the decide call for its ONE correction. */
-export const SAV_SMART_CORRECTION_INSTRUCTION = "CORRECTION : ta décision précédente (previousDecision) est refusée (voir problems). Plus d'outil : action \"final\", calls vide, une decision complète qui corrige chaque phrase en cause. unlisted_claim ou source_mismatch : retire le passage nommé (ni reformulé, ni atténué) et garde les étapes que les extraits portent ; si le besoin reste sans réponse, pose UNE question précise (message exact, écran) sans deviner. Sinon : handoff avec ta meilleure note. narrow à true : seulement ce que les extraits portent mot pour mot, ou UNE question précise.";
+export const SAV_SMART_CORRECTION_INSTRUCTION = "CORRECTION : ta décision précédente (previousDecision) est refusée (voir problems). Plus d'outil : action \"final\", calls vide, une decision complète qui corrige chaque phrase en cause et garde tout le reste. unlisted_claim ou source_mismatch : retire seulement le passage nommé, sans le reformuler ; garde les étapes que les extraits portent. Besoin resté sans réponse : UNE question précise hors askedBefore, sans deviner. Handoff si rien d'utile ne reste. narrow à true : seulement ce que les extraits portent mot pour mot.";
 
 export const smartDecidePrompt = () => DECIDE;
 export const smartUnderstandPrompt = () => UNDERSTAND;

@@ -18,7 +18,9 @@ import type { SmartCallKind } from "./smart-contract";
 type Env = Readonly<Record<string, string | undefined>>;
 export type SmartCallResult =
   | Readonly<{ status: "ok"; output: unknown; usage: AccessSkillUsage | null; inputBytes: number }>
-  | Readonly<{ status: "failed"; problem: string; uncertain: boolean; usage: AccessSkillUsage | null; inputBytes: number; sent: boolean }>;
+  | Readonly<{ status: "failed"; problem: string; uncertain: boolean; usage: AccessSkillUsage | null; inputBytes: number; sent: boolean;
+    /** v18: on `output_json_invalid`, the object a lenient repair could read (`smartLenientJson`), else absent. Still parsed by the schema and checked. */
+    lenient?: unknown }>;
 /** One model call of a turn: the port a turn uses (shadow: ledger + deadline; bench: its wire; tests: a script). */
 export type SmartModelPort = (call: Readonly<{ kind: Exclude<SmartCallKind, "embed">; system: string; payload: unknown; temperature: number }>) => Promise<SmartCallResult>;
 export type SmartEmbedPort = (texts: readonly string[]) => Promise<Readonly<{ status: "ok"; vectors: number[][] }> | Readonly<{ status: "failed"; problem: string; sent: boolean }>>;
@@ -86,7 +88,48 @@ export function smartWireResponse(json: unknown): AccessSkillWireResult {
   const text = ((json as { candidates?: Array<{ content?: { parts?: Array<{ text?: unknown }> } }> }).candidates?.[0]?.content?.parts ?? [])
     .map(part => typeof part.text === "string" ? part.text : "").join("");
   const own = smartReadJson(text);
-  return own.ok ? { status: "ok", output: own.value, usage: read.usage } : { ...read, problem: `output_json_invalid:${own.form}` };
+  if (own.ok) return { status: "ok", output: own.value, usage: read.usage };
+  // v18: the refusal stays a refusal (one new attempt first, `smart-agent.ts`); the lenient reading travels with it for the decide pass only.
+  const lenient = own.form === "multiple" ? null : smartLenientJson(text);
+  const failed = { ...read, problem: `output_json_invalid:${own.form}`, ...(lenient !== null ? { lenient } : {}) };
+  return failed;
+}
+
+/*
+ * v18 (bench 22/11, pareil-02: decide JSON invalid three times, then a handoff). A LENIENT reading, used only after the one new attempt: the first
+ * object, a trailing comma before a closing bracket removed, the missing closing brackets added at the end. An answer cut INSIDE a string (a reply
+ * cut mid-sentence) is never repaired, nor several root objects. Null when nothing can be read. The value is still parsed by the step schema and
+ * goes through every check: unparsed text is never sent.
+ */
+export function smartLenientJson(text: string): unknown {
+  const unfenced = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const start = unfenced.indexOf("{");
+  if (start < 0) return null;
+  const stack: string[] = [];
+  let out = "", inString = false, escaped = false, closed = false, end = unfenced.length;
+  for (let index = start; index < unfenced.length && !closed; index++) {
+    end = index + 1;
+    const char = unfenced[index]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      else if (char === "\n" || char === "\r" || char === "\t") { out += char === "\t" ? "\\t" : char === "\r" ? "\\r" : "\\n"; continue; }
+      out += char; continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{" || char === "[") stack.push(char === "{" ? "}" : "]");
+    else if (char === "}" || char === "]") {
+      if (stack.pop() !== char) return null;
+      out = out.replace(/,\s*$/, "");
+      if (!stack.length) closed = true;
+    }
+    out += char;
+  }
+  if (inString) return null;
+  if (closed && /[{[]/.test(unfenced.slice(end))) return null;
+  const repaired = out.replace(/,\s*$/, "") + [...stack].reverse().join("");
+  try { const value = JSON.parse(repaired) as unknown; return value && typeof value === "object" && !Array.isArray(value) ? value : null; } catch { return null; }
 }
 
 /** The byte cap of one call: the transport's existing `maxInputBytes`, or an own LOWER cap (`SAV_V2_SMART_MAX_INPUT_BYTES`); never above. */
@@ -145,7 +188,8 @@ export function smartGeminiModel(deps: AccessSkillDeps & Readonly<{ callTimeoutM
     if (inputBytes > cap) return { status: "failed", problem: "input_too_large", uncertain: false, usage: null, inputBytes, sent: false };
     const result = await prepared.send();
     return result.status === "ok" ? { status: "ok", output: result.output, usage: result.usage, inputBytes }
-      : { status: "failed", problem: result.problem, uncertain: result.uncertain, usage: result.usage, inputBytes, sent: true };
+      : { status: "failed", problem: result.problem, uncertain: result.uncertain, usage: result.usage, inputBytes, sent: true,
+        ...("lenient" in result && result.lenient !== undefined ? { lenient: result.lenient } : {}) };
   };
 }
 

@@ -45,12 +45,24 @@ describe("1. relecture : tout chemin, bouton, cause, état, délai ou limite doi
 
 describe("2. correction : retirer le passage sans source, garder les étapes portées, sinon UNE question", () => {
   it("la consigne de correction le dit, y compris en resserrement (narrow)", () => {
-    expect(SAV_SMART_CORRECTION_INSTRUCTION).toContain("unlisted_claim ou source_mismatch : retire le passage nommé (ni reformulé, ni atténué) et garde les étapes que les extraits portent ; si le besoin reste sans réponse, pose UNE question précise (message exact, écran) sans deviner.");
-    expect(SAV_SMART_CORRECTION_INSTRUCTION).toContain("narrow à true : seulement ce que les extraits portent mot pour mot, ou UNE question précise.");
+    // v18: keep everything useful; drop only the named passage; a handoff only when nothing useful is left.
+    expect(SAV_SMART_CORRECTION_INSTRUCTION).toContain("garde tout le reste. unlisted_claim ou source_mismatch : retire seulement le passage nommé, sans le reformuler ; garde les étapes que les extraits portent.");
+    expect(SAV_SMART_CORRECTION_INSTRUCTION).toContain("Besoin resté sans réponse : UNE question précise hors askedBefore, sans deviner. Handoff si rien d'utile ne reste.");
+    expect(SAV_SMART_CORRECTION_INSTRUCTION).toContain("narrow à true : seulement ce que les extraits portent mot pour mot.");
     expect(smartCorrectionPrompt().endsWith(SAV_SMART_CORRECTION_INSTRUCTION)).toBe(true);
   });
+  // v18: when the reply keeps its card step without the passage, the server drops the passage and sends the rest (smart-v18.test.ts). Here the cause
+  // stands next to a step no card carries: nothing grounded would remain, so the model's correction runs as before.
+  const causeOnly = smartGoodDecision({ reply: `Bonjour,\n\nVous n'arrivez pas à vous connecter. ${INVENTED_CAUSE}\n\nBelle journée.` });
+  it("v18 : la phrase nommée retirée, l'étape de la fiche reste → envoyée sans correction (3 appels)", async () => {
+    const { result, kinds } = await run({ understand: { output: smartReading() }, decide: { output: withCause }, verify: { output: unlisted } });
+    expect(kinds).toEqual(["understand", "decide", "verify"]);
+    expect(result).toMatchObject({ outcome: "reply", corrected: false });
+    expect(result.replyWithFooter).toContain("Utilisez l'adresse e-mail de votre invitation.");
+    expect(result.replyWithFooter).not.toContain("autorisation a expiré");
+  });
   it("cause inventée nommée par la relecture : la correction reçoit la phrase exacte, retire la cause et pose une question ; envoyée telle quelle (ask)", async () => {
-    const { result, calls, kinds } = await run({ understand: { output: smartReading() }, decide: { output: withCause }, verify: { output: unlisted },
+    const { result, calls, kinds } = await run({ understand: { output: smartReading() }, decide: { output: causeOnly }, verify: { output: unlisted },
       correct: { output: asks }, reverify: { output: SMART_CONFORME } });
     expect(kinds).toEqual(["understand", "decide", "verify", "correct", "reverify"]);
     expect(calls[3]!.system).toBe(smartCorrectionPrompt());
@@ -60,8 +72,8 @@ describe("2. correction : retirer le passage sans source, garder les étapes por
     expect(result.replyWithFooter).not.toContain("autorisation a expiré");
   });
   it("la cause revient après la 1re correction : le resserrement (narrow) reçoit la phrase et finit par une question, dans le budget d'appels", async () => {
-    const { result, calls, kinds } = await run({ understand: { output: smartReading() }, decide: { output: withCause }, verify: { output: unlisted },
-      correct: [{ output: withCause }, { output: asks }], reverify: [{ output: unlisted }, { output: SMART_CONFORME }] });
+    const { result, calls, kinds } = await run({ understand: { output: smartReading() }, decide: { output: causeOnly }, verify: { output: unlisted },
+      correct: [{ output: causeOnly }, { output: asks }], reverify: [{ output: unlisted }, { output: SMART_CONFORME }] });
     expect(kinds).toEqual(["understand", "decide", "verify", "correct", "reverify", "correct", "reverify"]);
     expect(kinds.length).toBeLessThanOrEqual(SAV_SMART_MAX_MODEL_CALLS);
     expect(calls[5]!.payload).toMatchObject({ narrow: true, lastStep: true, tools: [], problems: [{ code: "unlisted_claim", sentence: INVENTED_CAUSE }] });
