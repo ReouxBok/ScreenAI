@@ -52,9 +52,27 @@ Contrat : `docs/procedure-recording-format.md` (team-backend), `limova.recording
 
 - Démarrage : « Montrer à Limova » dans la carte Limova Team, puis « Dans cet onglet » (l’onglet rejoint le groupe) ou « Dans un nouvel onglet ». Refusé sur LinkedIn, le tableau de bord, les pages `chrome://`.
 - Pendant l’enregistrement, les appels de l’agent attendent (comme « Prendre la main ») ; ils reprennent à « Arrêter ».
-- Le bouton est masqué quand le serveur répond 404 (`procedures_enabled` désactivé) : à la connexion, le panneau envoie un corps vide à l’adresse d’envoi (404 : désactivé ; 400 ou 422 : activé).
+- Le bouton est masqué quand le serveur annonce `features.procedures: false` dans son `ready` (relu à chaque reconnexion). Un serveur plus ancien, sans `features`, est encore sondé avec un corps vide à l’adresse d’envoi (404 : désactivé ; 400 ou 422 : activé), et un 404 à l’envoi masque aussi le bouton.
+- Le message d’un 422 vient de `detail` ou de `error.message`.
 - Pas de narration vocale en v1 : `narration` n’est pas envoyée.
 - Pas d’indicateur dans la page : il faudrait ajouter un élément au DOM, visible et modifiable par la page, qui fausserait aussi `dom_changed`. Le panneau, le titre du groupe et le badge suffisent.
+
+## Touches, fichiers et cadres (TEAM-751)
+
+Contrat : `docs/browser-device-protocol.md` (team-backend), « Keys, file uploads and iframes ». Le `hello` annonce `browser.v2+keys`, `browser.v2+upload` et `browser.v2+frames`.
+
+| Fichier | Rôle |
+|---|---|
+| `page-actions.js` | Actions `key` et `upload` de `performPageAction`, `probeFocus` (quel cadre a le focus). |
+| `page-snapshot.js` | Champs de fichier cachés et leur déclencheur, `probeFrame` (place d’un cadre), lecture d’un cadre avec les budgets restants. |
+| `frame-tree.js` | Quels cadres lire et comment les nommer (`fr1`, `fr2`…), limites, sites bloqués. Pur. |
+| `browser-engine.js` | `browser.press_key`, `browser.upload`, étapes `key` de `browser.batch`, actions envoyées au bon cadre. |
+
+- **`browser.press_key`.** `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Delete`, les flèches, `Home`, `End`, `PageUp`, `PageDown`, avec `shift` en option ; rien d’autre (écrire, c’est `browser.fill`). Un événement clavier créé par un script n’a pas d’effet par défaut : l’extension envoie `keydown`, `keypress` (Entrée, Espace) et `keyup` avec `key`, `code`, `keyCode` et `which`, puis, si la page n’a pas annulé la touche, fait ce que le navigateur aurait fait (focus suivant dans l’ordre de tabulation, envoi du formulaire par son bouton par défaut, clic, saut de ligne, suppression d’un caractère avec `input`, option ou bouton radio suivant, curseur, défilement, fermeture d’un `<dialog>`). Entrée et Espace nomment toujours leur élément (`invalid_args` sinon). Retour arrière, Suppr et Espace sont refusés dans un champ sensible (`sensitive_field`). Sans élément, la touche va à l’élément qui a le focus, dans le cadre qui a le focus. La réponse ajoute `focused` (rôle et nom, jamais la valeur). Risque : Entrée dans un champ de formulaire se lit comme un envoi de ce formulaire, Entrée ou Espace sur un bouton comme un clic dessus ; seul `pay` attend la personne.
+- **`browser.upload`.** Fichiers `inline` (pièces jointes du chat, 1 à 10, 5 Mio en tout, base64 vérifié et taille exacte) : `File` → `DataTransfer` → `input.files`, puis `input` et `change`. L’élément peut être le champ, son libellé, le bouton à côté ou `aria-controls`, ou une zone de dépôt (`dragenter`, `dragover`, `drop` ; une zone qui n’annule ni `dragenter` ni `dragover` ne prend pas de fichiers et répond `invalid_args`). `accept` et `multiple` sont vérifiés avant de toucher la page. `source: "mac"` répond `unsupported` : seul Limova Desktop lit les dossiers du Mac. Les octets ne vivent que le temps de l’appel, jamais dans le cache des résultats ni dans les journaux. `read_page` liste chaque champ de fichier, même caché derrière un libellé ou un bouton, avec `accept`, `multiple`, `state` et `files` (un nombre). Un clic sur un champ de fichier est refusé (`invalid_args`).
+- **Cadres.** `read_page` lit les cadres visibles (au plus 20, 5 niveaux), le haut de la page d’abord pour `max_elements` et `max_text_chars` ; le texte d’un cadre suit une ligne `[Cadre fr1 · hôte]`. Les identifiants d’un cadre sont `fr1.e3`, `fr1.f1`, et chaque élément dit `frame`. Chaque cadre garde sa propre carte dans son monde isolé ; une action part vers le document du cadre (`documentIds`), et un cadre qui a navigué répond `stale_snapshot`. Un cadre sur un site bloqué est listé (`blocked_site`) sans être lu ; un cadre que Chrome ne laisse pas lire est `page_unavailable`. Les cadres invisibles ne sont pas listés. La capture masque aussi les champs des cadres placés dans la page et peut afficher `#fr1.e3`.
+- **Enregistrement.** L’enregistreur tourne dans les cadres de l’onglet (sauf sites bloqués) et ajoute `target.frame` (`origin`, `name`, `path`) ; la page d’une étape de cadre est celle de l’onglet. Il enregistre les touches utiles (voir `page-recorder.js`) ; un serveur antérieur qui refuse ces touches reçoit l’enregistrement une seconde fois avec Entrée, Échap et Tab seulement.
+- **`features.login_vault`.** À `false`, la proposition d’enregistrer une connexion ne garde même pas le mot de passe.
 
 ## Environnements
 
