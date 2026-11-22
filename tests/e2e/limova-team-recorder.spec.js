@@ -1,4 +1,6 @@
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test as base, chromium, expect } from '@playwright/test';
@@ -205,7 +207,12 @@ test('records in a cross-origin frame, a hidden file input and keys (TEAM-751)',
 
   // The person picks a file behind the label, types a city in the frame, picks an
   // option with ArrowDown, closes the list with Escape and leaves the field with Tab.
-  await site.locator('#proof').setInputFiles({ name: 'facture.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 secret bytes') });
+  // A file on disk: Chrome then fires a trusted change, as for a person's pick (a
+  // buffer would be set by page script, whose events the recorder rightly ignores).
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'limova-upload-'));
+  const file = path.join(folder, 'facture.pdf');
+  fs.writeFileSync(file, '%PDF-1.4 secret bytes');
+  await site.locator('#proof').setInputFiles(file);
   await frame.locator('#city').click();
   await site.keyboard.type('Lyon');
   await site.keyboard.press('ArrowLeft');
