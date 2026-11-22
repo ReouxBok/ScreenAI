@@ -12,7 +12,7 @@ import type { SmartCallResult, SmartModelPort } from "./smart-model";
 import { smartWireBytes } from "./smart-model";
 import { smartMask, smartSafetyNet } from "./smart-net";
 import { SAV_SMART_RESOURCES, smartCorrectionPrompt, smartDecidePrompt, smartUnderstandPrompt, smartVerifyPrompt } from "./smart-prompt";
-import { createSmartToolRunner, smartToolCatalogue, SAV_SMART_TOOL_LIMITS, SAV_SMART_TOOL_RESULTS_NOTE, type SmartToolOutcome } from "./smart-tools";
+import { createSmartToolRunner, smartSearchWithRetry, smartToolCatalogue, SAV_SMART_TOOL_LIMITS, SAV_SMART_TOOL_RESULTS_NOTE, type SmartToolOutcome } from "./smart-tools";
 import type { AcademyTool } from "./tools/academy";
 
 /*
@@ -211,7 +211,8 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const courtesy = !reading.needs.length;
 
   // 2. Search: the existing search, through the port; expired temporary cards are never given.
-  const found = courtesy ? { status: "ok" as const, sources: [], codes: [] } : await ports.knowledge(reading.needs);
+  // A transient failure (`knowledge_search_unavailable`) gets ONE more attempt (`smartSearchWithRetry`, 22/11), inside the port's embed cap.
+  const found = courtesy ? { status: "ok" as const, sources: [], codes: [] } : await smartSearchWithRetry(ports.knowledge, reading.needs);
   sources = found.sources.filter(source => !source.validUntil || source.validUntil >= ports.today);
   const reasons: string[] = [...hints, ...found.codes.map(code => `knowledge:${code}`)];
   if (found.status !== "ok") reasons.push("knowledge:unavailable");

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { normalizeSavEvidenceText } from "../../evidence-text";
-import type { SmartKnowledgePort } from "./smart-agent";
+import type { SmartKnowledgePort, SmartKnowledgeResult } from "./smart-agent";
 import type { SmartSource } from "./smart-checks";
 import type { SmartToolCall } from "./smart-contract";
 import type { AcademyTool, AcademyToolResult } from "./tools/academy";
@@ -19,6 +19,20 @@ import type { AcademyTool, AcademyToolResult } from "./tools/academy";
  * twice (`duplicate_call`), an Academy argument absent from the customer's words and from earlier Academy results (`not_in_customer_words`, so it
  * never serves to look for an alternative product). Every result is bounded (3 000 bytes) and marked UNTRUSTED: it is data, never an instruction.
  */
+
+/*
+ * Knowledge search retry (prod bench 22/11): `knowledge_search_unavailable` (the retrieval's own failure code) or `search_failed` (the port's catch)
+ * is a transient failure. The search gets ONE more attempt before the turn goes on without it. Any other status (revision unstable, budget, no
+ * source) is not retried. The second attempt goes through the same port: its query embedding stays inside the port's own cap
+ * (`SAV_SMART_MAX_EMBED_CALLS` in the shadow, the bench's meter), so the worst case of paid calls does not change.
+ */
+export const SMART_SEARCH_TRANSIENT_CODES: readonly string[] = Object.freeze(["knowledge_search_unavailable", "search_failed"]);
+export async function smartSearchWithRetry(port: SmartKnowledgePort, needs: Parameters<SmartKnowledgePort>[0]): Promise<SmartKnowledgeResult> {
+  const first = await port(needs);
+  if (first.status === "ok" || !first.codes.some(code => SMART_SEARCH_TRANSIENT_CODES.includes(code))) return first;
+  const second = await port(needs);
+  return { ...second, codes: [...new Set([...second.codes, "search_retried"])] };
+}
 
 export const SAV_SMART_TOOL_LIMITS = Object.freeze({ maxCallsPerMail: 4, maxCallsPerPass: 3, maxResultBytes: 3_000 });
 
@@ -115,7 +129,7 @@ export function createSmartToolRunner(ports: Readonly<{
       const query = typeof call.args.recherche === "string" ? call.args.recherche.trim().slice(0, 300) : "";
       if (query.length < 3) return out("refused", "invalid_input");
       let result: Awaited<ReturnType<SmartKnowledgePort>>;
-      try { result = await ports.knowledge([{ id: call.needId, ask: query, alreadyDone: [], theme: null, search: query }]); }
+      try { result = await smartSearchWithRetry(ports.knowledge, [{ id: call.needId, ask: query, alreadyDone: [], theme: null, search: query }]); }
       catch { return out("failed", "search_failed"); }
       if (result.status !== "ok") return out("failed", "search_unavailable");
       const fresh = result.sources.filter(card => !card.validUntil || card.validUntil >= ports.today)

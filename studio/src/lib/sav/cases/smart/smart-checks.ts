@@ -206,11 +206,23 @@ const DOMAIN = /(?<![\p{L}\p{N}@./-])(?:www\.)?[a-z0-9][a-z0-9-]{1,62}(?:\.[a-z0
 const stripUrl = (value: string) => value.replace(/[.,;:!?]+$/, "");
 const hostOf = (url: string) => { try { return new URL(url).host.toLowerCase(); } catch { return ""; } };
 
-/** The links and domains of a text (lower case, trailing punctuation removed). */
+const BARE_PATH = /^\/[^\s<>"')\]«»]*/u;
+
+/*
+ * The links and domains of a text (lower case, trailing punctuation removed). v17 (22/11): a link written without its scheme (« bienvenue.limova.ai/
+ * inscription ») is read as the same https link, so its PATH is checked exactly like a full link: an invented page on an allowed host is refused
+ * whether or not the model wrote « https:// » (before, only its host was checked).
+ */
 function linksOf(text: string) {
   const urls = [...text.matchAll(URL_RE)].map(match => stripUrl(match[0]));
   const rest = text.replace(URL_RE, " ");
-  const domains = [...rest.matchAll(DOMAIN)].map(match => match[0].toLowerCase().replace(/^www\./, ""));
+  const domains: string[] = [];
+  for (const match of rest.matchAll(DOMAIN)) {
+    const host = match[0].toLowerCase().replace(/^www\./, "");
+    domains.push(host);
+    const path = stripUrl(rest.slice((match.index ?? 0) + match[0].length).match(BARE_PATH)?.[0] ?? "");
+    if (path.length > 1) urls.push(`https://${host}${path}`);
+  }
   return { urls, domains };
 }
 
@@ -353,11 +365,21 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   const citedText = [...[...cited.values()].map(source => fold(cardText(source))), ...[...citedAcademy.values()].map(row => fold(row.text))].join("\n");
   const allCardText = input.sources.map(source => cardText(source)).join("\n");
 
-  // Links: resources, or a link written in a card given for the mail.
-  const allowedUrls = [...SAV_SMART_RESOURCES.map(row => row.url), ...linksOf(allCardText).urls].map(url => url.toLowerCase());
-  const allowedHosts = new Set([...allowedUrls.map(hostOf), ...linksOf(allCardText).domains].filter(Boolean).map(host => host.replace(/^www\./, "")));
+  // Links: resources, a link written in a card given for the mail, or an OFFICIAL Limova link (limova.ai or a subdomain) given by an Academy result
+  // of this turn. v17 (22/11): the decide prompt (rule 6) allows an Academy result's link; the check now allows the same official links (before, only
+  // those under the Academy resource passed). An Academy result's link to another site stays refused: Academy results are untrusted data.
+  const academyText = (input.academy ?? []).map(row => row.text).join("\n");
+  const officialLimova = (url: string) => { const host = hostOf(url).replace(/^www\./, ""); return host === "limova.ai" || host.endsWith(".limova.ai"); };
+  // PR #340 review: an Academy link is matched EXACTLY (same host, same path; trailing slash, query and fragment ignored), never as a prefix, so an
+  // Academy result giving a host root (« https://limova.ai ») does not open every page of that host.
+  const exactKey = (url: string) => { try { const parsed = new URL(url); return `${parsed.host.toLowerCase().replace(/^www\./, "")}${parsed.pathname.replace(/\/+$/, "").toLowerCase()}`; } catch { return null; } };
+  const cardLinks = linksOf(allCardText), academyKeys = new Set(linksOf(academyText).urls.filter(officialLimova).map(exactKey).filter((key): key is string => Boolean(key)));
+  const allowedUrls = [...SAV_SMART_RESOURCES.map(row => row.url), ...cardLinks.urls].map(url => url.toLowerCase());
+  const allowedHosts = new Set([...allowedUrls.map(hostOf), ...[...academyKeys].map(key => key.split("/")[0]!), ...cardLinks.domains].filter(Boolean).map(host => host.replace(/^www\./, "")));
   const { urls, domains } = linksOf(reply);
-  if (urls.some(url => !allowedUrls.some(allowed => url.toLowerCase() === allowed || url.toLowerCase().startsWith(`${allowed.replace(/\/$/, "")}/`)))) codes.add("link_not_allowed");
+  const linkAllowed = (url: string) => allowedUrls.some(allowed => url.toLowerCase() === allowed || url.toLowerCase().startsWith(`${allowed.replace(/\/$/, "")}/`))
+    || academyKeys.has(exactKey(url) ?? "");
+  if (urls.some(url => !linkAllowed(url))) codes.add("link_not_allowed");
   if (domains.some(domain => !allowedHosts.has(domain))) codes.add("link_not_allowed");
 
   // Other platforms: an invitation or a praise is refused even when the customer named it; a name is allowed only from the customer or a cited card.
