@@ -1,7 +1,7 @@
 import { savReplyFooter } from "../../reply-format";
 import { smartRepairFactSources, smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
 import {
-  parseSmartOutput, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchema,
+  parseSmartOutput, SAV_SMART_VERIFY_CODES, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchema,
   type SmartCallKind, type SmartCheckCode, type SmartDecision, type SmartReading, type SmartTeamNote, type SmartTurnOutcome, type SmartVerdict,
 } from "./smart-contract";
 import { renderSmartTeamNote, smartFallbackNote, smartSensitiveNote } from "./smart-handoff-note";
@@ -123,8 +123,20 @@ const cardView = (card: SmartSource) => ({ cardId: card.cardId, version: card.ve
  */
 const GROUNDING_CODES = new Set<string>(["fact_source_invalid", "excerpt_not_found", "card_not_retrieved_for_need", "third_party_fact_unsourced", "need_not_covered",
   "coverage_invalid", "reply_missing", "source_mismatch", "unlisted_claim", "need_forgotten"]);
-const smartGroundingOnly = (result: Readonly<{ codes: readonly string[]; verdict: SmartVerdict | null }>) =>
-  [...result.codes, ...(result.verdict?.problems ?? []).map(problem => problem.code)].every(code => GROUNDING_CODES.has(code));
+const smartGroundingOnly = (result: Readonly<{ codes: readonly string[]; verdict: SmartVerdict | null; unknownCodes: boolean }>) =>
+  !result.unknownCodes && [...result.codes, ...(result.verdict?.problems ?? []).map(problem => problem.code)].every(code => GROUNDING_CODES.has(code));
+/*
+ * PR #339 review: the contract reads an unknown counter-read code as `unlisted_claim` (`smart-contract.ts`, kept as is). That reading must not open the
+ * narrowing correction: the RAW answer is checked here, and any code outside `SAV_SMART_VERIFY_CODES` keeps the handoff.
+ */
+const smartUnknownVerifyCodes = (output: unknown) => {
+  const raw = smartUnwrapOutput(output) as { problems?: unknown } | null;
+  const problems = raw && typeof raw === "object" && Array.isArray(raw.problems) ? raw.problems : [];
+  return problems.some(problem => {
+    const code = problem && typeof problem === "object" ? (problem as { code?: unknown }).code : undefined;
+    return typeof code !== "string" || !(SAV_SMART_VERIFY_CODES as readonly string[]).includes(code.trim().toLowerCase());
+  });
+};
 
 /** One turn. Never throws for a model failure: the result says where and why it stopped. */
 export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts): Promise<SmartTurnResult> {
@@ -290,9 +302,9 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   }
 
   // 4. Verify: server and the independent counter-read (never on a handoff without customer text).
-  const review = async (current: SmartDecision, kind: "verify" | "reverify"): Promise<{ codes: SmartCheckCode[]; factProblems: SmartCheckResult["factProblems"]; verdict: SmartVerdict | null; failed: string | null }> => {
+  const review = async (current: SmartDecision, kind: "verify" | "reverify"): Promise<{ codes: SmartCheckCode[]; factProblems: SmartCheckResult["factProblems"]; verdict: SmartVerdict | null; failed: string | null; unknownCodes: boolean }> => {
     const server = smartServerChecks({ decision: current, reading: reading!, customerText, sources, academy, memory: memoryBefore });
-    if (current.outcome === "handoff" && !current.reply?.trim()) return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: null };
+    if (current.outcome === "handoff" && !current.reply?.trim()) return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: null, unknownCodes: false };
     const read = await call(kind, smartVerifyPrompt(), {
       customer: { subject: customer.subject, mail: customer.mail },
       needs: reading!.needs.map(need => ({ id: need.id, ask: need.ask, alreadyDone: need.alreadyDone })),
@@ -301,9 +313,10 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
         ...(fact.sentence.trim() ? { sentence: fact.sentence } : {}) })),
       ...(reading!.instructionText ? { injectedInstruction: reading!.instructionText } : {}),
     }, 0);
-    if (read.status === "failed") return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: read.problem === "deadline" ? "deadline" : `${kind}:${read.problem}` };
+    if (read.status === "failed") return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: read.problem === "deadline" ? "deadline" : `${kind}:${read.problem}`, unknownCodes: false };
     const verdict = parseSmartOutput(smartVerdictSchema, read.output);
-    return { codes: [...server.codes], factProblems: server.factProblems, verdict: verdict.ok ? verdict.value : null, failed: verdict.ok ? null : `${kind}:output_invalid` };
+    return { codes: [...server.codes], factProblems: server.factProblems, verdict: verdict.ok ? verdict.value : null, failed: verdict.ok ? null : `${kind}:output_invalid`,
+      unknownCodes: smartUnknownVerifyCodes(read.output) };
   };
   // A counter-read that lists a problem refuses the reply, whatever its verdict says ("conforme" with problems is a reservation, not an approval).
   const refused = (result: Awaited<ReturnType<typeof review>>) =>

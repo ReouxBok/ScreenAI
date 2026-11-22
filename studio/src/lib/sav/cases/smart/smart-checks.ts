@@ -183,10 +183,21 @@ const INTEGRATIONS_MENU = /\b(?:dans|depuis|via) (?:le |vos |les )?(?:menu |ongl
 // « mais », « puis », « ou », « et », « ; » and parentheses (a leading « Dans les intégrations de Limova, » stays with the choice that follows it); every other part is judged
 // by the shared per-clause rule (« Dans les intégrations de Limova, si le connecteur manque, optez pour Wix… » refuses).
 const integrationParts = (folded: string) => folded.split(/[;()]|\b(?:si|mais|puis|ou|et)\b/).map(row => row.trim()).filter(Boolean);
+/*
+ * PR #339 review (send gate aligned on the 22/11 rule): « Je vous recommande d'utiliser Calendly » or « Connectez Calendly dans Intégrations » passed the
+ * agent's check but were cancelled here. The mail hosts and connected tools (`SAV_OTHER_PLATFORM_CONNECTED`) are no longer names this gate orients or
+ * endorses on, UNLESS the sentence frames the tool as a replacement of Limova (`savOtherPlatformSubstitutes`: « à la place de Limova », « un autre
+ * outil »...), where every named tool counts again. A generic redirection (`savOtherPlatformRedirect`, « à la place de Limova » included) is still
+ * refused with no name at all.
+ */
+const SEND_GATE_ALL = [...new Set([...SAV_OTHER_PLATFORM_THIRD_PARTIES, ...SAV_OTHER_PLATFORM_COMPETITORS])];
+const SEND_GATE_NAMES = SEND_GATE_ALL.filter(name => !(SAV_OTHER_PLATFORM_CONNECTED as readonly string[]).includes(name));
 export const smartOtherPlatformInvite = (reply: string) => sentencesOf(reply).some(sentence => {
   const folded = fold(sentence);
-  if (savOtherPlatformRedirect(folded) || savOtherPlatformEndorses(folded, SAV_OTHER_PLATFORM_THIRD_PARTIES)) return true;
-  return integrationParts(folded).some(part => !INTEGRATIONS_MENU.test(part) && savOtherPlatformOrients(part, SAV_OTHER_PLATFORM_THIRD_PARTIES));
+  if (savOtherPlatformRedirect(folded)) return true;
+  if (savOtherPlatformSubstitutes(folded)) return savOtherPlatformEndorses(folded, SEND_GATE_ALL) || savOtherPlatformOrients(folded, SEND_GATE_ALL);
+  if (savOtherPlatformEndorses(folded, SEND_GATE_NAMES)) return true;
+  return integrationParts(folded).some(part => !INTEGRATIONS_MENU.test(part) && savOtherPlatformOrients(part, SEND_GATE_NAMES));
 });
 
 const URL_RE = /\bhttps?:\/\/[^\s<>"')\]]+/giu;

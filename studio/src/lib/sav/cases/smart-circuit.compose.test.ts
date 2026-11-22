@@ -155,6 +155,12 @@ describe("SAV-123 (N8) — interrupteur allumé : le cerveau smart décide, le c
     expect(run.report).toMatchObject({ status: "recorded", outcome: "accepted", closure: null, modelCalls: 1 });
     expect(decision(run.records[0]!)!.nextAction.kind).toBe("handoff");
     expect(run.turns[0]!.reasons).toContain("understand:no_need");
+    // PR #339 review: the team note says what the mail is, never « aucune fiche retrouvée ».
+    const action = decision(run.records[0]!)!.nextAction as { reason: string; report: { need: string; observed: string | null; expectedIntervention: string } };
+    expect(action.reason).toBe("diagnosis_out_of_tools");
+    expect(action.report.need).toBe("Message de remerciement / confirmation, aucune demande.");
+    expect(action.report.observed).toContain("Merci pour votre retour");
+    expect(JSON.stringify(action.report)).not.toMatch(/aucune fiche/i);
   });
 
   it("5. deux refus du validateur → l'équipe : le 1er refus est rendu au cerveau une fois, pas de 3e tour", async () => {

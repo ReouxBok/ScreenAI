@@ -4,7 +4,9 @@ import { savBenchJudgePrompt } from "../../bench/bench-judge";
 import { savBenchNormalize, type SavBenchConversation, type SavBenchExpect } from "../../bench/bench-types";
 import { runSmartTurn, SAV_SMART_MAX_MODEL_CALLS, type SmartTurnInput } from "./smart-agent";
 import { SMART_BENCH_REAL_GRID } from "./smart-bench-real-judge";
-import { smartOtherPlatformSentences, smartServerChecks, type SmartSource } from "./smart-checks";
+import { smartOtherPlatformInvite, smartOtherPlatformSentences, smartServerChecks, type SmartSource } from "./smart-checks";
+import { smartSendProblem } from "./smart-send-fence";
+import { smartSupportProvenance } from "../case-types";
 import { smartDecisionSchema, smartReadingSchema } from "./smart-contract";
 import { smartFallbackNote } from "./smart-handoff-note";
 import { smartEmptyMemory, type SmartCaseMemory } from "./smart-memory";
@@ -51,6 +53,24 @@ describe("a. other_platform_recommended : seulement un concurrent de Limova", ()
       "Vous pourriez passer par un autre outil pour ce besoin.",
       "Utilisez Calendly à la place de Limova.",
     ]) expect(checks(`${SMART_GOOD_REPLY} ${sentence}`, customer, [SMART_TEST_CARD, CALENDLY], [factOf(CALENDLY, "copiez votre lien de réservation")]), sentence).toContain("other_platform_recommended");
+  });
+});
+
+describe("PR #339 revue 1 : la barrière d'envoi suit la même règle (concurrent seulement)", () => {
+  const admitted = (body: string) => smartSendProblem({ admission: { qualification: { requests: [{ provenance: smartSupportProvenance("2026-11-22T08:00:00Z") }] } }, body, purpose: "answer" });
+  it("Calendly recommandé ou connecté dans Intégrations passe la barrière d'envoi", () => {
+    for (const body of ["Je vous recommande d'utiliser Calendly pour vos rendez-vous.", "Connectez Calendly dans Intégrations, puis copiez votre lien.", "Rendez-vous sur Calendly et copiez votre lien de réservation."])
+      expect(smartOtherPlatformInvite(body), body).toBe(false);
+  });
+  it("ChatGPT à la place de Limova, un concurrent recommandé, ou « à la place de Limova » sans nom : bloqués à l'envoi", () => {
+    for (const body of ["Utilisez ChatGPT à la place de Limova.", "Je vous recommande d'utiliser ChatGPT.", "Prenez Calendly à la place de Limova.", "À la place de Limova, passez par un autre outil."])
+      expect(smartOtherPlatformInvite(body), body).toBe(true);
+    expect(smartOtherPlatformInvite("Limova ne propose pas Pipedrive aujourd'hui : dites-nous ce que vous voulez faire.")).toBe(false);
+  });
+  it("au niveau de smartSendProblem (cas admis par l'entrée smart) : Calendly part, ChatGPT-à-la-place-de-Limova est annulé", () => {
+    expect(admitted("Je vous recommande d'utiliser Calendly.")).toBeNull();
+    expect(admitted("Connectez Calendly dans Intégrations, puis copiez votre lien.")).toBeNull();
+    expect(admitted("Utilisez ChatGPT à la place de Limova.")).toBe("CANCELLED_REPLY_OTHER_PLATFORM");
   });
 });
 
@@ -122,6 +142,15 @@ describe("e. refus après correction alors que la fiche était bonne : une corre
     expect(result.outcome).toBe("handoff");
     expect(result.reasons).toEqual(expect.arrayContaining(["refused_after_correction", "check:link_not_allowed"]));
     expect(kinds).toEqual(["understand", "decide", "verify", "correct", "reverify"]);
+  });
+  it("PR #339 revue 2 : un code de relecture inconnu (lu comme unlisted_claim par le contrat) n'ouvre PAS la correction de resserrement", async () => {
+    const unknown = { verdict: "non_conforme", problems: [{ code: "tone", sentence: "Belle journée." }] };
+    const { result, kinds } = await run({ understand: { output: smartReading() }, decide: { output: smartGoodDecision() }, verify: { output: unknown },
+      correct: { output: smartGoodDecision() }, reverify: { output: unknown } });
+    expect(kinds).toEqual(["understand", "decide", "verify", "correct", "reverify"]);
+    expect(result.outcome).toBe("handoff");
+    expect(result.reasons).not.toContain("correction:narrowed");
+    // The same refusal with a KNOWN grounding code does open it (the case above, « unlisted_claim »).
   });
   it("le budget d'appels décide : après 2 passes de décision, pas de 2e correction (7 appels au plus)", async () => {
     const tools = { thinking: "", action: "tools", calls: [{ id: "t1", tool: "chercher_fiches", needId: "n1", args: { query: "connexion" } }], decision: null };
