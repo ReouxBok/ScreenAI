@@ -2,6 +2,7 @@ import "server-only";
 import { z } from "zod";
 import { v2DailyReport, v2DailyReportInput } from "@/lib/sav/cases/v2-daily-report";
 import { listV2Cases, v2InventoryInput } from "@/lib/sav/cases/v2-inventory";
+import { readSmartTraceSummaries, readSmartTracesForThread } from "@/lib/sav/cases/smart/smart-trace-store";
 import type { SavClerkUser } from "@/lib/sav/intake/console-auth";
 import { listIntakeConsole } from "@/lib/sav/intake/console-store";
 import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
@@ -114,12 +115,13 @@ const listDossiers = { name: "list_dossiers", title: "Lister les dossiers SAV", 
         reason: row.reason ? intakeReasonLabel(row.reason) : null })) });
   } };
 const getDossier = { name: "get_dossier", title: "Lire un dossier SAV", write: false,
-  description: "Lit un dossier : état, verrous, décision courante, actions confirmées ou incertaines, dernier message (borné) et jeton de version à renvoyer avec toute écriture.",
+  description: "Lit un dossier : état, verrous, décision courante, actions confirmées ou incertaines, dernier message (borné), jeton de version à renvoyer avec toute écriture, et smartTrace : chaque tour de l’agent SAV (besoins, recherches et fiches par rang, décision et motif de transfert, texte proposé, contrôles, contre-lecture, appels et coût) et les réponses confirmées.",
   input: z.object({ threadId: z.uuid() }).strict(),
   async run(context: StudioMcpContext, input: { threadId: string }) {
     const data = await readIntakeConsoleDetail(input.threadId);
     if (!data) return refused("SAV_INTAKE_DOSSIER_NOT_FOUND", "Dossier introuvable dans la console des nouveaux dossiers.");
-    return done({ ...intakeDossierSummary(data), availableActions: await intakeAvailableActions(data, context.staff) });
+    // smartTrace: per V2 case of this thread, each smart turn (needs, searches and fiches by rank, decision, texts, checks, counter-read, calls, cost) and the confirmed replies.
+    return done({ ...intakeDossierSummary(data), availableActions: await intakeAvailableActions(data, context.staff), smartTrace: await readSmartTracesForThread(input.threadId) });
   } };
 const getDiagnostics = { name: "get_diagnostics", title: "Diagnostic technique d’un dossier", write: false,
   description: "Historique des analyses, tentatives, réveils, effets et derniers codes de refus. Réservé aux administrateurs, comme l’API de diagnostic.",
@@ -142,7 +144,9 @@ const listV2CasesTool = { name: "list_v2_cases", title: "Inventaire des dossiers
   input: v2InventoryInput,
   async run(context: StudioMcpContext, input: z.infer<typeof v2InventoryInput>) {
     if (context.staff.role !== "admin") return refused("SAV_V2_INVENTORY_FORBIDDEN", "Inventaire V2 réservé aux administrateurs.");
-    return done(await listV2Cases(input));
+    const data = await listV2Cases(input), smart = await readSmartTraceSummaries(data.rows.map(row => row.caseId));
+    // smart: the compact summary of the agent's turns (decision, handoff reason, fiches ids and titles, check codes, calls, cost), no customer text.
+    return done({ ...data, rows: data.rows.map(row => ({ ...row, smart: smart.get(row.caseId) ?? null })) });
   } };
 const getBudget = { name: "get_budget", title: "Budget IA de l’intake", write: false,
   description: "Plafond effectif, dépense confirmée, réservations et coûts incertains, glissant 30 jours et appels. Mêmes chiffres que la page Budget IA, réservée au propriétaire du budget. Lecture seule.",
