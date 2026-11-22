@@ -28,6 +28,7 @@ import { isSmartCaseRequest, smartCaseDecisionProvider } from "./smart/smart-cas
 import { smartGeminiModel, smartInputCap } from "./smart/smart-model";
 import { smartMaxExchanges } from "./smart/smart-memory";
 import type { SmartTurnPorts } from "./smart/smart-agent";
+import type { SmartCaseTraceSink } from "./smart/smart-trace";
 
 /*
  * B (4/11, LOCAL and OFF): the real adapters of the V2 investigation. Each talks to its provider through an injected `network` (`fetch` by
@@ -331,13 +332,15 @@ export function caseGeminiDecisionPreflight(env: () => Env) {
  * A call never reaches both. Same port, so the ledger, the V2 money gate and the validator are the same for both.
  */
 /** Academy tools are injected by the caller (`getAcademyTools()`), never imported here: the bench reaches this module and must not reach the Academy client. */
-export function caseSmartDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; now?: () => Date; academy?: SmartTurnPorts["academy"] }>): CaseV2ModelTransport {
+/** `trace` (recording only, injected by the production factory, absent on the bench): the trace of each real smart turn. */
+export function caseSmartDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; now?: () => Date; academy?: SmartTurnPorts["academy"]; trace?: SmartCaseTraceSink }>): CaseV2ModelTransport {
   const now = input.now ?? (() => new Date());
   return smartCaseDecisionProvider({ env: input.env, now, maxInputBytes: () => smartInputCap(input.env(), now()), maxExchanges: smartMaxExchanges(input.env()), ...(input.academy ? { academy: input.academy } : {}),
+    ...(input.trace ? { trace: input.trace } : {}),
     model: smartGeminiModel({ env: input.env, now, ...(input.network ? { network: input.network } : {}), ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}) }) });
 }
 
-export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; smart?: CaseV2ModelTransport }>): CaseV2ModelTransport {
+export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; smart?: CaseV2ModelTransport; trace?: SmartCaseTraceSink }>): CaseV2ModelTransport {
   const network = input.network ?? ((url, init) => fetch(url, init));
   let smart = input.smart;
   return async request => {

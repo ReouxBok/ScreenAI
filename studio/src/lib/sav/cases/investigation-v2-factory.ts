@@ -1,6 +1,7 @@
 import "server-only";
 import { readConfirmedV1Context } from "./admission-context-reader";
 import { savV2EntrySmartOn } from "./smart-entry-switch";
+import { smartCaseTraceStore } from "./smart/smart-trace-store";
 import { caseInvestigationQualify, type CaseApprovedRulePort } from "./admission-investigation-ports";
 import { caseTicketOwnerPortFromTransport } from "./admission-owner-reader";
 import type { AdmissionPolicyRecord, V1AdmissionAdapterPolicy } from "./admission-runtime";
@@ -120,7 +121,9 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
       prompt: caseInvestigationPromptRevision(caseAttachmentMediaMode(input.env()) !== "off", input.env()) }),
     ledger: caseCallLedgerOnStore,
     knowledge: { vectors, embed: caseGeminiEmbeddingTransport({ env: input.env, ...(input.network ? { network: input.network } : {}) }), spend: caseV2EmbeddingSpend(spendDeps) },
-    model: { preflight: caseGeminiDecisionPreflight(input.env), money: model.money, releaseMoney: model.release, provider: model.provider(caseGeminiDecisionProvider({ env: input.env, ...(input.network ? { network: input.network } : {}) })) },
+    model: { preflight: caseGeminiDecisionPreflight(input.env), money: model.money, releaseMoney: model.release, provider: model.provider(caseGeminiDecisionProvider({ env: input.env, ...(input.network ? { network: input.network } : {}),
+      // Recording only: the trace of each real smart turn, encrypted with the case (`smart-trace-store.ts`); never changes a decision.
+      trace: smartCaseTraceStore({ env: input.env, now }) })) },
   };
   return { ok: true, deps, provenance };
 }

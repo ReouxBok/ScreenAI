@@ -8,6 +8,7 @@ import type { SmartSource } from "./smart-checks";
 import type { SmartFact, SmartTeamNote } from "./smart-contract";
 import { smartEmptyMemory, type SmartCaseMemory } from "./smart-memory";
 import type { SmartModelPort } from "./smart-model";
+import { buildSmartCaseTrace, traceSmartKnowledge, type SmartCaseTraceSink, type SmartTraceSearch } from "./smart-trace";
 
 /*
  * SAV-123 (N8): the smart brain (`runSmartTurn`) as the V2 circuit's decision provider, behind `SAV_V2_ENTRY_SMART=on` and ONLY for a case admitted
@@ -161,7 +162,25 @@ export type SmartCaseProviderDeps = Readonly<{
   maxExchanges?: number;
   /** Measurement only (tests, bench): the turn just run. */
   observe?: (result: SmartTurnResult) => void;
+  /**
+   * Recording only (production: `writeSmartCaseTrace`, an encrypted row with the case): the trace of each real turn (needs, searches, decision,
+   * texts, checks, verdicts, calls). Called after the turn; its failure or slowness (bounded) never changes the turn's result.
+   */
+  trace?: SmartCaseTraceSink;
 }>;
+
+/**
+ * Upper bound of the wait on the trace sink: past it the turn returns, the write is abandoned. A bounded await, not fire-and-forget: on the
+ * serverless runtime a promise left running after the response may be frozen or killed, so the write would be lost silently.
+ */
+export const SAV_SMART_TRACE_WAIT_MS = 1_500;
+async function recordSmartTrace(sink: SmartCaseTraceSink | undefined, build: () => Parameters<SmartCaseTraceSink>[0]): Promise<void> {
+  if (!sink) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([Promise.resolve().then(() => sink(build())), new Promise<void>(resolve => { timer = setTimeout(resolve, SAV_SMART_TRACE_WAIT_MS); })]);
+  } catch { /* recording only: never alters the turn */ } finally { if (timer) clearTimeout(timer); }
+}
 
 /** Validator refusals of one input after which no brain runs again: the second refusal goes to the team (Ugo, 14/11, `SAV_CASE_REFUSALS_BEFORE_HANDOFF`). */
 const SECOND_REFUSAL_CALL = 3;
@@ -172,17 +191,22 @@ export function smartCaseDecisionProvider(deps: SmartCaseProviderDeps): CaseV2Mo
     const none = { inputTokens: 0, outputTokens: 0 };
     if (request.purpose !== "decision") return { result: { status: "failed", uncertain: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false } }, usage: none };
     // Second refusal of the validator for this input: the team, with the refusal codes; no brain, no model call.
-    if (request.feedback.length && request.call >= SECOND_REFUSAL_CALL)
-      return { result: { status: "ok", output: smartHandoffProposal(request, { reason: "repeated_failure", note: null,
-        noteText: `Décision refusée deux fois par le contrôle du serveur (${[...new Set(request.feedback.map(row => row.code))].sort().join(", ")}) : à reprendre par l'équipe.` }) }, usage: none };
+    if (request.feedback.length && request.call >= SECOND_REFUSAL_CALL) {
+      const output = smartHandoffProposal(request, { reason: "repeated_failure", note: null,
+        noteText: `Décision refusée deux fois par le contrôle du serveur (${[...new Set(request.feedback.map(row => row.code))].sort().join(", ")}) : à reprendre par l'équipe.` });
+      await recordSmartTrace(deps.trace, () => buildSmartCaseTrace({ request, result: null, proposal: output, searches: [], at: deps.now() }));
+      return { result: { status: "ok", output }, usage: none };
+    }
     const input = smartTurnInputFromCase(request), cap = deps.maxInputBytes();
     if (!input || cap === null) return { result: { status: "failed", uncertain: false, diagnostic: { stage: "preflight", code: input ? "policy_invalid" : "empty_response", networkAttempted: false } }, usage: none };
+    const searches: SmartTraceSearch[] = [];
     const result = await runSmartTurn(input, {
-      model: smartModelWithFeedback(deps.model, request.feedback), knowledge: smartCaseKnowledge(request), maxInputBytes: cap,
+      model: smartModelWithFeedback(deps.model, request.feedback), knowledge: deps.trace ? traceSmartKnowledge(smartCaseKnowledge(request), searches) : smartCaseKnowledge(request), maxInputBytes: cap,
       today: deps.now().toISOString().slice(0, 10), recordOwn: true, ...(deps.academy ? { academy: deps.academy } : {}), ...(deps.maxExchanges ? { maxExchanges: deps.maxExchanges } : {}),
     });
     deps.observe?.(result);
     const usage = smartTurnUsage(result), proposal = smartProposalFromTurn(result, request);
+    await recordSmartTrace(deps.trace, () => buildSmartCaseTrace({ request, result, proposal, searches, at: deps.now() }));
     if (!proposal) return { result: { status: "failed", uncertain: result.calls.some(call => call.uncertain),
       diagnostic: { stage: "content", code: "empty_response", networkAttempted: result.calls.some(call => call.sent) } }, usage };
     return { result: { status: "ok", output: proposal }, usage };
