@@ -2,11 +2,19 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { createSavTestDb } from "../../../test/sav-db";
 import { auditLogs, categories, contentItems, knowledgeProjectionCandidates, savKnowledgeActivations, savKnowledgeProposalDrafts, staffUsers } from "@/db/schema";
 
-const state = vi.hoisted(() => ({ db: null as unknown, embed: vi.fn(async (texts: string[]) => texts.map(() => Array(768).fill(1))) }));
+const state = vi.hoisted(() => ({ gate: null as null | (() => Promise<void>), db: null as unknown, embed: vi.fn(async (texts: string[]) => texts.map(() => Array(768).fill(1))) }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 vi.mock("@/lib/embeddings", () => ({ embedTexts: state.embed }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => { throw Error("NO_SESSION_ON_MCP"); }, clerkClient: async () => { throw Error("NO_REAL_CLERK"); } }));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
+// Race hook: runs once inside the publish, after the hash check and before the submission.
+vi.mock("@/lib/knowledge/workspace", async (importActual) => {
+  const actual = await importActual<typeof import("@/lib/knowledge/workspace")>();
+  return { ...actual, previewSavKnowledgeProposal: async (...args: Parameters<typeof actual.previewSavKnowledgeProposal>) => {
+    const gate = state.gate; state.gate = null; if (gate) await gate();
+    return actual.previewSavKnowledgeProposal(...args);
+  } };
+});
 import { handleStudioMcpRequest, resetStudioMcpRateLimit } from "./server";
 import { saveSavKnowledgeProposal } from "@/lib/knowledge/workspace";
 import { searchKnowledge } from "@/lib/search";
@@ -45,7 +53,7 @@ beforeEach(async () => {
   await f.db.insert(categories).values({ slug: "depannage", label: "Dépannage" });
   await f.db.insert(staffUsers).values([{ clerkId: "user_ugo", email: "ugo@limova.ai", name: "Ugo", role: "admin" },
     { clerkId: "user_reouven", email: "reouven@limova.ai", name: "Reouven", role: "admin" }, { clerkId: "user_contact", email: "contact@limova.ai", name: "Contact", role: "member" }]);
-  current = ugo; resetStudioMcpRateLimit();
+  current = ugo; state.gate = null; resetStudioMcpRateLimit();
   state.embed.mockReset().mockImplementation(async (texts: string[]) => texts.map(() => Array(768).fill(1)));
   vi.spyOn(console, "info").mockImplementation(() => undefined);
 });
@@ -100,6 +108,17 @@ describe("Studio MCP knowledge fiches", () => {
     expect(listed).toMatchObject({ outcome: "done", data: { total: 1, rows: [{ itemId, status: "production", version: 1 }] } });
     // Same request again: nothing to redo.
     expect(await publish({ draftId: draft.draftId, contentHash: fresh.contentHash })).toMatchObject({ outcome: "done", data: { steps: [] } });
+  });
+
+  it("publish_fiche refuses a draft edited between the hash check and the submission, and submits nothing", async () => {
+    const draft = await propose();
+    state.gate = async () => { await saveSavKnowledgeProposal({ draftId: draft.draftId, expectedRevision: 1, mode: "new", ...fiche, reason: "Motif fictif modifié pendant la publication.",
+      delivery: { version: 1, mode: "procedure", internalStepIds: [], groups: [{ id: "fiche.main", label: document.objective, stepIds: ["notebook.archive"], requiresHuman: false, prerequisiteIndexes: [0], exceptionIndexes: [0], includeExpectedResult: true, includeEscalation: true }] } }, "ugo@limova.ai"); };
+    expect(await publish(draft)).toMatchObject({ outcome: "refused", code: "SAV_MCP_FICHE_CHANGED" });
+    expect(state.gate).toBeNull();
+    expect(await f.db.select().from(knowledgeProjectionCandidates)).toHaveLength(0);
+    expect((await f.db.select().from(savKnowledgeProposalDrafts))[0]).toMatchObject({ status: "draft", revision: 2 });
+    expect(await f.db.select().from(savKnowledgeActivations)).toHaveLength(0);
   });
 
   it("propose_fiche_update keeps the active version live until publish_fiche", async () => {

@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { z, ZodError } from "zod";
 import { requireDb } from "@/db";
-import { contentItems, knowledgeProjectionCandidates, savKnowledgeActivations, savKnowledgeProposalDrafts } from "@/db/schema";
+import { contentItems, knowledgeFamilySources, knowledgeProjectionCandidates, savKnowledgeActivations, savKnowledgeProposalDrafts } from "@/db/schema";
 import { activateSavKnowledgeVersion, getSavKnowledgeDetail, paginateSavKnowledge, previewSavKnowledgeProposal, previewSavKnowledgeReview, publishSavKnowledgeVersion,
   reviewSavKnowledgeProposal, saveSavKnowledgeProposal, submitSavKnowledgeProposal } from "@/lib/knowledge/workspace";
 import { assertKnowledgeUgoApproval, canonicalKnowledgeSchema, type CanonicalKnowledge } from "@/lib/knowledge/contracts";
@@ -50,7 +50,9 @@ function stable(value: unknown): unknown {
   return value;
 }
 type DraftRow = typeof savKnowledgeProposalDrafts.$inferSelect;
-/** sha256 (hex) of one saved draft revision: any later edit, from the MCP or the Studio, changes it. */
+/** sha256 (hex) of one saved draft revision: any later edit, from the MCP or the Studio, changes it.
+ * The delivery (restitution) is not in the row: it is saved with its revision (audit `sav_knowledge_proposal_saved`),
+ * so any delivery change is a new save, hence a new revision, hence a new hash. Hashing the revision covers it. */
 export function ficheContentHash(draft: Pick<DraftRow, "id" | "revision" | "targetItemId" | "title" | "document" | "sources" | "reason">) {
   return createHash("sha256").update(JSON.stringify(stable({ v: 1, draftId: draft.id, revision: draft.revision, targetItemId: draft.targetItemId, title: draft.title,
     document: draft.document, sources: draft.sources, reason: draft.reason })), "utf8").digest("hex");
@@ -155,12 +157,18 @@ const publishFiche = studioMcpWrite("publish_fiche", "Publier et activer une fic
 async function publishChain(draft: DraftRow, reason: string, actor: string, steps: string[]): Promise<StudioMcpResult> {
   // 1. Submission, as « Soumettre » (returns the existing candidate when already submitted).
   let candidate;
+  // Exactly the hashed revision: the hash was checked outside any lock, so an edit landing since then is refused here
+  // (the submit snapshot binds the revision previewed), then confirmed on the submitted candidate's provenance.
+  const changed = () => refused("SAV_MCP_FICHE_CHANGED", "Le brouillon a changé pendant la publication : relire avec get_fiche et faire valider le contenu actuel.", { steps });
   if (draft.status === "draft") {
     const preview = await previewSavKnowledgeProposal(draft.id, actor);
+    if (preview.draft.revision !== draft.revision) return changed();
     candidate = await submitSavKnowledgeProposal({ draftId: draft.id, snapshot: preview.snapshot }, actor);
     steps.push("submitted");
   } else [candidate] = await requireDb().select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, draft.candidateId!));
   if (!candidate) return refused("KNOWLEDGE_CANDIDATE_NOT_FOUND", knowledgeErrorMessage("KNOWLEDGE_CANDIDATE_NOT_FOUND"));
+  const [submitted] = await requireDb().select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId));
+  if (submitted?.evidence.draftId !== draft.id || submitted.evidence.draftRevision !== draft.revision) return changed();
   // 2. Review, as « Valider » on the submitted document, unchanged.
   if (["pending", "needs_completion"].includes(candidate.status)) {
     const review = await previewSavKnowledgeReview(candidate.id, actor);
