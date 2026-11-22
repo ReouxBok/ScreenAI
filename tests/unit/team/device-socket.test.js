@@ -249,3 +249,105 @@ describe('DeviceSocket', () => {
     expect(FakeWebSocket.instances.length).toBeGreaterThan(1);
   });
 });
+
+describe('DeviceSocket: login vault (TEAM-729)', () => {
+  // Real timers: WebCrypto resolves on the event loop.
+  beforeEach(() => { FakeWebSocket.instances = []; });
+  const settle = async () => { for (let i = 0; i < 20; i += 1) await flush(); };
+
+  async function openVault(overrides = {}) {
+    const { createVaultKeyPair } = await import('../../../src/team/vault.js');
+    const made = make({
+      vault: { createKeyPair: vi.fn(() => createVaultKeyPair()) },
+      extraCapabilities: ['browser.v1+cookies'],
+      getDeviceId: () => 'paired-device-0001',
+      ...overrides
+    });
+    made.socket.start();
+    const ws = FakeWebSocket.instances.at(-1);
+    ws.open();
+    await settle();
+    return { ...made, ws };
+  }
+
+  it('says hello with browser.v1+vault, browser.v1+cookies and a bare public JWK', async () => {
+    const { ws, socket } = await openVault();
+    const hello = ws.sent[0];
+    expect(hello.type).toBe('hello');
+    expect(hello.capabilities).toEqual(['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1', 'browser.v1+cookies', 'browser.v1+vault']);
+    expect(Object.keys(hello.vault_key).sort()).toEqual(['crv', 'kty', 'x', 'y']);
+    expect(hello.vault_key).toEqual(expect.objectContaining({ kty: 'EC', crv: 'P-256' }));
+    expect(socket.vaultKey.privateKey.extractable).toBe(false);
+    socket.stop();
+  });
+
+  it('makes a new key for every socket and drops it on close', async () => {
+    const { ws, socket } = await openVault();
+    const first = ws.sent[0].vault_key.x;
+    expect(socket.vaultFor(ws)).toEqual(expect.objectContaining({ deviceId: 'paired-device-0001' }));
+    ws.serverClose(1011);
+    expect(socket.vaultKey).toBeNull();
+    expect(socket.vaultFor(ws)).toBeNull();
+    socket.start({ force: true });
+    const next = FakeWebSocket.instances.at(-1);
+    next.open();
+    await settle();
+    expect(next.sent[0].vault_key.x).not.toBe(first);
+    // The device id the server sent in `ready` wins over the stored one.
+    next.receive({ type: 'ready', device_id: 'ready-device-0002' });
+    expect(socket.vaultFor(next).deviceId).toBe('ready-device-0002');
+    expect(socket.vaultFor(ws)).toBeNull();
+    socket.stop();
+    expect(socket.vaultKey).toBeNull();
+  });
+
+  it('says hello without the vault when no key can be made', async () => {
+    const { ws, socket } = await openVault({ vault: { createKeyPair: async () => { throw new Error('no crypto'); } } });
+    expect(ws.sent[0].capabilities).not.toContain('browser.v1+vault');
+    expect(ws.sent[0].vault_key).toBeUndefined();
+    socket.stop();
+  });
+
+  it('opens a fill_secret seal with the key of the socket the call came on, and caches the answer only', async () => {
+    const { openSeal } = await import('../../../src/team/vault.js');
+    const { sealForDevice, loginPayload } = await import('./vault-helpers.js');
+    let opened = 0;
+    const onCall = vi.fn(async (call, ctx) => {
+      const vault = ctx.vault();
+      const result = await openSeal({ sealed: call.args.sealed, callId: call.call_id, deviceId: vault.deviceId, privateKey: vault.privateKey });
+      if (result.ok) opened += 1;
+      return result.ok ? { ok: true, data: { filled: { username: true, password: true, otp: false } } } : { ok: false, error: { code: 'secret_unreadable' } };
+    });
+    const { ws, socket } = await openVault({ handlers: { onCall, onSetAutonomy: vi.fn(), onBrowserControl: vi.fn() } });
+    ws.receive({ type: 'ready', device_id: 'ready-device-0003' });
+    const sealed = await sealForDevice({
+      devicePublicJwk: ws.sent[0].vault_key, callId: 'fill-1', deviceId: 'ready-device-0003',
+      payload: loginPayload({ callId: 'fill-1', deviceId: 'ready-device-0003' })
+    });
+    const call = { type: 'call', call_id: 'fill-1', tool: 'browser.fill_secret', args: { sealed } };
+    ws.receive(call);
+    await settle();
+    ws.receive(call);
+    await settle();
+    expect(onCall).toHaveBeenCalledTimes(1);
+    expect(opened).toBe(1);
+    const results = ws.sent.filter(message => message.type === 'result');
+    expect(results).toHaveLength(2);
+    expect(results[1]).toEqual(results[0]);
+    expect(JSON.stringify(ws.sent)).not.toContain('Tr0ub4dor');
+    socket.stop();
+  });
+
+  it('keeps the new error codes and answers import_sessions « cancelled »', async () => {
+    const onCall = vi.fn(async call => ({ ok: false, error: { code: call.args.code, message: 'x' } }));
+    const { ws, socket } = await openVault({ handlers: { onCall, onSetAutonomy: vi.fn(), onBrowserControl: vi.fn() } });
+    ws.receive({ type: 'call', call_id: 'a', tool: 'browser.fill_secret', args: { code: 'origin_mismatch' } });
+    ws.receive({ type: 'call', call_id: 'b', tool: 'browser.fill_secret', args: { code: 'secret_unreadable' } });
+    ws.receive({ type: 'import_sessions', request_id: 'r9', sites: ['free.fr'] });
+    await settle();
+    const codes = ws.sent.filter(message => message.type === 'result').map(message => message.error.code);
+    expect(codes.sort()).toEqual(['origin_mismatch', 'secret_unreadable']);
+    expect(ws.last('import_sessions_result')).toEqual({ type: 'import_sessions_result', request_id: 'r9', status: 'cancelled', sites: [] });
+    socket.stop();
+  });
+});

@@ -29,7 +29,9 @@ export const ACTION_TOOLS = Object.freeze([
   'browser.batch'
 ]);
 export const ACCESS_TOOLS = Object.freeze(['browser.request_tab']);
-export const BROWSER_TOOLS = Object.freeze([...READ_TOOLS, ...ACTION_TOOLS, ...ACCESS_TOOLS]);
+// TEAM-729: types a saved login, sealed by the server for this device (docs/login-vault.md).
+export const VAULT_TOOLS = Object.freeze(['browser.fill_secret']);
+export const BROWSER_TOOLS = Object.freeze([...READ_TOOLS, ...ACTION_TOOLS, ...ACCESS_TOOLS, ...VAULT_TOOLS]);
 
 // Higher wins when two readings disagree.
 const REASON_SEVERITY = { account: 6, pay: 6, delete: 5, send: 4, publish: 4, external_form: 3 };
@@ -38,6 +40,7 @@ export function toolKind(tool) {
   if (READ_TOOLS.includes(tool)) return 'read';
   if (ACTION_TOOLS.includes(tool)) return 'action';
   if (ACCESS_TOOLS.includes(tool)) return 'access';
+  if (VAULT_TOOLS.includes(tool)) return 'vault';
   return null;
 }
 
@@ -232,6 +235,8 @@ export function activityLabel(tool, args = {}, targetName = '') {
     case 'browser.download': return `Téléchargement de ${quoted(name, 40)}`;
     case 'browser.batch': return `Remplissage de la page (${Number(args.steps?.length) || 0} étapes)`;
     case 'browser.request_tab': return 'Demande d’accès à un onglet';
+    // Never the login's label or username: only that a saved login was used.
+    case 'browser.fill_secret': return 'Connexion avec un identifiant enregistré';
     default: return 'Action';
   }
 }

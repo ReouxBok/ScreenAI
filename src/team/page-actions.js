@@ -279,3 +279,150 @@ export function scrollPage(options) {
   }
   return { ok: true, ...scrollBox(null, true) };
 }
+
+// `browser.fill_secret` (TEAM-729, docs/login-vault.md): type a saved login into the
+// mapped fields. This is the ONE path that types into a password field; the generic
+// `fill` above keeps refusing sensitive fields. The service worker already opened the
+// seal and checked the tab's origin from Chrome; this function checks again, in the
+// page, right before typing:
+//   1. the LIVE top-frame origin (location.origin now) is `expectedOrigin` and one of
+//      the sealed `origins`                                         -> origin_mismatch
+//   2. the map is the asked snapshot of this very page               -> stale_snapshot
+//   3. every id is in the map, connected, visible, enabled, editable,
+//      in this top document                                         -> element_not_found
+//      and of the right kind (password: <input type=password>; username: <input>
+//      text/email/tel; otp: <input> text/tel/number/password)       -> invalid_args
+//   4. each field's form posts to this origin, one of `origins`, or the login's
+//      `site` (a button's own `formaction` counts too)              -> origin_mismatch
+// Page scripts run during the focus/input/change events of one field, so each field is
+// checked once more just before its value is set. Values are never returned, stored
+// or written anywhere but the field itself.
+export function fillSecretInPage(options) {
+  const kit = globalThis.__limovaBrowserKit;
+  const origins = Array.isArray(options?.origins) ? options.origins : [];
+  const site = String(options?.site || '').toLowerCase();
+  const values = options?.values || {};
+  const fields = options?.fields || {};
+  const ORDER = ['username', 'password', 'otp'];
+  const KINDS = {
+    username: ['text', 'email', 'tel'],
+    password: ['password'],
+    otp: ['text', 'tel', 'number', 'password']
+  };
+  // Read through the prototypes: a form's named controls (an <input name="action">,
+  // name="getAttribute"…) shadow its own properties, so `form.action` can lie.
+  const getAttr = (node, name) => Element.prototype.getAttribute.call(node, name);
+  const hasAttr = (node, name) => Element.prototype.hasAttribute.call(node, name);
+  const formElements = form => Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'elements').get.call(form);
+
+  function liveOriginOk() {
+    return window.top === window
+      && location.origin === options?.expectedOrigin
+      && origins.includes(location.origin);
+  }
+
+  function allowedTarget(raw) {
+    // No action: the form posts to this page.
+    if (raw === null || String(raw).trim() === '') return true;
+    let url;
+    try {
+      url = new URL(String(raw), document.baseURI);
+    } catch (_) {
+      return false;
+    }
+    if (url.protocol !== 'https:') return false;
+    if (url.origin === location.origin || origins.includes(url.origin)) return true;
+    const host = url.hostname.toLowerCase();
+    return Boolean(site) && (host === site || host.endsWith(`.${site}`));
+  }
+
+  function formOk(el) {
+    const form = el.form;
+    if (!form) return true;
+    const method = String(getAttr(form, 'method') || '').toLowerCase();
+    if (method !== 'dialog' && !allowedTarget(getAttr(form, 'action'))) return false;
+    for (const control of formElements(form)) {
+      if (hasAttr(control, 'formaction') && !allowedTarget(getAttr(control, 'formaction'))) return false;
+    }
+    return true;
+  }
+
+  function checkField(role, el) {
+    if (!el || !el.isConnected || el.ownerDocument !== document) return 'element_not_found';
+    if (!kit.isRendered(el) || kit.isDisabled(el)) return 'element_not_found';
+    if (!(el instanceof HTMLInputElement)) return 'invalid_args';
+    if (!KINDS[role].includes(el.type)) return 'invalid_args';
+    if (el.readOnly) return 'element_not_found';
+    if (!formOk(el)) return 'origin_mismatch';
+    return null;
+  }
+
+  function fail(code) {
+    return { ok: false, code };
+  }
+
+  // 1. The live origin first: nothing else is looked at on the wrong page.
+  if (!liveOriginOk()) return fail('origin_mismatch');
+  // 2. The snapshot.
+  const map = globalThis.__limovaBrowserMaps?.[String(options?.productKey || '')];
+  if (!kit || !map || map.snapshotId !== options?.snapshotId || map.path !== kit.pagePath()) return fail('stale_snapshot');
+  // 3 and 4. Every field, before typing anything.
+  const targets = [];
+  const used = new Set();
+  for (const role of ORDER) {
+    const id = fields[role];
+    if (id === undefined || id === null) continue;
+    const el = map.elements.get(String(id));
+    if (!el) return fail('element_not_found');
+    if (used.has(el)) return fail('invalid_args');
+    used.add(el);
+    const code = checkField(role, el);
+    if (code) return fail(code);
+    if (typeof values[role] !== 'string') return fail('invalid_args');
+    targets.push({ role, el });
+  }
+  if (!targets.length) return fail('invalid_args');
+
+  // The same watcher performPageAction starts, so the verification sees the changes.
+  try { globalThis.__limovaBrowserWatch?.observer?.disconnect(); } catch (_) { /* ignore */ }
+  const before = new Set();
+  document.querySelectorAll('[role="alert"], [role="status"], [aria-live]:not([aria-live="off"])').forEach(node => {
+    const text = kit.clean(node.textContent);
+    if (text) before.add(text);
+  });
+  const watch = { mutations: 0, structural: 0, lastAt: 0, startedAt: Date.now(), before, observer: null };
+  watch.observer = new MutationObserver(records => {
+    watch.mutations += records.length;
+    for (const record of records) {
+      if (record.type === 'childList' && (record.addedNodes.length || record.removedNodes.length)) watch.structural += 1;
+    }
+    watch.lastAt = Date.now();
+  });
+  watch.observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+  globalThis.__limovaBrowserWatch = watch;
+
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+  const InputEventCtor = typeof InputEvent === 'function' ? InputEvent : Event;
+  const filled = { username: false, password: false, otp: false };
+  try {
+    for (const { role, el } of targets) {
+      // Page scripts ran during the previous field's events: check again.
+      if (!liveOriginOk()) return { ok: false, code: 'origin_mismatch', filled };
+      const code = checkField(role, el);
+      if (code) return { ok: false, code, filled };
+      el.scrollIntoView?.({ block: 'center' });
+      el.focus({ preventScroll: true });
+      setter.call(el, values[role]);
+      // The event carries no `data`: a page's input listener gets the event, not the text.
+      el.dispatchEvent(new InputEventCtor('input', { bubbles: true, composed: true, inputType: 'insertText' }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      values[role] = null;
+      filled[role] = true;
+    }
+  } catch (_) {
+    return { ok: false, code: 'internal', filled };
+  } finally {
+    for (const role of ORDER) values[role] = null;
+  }
+  return { ok: true, filled };
+}
