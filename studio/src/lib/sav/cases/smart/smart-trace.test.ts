@@ -18,10 +18,10 @@ import type { SavRetrievalCandidate } from "../../request-retrieval";
 import { decryptSavPayload, encryptSavPayload } from "../../crypto";
 import { emptyCaseBody, SAV_CASE_CONTRACT_REVISION, type CaseSnapshot } from "../case-types";
 import type { CaseInvestigationModelRequest } from "../investigation-runner";
-import { smartCaseDecisionProvider } from "./smart-case-provider";
+import { SAV_SMART_TRACE_WAIT_MS, smartCaseDecisionProvider } from "./smart-case-provider";
 import { SMART_CONFORME, SMART_GOOD_REPLY, smartGoodDecision, smartReading, smartScriptedModel, type SmartScript } from "./smart-test-doubles";
 import { buildSmartCaseTrace, fitSmartCaseTrace, SAV_SMART_TRACE_MAX_BYTES, type SmartCaseTrace } from "./smart-trace";
-import { readSmartTracesForThread, SAV_SMART_TRACE_PREFIX, smartCaseTraceStore } from "./smart-trace-store";
+import { readSmartTracesForThread, SAV_SMART_TRACE_PREFIX, SAV_SMART_TRACE_PRUNE_KEY, smartCaseTraceStore } from "./smart-trace-store";
 
 /*
  * Trace of the real smart turns (22/11), on the real store (PGlite), FICTIONAL data only, no network, no key. Proves: a turn records its needs,
@@ -128,8 +128,13 @@ describe("trace des tours réels de l'agent SAV", () => {
     expect(await provider(GOOD, async () => { throw Error("BOOM"); })(requestOf(caseId))).toEqual(reference);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
-      const slow = provider(GOOD, () => new Promise<void>(() => undefined))(requestOf(caseId));
-      await vi.advanceTimersByTimeAsync(5_000);
+      let settled = false;
+      const slow = provider(GOOD, () => new Promise<void>(() => undefined))(requestOf(caseId)).finally(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(1_400);
+      expect(settled).toBe(false);
+      // Never delayed past the 1.5 s cap.
+      await vi.advanceTimersByTimeAsync(SAV_SMART_TRACE_WAIT_MS - 1_400);
+      expect(settled).toBe(true);
       expect(await slow).toEqual(reference);
     } finally { vi.useRealTimers(); }
     // The real store without a database: it logs a closed code with the case id only, and the turn is the same.
@@ -172,6 +177,39 @@ describe("trace des tours réels de l'agent SAV", () => {
     const row = listed.data.rows.find(entry => entry.caseId === caseId)!;
     expect(row.smart).toMatchObject({ turns: 1, lastDecision: "answer", fiches: [{ id: "fiche-connexion", title: "Se connecter" }, { id: "fiche-indesirables", title: "Dossier des indésirables" }] });
     expect(JSON.stringify(row.smart)).not.toMatch(/connecter à son espace|connexion code non reçu|Vous n'arrivez pas/);
+    // A non-admin staff member gets the dossier, with the field present but null (it holds customer text).
+    for (const role of ["agent", "support", "viewer"]) {
+      const other = await tool("get_dossier").run({ ...context, staff: { ...context.staff, role } }, { threadId } as never) as { outcome: string; data: Record<string, unknown> };
+      expect(other.outcome).toBe("done");
+      expect(other.data).toHaveProperty("smartTrace", null);
+      expect(JSON.stringify(other.data)).not.toMatch(/connexion code non reçu|Vous n'arrivez pas|Texte fictif envoyé/);
+    }
+  });
+
+  it("purge des traces de plus de 30 jours : au plus une fois par heure", async () => {
+    await f.db.delete(savSyncState).where(like(savSyncState.key, "sav-v2-smart-trace%"));
+    const old = (id: string) => f.db.insert(savSyncState).values({ key: `${SAV_SMART_TRACE_PREFIX}:${id}:in:x:call1`, status: "done", cursor: "x", startedAt: new Date(AT.getTime() - 31 * 86_400_000) });
+    const at = (ms: number) => smartCaseTraceStore({ env: () => ENV, now: () => new Date(AT.getTime() + ms), log: (event, fields) => logs.push([event, fields]) });
+    const trace = buildSmartCaseTrace({ request: requestOf(randomUUID()), result: null, proposal: null, searches: [], at: AT });
+    const deletes = vi.spyOn(f.db, "delete");
+    const oldIds = () => f.db.select().from(savSyncState).where(like(savSyncState.key, `${SAV_SMART_TRACE_PREFIX}:old-%`));
+    await old("old-1");
+    await at(0)(trace);
+    expect(await oldIds()).toEqual([]);
+    expect(deletes).toHaveBeenCalledTimes(1);
+    // Within the hour: the marker refuses the slot, no delete runs, the old row stays.
+    await old("old-2");
+    await at(30 * 60_000)(trace);
+    await at(59 * 60_000)(trace);
+    expect(deletes).toHaveBeenCalledTimes(1);
+    expect((await oldIds()).length).toBe(1);
+    // After the hour: one prune again.
+    await at(61 * 60_000)(trace);
+    expect(deletes).toHaveBeenCalledTimes(2);
+    expect(await oldIds()).toEqual([]);
+    const [marker] = await f.db.select().from(savSyncState).where(like(savSyncState.key, SAV_SMART_TRACE_PRUNE_KEY));
+    expect(marker!.completedAt).toEqual(new Date(AT.getTime() + 61 * 60_000));
+    expect(logs).toEqual([]);
   });
 
   it("taille bornée : une trace énorme reste sous la limite", () => {

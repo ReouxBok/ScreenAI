@@ -115,13 +115,15 @@ const listDossiers = { name: "list_dossiers", title: "Lister les dossiers SAV", 
         reason: row.reason ? intakeReasonLabel(row.reason) : null })) });
   } };
 const getDossier = { name: "get_dossier", title: "Lire un dossier SAV", write: false,
-  description: "Lit un dossier : état, verrous, décision courante, actions confirmées ou incertaines, dernier message (borné), jeton de version à renvoyer avec toute écriture, et smartTrace : chaque tour de l’agent SAV (besoins, recherches et fiches par rang, décision et motif de transfert, texte proposé, contrôles, contre-lecture, appels et coût) et les réponses confirmées.",
+  description: "Lit un dossier : état, verrous, décision courante, actions confirmées ou incertaines, dernier message (borné), jeton de version à renvoyer avec toute écriture, et smartTrace (administrateurs uniquement, null sinon) : chaque tour de l’agent SAV (besoins, recherches et fiches par rang, décision et motif de transfert, texte proposé, contrôles, contre-lecture, appels et coût) et les réponses confirmées.",
   input: z.object({ threadId: z.uuid() }).strict(),
   async run(context: StudioMcpContext, input: { threadId: string }) {
     const data = await readIntakeConsoleDetail(input.threadId);
     if (!data) return refused("SAV_INTAKE_DOSSIER_NOT_FOUND", "Dossier introuvable dans la console des nouveaux dossiers.");
-    // smartTrace: per V2 case of this thread, each smart turn (needs, searches and fiches by rank, decision, texts, checks, counter-read, calls, cost) and the confirmed replies.
-    return done({ ...intakeDossierSummary(data), availableActions: await intakeAvailableActions(data, context.staff), smartTrace: await readSmartTracesForThread(input.threadId) });
+    // smartTrace (admin only, it holds customer text; null otherwise): per V2 case of this thread, each smart turn (needs, searches and fiches by rank,
+    // decision, texts, checks, counter-read, calls, cost) and the confirmed replies.
+    return done({ ...intakeDossierSummary(data), availableActions: await intakeAvailableActions(data, context.staff),
+      smartTrace: context.staff.role === "admin" ? await readSmartTracesForThread(input.threadId) : null });
   } };
 const getDiagnostics = { name: "get_diagnostics", title: "Diagnostic technique d’un dossier", write: false,
   description: "Historique des analyses, tentatives, réveils, effets et derniers codes de refus. Réservé aux administrateurs, comme l’API de diagnostic.",

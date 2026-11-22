@@ -8,7 +8,7 @@ import { summarizeSmartCaseTraces, type SmartCaseTrace } from "./smart-trace";
 
 /*
  * Storage of the real smart turns' traces (`smart-trace.ts`): one ENCRYPTED row per decision call in `sav.sync_state` (no migration, same
- * pattern as the shadow), key `sav-v2-smart-trace.v1:<case>:<input>:call<n>`, kept 30 days (older rows are deleted by the next write).
+ * pattern as the shadow), key `sav-v2-smart-trace.v1:<case>:<input>:call<n>`, kept 30 days (older rows are deleted by a write, at most once per hour).
  * The row holds customer-derived text, so it never reaches a log: a failed write logs a closed code and the case id only, and is swallowed.
  * Read only by the staff MCP (`get_dossier` full trace; `list_v2_cases` a summary without customer text).
  */
@@ -16,6 +16,9 @@ import { summarizeSmartCaseTraces, type SmartCaseTrace } from "./smart-trace";
 type Env = Readonly<Record<string, string | undefined>>;
 export const SAV_SMART_TRACE_PREFIX = "sav-v2-smart-trace.v1";
 export const SAV_SMART_TRACE_RETENTION_MS = 30 * 86_400_000;
+/** Marker of the last prune (outside the trace prefix, so never pruned itself) and the minimum interval between two prunes. */
+export const SAV_SMART_TRACE_PRUNE_KEY = "sav-v2-smart-trace-prune.v1";
+export const SAV_SMART_TRACE_PRUNE_EVERY_MS = 3_600_000;
 /** Traces read per case (the latest ones). */
 export const SAV_SMART_TRACE_READ_PER_CASE = 12;
 
@@ -45,7 +48,11 @@ export function smartCaseTraceStore(deps: Readonly<{ env: () => Env; now?: () =>
       const at = now(), cursor = encryptSavPayload(stored), db = requireDb();
       await db.insert(savSyncState).values({ key: smartTraceKey(trace), status: "done", cursor, startedAt: at, completedAt: at, updatedAt: at })
         .onConflictDoUpdate({ target: savSyncState.key, set: { cursor, status: "done", completedAt: at, updatedAt: at } });
-      await db.delete(savSyncState).where(and(like(savSyncState.key, `${SAV_SMART_TRACE_PREFIX}:%`), lt(savSyncState.startedAt, new Date(at.getTime() - SAV_SMART_TRACE_RETENTION_MS))));
+      // The prune runs at most once per hour: one atomic marker upsert wins the slot (first write, or marker older than an hour), only then the delete.
+      const slot = await db.insert(savSyncState).values({ key: SAV_SMART_TRACE_PRUNE_KEY, status: "done", startedAt: at, completedAt: at, updatedAt: at })
+        .onConflictDoUpdate({ target: savSyncState.key, set: { completedAt: at, updatedAt: at }, setWhere: lt(savSyncState.completedAt, new Date(at.getTime() - SAV_SMART_TRACE_PRUNE_EVERY_MS)) })
+        .returning({ key: savSyncState.key });
+      if (slot.length) await db.delete(savSyncState).where(and(like(savSyncState.key, `${SAV_SMART_TRACE_PREFIX}:%`), lt(savSyncState.startedAt, new Date(at.getTime() - SAV_SMART_TRACE_RETENTION_MS))));
     } catch (error) {
       log("sav_smart_trace_write_failed", { caseId: trace.caseId, call: trace.call, code: error instanceof Error && /^[A-Z0-9_]{3,80}$/.test(error.message) ? error.message : "write_failed" });
     }

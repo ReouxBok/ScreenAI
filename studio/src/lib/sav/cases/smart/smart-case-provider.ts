@@ -169,8 +169,11 @@ export type SmartCaseProviderDeps = Readonly<{
   trace?: SmartCaseTraceSink;
 }>;
 
-/** Upper bound of the wait on the trace sink: past it the turn returns, the write is abandoned. */
-export const SAV_SMART_TRACE_WAIT_MS = 4_000;
+/**
+ * Upper bound of the wait on the trace sink: past it the turn returns, the write is abandoned. A bounded await, not fire-and-forget: on the
+ * serverless runtime a promise left running after the response may be frozen or killed, so the write would be lost silently.
+ */
+export const SAV_SMART_TRACE_WAIT_MS = 1_500;
 async function recordSmartTrace(sink: SmartCaseTraceSink | undefined, build: () => Parameters<SmartCaseTraceSink>[0]): Promise<void> {
   if (!sink) return;
   let timer: ReturnType<typeof setTimeout> | undefined;
