@@ -56,3 +56,16 @@
 .product-choice:focus-visible, .team-link-muted:focus-visible { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 2px; }
 .team-link-muted { align-self: flex-start; border: 0; background: transparent; color: var(--color-gray-500); font: 600 12px var(--font-family); cursor: pointer; padding: 2px 0; margin-top: 4px; }
 .training-close[hidden] { display: none; }
+
+/* TEAM-729: saved logins and « Envoyer ma session à Limova ». */
+.team-vault { display: grid; gap: 8px; border-top: 1px solid var(--color-gray-200); padding-top: 10px; }
+.team-vault-title { font-size: 12px; font-weight: 700; }
+.team-check { display: grid; grid-template-columns: auto 1fr; gap: 8px; align-items: start; font-size: 12px; cursor: pointer; }
+.team-check input { margin-top: 2px; accent-color: var(--product); }
+.team-never { list-style: none; display: grid; gap: 4px; font-size: 12px; }
+.team-never li { display: flex; justify-content: space-between; align-items: center; gap: 8px; word-break: break-all; }
+.team-never .team-link-muted { margin-top: 0; }
+.team-consent { display: grid; gap: 8px; padding: 10px; border-radius: 9px; background: #F5F0FF; font-size: 12px; }
+.team-error { color: #9A2F22; }
+.team-ok { color: #246648; }
+.team-check input:focus-visible { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 2px; }

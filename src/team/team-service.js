@@ -9,6 +9,13 @@
 // call runs, « ⏸ » while the person took over) and a chrome.alarms alarm that
 // reconnects every minute after Chrome restarts the service worker.
 //
+// TEAM-729 (docs/login-vault.md): each socket gets its own in-memory vault key
+// (vault.js) and advertises `browser.v1+vault` and `browser.v1+cookies`; the offer to
+// save a login (login-offers.js, save-login.html) and « Envoyer ma session à Limova »
+// (session-export.js) run from here. The two page messages of the login watcher
+// (`TEAM_LOGIN_SUBMITTED`, `TEAM_LOGIN_FIELD_GONE`) are the only TEAM_* messages
+// accepted from a web page; every other one must come from the extension's own pages.
+//
 // TEAM-726: user builds connect to production only. The environment is the build's
 // (build-config.js); the choice is only offered, and only accepted, when the developer
 // toggle is on.
@@ -21,6 +28,9 @@ import { createApprovalManager } from './approvals.js';
 import { createTeamController } from './team-controller.js';
 import { getEnvironment, getProduct, listProducts } from './products.js';
 import { DEVELOPER_TOGGLE_KEY, TEAM_BUILD } from './build-config.js';
+import { COOKIES_CAPABILITY, createVaultKeyPair } from './vault.js';
+import { createLoginOffers, TEAM_PAGE_MESSAGE_TYPES } from './login-offers.js';
+import { exportSession, isBlockedSite, siteOf } from './session-export.js';
 
 export const RECONNECT_ALARM = 'limova-team-reconnect';
 export const HOLDS_SESSION_KEY = 'limova_socket_holds_v1';
@@ -29,11 +39,19 @@ const ACTIVITY_LIMIT = 20;
 export const TEAM_MESSAGE_TYPES = Object.freeze([
   'TEAM_GET_STATE', 'TEAM_CONNECT', 'TEAM_DISCONNECT', 'TEAM_PAIR_CALLBACK', 'TEAM_SET_AUTONOMY',
   'TEAM_PAUSE', 'TEAM_RESUME', 'TEAM_STOP_ALL', 'TEAM_TAKE_OVER', 'TEAM_HAND_BACK', 'TEAM_RECONNECT',
-  'TEAM_APPROVAL_GET', 'TEAM_APPROVAL_DECIDE'
+  'TEAM_APPROVAL_GET', 'TEAM_APPROVAL_DECIDE',
+  // TEAM-729
+  'TEAM_LOGIN_OFFER_GET', 'TEAM_LOGIN_OFFER_DECIDE', 'TEAM_VAULT_SET_PREFS', 'TEAM_SESSION_SUGGEST',
+  'TEAM_SESSION_EXPORT', ...TEAM_PAGE_MESSAGE_TYPES
 ]);
 
 export function isTeamMessage(type) {
   return TEAM_MESSAGE_TYPES.includes(type);
+}
+
+// The only TEAM_* messages a web page's (isolated-world) watcher may send.
+export function isTeamPageMessage(type) {
+  return TEAM_PAGE_MESSAGE_TYPES.includes(type);
 }
 
 const PAIRING_ERRORS = {
@@ -53,7 +71,8 @@ export function createTeamService({
   renderCapture,
   timers = globalThis,
   now = () => Date.now(),
-  build = TEAM_BUILD
+  build = TEAM_BUILD,
+  cryptoImpl = globalThis.crypto
 } = {}) {
   const store = createConnectionStore({ storage: chromeApi.storage.local });
   const pairing = createPairing({
@@ -67,6 +86,17 @@ export function createTeamService({
   });
   const links = new Map();
   const activity = [];
+  const loginOffers = createLoginOffers({
+    chromeApi,
+    fetchImpl,
+    timers,
+    now,
+    getLinks: () => [...links.values()],
+    onChange: () => scheduleBroadcast()
+  });
+  let vaultPrefs = {};
+  const vault = cryptoImpl?.subtle ? { createKeyPair: () => createVaultKeyPair(cryptoImpl) } : null;
+  const extraCapabilities = typeof chromeApi.cookies?.getAll === 'function' ? [COOKIES_CAPABILITY] : [];
   let holds = null;
   let broadcastTimer = null;
   let initialized = null;
@@ -139,7 +169,12 @@ export function createTeamService({
             paused: state.paused,
             control: state.control,
             running: counts.running,
-            held: counts.held
+            held: counts.held,
+            // Settings only: never a login, a username or a cookie.
+            vault: {
+              offer_in_own_tabs: vaultPrefs[product.id]?.offer_in_own_tabs === true,
+              never_origins: [...(vaultPrefs[product.id]?.never_origins || [])]
+            }
           } : null
         };
       }),
@@ -178,6 +213,7 @@ export function createTeamService({
     links.delete(productId);
     link.socket.stop();
     link.controller.dispose();
+    loginOffers.forgetProduct(productId);
     refreshIndicator();
   }
 
@@ -204,18 +240,20 @@ export function createTeamService({
     const product = getProduct(connection.product);
     const env = getEnvironment(connection.product, connection.environment);
     if (!product || !env) return null;
-    const link = { productId: product.id, product, connection, status: 'connecting', email: null, ownerFetched: false };
+    const browser = engine.forProduct(product);
+    const link = { productId: product.id, product, connection, browser, status: 'connecting', email: null, ownerFetched: false };
     const controller = createTeamController({
       product,
       initial: connection,
       store,
-      browser: engine.forProduct(product),
+      browser,
       approvals,
       timers,
       now,
       onStateChange: scheduleBroadcast,
       onBusyChange: refreshIndicator,
-      onActivity: pushActivity
+      onActivity: pushActivity,
+      onVaultFill: fill => loginOffers.noteVaultFill(fill)
     });
     const socket = new DeviceSocket({
       url: `${env.api.replace(/^https:/, 'wss:')}/api/v1/devices/me/socket`,
@@ -240,7 +278,10 @@ export function createTeamService({
       WebSocketImpl,
       timers,
       now,
-      hold: holds?.[product.id] || null
+      hold: holds?.[product.id] || null,
+      vault,
+      extraCapabilities,
+      getDeviceId: () => link.connection.device_id
     });
     link.controller = controller;
     link.socket = socket;
@@ -269,7 +310,11 @@ export function createTeamService({
 
   function init() {
     if (initialized) return initialized;
-    chromeApi.windows?.onRemoved?.addListener?.(windowId => approvals.windowClosed(windowId));
+    chromeApi.windows?.onRemoved?.addListener?.(windowId => {
+      approvals.windowClosed(windowId);
+      loginOffers.windowClosed(windowId);
+    });
+    loginOffers.attach();
     chromeApi.alarms?.onAlarm?.addListener?.(alarm => {
       if (alarm?.name === RECONNECT_ALARM) ensureAll().catch(() => {});
     });
@@ -277,8 +322,29 @@ export function createTeamService({
     chromeApi.storage.onChanged?.addListener?.((changes, area) => {
       if (area === 'local' && DEVELOPER_TOGGLE_KEY in changes) loadDeveloperMode().then(scheduleBroadcast);
     });
-    initialized = Promise.all([loadDeveloperMode(), ensureAll()]).catch(() => {});
+    initialized = Promise.all([loadDeveloperMode(), ensureAll(), loadVaultPrefs()])
+      // The watchers survive a service-worker restart in their pages; make sure the
+      // tabs that should have one do (it is idempotent), and the others do not.
+      .then(() => { if (links.size) loginOffers.rearmAll().catch(() => {}); })
+      .catch(() => {});
     return initialized;
+  }
+
+  async function loadVaultPrefs() {
+    const next = {};
+    for (const product of listProducts()) next[product.id] = await loginOffers.getPrefs(product.id);
+    vaultPrefs = next;
+  }
+
+  function fromExtensionPage(sender, path = '') {
+    return typeof sender?.url === 'string' && sender.url.startsWith(extensionPage(path));
+  }
+
+  async function suggestSite() {
+    const [tab] = await Promise.resolve(chromeApi.tabs.query({ active: true, lastFocusedWindow: true })).catch(() => []) || [];
+    const site = siteOf(tab?.url || '');
+    if (!site || !/^https?:/.test(tab?.url || '') || isBlockedSite(site)) return null;
+    return site;
   }
 
   function controllerFor(productId) {
@@ -287,6 +353,10 @@ export function createTeamService({
 
   async function handleMessage(request, sender = {}) {
     await (initialized || init());
+    // The login watcher in a web page: its own checks (top frame, origin from Chrome).
+    if (isTeamPageMessage(request.type)) return loginOffers.handlePageMessage(request, sender);
+    // Everything else comes from the extension's own pages, never from a web page.
+    if (sender?.tab && !fromExtensionPage(sender)) return { ok: false, error: 'unknown_message' };
     const productId = typeof request.productId === 'string' ? request.productId : 'limova_team';
     switch (request.type) {
       case 'TEAM_GET_STATE':
@@ -386,10 +456,56 @@ export function createTeamService({
         return { ok: decided };
       }
 
+      case 'TEAM_LOGIN_OFFER_GET': {
+        if (!fromExtensionPage(sender, 'src/team/save-login.html')) return { ok: false };
+        const details = loginOffers.getOffer(String(request.id || ''));
+        return details ? { ok: true, details } : { ok: false };
+      }
+
+      case 'TEAM_LOGIN_OFFER_DECIDE': {
+        if (!fromExtensionPage(sender, 'src/team/save-login.html')) return { ok: false };
+        const outcome = await loginOffers.decide(String(request.id || ''), request.decision, { username: request.username });
+        if (request.decision === 'never' && outcome.ok) await loadVaultPrefs().then(scheduleBroadcast);
+        return outcome;
+      }
+
+      case 'TEAM_VAULT_SET_PREFS': {
+        if (!getProduct(productId)) return { ok: false, error: 'not_connected' };
+        const prefs = await loginOffers.setPrefs(productId, {
+          offer_in_own_tabs: typeof request.offer_in_own_tabs === 'boolean' ? request.offer_in_own_tabs : undefined,
+          remove_never: typeof request.remove_never === 'string' ? request.remove_never : undefined
+        });
+        vaultPrefs = { ...vaultPrefs, [productId]: prefs };
+        scheduleBroadcast();
+        return { ok: true, prefs };
+      }
+
+      case 'TEAM_SESSION_SUGGEST': {
+        // Without `input`: the current tab's site, as a suggestion. With it: what the
+        // person typed, as the registrable domain the consent screen will name.
+        if (request.input === undefined) return { ok: true, site: await suggestSite() };
+        const site = siteOf(String(request.input || ''));
+        if (!site) return { ok: false, error: 'invalid_site' };
+        if (isBlockedSite(site)) return { ok: false, error: 'blocked_site' };
+        return { ok: true, site };
+      }
+
+      case 'TEAM_SESSION_EXPORT': {
+        const link = links.get(productId);
+        if (!link) return { ok: false, error: 'not_connected' };
+        // The panel shows the consent screen for this exact site first.
+        if (request.consent !== true) return { ok: false, error: 'consent_required' };
+        const site = siteOf(String(request.site || ''));
+        if (!site || site !== request.site) return { ok: false, error: 'invalid_site' };
+        const outcome = await exportSession({ connection: link.connection, site, cookiesApi: chromeApi.cookies, fetchImpl });
+        pushActivity({ product: productId, at: now(), domain: site, label: 'Session envoyée à Limova', outcome: outcome.ok ? 'done' : outcome.error });
+        return outcome;
+      }
+
       default:
         return { ok: false, error: 'unknown_message' };
     }
   }
 
-  return { init, ensureAll, handleMessage, panelState, links, approvals, store };
+  return { init, ensureAll, handleMessage, panelState, links, approvals, store, loginOffers };
 }

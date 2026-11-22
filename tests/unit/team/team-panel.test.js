@@ -103,6 +103,41 @@ describe('side panel « Connexions »', () => {
     expect(document.querySelector('#teamActivity img, #teamActivity b')).toBeNull();
   });
 
+  it('shows the saved-logins opt-in (off by default) and asks consent for one site before sending a session (TEAM-729)', async () => {
+    state = STATE({ environment: 'production', environment_label: 'Production', status: 'online', autonomy: 'full_access', paused: false, control: 'agent', running: 0, held: 0,
+      vault: { offer_in_own_tabs: false, never_origins: ['https://bad.example'] } });
+    chromeMock.runtime.sendMessage = vi.fn(async message => {
+      if (message.type === 'TEAM_GET_STATE') return { ok: true, state };
+      if (message.type === 'TEAM_SESSION_SUGGEST') return message.input === undefined ? { ok: true, site: 'example.org' } : { ok: true, site: 'free.fr' };
+      if (message.type === 'TEAM_SESSION_EXPORT') return { ok: true, count: 12, updated: false };
+      return { ok: true };
+    });
+    await load();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const card = () => document.querySelector('[data-product="limova_team"]');
+    expect(card().textContent).toContain('Proposer aussi d’enregistrer mes connexions dans mes onglets');
+    const toggle = card().querySelector('#teamVaultOwnTabs-limova_team');
+    expect(toggle.checked).toBe(false);
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event('change'));
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({ type: 'TEAM_VAULT_SET_PREFS', productId: 'limova_team', offer_in_own_tabs: true });
+    expect(card().textContent).toContain('https://bad.example');
+
+    // The current tab's site is suggested; the person types another one.
+    const site = card().querySelector('#teamSessionSite-limova_team');
+    expect(site.value).toBe('example.org');
+    site.value = 'https://subscribe.free.fr/login';
+    site.dispatchEvent(new Event('input'));
+    card().querySelector('#teamSessionStart-limova_team').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(chromeMock.runtime.sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'TEAM_SESSION_EXPORT' }));
+    expect(card().textContent).toContain('Limova pourra utiliser ta session free.fr depuis ses navigateurs dans le cloud. Elle est chiffrée et tu peux la supprimer à tout moment.');
+    card().querySelector('#teamSessionConfirm-limova_team').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({ type: 'TEAM_SESSION_EXPORT', productId: 'limova_team', site: 'free.fr', consent: true });
+    expect(card().textContent).toContain('Session free.fr envoyée (12 cookies).');
+  });
+
   describe('home screen product picker (TEAM-726)', () => {
     function mountPicker() {
       document.body.insertAdjacentHTML('afterbegin', `

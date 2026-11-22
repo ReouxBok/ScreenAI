@@ -39,7 +39,9 @@ if (Number.parseInt(manifest.minimum_chrome_version, 10) < 116) {
 }
 
 // tabGroups: the Limova Team tab group; alarms: reconnect after a worker restart (TEAM-724).
-const expectedPermissions = ['activeTab', 'sidePanel', 'storage', 'scripting', 'webNavigation', 'tabGroups', 'alarms'];
+// cookies: « Envoyer ma session à Limova », one site at a time after its consent screen,
+// read by src/team/session-export.js only, never by Charly (TEAM-729).
+const expectedPermissions = ['activeTab', 'sidePanel', 'storage', 'scripting', 'webNavigation', 'tabGroups', 'alarms', 'cookies'];
 const actualPermissions = [...(manifest.permissions || [])].sort();
 if (JSON.stringify(actualPermissions) !== JSON.stringify([...expectedPermissions].sort())) {
   failures.push(`permissions must stay least-privilege: ${expectedPermissions.join(', ')}`);

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { createTeamService, isTeamMessage, RECONNECT_ALARM } from '../../../src/team/team-service.js';
+import { createTeamService, isTeamMessage, isTeamPageMessage, RECONNECT_ALARM } from '../../../src/team/team-service.js';
 import { CONNECTIONS_STORAGE_KEY } from '../../../src/team/connections.js';
 
 class FakeWebSocket {
@@ -152,5 +152,78 @@ describe('team service', () => {
     expect(new URL(chromeApi.tabs.create.mock.calls[0][0].url).origin).toBe('https://staging.team.limova.ai');
     expect(await service.handleMessage({ type: 'TEAM_CONNECT', productId: 'limova_team', environment: 'production' }))
       .toEqual({ ok: false, error: 'invalid_environment' });
+  });
+
+  describe('login vault (TEAM-729)', () => {
+    const EXT = 'chrome-extension://fpkgfhhomlijmhbgcpbpjnfafdedfccj/';
+    const sidebar = { url: `${EXT}src/sidebar/sidebar.html` };
+
+    it('accepts only the watcher\'s two messages from web pages', async () => {
+      expect(isTeamPageMessage('TEAM_LOGIN_SUBMITTED')).toBe(true);
+      expect(isTeamPageMessage('TEAM_LOGIN_FIELD_GONE')).toBe(true);
+      expect(isTeamPageMessage('TEAM_SESSION_EXPORT')).toBe(false);
+      const service = createTeamService({ chromeApi: fakeChrome(area({ [CONNECTIONS_STORAGE_KEY]: STORED })), WebSocketImpl: FakeWebSocket, fetchImpl: vi.fn() });
+      await service.init();
+      const webPage = { id: 'fpkgfhhomlijmhbgcpbpjnfafdedfccj', tab: { id: 5 }, frameId: 0, url: 'https://example.com/', origin: 'https://example.com' };
+      for (const type of ['TEAM_GET_STATE', 'TEAM_SESSION_EXPORT', 'TEAM_VAULT_SET_PREFS', 'TEAM_DISCONNECT', 'TEAM_LOGIN_OFFER_GET']) {
+        expect(await service.handleMessage({ type, productId: 'limova_team', site: 'example.com', consent: true }, webPage), type)
+          .toEqual(expect.objectContaining({ ok: false }));
+      }
+      expect(service.links.size).toBe(1);
+    });
+
+    it('lets only the save window read an offer', async () => {
+      const service = createTeamService({ chromeApi: fakeChrome(area()), WebSocketImpl: FakeWebSocket, fetchImpl: vi.fn() });
+      expect((await service.handleMessage({ type: 'TEAM_LOGIN_OFFER_GET', id: 'x' }, sidebar)).ok).toBe(false);
+      expect((await service.handleMessage({ type: 'TEAM_LOGIN_OFFER_DECIDE', id: 'x', decision: 'save' }, sidebar)).ok).toBe(false);
+      expect((await service.handleMessage({ type: 'TEAM_LOGIN_OFFER_GET', id: 'x' }, { url: `${EXT}src/team/save-login.html?id=x` })).ok).toBe(false);
+    });
+
+    it('sends a session only with the consent flag, for a registrable domain, and records the site only', async () => {
+      const chromeApi = fakeChrome(area({ [CONNECTIONS_STORAGE_KEY]: STORED }));
+      chromeApi.cookies = { getAll: vi.fn(async () => [{ name: 'sid', value: 'cookie-value-1', domain: '.free.fr', path: '/', secure: true, httpOnly: true, sameSite: 'lax', session: true }]) };
+      const fetchImpl = vi.fn(async () => ({ status: 201, ok: true, json: async () => ({ updated: false }) }));
+      const service = createTeamService({ chromeApi, WebSocketImpl: FakeWebSocket, fetchImpl });
+      await service.init();
+      expect(await service.handleMessage({ type: 'TEAM_SESSION_EXPORT', productId: 'limova_team', site: 'free.fr' }, sidebar))
+        .toEqual({ ok: false, error: 'consent_required' });
+      expect(await service.handleMessage({ type: 'TEAM_SESSION_SUGGEST', input: 'https://subscribe.free.fr/login' }, sidebar))
+        .toEqual({ ok: true, site: 'free.fr' });
+      expect(await service.handleMessage({ type: 'TEAM_SESSION_SUGGEST', input: 'www.linkedin.com' }, sidebar))
+        .toEqual({ ok: false, error: 'blocked_site' });
+      expect(await service.handleMessage({ type: 'TEAM_SESSION_EXPORT', productId: 'limova_team', site: 'subscribe.free.fr', consent: true }, sidebar))
+        .toEqual({ ok: false, error: 'invalid_site' });
+      expect(chromeApi.cookies.getAll).not.toHaveBeenCalled();
+      expect(await service.handleMessage({ type: 'TEAM_SESSION_EXPORT', productId: 'limova_team', site: 'free.fr', consent: true }, sidebar))
+        .toEqual({ ok: true, count: 1, updated: false });
+      const { state } = await service.handleMessage({ type: 'TEAM_GET_STATE' }, sidebar);
+      expect(state.activity[0]).toEqual(expect.objectContaining({ domain: 'free.fr', label: 'Session envoyée à Limova', outcome: 'done' }));
+      expect(JSON.stringify(state)).not.toContain('cookie-value-1');
+    });
+
+    it('stores the opt-in and shows it in the panel state, off by default', async () => {
+      const local = area({ [CONNECTIONS_STORAGE_KEY]: STORED });
+      const service = createTeamService({ chromeApi: fakeChrome(local), WebSocketImpl: FakeWebSocket, fetchImpl: vi.fn() });
+      await service.init();
+      let { state } = await service.handleMessage({ type: 'TEAM_GET_STATE' }, sidebar);
+      expect(state.products[0].connection.vault).toEqual({ offer_in_own_tabs: false, never_origins: [] });
+      expect((await service.handleMessage({ type: 'TEAM_VAULT_SET_PREFS', productId: 'limova_team', offer_in_own_tabs: true }, sidebar)).ok).toBe(true);
+      ({ state } = await service.handleMessage({ type: 'TEAM_GET_STATE' }, sidebar));
+      expect(state.products[0].connection.vault.offer_in_own_tabs).toBe(true);
+      expect(local.data.get('limova_team_vault_prefs_v1')).toEqual({ version: 1, products: { limova_team: { offer_in_own_tabs: true, never_origins: [] } } });
+    });
+
+    it('advertises the vault and cookies capabilities with a key in hello', async () => {
+      const chromeApi = fakeChrome(area({ [CONNECTIONS_STORAGE_KEY]: STORED }));
+      chromeApi.cookies = { getAll: vi.fn() };
+      const service = createTeamService({ chromeApi, WebSocketImpl: FakeWebSocket, fetchImpl: vi.fn() });
+      await service.init();
+      const ws = FakeWebSocket.instances[0];
+      ws.readyState = 1;
+      ws.onopen();
+      for (let i = 0; i < 20; i += 1) await new Promise(resolve => setTimeout(resolve, 0));
+      expect(ws.sent[0].capabilities).toEqual(expect.arrayContaining(['browser.v1', 'browser.v2', 'browser.v1+vault', 'browser.v1+cookies']));
+      expect(Object.keys(ws.sent[0].vault_key).sort()).toEqual(['crv', 'kty', 'x', 'y']);
+    });
   });
 });
