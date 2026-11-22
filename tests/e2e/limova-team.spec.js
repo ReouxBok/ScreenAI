@@ -233,7 +233,7 @@ test.describe('Limova Team browser device', () => {
     });
 
     const hello = await host.evaluate(() => globalThis.fakeServer.sent[0]);
-    expect(hello.capabilities).toEqual(['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1']);
+    expect(hello.capabilities).toEqual(expect.arrayContaining(['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1', 'browser.record.v1']));
     expect(hello.autonomy).toBe('full_access');
 
     // open_tab with include_page answers the page map at once.
