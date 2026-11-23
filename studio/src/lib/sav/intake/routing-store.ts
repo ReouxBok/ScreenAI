@@ -27,7 +27,7 @@ export const SAV_INTAKE_ROUTING_DECIDED = "sav_intake_routing_decided";
 const ATTEMPT = "sav_intake_routing_attempt";
 const LEASE_SECONDS = 120;
 const actionOf = (step: IntakeRoutingStep) => `sav_intake_routing_${step}`;
-const STEPS: readonly IntakeRoutingStep[] = ["claimed", "forward_dispatched", "forward_confirmed", "confirmed", "not_applied", "uncertain"];
+const STEPS: readonly IntakeRoutingStep[] = ["claimed", "forward_dispatched", "forward_acked", "forward_confirmed", "confirmed", "not_applied", "uncertain"];
 
 /** The decision of one analysed mail (shadow and live), codes and team recipient only: the measurable trace of the routing, and the live sweep's input. */
 export async function recordIntakeRoutingDecision(decision: SavIntakeRoutingDecision & { mode: "shadow" | "live" }) {
@@ -61,6 +61,11 @@ export const intakeRoutingAuditStore: IntakeRoutingStore = {
     const rows = (Array.isArray(taken) ? taken : (taken as { rows?: unknown[] }).rows ?? []) as Array<{ cursor?: unknown }>;
     if (rows[0]?.cursor !== token) return null;
     return async () => { await requireDb().update(savSyncState).set({ status: "idle", updatedAt: new Date() }).where(and(eq(savSyncState.key, key), eq(savSyncState.cursor, token))); };
+  },
+  async receipt(messageId, step) {
+    const [row] = await requireDb().select({ metadata: auditLogs.technicalMetadata }).from(auditLogs).where(and(eq(auditLogs.entityType, ENTITY),
+      eq(auditLogs.entityId, messageId), eq(auditLogs.actorEmail, ACTOR), eq(auditLogs.action, actionOf(step)))).orderBy(asc(auditLogs.createdAt)).limit(1);
+    return row?.metadata ?? null;
   },
   async attempt(messageId, metadata) {
     const db = requireDb();
@@ -122,12 +127,27 @@ export async function readIntakeRoutingFacts(messageId: string): Promise<IntakeR
 
 const sentList = z.object({ messages: z.array(z.object({ id: z.string().min(1) }).passthrough()).optional(), nextPageToken: z.string().optional() }).passthrough();
 const threadLabels = z.object({ id: z.string(), messages: z.array(z.object({ labelIds: z.array(z.string()).optional() }).passthrough()).min(1) }).passthrough();
+const rawMessage = z.object({ id: z.string(), raw: z.string().min(1) }).passthrough();
+const sentMetadata = z.object({ id: z.string(), labelIds: z.array(z.string()).optional(),
+  payload: z.object({ headers: z.array(z.object({ name: z.string(), value: z.string() })).optional() }).passthrough().optional() }).passthrough();
 const gmailId = (value: string) => { if (!/^[a-f0-9]{1,64}$/i.test(value)) throw Error("SAV_INTAKE_ROUTING_GMAIL_ID_INVALID"); return value; };
 /** Gmail calls of the routing, on contact@limova.ai only. */
 export function createIntakeRoutingGmail(gmail: GmailRequest = requestSavGmail): IntakeRoutingGmail {
   const mailbox = (email: string) => { if (email !== SAV_INTAKE_ROUTING_MAILBOX) throw Error("SAV_INTAKE_ROUTING_MAILBOX_REFUSED"); return email; };
   return {
-    send: (email, raw, signal) => gmail<{ id: string; threadId: string }>(mailbox(email), "messages/send", { method: "POST", signal, body: JSON.stringify({ raw: Buffer.from(raw).toString("base64url") }) }),
+    async readOriginal(email, messageId, signal) {
+      const message = rawMessage.parse(await gmail<unknown>(mailbox(email), `messages/${gmailId(messageId)}?format=raw`, { signal }));
+      if (message.id !== messageId) throw Error("SAV_INTAKE_ROUTING_ORIGINAL_MISMATCH");
+      return Buffer.from(message.raw, "base64url");
+    },
+    send: (email, raw, signal) => gmail<{ id: string; threadId: string }>(mailbox(email), "messages/send", { method: "POST", signal, body: JSON.stringify({ raw: raw.toString("base64url") }) }),
+    async sentMessageId(email, messageId, signal) {
+      let message: z.infer<typeof sentMetadata>;
+      try { message = sentMetadata.parse(await gmail<unknown>(mailbox(email), `messages/${gmailId(messageId)}?format=metadata&metadataHeaders=Message-ID`, { signal })); }
+      catch (error) { if (error instanceof Error && /^GMAIL_HTTP_(404|410)$/.test(error.message)) return null; throw error; }
+      if (message.id !== messageId || !message.labelIds?.includes("SENT")) return null;
+      return message.payload?.headers?.find(h => h.name.toLowerCase() === "message-id")?.value ?? null;
+    },
     async findSent(email, rfcMessageId, signal) {
       const query = new URLSearchParams({ q: `in:sent rfc822msgid:${rfcMessageId}`, maxResults: "2" });
       const list = sentList.parse(await gmail<unknown>(mailbox(email), `messages?${query}`, { signal }));

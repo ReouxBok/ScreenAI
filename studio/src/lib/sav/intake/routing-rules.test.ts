@@ -6,7 +6,9 @@ import { decideIntakeRouting, intakeRoutingModelFromSemantics, intakeRoutingShad
 const MID = "50000000-0000-4000-8000-000000000001";
 const facts = (cls: SavIntakeRoutingClass, over: Partial<SavIntakeRoutingFacts> = {}, confidence: "high" | "medium" | "low" = "high"): SavIntakeRoutingFacts => ({
   messageId: MID, model: { class: cls, confidence, justification: "Fait court." },
-  plan: { classification: "commercial", requestKinds: ["commercial"], disposition: "no_ticket", progress: "supervised_action" },
+  // Default: the V1 plan that agrees with the class (review #347).
+  plan: (c => ({ classification: c, requestKinds: [c], disposition: "no_ticket", progress: "supervised_action" }))(
+    cls === "lead_commercial" ? "commercial" : cls === "partenariat" ? "partnership" : cls === "investisseur" ? "investor" : ["candidature", "demarchage", "notification_auto"].includes(cls) ? "other" : cls),
   thread: { conversationLength: 1, ticketId: null, humanContext: false, quotedReply: false }, ...over });
 
 describe("mode switch", () => {
@@ -18,20 +20,46 @@ describe("mode switch", () => {
   });
 });
 
-describe("routing per class", () => {
+type Plan = NonNullable<SavIntakeRoutingFacts["plan"]>;
+const plan = (classification: string, requestKinds: string[] = [classification], disposition = "no_ticket", progress = "supervised_action"): Plan =>
+  ({ classification, requestKinds, disposition, progress });
+
+describe("routing per class (V1's plan agrees)", () => {
   it.each([
-    ["lead_commercial", "forward", "sacha@limova.ai"], ["candidature", "forward", "sacha@limova.ai"], ["investisseur", "forward", "sacha@limova.ai"],
-    ["partenariat", "forward", "nathan@limova.ai"], ["demarchage", "archive", null], ["notification_auto", "archive", null],
-  ] as const)("%s → %s %s", (cls, action, recipient) => {
-    const decision = decideIntakeRouting(facts(cls));
-    expect(decision).toMatchObject({ action, recipient, class: cls, reason: null });
+    ["lead_commercial", plan("commercial"), "forward", "sacha@limova.ai"], ["lead_commercial", plan("other", ["other"], "no_ticket", "qualified_other"), "forward", "sacha@limova.ai"],
+    ["candidature", plan("other", ["other"], "no_ticket", "qualified_other"), "forward", "sacha@limova.ai"], ["investisseur", plan("investor"), "forward", "sacha@limova.ai"],
+    ["partenariat", plan("partnership"), "forward", "nathan@limova.ai"],
+    ["demarchage", plan("other", ["other"], "no_ticket", "qualified_other"), "archive", null], ["demarchage", plan("acknowledgement", ["acknowledgement"], "no_ticket", "completed"), "archive", null],
+    ["notification_auto", plan("other", [], "no_ticket", "qualified_other"), "archive", null],
+  ] as const)("%s with V1 %o → %s %s", (cls, agreeing, action, recipient) => {
+    expect(decideIntakeRouting(facts(cls, { plan: agreeing }))).toMatchObject({ action, recipient, class: cls, reason: null });
   });
   it.each(["support", "finance", "cancellation", "acknowledgement", "mixed", "unknown"] as const)("model class %s keeps the current path", cls => {
     expect(decideIntakeRouting(facts(cls)).action).toBe("keep");
   });
-  it("a bounce V1 left unknown/human_choice is archived when the model is sure", () => {
-    expect(decideIntakeRouting(facts("notification_auto", { plan: { classification: "unknown", requestKinds: ["unknown"], disposition: "collect_context", progress: "human_choice" } })))
-      .toMatchObject({ action: "archive" });
+});
+
+describe("review #347: disagreement with V1 stays human and is recorded", () => {
+  it.each([
+    ["demarchage", plan("partnership")], ["demarchage", plan("commercial")], ["notification_auto", plan("investor")],
+    ["demarchage", plan("other", ["other", "commercial"])], ["notification_auto", plan("acknowledgement", ["acknowledgement", "partnership"])],
+    ["lead_commercial", plan("partnership")], ["lead_commercial", plan("investor")], ["lead_commercial", plan("other", ["other", "partnership"])],
+    ["lead_commercial", plan("other", ["other", "investor"])], ["lead_commercial", plan("acknowledgement")],
+    ["partenariat", plan("commercial")], ["partenariat", plan("other")], ["investisseur", plan("partnership")], ["investisseur", plan("commercial")],
+    ["candidature", plan("commercial")], ["candidature", plan("partnership")], ["candidature", plan("acknowledgement")], ["candidature", plan("other", ["other", "commercial"])],
+  ] as const)("%s while V1 says %o → keep routing_disagreement", (cls, disagreeing) => {
+    expect(decideIntakeRouting(facts(cls, { plan: disagreeing }))).toMatchObject({ action: "keep", reason: "routing_disagreement", class: cls });
+  });
+  it.each(["notification_auto", "demarchage", "candidature", "lead_commercial"] as const)("%s while V1 is collect_context → keep v1_collect_context", cls => {
+    expect(decideIntakeRouting(facts(cls, { plan: plan("unknown", ["unknown"], "collect_context", "human_choice") })))
+      .toMatchObject({ action: "keep", reason: "v1_collect_context" });
+    expect(decideIntakeRouting(facts(cls, { plan: plan("other", ["other"], "collect_context", "human_choice") })).reason).toBe("v1_collect_context");
+  });
+  it("the disagreement code reaches the diagnostics projection (measurable)", () => {
+    expect(publicIntakeRoutingDecision({ ...decideIntakeRouting(facts("demarchage", { plan: plan("partnership") })), mode: "shadow" }))
+      .toMatchObject({ action: "keep", reason: "routing_disagreement", label: null });
+    expect(publicIntakeRoutingDecision({ ...decideIntakeRouting(facts("demarchage", { plan: plan("unknown", ["unknown"], "collect_context") })), mode: "shadow" })?.reason)
+      .toBe("v1_collect_context");
   });
 });
 

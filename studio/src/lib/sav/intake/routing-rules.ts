@@ -92,8 +92,12 @@ export function decideIntakeRouting(facts: SavIntakeRoutingFacts): SavIntakeRout
   if (plan.classification === "support" || plan.requestKinds.includes("support")) return keep("support_request");
   if (plan.classification === "mixed") return keep("mixed_request");
   if (plan.disposition === "ticket" || plan.disposition === "request_identification") return keep("v1_ticket_path");
+  // Review #347: V1 still collecting context (an unqualified Other, an unresolved scope) is never routed.
+  if (plan.disposition === "collect_context") return keep("v1_collect_context");
   if (!model) return keep("model_routing_missing");
   if (NEVER_ROUTED.includes(model.class)) return keep(`class_${model.class}`);
+  // Review #347: the routing class must agree with V1's own plan; a disagreement stays human and is recorded to be measured.
+  if (!intakeRoutingAgrees(model.class, plan)) return keep("routing_disagreement");
   if (model.confidence !== "high") return keep(`confidence_${model.confidence}`);
   if (thread.ticketId) return keep("thread_ticket");
   if (thread.conversationLength !== 1) return keep("thread_history");
@@ -106,6 +110,26 @@ export function decideIntakeRouting(facts: SavIntakeRoutingFacts): SavIntakeRout
   if (recipient) return { ...base, action: "forward", recipient, reason: null };
   if (SAV_INTAKE_ROUTING_ARCHIVED.includes(model.class)) return { ...base, action: "archive", recipient: null, reason: null };
   return keep(`class_${model.class}`);
+}
+
+const OUTSIDE_KINDS: readonly string[] = ["commercial", "partnership", "investor"];
+/**
+ * Review #347: agreement between the model's routing class and V1's plan (both must say the same thing before anything leaves the inbox).
+ *   archive (demarchage, notification_auto): V1 other or acknowledgement, no_ticket, no commercial/partnership/investor request.
+ *   lead_commercial ← commercial (or other with no partnership/investor request); partenariat ← partnership; investisseur ← investor; candidature ← other.
+ */
+export function intakeRoutingAgrees(cls: SavIntakeRoutingClass, plan: NonNullable<SavIntakeRoutingFacts["plan"]>) {
+  if (plan.disposition !== "no_ticket") return false;
+  const kinds = plan.requestKinds, outside = kinds.filter(kind => OUTSIDE_KINDS.includes(kind));
+  switch (cls) {
+    case "demarchage": case "notification_auto": return ["other", "acknowledgement"].includes(plan.classification) && !outside.length;
+    case "lead_commercial": return plan.classification === "commercial"
+      || plan.classification === "other" && !kinds.includes("partnership") && !kinds.includes("investor");
+    case "partenariat": return plan.classification === "partnership";
+    case "investisseur": return plan.classification === "investor";
+    case "candidature": return plan.classification === "other" && !outside.length;
+    default: return false;
+  }
 }
 
 /** The plan facts of a V1 plan (decision classification, request kinds, disposition, progress), or null. */
@@ -148,7 +172,7 @@ export function publicIntakeRoutingDecision(raw: unknown) {
   return {
     mode: value.mode === "shadow" || value.mode === "live" ? value.mode : null,
     class: cls, confidence: ["high", "medium", "low"].includes(String(value.confidence)) ? String(value.confidence) : null,
-    action, recipient, reason: typeof value.reason === "string" && /^[a-z_]{1,60}$/.test(value.reason) ? value.reason : null,
+    action, recipient, reason: typeof value.reason === "string" && /^[a-z0-9_]{1,60}$/.test(value.reason) ? value.reason : null,
     label: value.mode === "shadow" ? intakeRoutingShadowLabel({ action: action ?? "keep", recipient, class: cls }) : null,
   };
 }
