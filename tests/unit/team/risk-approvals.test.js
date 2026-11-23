@@ -1,8 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import {
-  approvalTitle, classifyAction, needsOwnerApproval, reasonFromName, riskHint, strictestOf, stricterRisk, targetMatches, toolKind
+  activityLabel, classifyAction, isPaymentClass, reasonFromName, riskHint, strictestOf, stricterRisk, targetMatches, toolKind
 } from '../../../src/team/risk.js';
-import { createApprovalManager } from '../../../src/team/approvals.js';
 
 describe('risk classification', () => {
   it('reads risky words in French, English and Spanish', () => {
@@ -48,12 +47,12 @@ describe('risk classification', () => {
     expect(stricterRisk({}, { risk: 'write', reason: null })).toEqual({ risk: 'write', reason: null });
   });
 
-  it('only asks the person before paying (browser.v2)', () => {
-    expect(needsOwnerApproval({ risk: 'risky', reason: 'pay' })).toBe(true);
+  it('only a payment needs a payment token (browser.v3)', () => {
+    expect(isPaymentClass({ risk: 'risky', reason: 'pay' })).toBe(true);
     for (const reason of ['send', 'publish', 'delete', 'account', 'external_form', null]) {
-      expect(needsOwnerApproval({ risk: 'risky', reason })).toBe(false);
+      expect(isPaymentClass({ risk: 'risky', reason })).toBe(false);
     }
-    expect(needsOwnerApproval({ risk: 'write', reason: null })).toBe(false);
+    expect(isPaymentClass({ risk: 'write', reason: null })).toBe(false);
     // A batch takes the strictest of its steps.
     expect(strictestOf([{ risk: 'write', reason: null }, { risk: 'risky', reason: 'pay' }, { risk: 'risky', reason: 'send' }]))
       .toEqual({ risk: 'risky', reason: 'pay' });
@@ -73,63 +72,7 @@ describe('risk classification', () => {
     expect(targetMatches('OK', 'Annuler')).toBe(false);
   });
 
-  it('writes the approval sentence', () => {
-    expect(approvalTitle('Limova Team', 'browser.click', 'Envoyer', 'example.com'))
-      .toBe('Limova Team veut cliquer sur « Envoyer » sur example.com');
-  });
-});
-
-describe('approval windows', () => {
-  let windowsApi;
-  let manager;
-  beforeEach(() => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
-    windowsApi = { create: vi.fn(async () => ({ id: 77 })), remove: vi.fn(async () => {}) };
-    let n = 0;
-    manager = createApprovalManager({ windowsApi, getUrl: path => `chrome-extension://x/${path}`, randomId: () => `a${n += 1}` });
-  });
-  afterEach(() => vi.useRealTimers());
-
-  it('opens a popup with only an opaque id in its URL', async () => {
-    manager.request({ kind: 'action', productId: 'limova_team', title: 'T', target: 'Envoyer' }, { deadlineMs: Date.now() + 10_000 });
-    await Promise.resolve();
-    const options = windowsApi.create.mock.calls[0][0];
-    expect(options.type).toBe('popup');
-    expect(options.url).toBe('chrome-extension://x/src/team/approval.html?id=a1');
-    expect(manager.get('a1')).toEqual(expect.objectContaining({ title: 'T', target: 'Envoyer' }));
-  });
-
-  it('resolves approve, deny, timeout and window close', async () => {
-    const approved = manager.request({ kind: 'action', productId: 'p' }, { deadlineMs: Date.now() + 10_000 });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(manager.decide('a1', 'approve')).toBe(true);
-    expect(await approved).toEqual({ decision: 'approve' });
-    expect(windowsApi.remove).toHaveBeenCalledWith(77);
-
-    const timedOut = manager.request({ kind: 'action', productId: 'p' }, { deadlineMs: Date.now() + 5_000 });
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(await timedOut).toEqual({ decision: 'timeout' });
-
-    const closed = manager.request({ kind: 'action', productId: 'p' }, { deadlineMs: Date.now() + 5_000 });
-    await vi.advanceTimersByTimeAsync(0);
-    manager.windowClosed(77);
-    expect(await closed).toEqual({ decision: 'deny' });
-  });
-
-  it('denies every open approval of a product on « Tout arrêter »', async () => {
-    const first = manager.request({ kind: 'action', productId: 'limova_team' }, { deadlineMs: Date.now() + 10_000 });
-    const other = manager.request({ kind: 'action', productId: 'limova' }, { deadlineMs: Date.now() + 10_000 });
-    expect(manager.denyAll('limova_team')).toBe(1);
-    expect(await first).toEqual({ decision: 'deny' });
-    expect(manager.size()).toBe(1);
-    manager.denyAll();
-    expect(await other).toEqual({ decision: 'deny' });
-  });
-
-  it('needs a tab to approve a request_tab', async () => {
-    const shared = manager.request({ kind: 'request_tab', productId: 'p', tabs: [] }, { deadlineMs: Date.now() + 10_000 });
-    expect(manager.decide('a1', 'approve')).toBe(false);
-    expect(manager.decide('a1', 'approve', { tabId: 5 })).toBe(true);
-    expect(await shared).toEqual({ decision: 'approve', tabId: 5 });
+  it('writes the activity label (the extension has no approval window any more)', () => {
+    expect(activityLabel('browser.click', { target: 'Envoyer' })).toBe('Clic sur « Envoyer »');
   });
 });

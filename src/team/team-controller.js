@@ -1,5 +1,5 @@
-// team-controller.js — One product connection's rules: autonomy, approvals, pause,
-// take-over and « Tout arrêter » (TEAM-724).
+// team-controller.js — One product connection's rules: autonomy, payments, pause,
+// take-over and « Tout arrêter » (TEAM-724, TEAM-757).
 //
 // The socket (device-socket.js) hands every `call`, `set_autonomy` and
 // `browser_control` to this controller. The controller decides, the engine
@@ -9,14 +9,18 @@
 // - taken over (« Prendre la main »): new calls are held (`progress` `taken_over`) and
 //   run in order on « Rendre la main »; a call still held at its deadline answers
 //   `taken_over`;
-// - otherwise reads and actions run at once (`browser.v2`, TEAM-726): the engine checks
-//   every action (sensitive fields, blocked sites, stale ids) and the only approval
-//   window left is for paying, judged with the stricter of the server's and the
-//   extension's reading (`progress` `waiting_approval`, `approval_timeout` at the
-//   deadline, `denied_by_owner` on « Refuser »). Other confirmations happen in the
-//   chat, decided by the server from the autonomy level;
-// - « Tout arrêter » cancels running and held calls (`paused`), closes open approval
-//   windows as refused, sets paused and sends `state`.
+// - otherwise reads and actions run at once. `browser.v3` (TEAM-757): the extension
+//   shows NO prompt of its own. The chat's single level is the only permission, and the
+//   server asks in the chat when it wants a yes. The engine still checks every action
+//   (sensitive fields, blocked sites, stale ids). A payment-class action (the stricter
+//   of the server's and the extension's reading says `pay`) runs only with a valid,
+//   single-use `payment_token` the server mints after the owner's click on the chat's
+//   payment card (payment-token.js); otherwise it answers
+//   `payment_confirmation_required` and does nothing;
+// - `browser.request_tab` takes the person's current tab (the active tab of the last
+//   focused window) into the group, without a picker;
+// - « Tout arrêter » cancels running and held calls (`paused`), sets paused and sends
+//   `state`.
 //
 // `browser.fill_secret` (TEAM-729) follows the same pause and take-over rules, never
 // opens a window (the person chose to save that login for Limova), and runs only on a
@@ -26,8 +30,8 @@
 // does not ask to save the login Limova just typed.
 //
 // `browser.press_key` and `browser.upload` (TEAM-751) are actions like the others: the
-// engine reads them (Enter on « Payer » is `pay`), and only a payment waits for the
-// owner. A key pressed on the focused element names no element (`plan.element` null).
+// engine reads them (Enter on « Payer » is `pay`, so it needs a payment token). A key
+// pressed on the focused element names no element (`plan.element` null).
 //
 // `set_autonomy` applies at once, in both directions, without a window (TEAM-726: only
 // the signed-in owner can send it, and the level now only drives the chat's
@@ -35,7 +39,7 @@
 
 import { DEFAULT_AUTONOMY, isAutonomyLevel } from './products.js';
 import {
-  activityLabel, approvalTitle, classifyAction, needsOwnerApproval, PAY_REASON_TEXT, stricterRisk, toolKind
+  activityLabel, classifyAction, isPaymentClass, stricterRisk, toolKind
 } from './risk.js';
 import { toolError } from './browser-engine.js';
 
@@ -48,17 +52,13 @@ export const AUTONOMY_LABELS = Object.freeze({
   full_access: 'Accès complet'
 });
 
-function previewValue(value) {
-  const text = String(value || '').replace(/\s+/g, ' ').trim();
-  return text.length > 300 ? `${text.slice(0, 299)}…` : text;
-}
-
 export function createTeamController({
   product,
   initial = {},
   store,
   browser,
-  approvals,
+  // payment-token.js verifier for this connection (TEAM-757).
+  payments = null,
   timers = globalThis,
   now = () => Date.now(),
   onStateChange = () => {},
@@ -106,22 +106,6 @@ export function createTeamController({
     });
   }
 
-  async function ask(details, call, ctx, signal) {
-    ctx.progress?.('waiting_approval');
-    return approvals.request({
-      productId: product.id,
-      productLabel: product.label,
-      productColor: product.color,
-      ...details
-    }, { deadlineMs: deadlineOf(call, 'action'), signal });
-  }
-
-  function outcomeError(decision) {
-    if (decision === 'deny') return toolError('denied_by_owner', 'The person refused.');
-    if (decision === 'timeout') return toolError('approval_timeout', 'The person did not answer in time.');
-    return toolError('paused', 'Stopped by the person.');
-  }
-
   async function execute(call, ctx, signal) {
     const kind = toolKind(call.tool);
     const args = call.args || {};
@@ -143,16 +127,10 @@ export function createTeamController({
       if (typeof args.reason !== 'string' || !args.reason.trim() || args.reason.length > 200) {
         return toolError('invalid_args', 'reason must be 1 to 200 characters');
       }
-      const tabs = await browser.shareableTabs();
-      const outcome = await ask({
-        kind: 'request_tab',
-        title: `${product.label} demande l’accès à l’un de vos onglets`,
-        reason: args.reason.trim(),
-        tabs
-      }, call, ctx, signal);
-      if (outcome.decision !== 'approve') return outcomeError(outcome.decision);
-      if (state.paused) return toolError('paused', 'Paused by the person.');
-      const result = await browser.adoptTab(outcome.tabId, true);
+      // No picker (TEAM-757): the chat level already decided; the person's current tab
+      // joins the group. `reason` is kept for the activity list.
+      if (state.paused || signal.aborted) return toolError('paused', 'Paused by the person.');
+      const result = await browser.adoptActiveTab(true);
       record(call, result);
       return result;
     }
@@ -168,29 +146,12 @@ export function createTeamController({
     const local = plan.local || classifyAction(call.tool, plan.element || {});
     const targetName = plan.element?.name || '';
     const risk = stricterRisk({ risk: args.risk, reason: args.risk_reason }, local);
-    if (needsOwnerApproval(risk)) {
-      const lines = [];
-      if (call.tool === 'browser.fill') lines.push({ label: 'Texte', text: previewValue(args.value) });
-      if (call.tool === 'browser.select') lines.push({ label: 'Choix', text: previewValue(args.option) });
-      if (call.tool === 'browser.press_key') lines.push({ label: 'Touche', text: activityLabel(call.tool, args, '') });
-      if (plan.kind === 'batch') {
-        lines.push({
-          label: 'Étapes',
-          text: plan.steps.map((step, index) => `${index + 1}. ${step.action === 'key'
-            ? activityLabel('browser.press_key', step, step.element?.name || '')
-            : activityLabel(`browser.${step.action === 'check' ? 'click' : step.action}`, {}, step.element.name)}`).join('\n')
-        });
-      }
-      const outcome = await ask({
-        kind: 'action',
-        title: approvalTitle(product.label, call.tool, targetName, plan.domain),
-        domain: plan.domain,
-        target: targetName,
-        reason: PAY_REASON_TEXT,
-        lines
-      }, call, ctx, signal);
-      if (outcome.decision !== 'approve') {
-        const error = outcomeError(outcome.decision);
+    if (isPaymentClass(risk)) {
+      // Only the owner's click in the chat pays: a valid, unused token for this exact call.
+      const verdict = payments ? await payments.verify(call.tool, args) : { ok: false, reason: 'missing' };
+      if (!verdict.ok) {
+        const error = toolError('payment_confirmation_required',
+          `A payment needs the owner's confirmation in the Limova chat (${verdict.reason}).`);
         record(call, error, targetName);
         return error;
       }
@@ -307,7 +268,6 @@ export function createTeamController({
       timers.clearTimeout(item.timer);
       item.resolve(toolError('paused', 'Stopped by the person.'));
     }
-    approvals.denyAll(product.id);
     store?.update(product.id, { paused: true }).catch(() => null);
     sendState();
     busyChanged();
@@ -348,7 +308,6 @@ export function createTeamController({
       timers.clearTimeout(item.timer);
       item.resolve(toolError('paused', 'Disconnected.'));
     }
-    approvals.denyAll(product.id);
     socket = null;
     busyChanged();
   }

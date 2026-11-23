@@ -190,7 +190,15 @@ const translations = {
     teamRecordLimitSteps: '300 étapes atteintes : l’enregistrement s’est arrêté.',
     teamRecordLimitDuration: '2 heures atteintes : l’enregistrement s’est arrêté.',
     teamRecordStartFailed: 'L’enregistrement n’a pas pu démarrer.',
-    teamRecordBlocked: 'Limova ne peut pas enregistrer sur ce site.'
+    teamRecordBlocked: 'Limova ne peut pas enregistrer sur ce site.',
+    teamLoginOfferTitle: 'Enregistrer cette connexion pour Limova ?',
+    teamLoginOfferUpdate: 'Mettre à jour la connexion enregistrée ?',
+    teamLoginOfferUser: 'Identifiant',
+    teamLoginOfferSave: 'Enregistrer',
+    teamLoginOfferLater: 'Pas maintenant',
+    teamLoginOfferNever: 'Jamais pour ce site',
+    teamLoginOfferSaved: 'Connexion enregistrée pour Limova.',
+    teamLoginOfferFailed: 'La connexion n’a pas pu être enregistrée.'
   },
   en: {
     title: 'Charly',
@@ -370,7 +378,15 @@ const translations = {
     teamRecordLimitSteps: '300 steps reached: the recording stopped.',
     teamRecordLimitDuration: '2 hours reached: the recording stopped.',
     teamRecordStartFailed: 'The recording could not start.',
-    teamRecordBlocked: 'Limova cannot record on this site.'
+    teamRecordBlocked: 'Limova cannot record on this site.',
+    teamLoginOfferTitle: 'Save this login for Limova?',
+    teamLoginOfferUpdate: 'Update the saved login?',
+    teamLoginOfferUser: 'Username',
+    teamLoginOfferSave: 'Save',
+    teamLoginOfferLater: 'Not now',
+    teamLoginOfferNever: 'Never for this site',
+    teamLoginOfferSaved: 'Login saved for Limova.',
+    teamLoginOfferFailed: 'The login could not be saved.'
   },
   es: {
     title: 'Charly',
@@ -550,7 +566,15 @@ const translations = {
     teamRecordLimitSteps: '300 pasos alcanzados: la grabación se detuvo.',
     teamRecordLimitDuration: '2 horas alcanzadas: la grabación se detuvo.',
     teamRecordStartFailed: 'La grabación no pudo empezar.',
-    teamRecordBlocked: 'Limova no puede grabar en este sitio.'
+    teamRecordBlocked: 'Limova no puede grabar en este sitio.',
+    teamLoginOfferTitle: '¿Guardar este acceso para Limova?',
+    teamLoginOfferUpdate: '¿Actualizar el acceso guardado?',
+    teamLoginOfferUser: 'Usuario',
+    teamLoginOfferSave: 'Guardar',
+    teamLoginOfferLater: 'Ahora no',
+    teamLoginOfferNever: 'Nunca para este sitio',
+    teamLoginOfferSaved: 'Acceso guardado para Limova.',
+    teamLoginOfferFailed: 'No se pudo guardar el acceso.'
   }
 };
 

@@ -1636,14 +1636,31 @@ export function createBrowserEngine({
 
     // ---------------------------------------------------------------- access
 
-    // The person's own tabs they may share (never LinkedIn, Limova or chrome:// pages).
-    async function shareableTabs() {
-      const groupId = await currentGroupId();
-      const all = await chromeApi.tabs.query({});
-      return all
-        .filter(tab => tab.groupId !== groupId || groupId === null)
-        .filter(tab => classifyUrl(tab.url || '').ok)
-        .map(toTab);
+    // `browser.request_tab` with browser.v3 (TEAM-757): no picker. The chat level already
+    // decided; the person's current tab (the active tab of the last focused normal
+    // window) joins the group. The person is usually writing to Limova in the Team
+    // dashboard, which is never shared (blocked_site): then the tab they used just
+    // before it in that window is taken (Chrome's `lastAccessed`, Chrome 121+).
+    async function adoptActiveTab(busy) {
+      const window = await chromeApi.windows?.getLastFocused?.({ windowTypes: ['normal'] }).catch(() => null);
+      if (!window || !Number.isInteger(window.id)) return toolError('tab_not_found', 'No Chrome window is open.');
+      const tabs = await chromeApi.tabs.query({ windowId: window.id }).catch(() => []);
+      const active = tabs.find(tab => tab.active);
+      if (!active) return toolError('tab_not_found', 'No tab is open in this window.');
+      let chosen = active;
+      const activeHost = (() => { try { return new URL(active.url || '').hostname.toLowerCase(); } catch { return ''; } })();
+      const onOwnDashboard = (product.ownHosts || []).some(own => activeHost === own || activeHost.endsWith(`.${own}`));
+      if (onOwnDashboard) {
+        const previous = tabs
+          .filter(tab => tab.id !== active.id && classifyUrl(tab.url || '').ok && Number.isFinite(tab.lastAccessed))
+          .sort((a, b) => b.lastAccessed - a.lastAccessed)[0];
+        if (previous) chosen = previous;
+      }
+      const verdict = classifyUrl(chosen.url || '');
+      if (!verdict.ok) return toolError(verdict.code, verdict.code === 'blocked_site' ? 'Limova does not act on this site.' : 'Chrome does not let extensions use this page.');
+      await addToGroup(chosen.id, busy);
+      const fresh = await chromeApi.tabs.get(chosen.id).catch(() => chosen);
+      return ok({ tab: toTab(fresh) });
     }
 
     async function adoptTab(tabId, busy) {
@@ -1671,7 +1688,7 @@ export function createBrowserEngine({
       prepareAction,
       executeAction,
       fillSecret,
-      shareableTabs,
+      adoptActiveTab,
       adoptTab,
       // TEAM-731: the person's click on « Montrer à Limova » is the consent to bring
       // this tab (or a new tab) into the group; the recorder checks the site itself.

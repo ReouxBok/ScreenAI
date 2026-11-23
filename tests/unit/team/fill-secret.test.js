@@ -290,7 +290,6 @@ describe('browser.fill_secret through the controller', () => {
     const controller = createTeamController({
       product: TEAM_PRODUCT,
       browser,
-      approvals: { request: vi.fn(), denyAll: vi.fn() },
       now: steppingClock(),
       onActivity,
       onVaultFill

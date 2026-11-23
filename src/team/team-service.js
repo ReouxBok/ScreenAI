@@ -11,7 +11,7 @@
 //
 // TEAM-729 (docs/login-vault.md): each socket gets its own in-memory vault key
 // (vault.js) and advertises `browser.v1+vault` and `browser.v1+cookies`; the offer to
-// save a login (login-offers.js, save-login.html) and « Envoyer ma session à Limova »
+// save a login (login-offers.js, a notice in the side panel) and « Envoyer ma session à Limova »
 // (session-export.js) run from here. The two page messages of the login watcher
 // (`TEAM_LOGIN_SUBMITTED`, `TEAM_LOGIN_FIELD_GONE`) are the only TEAM_* messages
 // accepted from a web page; every other one must come from the extension's own pages.
@@ -21,6 +21,11 @@
 // messages (`TEAM_RECORD_EVENT`, `TEAM_RECORD_OBSERVED`, `TEAM_RECORD_PING`) are, with
 // the login watcher's two, the only TEAM_* messages accepted from a web page, and only
 // for a tab being recorded.
+//
+// TEAM-757 (`browser.v3`): no prompt of the extension's own. The chat level is the
+// only permission; there is no approval window, no tab picker, no payment window and
+// the save-login offer is a panel notice. Each connection gets a payment verifier
+// (payment-token.js) bound to its own device id and token.
 //
 // Server features (TEAM-731, `ready.features`): on every `ready` the link keeps
 // `{procedures, login_vault}`. `procedures` shows or hides « Montrer à Limova » (the
@@ -36,7 +41,7 @@ import { DeviceSocket } from './device-socket.js';
 import { createConnectionStore, fetchDeviceOwner, revokeConnection } from './connections.js';
 import { createPairing } from './pairing.js';
 import { createBrowserEngine } from './browser-engine.js';
-import { createApprovalManager } from './approvals.js';
+import { createPaymentVerifier } from './payment-token.js';
 import { createTeamController } from './team-controller.js';
 import { getEnvironment, getProduct, listProducts } from './products.js';
 import { DEVELOPER_TOGGLE_KEY, TEAM_BUILD } from './build-config.js';
@@ -52,9 +57,8 @@ const ACTIVITY_LIMIT = 20;
 export const TEAM_MESSAGE_TYPES = Object.freeze([
   'TEAM_GET_STATE', 'TEAM_CONNECT', 'TEAM_DISCONNECT', 'TEAM_PAIR_CALLBACK', 'TEAM_SET_AUTONOMY',
   'TEAM_PAUSE', 'TEAM_RESUME', 'TEAM_STOP_ALL', 'TEAM_TAKE_OVER', 'TEAM_HAND_BACK', 'TEAM_RECONNECT',
-  'TEAM_APPROVAL_GET', 'TEAM_APPROVAL_DECIDE',
   // TEAM-729
-  'TEAM_LOGIN_OFFER_GET', 'TEAM_LOGIN_OFFER_DECIDE', 'TEAM_VAULT_SET_PREFS', 'TEAM_SESSION_SUGGEST',
+  'TEAM_LOGIN_OFFER_DECIDE', 'TEAM_VAULT_SET_PREFS', 'TEAM_SESSION_SUGGEST',
   'TEAM_SESSION_EXPORT', ...TEAM_PAGE_MESSAGE_TYPES,
   // TEAM-731
   'TEAM_RECORD_START', 'TEAM_RECORD_PAUSE', 'TEAM_RECORD_RESUME', 'TEAM_RECORD_STOP', 'TEAM_RECORD_GET',
@@ -104,11 +108,6 @@ export function createTeamService({
     session: chromeApi.storage.session, tabs: chromeApi.tabs, runtime: chromeApi.runtime, store, fetchImpl
   });
   const engine = createBrowserEngine({ chromeApi, renderCapture });
-  const approvals = createApprovalManager({
-    windowsApi: chromeApi.windows,
-    getUrl: path => chromeApi.runtime.getURL(path),
-    timers
-  });
   const links = new Map();
   const activity = [];
   const recorder = createRecorder({
@@ -228,7 +227,9 @@ export function createTeamService({
       activity: [...activity].reverse(),
       // Counts and status only: the steps and their values go to the panel on
       // TEAM_RECORD_GET, never in this broadcast.
-      recorder: recorder.summary()
+      recorder: recorder.summary(),
+      // Save-login notices (TEAM-757): site and username only, never a password.
+      login_offers: loginOffers.listOffers()
     };
   }
 
@@ -301,7 +302,13 @@ export function createTeamService({
       initial: connection,
       store,
       browser,
-      approvals,
+      payments: createPaymentVerifier({
+        // The id `ready` gave this socket, else the one from pairing.
+        deviceId: () => link.socket?.deviceId || link.connection.device_id,
+        deviceToken: () => link.connection.device_token,
+        now,
+        cryptoImpl
+      }),
       timers,
       now,
       onStateChange: scheduleBroadcast,
@@ -371,10 +378,6 @@ export function createTeamService({
 
   function init() {
     if (initialized) return initialized;
-    chromeApi.windows?.onRemoved?.addListener?.(windowId => {
-      approvals.windowClosed(windowId);
-      loginOffers.windowClosed(windowId);
-    });
     loginOffers.attach();
     const nav = chromeApi.webNavigation;
     nav?.onCommitted?.addListener?.(details => recorder.onCommitted(details));
@@ -511,26 +514,9 @@ export function createTeamService({
         return { ok: true };
       }
 
-      case 'TEAM_APPROVAL_GET': {
-        if (typeof sender.url !== 'string' || !sender.url.startsWith(extensionPage('src/team/approval.html'))) return { ok: false };
-        const details = approvals.get(String(request.id || ''));
-        return details ? { ok: true, details } : { ok: false };
-      }
-
-      case 'TEAM_APPROVAL_DECIDE': {
-        if (typeof sender.url !== 'string' || !sender.url.startsWith(extensionPage('src/team/approval.html'))) return { ok: false };
-        const decided = approvals.decide(String(request.id || ''), request.decision, { tabId: request.tabId });
-        return { ok: decided };
-      }
-
-      case 'TEAM_LOGIN_OFFER_GET': {
-        if (!fromExtensionPage(sender, 'src/team/save-login.html')) return { ok: false };
-        const details = loginOffers.getOffer(String(request.id || ''));
-        return details ? { ok: true, details } : { ok: false };
-      }
-
       case 'TEAM_LOGIN_OFFER_DECIDE': {
-        if (!fromExtensionPage(sender, 'src/team/save-login.html')) return { ok: false };
+        // From the side panel's notice only (TEAM-757), never from a web page.
+        if (!fromExtensionPage(sender, 'src/sidebar/sidebar.html')) return { ok: false };
         const outcome = await loginOffers.decide(String(request.id || ''), request.decision, { username: request.username });
         if (request.decision === 'never' && outcome.ok) await loadVaultPrefs().then(scheduleBroadcast);
         return outcome;
@@ -603,5 +589,5 @@ export function createTeamService({
     }
   }
 
-  return { init, ensureAll, handleMessage, panelState, links, approvals, store, loginOffers, recorder };
+  return { init, ensureAll, handleMessage, panelState, links, store, loginOffers, recorder };
 }

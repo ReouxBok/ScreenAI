@@ -21,13 +21,17 @@
 // - ASKING. `GET /devices/me/login-secrets?origin=` first: a 404 means the vault is off
 //   for this workspace, so nothing is asked (and nothing asked for 10 minutes); a
 //   username already saved words the prompt « Mettre à jour la connexion enregistrée ? ».
-//   The question opens in a small extension window (save-login.html) whose URL holds an
-//   opaque id only; the window reads the site and username by message, never the password.
+//   TEAM-757 (`browser.v3`, no prompt of the extension's own): the question is a
+//   NON-BLOCKING notice in the side panel (« Enregistrer cette connexion pour Limova ? »,
+//   with « Enregistrer », « Pas maintenant », « Jamais pour ce site »), never a window
+//   that stops the page. The panel's state carries the site and username, never the
+//   password; the notice goes away on its own when the capture expires.
 // - SENDING. « Enregistrer » posts `{origin, username, password}` to
 //   `POST /devices/me/login-secrets` with the device token, then drops the password.
-//   « Pas maintenant » or closing the window drops it, and that origin is not asked again
-//   for 10 minutes (a page faking logins cannot open window after window); a newer login
-//   in the same tab replaces the question still open. « Jamais pour ce site » adds the
+//   « Pas maintenant » (or letting the notice expire) drops it, and after « Pas
+//   maintenant » that origin is not asked again for 10 minutes (a page faking logins
+//   cannot fill the panel with notices); a newer login in the same tab replaces the
+//   notice still shown. « Jamais pour ce site » adds the
 //   origin to a local list (chrome.storage.local, origins only) and drops it.
 //
 // The captured password lives in this module's memory only, two minutes at most from
@@ -39,15 +43,14 @@ import { classifyUrl, domainOf, isBlockedHost } from './products.js';
 import { probeLoginForm, watchLoginForms } from './page-login-watch.js';
 
 export const VAULT_PREFS_KEY = 'limova_team_vault_prefs_v1';
-export const OFFER_PAGE = 'src/team/save-login.html';
 export const CAPTURE_TTL_MS = 2 * 60_000;
 export const SUCCESS_WINDOW_MS = 10_000;
 export const VAULT_FILL_QUIET_MS = 2 * 60_000;
 const NAVIGATION_PROBE_MAX_MS = 20_000;
 const HISTORY_PROBE_DELAY_MS = 1_000;
 const FEATURE_OFF_RETRY_MS = 10 * 60_000;
-// After « Pas maintenant » (or closing the window), that origin is not asked again for a
-// while: a page cannot open prompt after prompt by faking logins.
+// After « Pas maintenant », that origin is not asked again for a while: a page cannot
+// show notice after notice by faking logins.
 const DISMISS_QUIET_MS = 10 * 60_000;
 const NEVER_LIMIT = 200;
 const MAX_USERNAME = 320;
@@ -322,7 +325,7 @@ export function createLoginOffers({
       return;
     }
     // One question per tab: a newer login replaces the one still waiting.
-    for (const [openId, open] of [...offers]) if (open.tabId === entry.tabId) finish(openId, { closeWindow: true });
+    for (const [openId, open] of [...offers]) if (open.tabId === entry.tabId) finish(openId);
     const existing = await deviceFetch(link.connection, `/api/v1/devices/me/login-secrets?origin=${encodeURIComponent(entry.origin)}`, { method: 'GET' });
     if (existing.status === 404) {
       // The vault is off for this workspace: ask nothing.
@@ -352,45 +355,33 @@ export function createLoginOffers({
       password: entry.password,
       update,
       expiresAt,
-      windowId: null,
       timer: null,
       busy: false
     };
     entry.password = null;
-    item.timer = timers.setTimeout(() => finish(id, { closeWindow: true }), Math.max(0, expiresAt - now()));
+    item.timer = timers.setTimeout(() => finish(id), Math.max(0, expiresAt - now()));
     offers.set(id, item);
-    Promise.resolve(chromeApi.windows?.create({
-      type: 'popup',
-      url: chromeApi.runtime.getURL(`${OFFER_PAGE}?id=${encodeURIComponent(id)}`),
-      width: 420,
-      height: 460,
-      focused: true
-    })).then(window => {
-      const current = offers.get(id);
-      if (!current) {
-        if (window?.id !== undefined) Promise.resolve(chromeApi.windows?.remove(window.id)).catch(() => {});
-        return;
-      }
-      current.windowId = window?.id ?? null;
-    }).catch(() => finish(id));
+    // A notice in the side panel: nothing opens, nothing stops the page.
+    onChange();
   }
 
-  function finish(id, { closeWindow = false } = {}) {
+  function finish(id) {
     const item = offers.get(id);
     if (!item) return false;
     offers.delete(id);
     timers.clearTimeout(item.timer);
     item.password = null;
-    if (closeWindow && item.windowId !== null) Promise.resolve(chromeApi.windows?.remove(item.windowId)).catch(() => {});
+    onChange();
     return true;
   }
 
-  // What the window shows: never the password.
+  // What the panel's notice shows: never the password.
   function getOffer(id) {
     const item = offers.get(id);
     if (!item || now() >= item.expiresAt) return null;
     return {
       id,
+      product: item.productId,
       productLabel: item.productLabel,
       productColor: item.productColor,
       origin: item.origin,
@@ -409,7 +400,7 @@ export function createLoginOffers({
     const item = offers.get(id);
     if (!item || item.busy) return { ok: false, error: 'expired' };
     if (now() >= item.expiresAt) {
-      finish(id, { closeWindow: true });
+      finish(id);
       return { ok: false, error: 'expired' };
     }
     if (decision === 'later') {
@@ -455,16 +446,6 @@ export function createLoginOffers({
     return { ok: false, error: SAVE_ERRORS[saved.status] || 'unavailable' };
   }
 
-  function windowClosed(windowId) {
-    for (const [id, item] of offers) {
-      // Closing the window is « Pas maintenant ».
-      if (item.windowId === windowId && !item.busy) {
-        dismissed.set(`${item.productId}\n${item.origin}`, now() + DISMISS_QUIET_MS);
-        finish(id);
-      }
-    }
-  }
-
   // ------------------------------------------------------------------ settings
 
   async function getPrefs(productId) {
@@ -496,7 +477,7 @@ export function createLoginOffers({
   // The connection went away: nothing captured for it survives.
   function forgetProduct(productId) {
     for (const [tabId, entry] of [...pending]) if (entry.productId === productId) dropPending(tabId);
-    for (const [id, item] of [...offers]) if (item.productId === productId) finish(id, { closeWindow: true });
+    for (const [id, item] of [...offers]) if (item.productId === productId) finish(id);
   }
 
   // ------------------------------------------------------------------ chrome events
@@ -533,8 +514,9 @@ export function createLoginOffers({
     onNavigation,
     probe: tabId => (pending.get(tabId) ? probe(pending.get(tabId)) : Promise.resolve()),
     getOffer,
+    // The notices the side panel shows (TEAM-757): site and username, never the password.
+    listOffers: () => [...offers.keys()].map(getOffer).filter(Boolean),
     decide,
-    windowClosed,
     getPrefs,
     setPrefs,
     noteVaultFill,

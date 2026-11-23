@@ -272,6 +272,7 @@
       actions.append(button(tr('teamTakeOver'), 'team-secondary', () => send({ type: 'TEAM_TAKE_OVER', productId: product.id })));
     }
     card.append(actions);
+    for (const offer of (state?.login_offers || []).filter(item => item.product === product.id)) card.append(renderLoginOffer(offer));
     const recorderBox = renderRecorder(product);
     if (recorderBox) card.append(recorderBox);
     card.append(renderVault(product, connection));
@@ -340,6 +341,41 @@
       if (item.domain) row.append(el('span', 'team-activity-domain', item.domain));
       list.append(row);
     }
+  }
+
+  // ------------------------------------------------ save-login notice (TEAM-729, TEAM-757)
+  // « Enregistrer cette connexion pour Limova ? » as a notice in the card: nothing opens,
+  // nothing stops the page, and it goes away by itself when the capture expires.
+  let loginFeedback = '';
+  // Redraws come with every broadcast: keep what the person typed in the username.
+  const loginDrafts = new Map();
+
+  function renderLoginOffer(offer) {
+    const box = el('section', 'team-login-offer');
+    box.dataset.offer = offer.id;
+    box.setAttribute('role', 'status');
+    box.append(el('strong', '', tr(offer.update ? 'teamLoginOfferUpdate' : 'teamLoginOfferTitle')));
+    box.append(el('p', 'team-muted', offer.site));
+    const user = el('input', 'team-select');
+    user.id = `teamLoginUser-${offer.id}`;
+    user.type = 'text';
+    user.autocomplete = 'off';
+    user.value = loginDrafts.has(offer.id) ? loginDrafts.get(offer.id) : offer.username || '';
+    user.addEventListener('input', () => loginDrafts.set(offer.id, user.value));
+    box.append(labelled(tr('teamLoginOfferUser'), user));
+    const decide = async decision => {
+      const response = await send({ type: 'TEAM_LOGIN_OFFER_DECIDE', id: offer.id, decision, ...(decision === 'save' ? { username: user.value } : {}) });
+      loginDrafts.delete(offer.id);
+      loginFeedback = decision === 'save' ? tr(response?.ok ? 'teamLoginOfferSaved' : 'teamLoginOfferFailed') : '';
+      refresh();
+    };
+    const actions = el('div', 'team-actions');
+    actions.append(
+      button(tr('teamLoginOfferSave'), 'team-primary', () => decide('save')),
+      button(tr('teamLoginOfferLater'), 'team-secondary', () => decide('later'))
+    );
+    box.append(actions, button(tr('teamLoginOfferNever'), 'team-link-muted', () => decide('never')));
+    return box;
   }
 
   // ------------------------------------------------ « Montrer à Limova » (TEAM-731)
@@ -515,7 +551,7 @@
       if (state.products.some(product => product.connection)) suggestSite();
     }
     const note = $('teamFeedback');
-    if (note) note.textContent = feedback;
+    if (note) note.textContent = loginFeedback || feedback;
     const anyConnected = (state?.products || []).some(product => product.connection);
     const stopAll = $('teamStopAll');
     if (stopAll) stopAll.hidden = !anyConnected;

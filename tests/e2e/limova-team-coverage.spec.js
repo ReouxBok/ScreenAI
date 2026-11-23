@@ -99,7 +99,8 @@ test.afterAll(async () => {
 // The engine runs in an extension page, like the service worker would run it.
 async function engineHost(context, extensionId) {
   const page = await context.newPage();
-  await page.goto(`chrome-extension://${extensionId}/src/team/approval.html?id=none`);
+  // Any extension page can host the engine (TEAM-757 removed the approval page).
+  await page.goto(`chrome-extension://${extensionId}/src/team/pair-callback.html`);
   await page.evaluate(async () => {
     const { createBrowserEngine } = await import(chrome.runtime.getURL('src/team/browser-engine.js'));
     const { PRODUCTS } = await import(chrome.runtime.getURL('src/team/products.js'));

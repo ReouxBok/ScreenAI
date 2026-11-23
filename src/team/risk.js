@@ -1,16 +1,17 @@
-// risk.js — The extension's own reading of what an action does, and who must approve it.
+// risk.js — The extension's own reading of what an action does.
 //
 // TEAM-724, docs/browser-device-protocol.md « Risk classes and autonomy ». The server
 // sends its own `risk` / `risk_reason` with every action, computed from the latest
 // snapshot. The extension computes its own from the LIVE element and keeps the
 // stricter of the two, so a wrong or manipulated server reading can only add an
-// approval, never remove one.
+// requirement, never remove one.
 //
-// `browser.v2` (TEAM-726): the extension no longer asks before actions, whatever its
-// autonomy level. Only paying (`pay`, from the server or from this reading) waits for
-// the person's click in a Chrome window. Other confirmations happen in the chat,
-// decided by the server from the autonomy level. Sensitive fields, blocked sites,
-// pause and take-over are still enforced elsewhere, at every level.
+// `browser.v3` (TEAM-757): the extension never asks the person anything. The chat's
+// single level is the only permission (the server asks in the chat). A payment-class
+// action (`pay`, from the server or from this reading) needs the server's single-use
+// payment token, minted after the owner's click on the chat's payment card
+// (payment-token.js). Sensitive fields, blocked sites, pause and take-over are still
+// enforced elsewhere, at every level.
 //
 // TEAM-751: `browser.press_key` is a write, except Enter and Space on an element, which
 // are judged like what they do (Enter in a form field like `browser.submit` on that
@@ -22,8 +23,8 @@
 // about the element (name, form, type), never a decision.
 
 export const RISK_REASONS = Object.freeze(['send', 'pay', 'publish', 'delete', 'account', 'external_form', 'upload']);
-// The only reason the extension itself still asks the person (TEAM-726).
-export const OWNER_APPROVAL_REASONS = Object.freeze(['pay']);
+// The reason that needs a payment token (TEAM-757).
+export const PAYMENT_REASONS = Object.freeze(['pay']);
 export const HINT_REASONS = Object.freeze(['send', 'pay', 'publish', 'delete', 'account']);
 
 export const READ_TOOLS = Object.freeze([
@@ -195,13 +196,12 @@ export function stricterRisk(server = {}, local = {}) {
 }
 
 /**
- * Must the person click « Autoriser » in Chrome before this action runs?
- * Only for a payment (TEAM-726); everything else runs, at every autonomy level.
+ * Is this a payment, which runs only with a valid payment token (TEAM-757)?
  * @param {{risk: string, reason: string|null}} risk the stricter reading
  * @returns {boolean}
  */
-export function needsOwnerApproval(risk = {}) {
-  return OWNER_APPROVAL_REASONS.includes(risk.reason);
+export function isPaymentClass(risk = {}) {
+  return PAYMENT_REASONS.includes(risk.reason);
 }
 
 /**
@@ -235,36 +235,16 @@ export function targetMatches(target, name) {
   return shared / union >= 0.6;
 }
 
-const VERBS = {
-  'browser.click': 'cliquer sur',
-  'browser.fill': 'écrire dans',
-  'browser.select': 'choisir une option dans',
-  'browser.submit': 'envoyer le formulaire',
-  'browser.download': 'télécharger',
-  'browser.batch': 'agir sur',
-  'browser.press_key': 'appuyer sur une touche dans',
-  'browser.upload': 'déposer des fichiers dans'
-};
-
-// The French name of a key, for the activity list and the approval window.
+// The French name of a key, for the activity list.
 export const KEY_LABELS = Object.freeze({
   Enter: 'Entrée', Tab: 'Tab', Escape: 'Échap', Space: 'Espace', Backspace: 'Retour arrière', Delete: 'Suppr',
   ArrowUp: 'Flèche haut', ArrowDown: 'Flèche bas', ArrowLeft: 'Flèche gauche', ArrowRight: 'Flèche droite',
   Home: 'Début', End: 'Fin', PageUp: 'Page précédente', PageDown: 'Page suivante'
 });
 
-// The approval window only opens for a payment now (TEAM-726).
-export const PAY_REASON_TEXT = 'Cette action peut déclencher un paiement. Limova attend votre accord avant de payer.';
-
 function quoted(text, max = 80) {
   const clean = String(text || '').replace(/\s+/g, ' ').trim();
   return `« ${clean.length > max ? `${clean.slice(0, max - 1)}…` : clean} »`;
-}
-
-// « Limova Team veut cliquer sur « Envoyer » sur example.com »
-export function approvalTitle(productLabel, tool, targetName, domain) {
-  const verb = VERBS[tool] || 'agir sur';
-  return `${productLabel} veut ${verb} ${quoted(targetName)}${domain ? ` sur ${domain}` : ''}`;
 }
 
 // The short label shown in the side panel's activity list and the chat's live steps.

@@ -41,7 +41,8 @@ async function routeSite(context) {
 
 async function enginePage(context, extensionId) {
   const page = await context.newPage();
-  await page.goto(`chrome-extension://${extensionId}/src/team/approval.html?id=none`);
+  // Any extension page can host the engine (TEAM-757 removed the approval page).
+  await page.goto(`chrome-extension://${extensionId}/src/team/pair-callback.html`);
   return page;
 }
 
@@ -173,9 +174,9 @@ test.describe('Limova Team browser device', () => {
     await page.close();
   });
 
-  test('browser.v2 end to end: no approval except paying, set_autonomy at once, include_page and batch', async ({ context, extensionId }) => {
+  test('browser.v3 end to end: no prompt, payment by token, current tab, set_autonomy at once, include_page and batch', async ({ context, extensionId }) => {
     const host = await enginePage(context, extensionId);
-    // The real service, controller, engine and approval windows run in this extension
+    // The real service, controller and engine run in this extension
     // page; only the server socket is a fake (Playwright cannot route a service
     // worker's WebSocket), with an in-memory storage area so the real worker is untouched.
     await host.evaluate(async () => {
@@ -233,7 +234,7 @@ test.describe('Limova Team browser device', () => {
     });
 
     const hello = await host.evaluate(() => globalThis.fakeServer.sent[0]);
-    expect(hello.capabilities).toEqual(expect.arrayContaining(['browser.v1', 'browser.v2', 'autonomy.v1', 'browser_control.v1', 'browser.record.v1']));
+    expect(hello.capabilities).toEqual(expect.arrayContaining(['browser.v1', 'browser.v2', 'browser.v3', 'autonomy.v1', 'browser_control.v1', 'browser.record.v1']));
     expect(hello.autonomy).toBe('full_access');
 
     // open_tab with include_page answers the page map at once.
@@ -277,23 +278,58 @@ test.describe('Limova Team browser device', () => {
     }, { tab_id: tabId, snapshot_id: batch.data.page.snapshot_id, element_id: batch.data.page.elements.find(e => e.name === 'Mot de passe').id, target: 'Mot de passe', value: 'x', risk: 'write', risk_reason: null });
     expect(sensitive.error.code).toBe('sensitive_field');
 
-    // Paying still waits for the person, in a Chrome window, even though the server said « write ».
+    // Paying needs the server's token, minted after the owner's click in the chat: never a window.
     const payId = batch.data.page.elements.find(e => e.name === 'Payer 49 €').id;
-    await host.evaluate(args => {
-      globalThis.fakeServer.push({ type: 'call', call_id: 'c-pay', tool: 'browser.click', deadline_ms: Date.now() + 100_000, args });
-    }, { tab_id: tabId, snapshot_id: batch.data.page.snapshot_id, element_id: payId, target: 'Payer 49 €', risk: 'write', risk_reason: null });
-    await expect.poll(() => host.evaluate(() => globalThis.fakeServer.sent.some(m => m.type === 'progress' && m.call_id === 'c-pay' && m.status === 'waiting_approval'))).toBe(true);
-    await expect.poll(() => host.evaluate(() => globalThis.fakeServer.popups())).toBe(before + 1);
+    const payArgs = { tab_id: tabId, snapshot_id: batch.data.page.snapshot_id, element_id: payId, target: 'Payer 49 €', risk: 'write', risk_reason: null };
+    const refused = await host.evaluate(async args => {
+      const server = globalThis.fakeServer;
+      server.push({ type: 'call', call_id: 'c-pay-0', tool: 'browser.click', deadline_ms: Date.now() + 100_000, args });
+      return server.result('c-pay-0');
+    }, payArgs);
+    expect(refused.error.code).toBe('payment_confirmation_required');
+    expect(await host.evaluate(() => globalThis.fakeServer.popups())).toBe(before);
+    expect(await host.evaluate(() => globalThis.fakeServer.sent.some(m => m.type === 'progress'))).toBe(false);
     expect(await site.locator('#out').textContent()).toBe('Bouton cliqué');
-    // The person clicks « Autoriser » (decided here: the window talks to the real worker,
-    // which does not know this page's approval).
-    await host.evaluate(() => {
-      const { approvals } = globalThis.fakeServer.service;
-      return approvals.decide(approvals.ids()[0], 'approve');
-    });
-    const paid = await host.evaluate(() => globalThis.fakeServer.result('c-pay'));
+    // What the server does after the owner's click: mint a single-use token for this call.
+    const token = await host.evaluate(async args => {
+      const { paymentFingerprint, sha256Hex, hmacSha256Hex } = await import(chrome.runtime.getURL('src/team/payment-token.js'));
+      const id = crypto.randomUUID();
+      const deviceId = '3f8b2c1e-0000-4000-8000-000000000001';
+      const fp = await paymentFingerprint('browser.click', args);
+      const expMs = Date.now() + 120_000;
+      const key = await sha256Hex('lmd_abcdefghijklmnopqrstuvwxyz012345');
+      const sig = await hmacSha256Hex(key, `limova-pay.v1|${id}|${deviceId}|${fp}|${expMs}`);
+      return { v: 1, id, device_id: deviceId, fp, exp_ms: expMs, sig };
+    }, payArgs);
+    const paid = await host.evaluate(async args => {
+      const server = globalThis.fakeServer;
+      server.push({ type: 'call', call_id: 'c-pay', tool: 'browser.click', deadline_ms: Date.now() + 100_000, args });
+      return server.result('c-pay');
+    }, { ...payArgs, payment_token: token });
     expect(paid.ok).toBe(true);
     expect(await site.locator('#out').textContent()).toBe('Payé');
+    const replayed = await host.evaluate(async args => {
+      const server = globalThis.fakeServer;
+      server.push({ type: 'call', call_id: 'c-pay-2', tool: 'browser.click', deadline_ms: Date.now() + 100_000, args });
+      return server.result('c-pay-2');
+    }, { ...payArgs, payment_token: token });
+    expect(replayed.error.code).toBe('payment_confirmation_required');
+    expect(await host.evaluate(() => globalThis.fakeServer.popups())).toBe(before);
+
+    // request_tab: no picker, the person's current tab joins the group.
+    const own = await context.newPage();
+    await own.goto(`${SITE}/other`);
+    await own.bringToFront();
+    const shared = await host.evaluate(async () => {
+      const server = globalThis.fakeServer;
+      server.push({ type: 'call', call_id: 'c-tab', tool: 'browser.request_tab', deadline_ms: Date.now() + 40_000, args: { reason: 'Pour lire la page' } });
+      const answer = await server.result('c-tab');
+      const tab = await chrome.tabs.get(answer.data.tab.tab_id);
+      return { answer, group: tab.groupId >= 0 ? (await chrome.tabGroups.get(tab.groupId)).title : null };
+    });
+    expect(shared.answer.data.tab.url).toBe(`${SITE}/other`);
+    expect(shared.group).toMatch(/^Limova Team/);
+    expect(await host.evaluate(() => globalThis.fakeServer.popups())).toBe(before);
 
     // set_autonomy applies at once, either way, sending state before its answer, with no window.
     const autonomy = await host.evaluate(async () => {

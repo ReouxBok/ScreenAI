@@ -46,7 +46,8 @@ export const DEVICE_SUBPROTOCOL = 'limova-device.v1';
 // browser.record.v1 (TEAM-731): this app uploads recordings and adds the descriptor
 // fields (label, placeholder, nearby, hints) to read_page elements.
 export const CAPABILITIES = Object.freeze([
-  'browser.v1', 'browser.v2', 'browser.v2+keys', 'browser.v2+upload', 'browser.v2+frames',
+  // browser.v3 (TEAM-757): no prompt of the app's own; payments need a payment token.
+  'browser.v1', 'browser.v2', 'browser.v3', 'browser.v2+keys', 'browser.v2+upload', 'browser.v2+frames',
   'autonomy.v1', 'browser_control.v1', 'browser.record.v1'
 ]);
 export const PING_INTERVAL_MS = 25_000;
@@ -62,7 +63,9 @@ const OPEN = 1;
 const KNOWN_ERROR_CODES = new Set([
   'denied_by_owner', 'paused', 'approval_timeout', 'invalid_args', 'too_large', 'unsupported', 'internal',
   'not_found', 'taken_over', 'not_in_group', 'tab_not_found', 'stale_snapshot', 'element_not_found',
-  'sensitive_field', 'blocked_site', 'page_unavailable', 'origin_mismatch', 'secret_unreadable'
+  'sensitive_field', 'blocked_site', 'page_unavailable', 'origin_mismatch', 'secret_unreadable',
+  // TEAM-757: a payment-class action without a valid payment token.
+  'payment_confirmation_required'
 ]);
 
 export function backoffDelay(attempt, random = Math.random) {
