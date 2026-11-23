@@ -5,7 +5,8 @@ export const SAV_INTAKE_DAY_MS = 86_400_000;
  * the shared ledger: spent and uncertain reservations keep counting against the new cap. */
 export const SAV_INTAKE_BUDGET_BOUNDS = {
   // SAV-92 (Ugo, 14/11): rolling ceiling 200 USD, aligned with the shared 30-day cap. The pinned value is still read from the runtime config.
-  operational: { maxNanoUsd: 5_000_000_000, maxRollingNanoUsd: 200_000_000_000, maxCalls: 300 },
+  // Ugo (23/11): up to 500 V1 calls per UTC day; dollar ceilings unchanged. The execution policy does not pin maxCalls.
+  operational: { maxNanoUsd: 5_000_000_000, maxRollingNanoUsd: 200_000_000_000, maxCalls: 500 },
   qualification: { maxNanoUsd: 3_000_000_000, maxCalls: 30 },
   /** Ceiling of the daily cap the budget owner may set from the Studio, without a deployment. */
   studio: { maxNanoUsd: 20_000_000_000 },
