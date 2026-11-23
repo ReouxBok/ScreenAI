@@ -382,7 +382,7 @@ function operational() {
 it("operational profile separates an old initial frontier from bounded30day authority and requires explicit rolling cap",()=>{
   const pins={...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),budgetProfile:"operational_utc_v1",maxRollingNanoUsd:90000000000,maxCalls:300,createdAfter:"2020-01-01T00:00:00.000Z",expiresAt:new Date(Date.now()+29*86400000).toISOString()};
   expect(savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify(pins)})).toHaveProperty("budgetProfile","operational_utc_v1");
-  for(const change of [{maxRollingNanoUsd:undefined},{maxCalls:301},{maxRollingNanoUsd:200000000001},{expiresAt:new Date(Date.now()+31*86400000).toISOString()}]) expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...pins,...change})})).toThrow();
+  for(const change of [{maxRollingNanoUsd:undefined},{maxCalls:501},{maxRollingNanoUsd:200000000001},{expiresAt:new Date(Date.now()+31*86400000).toISOString()}]) expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...pins,...change})})).toThrow();
 });
 it("operational profile accepts the approved5 USD daily cap while every other bound stays strict",()=>{
   const pins={...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),budgetProfile:"operational_utc_v1",maxRollingNanoUsd:90000000000,maxCalls:300,maxNanoUsd:5000000000,expiresAt:new Date(Date.now()+29*86400000).toISOString()};
@@ -391,12 +391,18 @@ it("operational profile accepts the approved5 USD daily cap while every other bo
   expect(parse({maxNanoUsd:3000000000})).toHaveProperty("maxNanoUsd",3000000000);
   expect(parse({})!.configHash).not.toBe(parse({maxNanoUsd:3000000000})!.configHash);
   for(const maxNanoUsd of [5000000001,0,-1,1.5,Number.NaN,Number.POSITIVE_INFINITY,"5000000000",null]) expect(()=>parse({maxNanoUsd})).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
-  for(const change of [{maxRollingNanoUsd:200000000001},{maxCalls:301}]) expect(()=>parse(change)).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
+  for(const change of [{maxRollingNanoUsd:200000000001},{maxCalls:501}]) expect(()=>parse(change)).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
+  // Ugo (23/11): the operational daily call cap goes up to 500, never above; the dollar bounds above are unchanged.
+  for(const maxCalls of [301,500]) expect(parse({maxCalls})).toHaveProperty("maxCalls",maxCalls);
+  expect(parse({maxCalls:500})!.configHash).not.toBe(parse({})!.configHash);
+  for(const maxCalls of [0,1.5,"500",null]) expect(()=>parse({maxCalls})).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
   // Qualification (no profile) keeps its historical lifetime cap and30 calls.
   const legacy=JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!);
   expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...legacy,maxNanoUsd:5000000000})})).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
   expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...legacy,maxNanoUsd:3000000001})})).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
   expect(savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...legacy,maxNanoUsd:3000000000})})).toHaveProperty("maxNanoUsd",3000000000);
+  for(const maxCalls of [31,500]) expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...legacy,maxCalls})})).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
+  expect(savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...legacy,maxCalls:30})})).toHaveProperty("maxCalls",30);
 });
 it("5 USD deducts settled and uncertain usage, never resets the ledger, and the30day cap still defers with daily margin",async()=>{
   operational();

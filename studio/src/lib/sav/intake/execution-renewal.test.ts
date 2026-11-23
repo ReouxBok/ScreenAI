@@ -103,6 +103,20 @@ it("a typed source UUID keeps an operational automatic policy exactly (maxDossie
   expect(decryptSavPayload(created.payloadCiphertext)).toEqual({ ...source, codeRevision: NEW });
 });
 
+it("an operational policy approved under 300 calls/day renews unchanged when the deployed runtime raises the daily call cap to 500 (maxCalls is not a policy pin)", async () => {
+  const expiresAt = new Date(Date.now() + 5 * 86400000).toISOString();
+  pins = { ...pins, expiresAt, budgetProfile: "operational_utc_v1", maxRollingNanoUsd: 90000000000, maxCalls: 300, maxNanoUsd: 5000000000 };
+  await approveSource({ expiresAt, budgetProfile: "operational_utc_v1", maxDossiers: 100, mutations: ["link_ticket"], admission: { kind: "automatic" } });
+  const deployed = env(NEW, { maxCalls: 500 }), commandId = randomUUID();
+  const preview = await previewIntakeExecutionRenewal(commandId, "", deployed);
+  const receipt = await commitIntakeExecutionRenewal(commandId, preview.hash, deployed);
+  const [created] = (await policyRows()).filter(r => r.id === receipt.policyId);
+  expect(decryptSavPayload(created.payloadCiphertext)).toEqual({ ...source, codeRevision: NEW });
+  expect(await readIntakeExecutionAuthorityState(env(NEW, { maxCalls: 500 }, { SAV_INTAKE_EXECUTION_POLICY_ID: receipt.policyId, SAV_INTAKE_EXECUTION_POLICY_SHA256: receipt.policyHash }))).toBe("valid");
+  await expect(previewIntakeExecutionRenewal(randomUUID(), "", env(NEW, { maxCalls: 501 }))).rejects.toThrow("SAV_INTAKE_RENEWAL_RUNTIME_INVALID");
+  expect(fetch).not.toHaveBeenCalled();
+});
+
 it("refuses explicitly: unknown, revoked, incoherent, expired source, approver without access, nothing to renew, env hash mismatch, missing revision", async () => {
   const deployed = env(NEW), go = (source: string, e = deployed) => previewIntakeExecutionRenewal(randomUUID(), source, e);
   await expect(go(randomUUID())).rejects.toThrow("SAV_INTAKE_RENEWAL_SOURCE_UNKNOWN");
