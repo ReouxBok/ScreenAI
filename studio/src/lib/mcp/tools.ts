@@ -3,6 +3,7 @@ import { z } from "zod";
 import { v2DailyReport, v2DailyReportInput } from "@/lib/sav/cases/v2-daily-report";
 import { listV2Cases, v2InventoryInput } from "@/lib/sav/cases/v2-inventory";
 import { readSmartTraceSummaries, readSmartTracesForThread } from "@/lib/sav/cases/smart/smart-trace-store";
+import { readSmartShadowReport, smartShadowReportInput } from "@/lib/sav/cases/smart/smart-shadow-report";
 import type { SavClerkUser } from "@/lib/sav/intake/console-auth";
 import { listIntakeConsole } from "@/lib/sav/intake/console-store";
 import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
@@ -141,6 +142,13 @@ const v2DailyReportTool = { name: "v2_daily_report", title: "Mesures quotidienne
     if (context.staff.role !== "admin") return refused("SAV_V2_REPORT_FORBIDDEN", "Rapport V2 réservé aux administrateurs.");
     return done(await v2DailyReport(input));
   } };
+const v2ShadowReportTool = { name: "v2_shadow_report", title: "Rapport du shadow de l’agent SAV", write: false,
+  description: "Rapport administrateur du mode shadow de l’agent SAV, sans contenu client. from/until : jours UTC AAAA-MM-JJ inclus, 7 jours maximum. summary : agrégat existant (issues, motifs d’arrêt et de transfert, refus serveur et contre-lecture, corrections, thèmes sans fiche, outils par statut, passes de décision, coûts en micro-USD, révisions). cases : un mail par ligne, du plus récent au plus ancien, 50 maximum (outcome filtre la liste seulement ; casesTotal et casesTruncated indiquent le reste) : identifiants internes (messageId, threadId pour get_dossier), jour, issue, motifs (reasons), raison de transfert, raison et compteurs de la note équipe, codes de refus serveur et de contre-lecture, thèmes manquants, fiches (id, version), passes de décision, appels d’outils avec statut, appels modèle, coût, révision. Jamais le texte du mail, l’objet, la réponse proposée, le texte de la note, une adresse ou un nom. itemsWithoutResult compte les mails réservés sans résultat (pending, failed). Lecture seule, lignes conservées 30 jours.",
+  input: smartShadowReportInput,
+  async run(context: StudioMcpContext, input: z.infer<typeof smartShadowReportInput>) {
+    if (context.staff.role !== "admin") return refused("SAV_V2_SHADOW_REPORT_FORBIDDEN", "Rapport du shadow réservé aux administrateurs.");
+    return done(await readSmartShadowReport(input));
+  } };
 const listV2CasesTool = { name: "list_v2_cases", title: "Inventaire des dossiers V2", write: false,
   description: "Inventaire V2 réservé aux administrateurs, sans contenu client. from/until : dates ISO inclusives de création du dossier, jusqu’à min(until, snapshotAt) ; state filtre uniquement l’affichage : processing, awaiting_customer, reply_sent, handed_to_team, failed, paused. 25 dossiers parcourus par défaut, 100 maximum. Réutiliser le curseur et les mêmes filtres : borne snapshotAt figée, insertions ultérieures exclues ; attendus reste le total du périmètre immuable. statesFilterApplied indique si le filtre d’état est appliqué ; filteredOut compte les dossiers masqués sur chaque page. Contrôlés = lignes listées + filteredOut cumulés ; continuer tant que nextCursor existe, même avec une page vide. Une suppression ou un commit tardif ajoutant un dossier antérieur à snapshotAt invalide le parcours (SAV_V2_INVENTORY_MEMBERSHIP_CHANGED) : relancer alors le parcours depuis le début, sans curseur. Valeurs relues par page. outcomes expose séparément mail, note et statut par exécution : confirmed exige une preuve du registre, uncertain impose une vérification, blocked/skipped donne un motif lisible. Un mail confirmé ne prouve ni la note ni le statut. hubspot est le résumé historique ; consulter outcomes pour les refus et incertitudes. Coûts en micro-USD ; usage inconnu conservé en réservé. Curseur keyset compact. questions compte séparément asked, answered et open, sans texte client. replyDelaySeconds mesure le délai jusqu’à la confirmation de l’envoi. Historiques limités à 1000 entrées par dossier (dépassement explicite), registres à 1000 et 1 Mio chacun (coûts inconnus au-delà).",
   input: v2InventoryInput,
@@ -163,4 +171,4 @@ const whoami = { name: "whoami", title: "Identité Studio", write: false,
   async run(context: StudioMcpContext) { return done({ email: context.staff.email, role: context.staff.role, name: context.staff.name }); } };
 
 /** Read-only tools of this lot. Write tools (SAV-27 to SAV-30) register with write: true. */
-export const studioMcpTools: StudioMcpTool[] = [whoami, listDossiers, listV2CasesTool, v2DailyReportTool, getDossier, getDiagnostics, getBudget] as unknown as StudioMcpTool[];
+export const studioMcpTools: StudioMcpTool[] = [whoami, listDossiers, listV2CasesTool, v2DailyReportTool, v2ShadowReportTool, getDossier, getDiagnostics, getBudget] as unknown as StudioMcpTool[];

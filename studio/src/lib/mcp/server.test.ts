@@ -1,7 +1,7 @@
-import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
-import { staffUsers } from "@/db/schema";
+import { savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, diagnostics: vi.fn(), list: vi.fn() }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => { throw Error("NO_SESSION_ON_MCP"); }, clerkClient: async () => { throw Error("NO_REAL_CLERK"); } }));
@@ -10,6 +10,8 @@ vi.mock("@/lib/sav/intake/console-store", () => ({ listIntakeConsole: state.list
 import { handleStudioMcpRequest, resetStudioMcpRateLimit, STUDIO_MCP_RATE } from "./server";
 import { StudioMcpAuthError } from "./identity";
 import { studioMcpConfig } from "./config";
+import { encryptSavPayload } from "@/lib/sav/crypto";
+import { aggregateSmartShadow, SAV_SMART_SHADOW_PREFIX, type SmartShadowStored } from "@/lib/sav/cases/smart/smart-shadow";
 
 /** SAV-23/24/26: the MCP applies the console's staff checks to a token identity. Synthetic users only. */
 let f: Awaited<ReturnType<typeof createSavTestDb>>;
@@ -80,7 +82,7 @@ it("SAV-24 refuses browsers: cross-origin requests and preflights", async () => 
   expect(preflight.status).toBe(403); expect(preflight.headers.get("access-control-allow-origin")).toBeNull();
 });
 it("SAV-24 lists read tools only while writes are off; with writes on, write tools carry write annotations", async () => {
-  const read = ["get_agent_pause", "get_budget", "get_diagnostics", "get_dossier", "get_fiche", "list_dossiers", "list_v2_cases", "search_fiches", "v2_daily_report", "whoami"];
+  const read = ["get_agent_pause", "get_budget", "get_diagnostics", "get_dossier", "get_fiche", "list_dossiers", "list_v2_cases", "search_fiches", "v2_daily_report", "v2_shadow_report", "whoami"];
   const write = ["classify_invalid_source_other", "classify_other", "close_handled_outside", "continue_dossier", "reconcile_effect", "reconcile_identification", "reconcile_note",
     "propose_fiche", "propose_fiche_update", "publish_fiche", "record_choice", "release_hold", "request_reinvestigation", "set_agent_pause"];
   const list = async (flags: Record<string, string>) => ((await (await rpc("tools/list", {}, { env: flags })).json()) as { result: { tools: { name: string; annotations: { readOnlyHint: boolean; destructiveHint: boolean } }[] } }).result.tools;
@@ -204,4 +206,105 @@ it("SAV-92 daily report is administrator-only and requires a bounded window", as
   expect((await callTool("v2_daily_report", args)).result?.structuredContent).toMatchObject({ outcome: "done", data: { coverage: { expected: 0, checked: 0, complete: true } } });
   expect((await callTool("v2_daily_report")).result?.isError).toBe(true);
   expect((await callTool("v2_daily_report", { ...args, until: "2026-11-23T00:00:00Z" })).result?.isError).toBe(true);
+});
+
+/*
+ * v2_shadow_report: the smart agent's shadow rows over a range of UTC days, codes and numbers only. FICTIONAL rows; every free-text field of the
+ * stored turn carries a marker that must never come out of the tool.
+ */
+const LEAK = ["MARKER_MAIL_BODY", "MARKER_SUBJECT", "MARKER_REPLY", "MARKER_NOTE", "MARKER_READING", "MARKER_FACT", "MARKER_MEMORY", "MARKER_SENTENCE", "MARKER_THINKING",
+  "fictif@exemple.invalid", "Jeanne Fictive"];
+function shadowRow(messageId: string, outcome: "handoff" | "reply" | "ask", extra: Partial<SmartShadowStored> = {}): SmartShadowStored {
+  const note = { raison: "no_source", besoin: "MARKER_NOTE besoin de Jeanne Fictive", compris: "MARKER_NOTE compris", verifie: [{ fait: "MARKER_NOTE fait", source: "fiche-x" }],
+    essaye: [{ quoi: "MARKER_NOTE essai", resultat: "échec" }], hypotheses: [], prochaineVerification: "MARKER_NOTE vérifier", ditAuClient: null };
+  return { v1Gate: "support", messageId, receivedAt: "2026-11-22T17:00:00.000Z", startedAt: "2026-11-22T18:10:00.000Z", durationMs: 4_200, costMicroUsd: 1_500,
+    revision: "smart-v19", promptSha256: "a".repeat(64), contractRevision: "c5", model: "gemini-test", codeSha: "e0a23e6f",
+    turn: { outcome, reasons: outcome === "handoff" ? ["refused_after_correction"] : [], sensitiveStop: null,
+      reading: { summary: "MARKER_READING fictif@exemple.invalid" } as never,
+      decision: { outcome, reply: "MARKER_REPLY Bonjour Jeanne Fictive", teamNote: outcome === "handoff" ? note : null, handoffReason: outcome === "handoff" ? "no_source" : null,
+        coverage: [], facts: [{ sentence: "MARKER_FACT" }], memory: { newFacts: [{ text: "MARKER_MEMORY" }] } } as never,
+      replyWithFooter: "MARKER_REPLY avec pied", checks: { first: ["need_not_covered"], second: outcome === "handoff" ? ["excerpt_not_found"] : null },
+      verdicts: { first: { verdict: "non_conforme", problems: [{ code: "unlisted_claim", sentence: "MARKER_SENTENCE" }] }, second: null },
+      corrected: true,
+      calls: [{ kind: "decide", status: "ok", problem: null, inputBytes: 9_000, uncertain: false, sent: true, usage: { inputTokens: 1_000, outputTokens: 200 } }],
+      sources: [{ cardId: "fiche-connexion", version: "v3", needIds: ["n1"] }],
+      missing: [{ needId: "n2", theme: "Facturation" }],
+      steps: [{ pass: 1, kind: "decide", action: "tools" }, { pass: 1, kind: "tool", tool: "chercher_fiches", status: "ok", code: null, argsHash: "h", bytes: 300 },
+        { pass: 2, kind: "decide", action: "final" }],
+      teamNote: outcome === "handoff" ? note as never : null, teamNoteText: outcome === "handoff" ? "MARKER_NOTE texte rendu" : null,
+      memory: { facts: ["MARKER_MEMORY"], thinking: "MARKER_THINKING" } as never, progressed: true },
+    ...extra };
+}
+async function storeShadow(day: string, status: string, result: SmartShadowStored | null, messageId: string = crypto.randomUUID()) {
+  await f.db.insert(savSyncState).values({ key: `${SAV_SMART_SHADOW_PREFIX}:item:mail:${messageId}`, status, startedAt: new Date(`${day}T18:10:00.000Z`),
+    cursor: encryptSavPayload({ version: 1, scope: day, reservedMicroUsd: 10_000, costMicroUsd: result ? result.costMicroUsd : null, result }) });
+  return messageId;
+}
+describe("v2_shadow_report", () => {
+  const args = { from: "2026-11-22", until: "2026-11-23" };
+  beforeEach(async () => {
+    vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "mcp-shadow-report-fixture-key-32chars!!");
+    await f.db.delete(savSyncState);
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("is administrator-only: owner and member are refused, even with rows in range", async () => {
+    await storeShadow("2026-11-22", "done", shadowRow(crypto.randomUUID(), "handoff"));
+    for (const other of [reouven, contact]) {
+      current = other;
+      const refusal = await callTool("v2_shadow_report", args);
+      expect(refusal.result?.structuredContent).toMatchObject({ outcome: "refused", code: "SAV_V2_SHADOW_REPORT_FORBIDDEN" });
+      expect(refusal.result?.structuredContent?.data).toBeUndefined();
+    }
+  });
+  it("requires a range of UTC days, 7 days maximum, from before until", async () => {
+    for (const bad of [{}, { from: "2026-11-22" }, { from: "2026-11-16", until: "2026-11-23" }, { from: "2026-11-23", until: "2026-11-22" },
+      { from: "2026-11-22T00:00:00Z", until: "2026-11-23" }, { from: "2026-02-30", until: "2026-03-01" }, { ...args, extra: true }, { ...args, outcome: "maybe" }])
+      expect((await callTool("v2_shadow_report", bad)).result?.isError).toBe(true);
+    expect((await callTool("v2_shadow_report", { from: "2026-11-17", until: "2026-11-23" })).result?.structuredContent).toMatchObject({ outcome: "done", data: { cases: [], casesTotal: 0 } });
+    expect((await callTool("v2_shadow_report", { from: "2026-11-23", until: "2026-11-23" })).result?.structuredContent).toMatchObject({ outcome: "done" });
+  });
+  it("passes the existing aggregate through, lists each mail with codes only, and never leaks customer content", async () => {
+    const [mailbox] = await f.db.insert(savMailboxes).values({ email: `support-${crypto.randomUUID()}@exemple.invalid` }).returning();
+    const [thread] = await f.db.insert(savThreads).values({ mailboxId: mailbox!.id, gmailThreadId: `t-${crypto.randomUUID()}`, subject: "MARKER_SUBJECT", customerEmail: "fictif@exemple.invalid" }).returning();
+    const [message] = await f.db.insert(savMessages).values({ threadId: thread!.id, mailboxId: mailbox!.id, direction: "inbound", fromEmail: "fictif@exemple.invalid", toEmails: [],
+      subject: "MARKER_SUBJECT", bodyCiphertext: encryptSavPayload({ text: "MARKER_MAIL_BODY" }), receivedAt: new Date("2026-11-22T17:00:00.000Z"), gmailMessageId: `gm-${crypto.randomUUID()}` }).returning();
+    const handoff = shadowRow(message!.id, "handoff"), reply = shadowRow(crypto.randomUUID(), "reply", { startedAt: "2026-11-23T08:00:00.000Z" });
+    await storeShadow("2026-11-22", "done", handoff, handoff.messageId);
+    await storeShadow("2026-11-23", "done", reply, reply.messageId);
+    await storeShadow("2026-11-21", "done", shadowRow(crypto.randomUUID(), "ask"));
+    await storeShadow("2026-11-23", "pending", null);
+    await f.db.insert(savSyncState).values({ key: `${SAV_SMART_SHADOW_PREFIX}:gate:mail:${crypto.randomUUID()}`, status: "team", startedAt: new Date("2026-11-22T19:00:00.000Z"),
+      cursor: encryptSavPayload({ messageId: crypto.randomUUID(), gate: "team", reason: "finance", at: "2026-11-22T19:00:00.000Z" }) });
+
+    const response = await callTool("v2_shadow_report", args);
+    const data = response.result?.structuredContent?.data as { summary: unknown; cases: Array<Record<string, unknown>>; casesTotal: number; itemsWithoutResult: unknown; rowsTruncated: boolean };
+    expect(response.result?.structuredContent?.outcome).toBe("done");
+    expect(data.summary).toEqual(JSON.parse(JSON.stringify(aggregateSmartShadow([handoff, reply], [{ reason: "finance" }]))));
+    expect(data.summary).toMatchObject({ support: { mails: 2, outcomes: { handoff: 1, reply: 1 } }, discardedByV1: { mails: 1, byReason: { finance: 1 } } });
+    expect(data).toMatchObject({ casesTotal: 2, itemsWithoutResult: { pending: 1 }, rowsTruncated: false });
+    expect(data.cases.map(line => line.outcome)).toEqual(["reply", "handoff"]);
+    expect(data.cases[1]).toEqual({
+      messageId: message!.id, threadId: thread!.id, day: "2026-11-22", receivedAt: "2026-11-22T17:00:00.000Z", startedAt: "2026-11-22T18:10:00.000Z", durationMs: 4_200, v1Gate: "support",
+      outcome: "handoff", reasons: ["refused_after_correction"], sensitiveStop: null, decisionOutcome: "handoff", handoffReason: "no_source",
+      teamNote: { raison: "no_source", verified: 1, tried: 1, hypotheses: 0, nextCheck: true, toldCustomer: false },
+      serverRefusals: { first: ["need_not_covered"], second: ["excerpt_not_found"] },
+      verifyRefusals: { first: { verdict: "non_conforme", codes: ["unlisted_claim"] }, second: null },
+      corrected: true, progressed: true, missingThemes: ["facturation"], sources: [{ cardId: "fiche-connexion", version: "v3", needs: 1 }],
+      decidePasses: [{ pass: 1, action: "tools", status: null, code: null }, { pass: 2, action: "final", status: null, code: null }],
+      tools: [{ pass: 1, tool: "chercher_fiches", status: "ok", code: null, bytes: 300 }],
+      calls: [{ kind: "decide", status: "ok", problem: null, inputBytes: 9_000, uncertain: false, sent: true, inputTokens: 1_000, outputTokens: 200 }],
+      costMicroUsd: 1_500, revision: { prompt: "smart-v19", promptSha256: "a".repeat(16), contract: "c5", model: "gemini-test", codeSha: "e0a23e6f" } });
+    expect(data.cases[0]).toMatchObject({ threadId: null, teamNote: null, day: "2026-11-23" });
+    const text = JSON.stringify(response);
+    for (const marker of LEAK) expect(text).not.toContain(marker);
+
+    const filtered = (await callTool("v2_shadow_report", { ...args, outcome: "handoff" })).result?.structuredContent?.data as { cases: unknown[]; casesTotal: number; summary: unknown };
+    expect(filtered.cases).toHaveLength(1); expect(filtered.casesTotal).toBe(1); expect(filtered.summary).toEqual(data.summary);
+  });
+  it("lists 50 mails at most, newest first, and says how many remain", async () => {
+    for (let n = 0; n < 53; n++) await storeShadow("2026-11-22", "done", shadowRow(crypto.randomUUID(), "handoff", { costMicroUsd: n }));
+    const data = (await callTool("v2_shadow_report", args)).result?.structuredContent?.data as { cases: unknown[]; casesTotal: number; casesTruncated: boolean };
+    expect(data.cases).toHaveLength(50); expect(data).toMatchObject({ casesTotal: 53, casesTruncated: true, summary: { support: { mails: 53 } } });
+  });
 });
