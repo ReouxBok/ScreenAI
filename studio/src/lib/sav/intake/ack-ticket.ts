@@ -13,16 +13,18 @@ export function savAckTicketSummary(currentText: string): string {
   return line.length > SUMMARY_MAX ? `${line.slice(0, SUMMARY_MAX - 1).trimEnd()}…` : line;
 }
 
-/** The note added to the thread's ticket. `previousStage` is the stage read before the link: an open ticket is moved back to « Nouveau ». */
-export function savAckTicketNote(currentText: string, previousStage: "new" | "open"): string {
+/** The note added to the thread's ticket. `previousStage` is the stage read before the link: an open ticket is moved back to « Nouveau », a closed
+ * one is reopened in « Nouveau » (Ugo 23/11: most thanks arrive after the team closed the ticket; the team confirms the resolution and closes again). */
+export function savAckTicketNote(currentText: string, previousStage: "new" | "open" | "closed"): string {
   return [`Le client remercie / confirme la résolution : « ${savAckTicketSummary(currentText)} »`,
-    previousStage === "open" ? "Le ticket repasse en Nouveau : l'équipe confirme la résolution puis le ferme."
+    previousStage === "closed" ? "Le ticket est rouvert et repasse en Nouveau : l'équipe confirme la résolution puis le referme."
+      : previousStage === "open" ? "Le ticket repasse en Nouveau : l'équipe confirme la résolution puis le ferme."
       : "Le ticket est en Nouveau : l'équipe confirme la résolution puis le ferme."].join("\n");
 }
 
 /** Why an acknowledgement stays without ticket (today's « acknowledgement_only »), when the fact was given to the engine. */
-export const SAV_ACK_TICKET_REASONS = ["no_thread_ticket", "contact_not_found", "contact_ambiguous", "thread_ticket_not_on_contact", "thread_ticket_closed",
-  "thread_ticket_stage_unknown", "multi_ticket_warning_unavailable", "crm_incomplete"] as const;
+export const SAV_ACK_TICKET_REASONS = ["no_thread_ticket", "contact_not_found", "contact_ambiguous", "thread_ticket_not_on_contact", "thread_ticket_owner_unknown",
+  "thread_ticket_closed_after_mail", "thread_ticket_stage_unknown", "multi_ticket_warning_unavailable", "crm_incomplete"] as const;
 export type SavAckTicketReason = typeof SAV_ACK_TICKET_REASONS[number];
 export type SavAckTicketOutcome = Readonly<{ outcome: "attached"; ticketId: string }> | Readonly<{ outcome: "not_attached"; reason: SavAckTicketReason }>;
 
@@ -31,7 +33,8 @@ export const savAckTicketReasonLabels: Record<SavAckTicketReason, string> = {
   contact_not_found: "aucune fiche HubSpot pour l’expéditeur (pas de mail d’identification pour un remerciement)",
   contact_ambiguous: "plusieurs fiches HubSpot possibles",
   thread_ticket_not_on_contact: "le ticket du fil n’est pas sur la fiche de l’expéditeur",
-  thread_ticket_closed: "le ticket du fil est déjà fermé",
+  thread_ticket_owner_unknown: "propriétaire du ticket fermé illisible (la réouverture doit le conserver)",
+  thread_ticket_closed_after_mail: "ticket fermé après ce mail (ou date de fermeture inconnue) : pas de réouverture",
   thread_ticket_stage_unknown: "étape du ticket du fil inconnue",
   multi_ticket_warning_unavailable: "avertissement « plusieurs tickets ouverts » indisponible",
   crm_incomplete: "lecture HubSpot incomplète",

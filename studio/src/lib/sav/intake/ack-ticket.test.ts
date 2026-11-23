@@ -122,9 +122,52 @@ describe("SAV-128 an acknowledgement goes into its thread's ticket", () => {
     expect(f.calls).toEqual(["analyse"]);
     expect(savAckTicketConsoleReason(plan.acknowledgementTicket)).toContain("Non rattaché au ticket : aucun ticket lié au fil.");
   });
-  it("thread ticket closed: never reopened by a thank-you", async () => {
-    const f = fixture(); f.tickets[0] = ticket("201", { stage: "closed", closedAt: "2026-11-20T00:00:00.000Z" });
-    acknowledgementOnly(await f.run(), "thread_ticket_closed");
+  it("thread ticket closed by the team: reopened in New, owner kept, mail + note attached", async () => {
+    const f = fixture(); f.tickets[0] = ticket("201", { stage: "closed", closedAt: "2026-11-20T00:00:00.000Z", ownerId: "77" });
+    const plan = await f.run();
+    const d = linked(plan);
+    expect(d.target).toMatchObject({ operation: "reopen", ticketId: "201", contactId: "101", preserveOwnerId: "77" });
+    expect(plan.steps.map(s => s.mutation)).toEqual(["link_ticket", "associate_email", "append_ticket_note", "set_ticket_new"]);
+    expect(plan.steps.every(s => s.ticketId === "201")).toBe(true);
+    expect(d.note).toMatchObject({ kind: "acknowledgement_summary", previousStage: "closed", warningPrefix: null });
+    expect(d.multiTicketNote.openTicketIdsOnTargetContact).toEqual([]);
+    expect(plan.noteText).toBe("Le client remercie / confirme la résolution : « J'ai trouvé l'option et j'ai supprimé le compte de test, désolé pour le dérangement. »\n"
+      + "Le ticket est rouvert et repasse en Nouveau : l'équipe confirme la résolution puis le referme.");
+    expect(plan.acknowledgementTicket).toEqual({ outcome: "attached", ticketId: "201" });
+    expect(f.calls).not.toContain("assess");
+    expect(savIntakeDecisionSchema.safeParse(plan.decision).success).toBe(true);
+  });
+  it("closed long ago (beyond the support 15-day window): still the thread's ticket reopened, never a new ticket", async () => {
+    const f = fixture(); f.tickets[0] = ticket("201", { stage: "closed", closedAt: "2026-06-01T00:00:00.000Z", ownerId: null });
+    const plan = await f.run();
+    expect(linked(plan).target).toMatchObject({ operation: "reopen", ticketId: "201", preserveOwnerId: null });
+    expect(plan.newTicket).toBeUndefined();
+    expect(plan.steps.some(s => s.mutation === "create_ticket")).toBe(false);
+  });
+  it("closed thread ticket while another ticket is open: the approved warning prefixes the note", async () => {
+    const f = fixture(); f.tickets[0] = ticket("201", { stage: "closed", closedAt: "2026-11-20T00:00:00.000Z", ownerId: null }); f.tickets.push(ticket("202"));
+    const plan = await f.run();
+    const d = linked(plan);
+    expect(d.target).toMatchObject({ operation: "reopen", ticketId: "201" });
+    expect(d.multiTicketNote.openTicketIdsOnTargetContact).toEqual(["202"]);
+    expect(plan.noteText?.startsWith(`${warning}\n\nLe client remercie`)).toBe(true);
+  });
+  it("closed thread ticket with an unreadable owner: no reopen (the owner must be kept), today's plan", async () => {
+    const f = fixture(); f.tickets[0] = ticket("201", { stage: "closed", closedAt: "2026-11-20T00:00:00.000Z" }); delete f.tickets[0].ownerId;
+    acknowledgementOnly(await f.run(), "thread_ticket_owner_unknown");
+  });
+  it.each([["closed after the mail", "2026-11-23T10:06:00.000Z"], ["closing date unknown", undefined]])("thread ticket %s: never reopened (re-analysis safe)", async (_name, closedAt) => {
+    const f = fixture(); f.tickets[0] = ticket("201", { stage: "closed", ownerId: null, ...(closedAt ? { closedAt } : {}) });
+    acknowledgementOnly(await f.run(), "thread_ticket_closed_after_mail");
+  });
+  it("contract: a reopen carries the closed stage in its note", async () => {
+    const f = fixture(); f.tickets[0] = ticket("201", { stage: "closed", closedAt: "2026-11-20T00:00:00.000Z", ownerId: null });
+    const plan = await f.run(); const d = linked(plan);
+    const parsed = savIntakeDecisionSchema.safeParse({ ...plan.decision, disposition: { ...d, note: { ...d.note!, previousStage: "open" } } });
+    expect(parsed.success).toBe(false);
+    expect(JSON.stringify(parsed.error?.issues)).toContain("SAV_INTAKE_ACKNOWLEDGEMENT_NOTE_INVALID");
+    const noStage = savIntakeDecisionSchema.safeParse({ ...plan.decision, disposition: { ...d, requiredPermissions: ["link_ticket", "associate_email", "append_ticket_note"] } });
+    expect(noStage.success).toBe(false);
   });
   it("thread ticket not on the sender's contact: nothing attached, no other ticket chosen", async () => {
     const f = fixture(); f.tickets[0] = ticket("201", { contactIds: ["999"] }); f.tickets.push(ticket("202"));

@@ -550,26 +550,33 @@ export async function planSavIntake(
     }
     if (evidence.length > 95) return context("history_incomplete");
     if (acknowledgementTicketId) {
-      // SAV-128: the thread's ticket, nothing else: it must be on the identified contact (or a directly associated one) and open. A closed ticket is
-      // never reopened by a thank-you (the team already closed it); any doubt keeps today's plan.
+      // SAV-128: the thread's ticket, nothing else: it must be on the identified contact (or a directly associated one). Open: back to « Nouveau ».
+      // Closed (Ugo 23/11, most thanks come after the team closed it): reopened in « Nouveau », owner kept, whatever its closing date (a thank-you never
+      // creates a new ticket). Any doubt keeps today's plan.
       const ticketId: string = acknowledgementTicketId;
       const threadTicket = tickets.get(ticketId);
       if (!threadTicket) return acknowledgementOnly("thread_ticket_not_on_contact");
       if (threadTicket.stage === "unknown") return acknowledgementOnly("thread_ticket_stage_unknown");
-      if (threadTicket.stage === "closed") return acknowledgementOnly("thread_ticket_closed");
+      // The reopen keeps the owner the ticket has: an unreadable owner is no reopen (same rule as a support follow-up).
+      if (threadTicket.stage === "closed" && threadTicket.ownerId === undefined) return acknowledgementOnly("thread_ticket_owner_unknown");
+      // Closed AFTER this mail (or at an unknown date): the team already saw the thank-you and closed; a re-analysis never reopens it.
+      if (threadTicket.stage === "closed" && !(threadTicket.closedAt && Date.parse(threadTicket.closedAt) <= Date.parse(message.receivedAt)))
+        return acknowledgementOnly("thread_ticket_closed_after_mail");
       const contactId = threadTicket.contactIds.includes(primary.id) ? primary.id : threadTicket.contactIds.filter(id => scopeContacts.some(c => c.contactId === id)).sort()[0];
       if (!contactId) return acknowledgementOnly("thread_ticket_not_on_contact");
       const openIds = candidateTickets.filter(t => t.stage !== "closed" && t.contactIds.includes(contactId)).map(t => t.id).sort();
-      const warning = openIds.length > 1 ? policy.resources.multiTicketWarning : undefined;
-      if (openIds.length > 1 && (!warning || createHash("sha256").update(warning.text).digest("hex") !== warning.sha256)) return acknowledgementOnly("multi_ticket_warning_unavailable");
+      const multiple = openIds.length + (threadTicket.stage === "closed" ? 1 : 0) > 1;
+      const warning = multiple ? policy.resources.multiTicketWarning : undefined;
+      if (multiple && (!warning || createHash("sha256").update(warning.text).digest("hex") !== warning.sha256)) return acknowledgementOnly("multi_ticket_warning_unavailable");
       const warningResource = warning ? savIntakePrivateResourceSchema.parse({ resourceId: warning.resourceId, revisionId: warning.revisionId, sha256: warning.sha256 }) : null;
-      const previousStage = threadTicket.stage === "new" ? "new" as const : "open" as const;
+      const previousStage = threadTicket.stage === "new" ? "new" as const : threadTicket.stage === "closed" ? "closed" as const : "open" as const;
       noteText = [warning?.text, savAckTicketNote(message.currentText, previousStage)].filter(Boolean).join("\n\n");
       const binding = { ticketId, contactId, ticketEvidenceId: `ticket-${ticketId}`, contactAssociationEvidenceId: `membership-${ticketId}-${contactId}` };
       const permissions: Extract<SavIntakeDecision["disposition"], { kind: "ticket" }>["requiredPermissions"] = ["link_ticket", "associate_email", "append_ticket_note"];
-      if (previousStage === "open") permissions.push("set_ticket_new");
+      if (previousStage !== "new") permissions.push("set_ticket_new");
       acknowledgementOutcome = { outcome: "attached", ticketId };
-      return finalize({ kind: "ticket", target: { operation: "link", ...binding, alreadyNew: previousStage === "new" }, requestIds: requests.map(r => r.id),
+      return finalize({ kind: "ticket", target: previousStage === "closed" ? { operation: "reopen", ...binding, preserveOwnerId: threadTicket.ownerId ?? null }
+        : { operation: "link", ...binding, alreadyNew: previousStage === "new" }, requestIds: requests.map(r => r.id),
         contactScope: { primaryContactId: primary.id, contacts: scopeContacts, complete: true }, search: "complete", history: "complete",
         identity: { kind: "unique_crm_match_for_intake", addressOrigin, scope: "intake_only", evidenceIds: identityEvidenceIds },
         sameIssueEvidenceIds: unique([current, `ticket-${ticketId}`, `history-${ticketId}`]).sort(), requiredPermissions: permissions,

@@ -158,7 +158,7 @@ const ticketNote = z.discriminatedUnion("kind", [
   // One note containing only the approved warning, without a new return summary.
   z.object({ kind: z.literal("multi_ticket_warning_only"), warningResource: savIntakePrivateResourceSchema, ...noteOrigin }).strict(),
   // SAV-128: a customer's acknowledgement put into the open ticket of its thread (`ack-ticket.ts`), for the team to confirm the resolution.
-  z.object({ kind: z.literal("acknowledgement_summary"), version: z.literal(SAV_ACK_TICKET_NOTE_VERSION), previousStage: z.enum(["new", "open"]),
+  z.object({ kind: z.literal("acknowledgement_summary"), version: z.literal(SAV_ACK_TICKET_NOTE_VERSION), previousStage: z.enum(["new", "open", "closed"]),
     warningPrefix: z.object({ placement: z.literal("before_summary"), resource: savIntakePrivateResourceSchema }).strict().nullable(),
     ...noteOrigin,
   }).strict(),
@@ -238,7 +238,7 @@ export const savIntakeDecisionSchema = z.object({
   else if (outsideKinds.length > 1) compatible = ["mixed"];
   else compatible = neutralKinds;
   if (!compatible.includes(decision.classification)) reject("SAV_INTAKE_REQUEST_CLASSIFICATION_MISMATCH");
-  // SAV-128: only an acknowledgement (every request one) may also go into the open ticket of its thread; nothing else changes.
+  // SAV-128: only an acknowledgement (every request one) may also go into the ticket of its thread (open, or reopened); nothing else changes.
   const acknowledgementOnly = decision.classification === "acknowledgement" && kinds.size === 1 && kinds.has("acknowledgement");
   if (unresolved || compatible.includes("mixed")) {
     if (disposition.kind !== "collect_context" || !disposition.reasons.includes("classification_incomplete")) reject("SAV_INTAKE_CLASSIFICATION_CONTEXT_REQUIRED");
@@ -250,7 +250,7 @@ export const savIntakeDecisionSchema = z.object({
     referenced.push(...disposition.sameIssueEvidenceIds, ...disposition.identity.evidenceIds, ...disposition.contactScope.contacts.flatMap(contact => contact.evidenceIds));
     if (!currentRequestIds.length || currentRequestIds.length !== disposition.requestIds.length
       || currentRequestIds.some(id => !disposition.requestIds.includes(id))) reject("SAV_INTAKE_ALL_REQUESTS_ONE_TICKET_REQUIRED");
-    const acknowledgementTicket = acknowledgementOnly && disposition.target.operation === "link" && disposition.note?.kind === "acknowledgement_summary";
+    const acknowledgementTicket = acknowledgementOnly && ["link", "reopen"].includes(disposition.target.operation) && disposition.note?.kind === "acknowledgement_summary";
     if (!["support", "finance", "cancellation"].includes(decision.classification) && !acknowledgementTicket) reject("SAV_INTAKE_TICKET_CLASSIFICATION_REQUIRED");
     if (disposition.note?.kind === "acknowledgement_summary" && !acknowledgementTicket) reject("SAV_INTAKE_ACKNOWLEDGEMENT_NOTE_INVALID");
     if (!disposition.contactScope.complete || !disposition.contactScope.contacts.some(contact => contact.contactId === disposition.target.contactId)) reject("SAV_INTAKE_TARGET_OUTSIDE_SCOPE");
@@ -315,7 +315,7 @@ export const savIntakeDecisionSchema = z.object({
     if (!multipleOpenAfterAction && warning) reject("SAV_INTAKE_UNNECESSARY_WARNING");
     // SAV-128: the acknowledgement note is always written, and names the stage the link found.
     if (note?.kind === "acknowledgement_summary") {
-      if (target.operation !== "link" || note.previousStage !== (target.alreadyNew ? "new" : "open")) reject("SAV_INTAKE_ACKNOWLEDGEMENT_NOTE_INVALID");
+      if (note.previousStage !== (target.operation === "reopen" ? "closed" : target.operation === "link" ? (target.alreadyNew ? "new" : "open") : null)) reject("SAV_INTAKE_ACKNOWLEDGEMENT_NOTE_INVALID");
     } else if (returnsToNew) {
       if (note?.kind !== "existing_return_summary" || note.previousState !== (target.operation === "reopen" ? "closed" : "open")) reject("SAV_INTAKE_RETURN_SUMMARY_REQUIRED");
     } else if (multipleOpenAfterAction) {
