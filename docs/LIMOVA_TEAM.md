@@ -10,15 +10,15 @@ L’extension se connecte à Limova Team comme un appareil, à côté de Limova 
 | `connections.js` | Une connexion par produit dans `chrome.storage.local` (`limova_connections_v1`), révocation `DELETE /api/v1/devices/me`. |
 | `pairing.js`, `pair-callback.html/.js` | Appairage PKCE par un onglet normal du tableau de bord et une page de retour de l’extension. |
 | `device-socket.js` | WebSocket `limova-device.v1`, hello, ping 25 s, état, appels, cache 10 min, reconnexion et codes 4401/4404/4409/4400. |
-| `team-controller.js` | Autonomie, accords, prise de main, « Tout arrêter », `set_autonomy`, `browser_control`. |
-| `risk.js` | Lecture du risque d’une action, choix « exécuter » ou « demander », vérification de `target`. |
+| `team-controller.js` | Autonomie, jeton de paiement, prise de main, « Tout arrêter », `set_autonomy`, `browser_control`. |
+| `risk.js` | Lecture du risque d’une action (un paiement demande un jeton), vérification de `target`. |
 | `browser-engine.js` | Outils `browser.*`, groupe d’onglets, vérification après action, captures. |
 | `page-snapshot.js`, `page-actions.js` | Fonctions injectées dans le monde isolé de l’onglet : carte de page, actions, messages affichés. |
-| `approvals.js`, `approval.html/.js` | Petite fenêtre « Autoriser » / « Refuser », et choix d’un onglet pour `browser.request_tab`. |
+| `payment-token.js` | TEAM-757 : vérification du `payment_token` d’un paiement (appareil, empreinte, expiration, signature, usage unique). |
 | `team-panel.js/.css` | Section « Connexions » du panneau latéral, bandeau d’activité. |
 | `team-service.js` | Assemblage dans le service worker, badge, alarme de reconnexion. |
 | `vault.js` | TEAM-729 : clé ECDH P-256 par connexion (non exportable, en mémoire), ouverture du scellé de `browser.fill_secret`. |
-| `login-offers.js`, `page-login-watch.js`, `save-login.html/.js` | TEAM-729 : repérer une connexion réussie, demander « Enregistrer cette connexion pour Limova ? », l’envoyer après « Enregistrer ». |
+| `login-offers.js`, `page-login-watch.js` | TEAM-729 : repérer une connexion réussie, proposer « Enregistrer cette connexion pour Limova ? » (notice du panneau depuis TEAM-757), l’envoyer après « Enregistrer ». |
 | `session-export.js` | TEAM-729 : « Envoyer ma session à Limova », un site à la fois, après consentement. |
 
 ## `browser.v2` (TEAM-726)
@@ -29,13 +29,22 @@ L’extension se connecte à Limova Team comme un appareil, à côté de Limova 
 - `include_page: true` sur `open_tab`, `navigate`, `scroll`, `click`, `fill`, `select`, `submit`, `download` et `batch` renvoie `data.page` (4000 caractères et 200 éléments par défaut).
 - `browser.batch` : 1 à 20 étapes `fill` / `select` / `check` / `click` sur un même instantané, toutes vérifiées avant la première, arrêt à la première erreur, et une navigation termine le lot (`stale_snapshot` pour la suite).
 
+## `browser.v3` (TEAM-757)
+
+Contrat : `docs/browser-device-protocol.md` (team-backend), « The chat level is the only permission, and the AI picks the browser ». Le `hello` annonce `browser.v3`.
+
+- Aucune demande de l’extension : ni fenêtre d’accord, ni choix d’onglet, ni fenêtre de paiement, ni fenêtre d’enregistrement de connexion. Le niveau du sélecteur du chat (TEAM-754) est la seule permission ; le serveur demande dans le chat quand ce niveau le veut.
+- `browser.request_tab` : l’onglet actif de la dernière fenêtre normale rejoint le groupe (badge « IA »). Si cet onglet est le tableau de bord de Limova Team, d’où la personne écrit, c’est l’onglet utilisé juste avant dans cette fenêtre (`lastAccessed`). `reason` reste dans l’activité.
+- Paiement : une action lue `pay` (par le serveur ou par l’extension) s’exécute seulement avec un `payment_token` valide : `device_id` de cette connexion, `exp_ms` à venir, `fp` = SHA-256 de `["limova-pay.v1", tool, tab_id, snapshot_id, targets]` en JSON compact, `sig` = HMAC-SHA256 avec la clé SHA-256 (hex) du jeton de l’appareil, `id` jamais vu (gardé jusqu’à expiration). Sinon : `payment_confirmation_required`, sans aucun effet sur la page ; le serveur montre alors la carte de paiement dans le chat et renvoie l’appel avec un jeton.
+- « Enregistrer cette connexion pour Limova ? » est une notice du panneau latéral, qui disparaît seule à l’expiration de la capture (deux minutes).
+
 ## Connexions enregistrées et sessions (TEAM-729)
 
 Contrat : `docs/login-vault.md` du dépôt team-backend (`browser.v1+vault`, `browser.v1+cookies`), derrière `login_vault_enabled` côté serveur.
 
 - **Clé du coffre.** À chaque ouverture de la connexion, une nouvelle paire ECDH P-256 (WebCrypto, clé privée non exportable, en mémoire seulement, oubliée à la fermeture). Le `hello` annonce `browser.v1+vault` et `browser.v1+cookies` et porte `vault_key` (`kty`, `crv`, `x`, `y`).
 - **`browser.fill_secret`.** Ouverture : ECDH → HKDF-SHA256 (sel = `call_id`, info = `limova-vault-fill.v1`) → AES-256-GCM avec l’AAD `limova-vault-fill.v1|<call_id>|<device_id>` (`device_id` du `ready`). Puis, dans l’ordre : groupe, pause et prise de main ; scellé (`secret_unreadable` pour un autre appel, un autre appareil ou une expiration) ; origine réelle de l’onglet, lue dans Chrome puis dans la page, égale à `args.origin` et à l’une des origines scellées (`origin_mismatch`) ; identifiants de l’instantané (`stale_snapshot`, `element_not_found`) et nature des champs (`invalid_args`) ; destination du formulaire, `formaction` compris (`origin_mismatch`). Chaque champ est revérifié juste avant d’être tapé, car les scripts de la page s’exécutent pendant les événements du champ précédent. Réponse : `ActionResult`, `filled`, `page` si demandé, jamais une valeur. `browser.fill` et `browser.batch` refusent toujours les champs sensibles.
-- **Proposer d’enregistrer.** Observateur injecté dans le monde isolé des onglets du groupe (et des autres onglets si la case « Proposer aussi d’enregistrer mes connexions dans mes onglets » est cochée). Connexion réussie = navigation ou disparition du champ dans les 10 s, sans retour du formulaire. Pas sur `http:`, les sites bloqués, un formulaire d’inscription, juste après un remplissage par Limova ni sur la liste « Jamais pour ce site ». `GET /devices/me/login-secrets?origin=` choisit entre « Enregistrer cette connexion pour Limova ? » et « Mettre à jour la connexion enregistrée ? » (un 404 coupe la proposition 10 minutes) ; la fenêtre ne reçoit qu’un identifiant opaque ; « Enregistrer » envoie `POST /devices/me/login-secrets`. Mot de passe en mémoire deux minutes au plus. Après « Pas maintenant », le site n’est plus proposé pendant 10 minutes.
+- **Proposer d’enregistrer.** Observateur injecté dans le monde isolé des onglets du groupe (et des autres onglets si la case « Proposer aussi d’enregistrer mes connexions dans mes onglets » est cochée). Connexion réussie = navigation ou disparition du champ dans les 10 s, sans retour du formulaire. Pas sur `http:`, les sites bloqués, un formulaire d’inscription, juste après un remplissage par Limova ni sur la liste « Jamais pour ce site ». `GET /devices/me/login-secrets?origin=` choisit entre « Enregistrer cette connexion pour Limova ? » et « Mettre à jour la connexion enregistrée ? » (un 404 coupe la proposition 10 minutes) ; la question est une notice non bloquante du panneau latéral (site et identifiant, jamais le mot de passe) ; « Enregistrer » envoie `POST /devices/me/login-secrets`. Mot de passe en mémoire deux minutes au plus. Après « Pas maintenant », le site n’est plus proposé pendant 10 minutes.
 - **« Envoyer ma session à Limova ».** Dans le panneau, site de l’onglet courant proposé, modifiable ; le service worker le ramène au domaine enregistrable, l’écran de consentement nomme ce domaine, puis `chrome.cookies.getAll({ domain })` et `POST /devices/me/session-profiles` (300 cookies et 256 Kio au plus, LinkedIn et Limova refusés).
 - **`import_sessions`.** Réservé à Limova Desktop : l’extension répond toujours `cancelled`, les cookies sont déjà dans Chrome.
 
