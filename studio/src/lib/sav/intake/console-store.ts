@@ -22,6 +22,7 @@ import { readIntakeExecutionProgress } from "./executor";
 import { invalidIntakeAddressMetadata, SAV_INTAKE_INVALID_SOURCE } from "./source-validation";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 import { intakeRoutingShadowLabel, savIntakeRoutingClassLabels } from "./routing-rules";
+import { savAckTicketConsoleReason } from "./ack-ticket";
 export type ConsoleProjection = { view: SavIntakeView | null; status: string; reason: string | null };
 /** Runs only in the worker. CAS against the monotone source epoch means a new
  * inbound arriving during computation can never be cleared by an old result. */
@@ -100,7 +101,7 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
     else if (plan?.progress.kind === "qualified_other") result = { view: "other", status: "qualified_other", reason: payload.other ? `${payload.other.label} · règle ${payload.other.ruleId}`
       : plan.decision.disposition.kind === "no_ticket" && plan.decision.disposition.qualifiedInformation === "automated_noise" ? `Mail automatique · ${payload.noise?.reason ?? "filtre déterministe"}` : "Classement confirmé par un opérateur" };
     else if (plan?.decision.disposition.kind === "no_ticket" && plan.decision.disposition.reason === "acknowledgement_only")
-      result = {view:"completed",status:"acknowledgement_only",reason:"Accusé de réception sans nouvelle demande ; aucun ticket fermé par ce classement."};
+      result = {view:"completed",status:"acknowledgement_only",reason:savAckTicketConsoleReason(plan.acknowledgementTicket)};
     // SAV-92 (B): a V1 request for context the team must give is a team decision, not a technical wait.
     else result = intakeContextRequiredRoute({ disposition: plan?.decision.disposition, progressKind: plan?.progress.kind, runState: run.state,
       readRetryScheduled: payload.readRecovery?.state === "scheduled",

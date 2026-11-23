@@ -5,6 +5,7 @@ import {
   type SavIntakeDecision, type SavIntakeProgress,
 } from "./contract";
 import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "../ticket-return-note";
+import { SAV_ACK_TICKET_NOTE_VERSION, savAckTicketNote, type SavAckTicketOutcome, type SavAckTicketReason } from "./ack-ticket";
 import { savEvidenceContains } from "../evidence-text";
 import { savIntakeAccountConflict, savIntakeDeclaredAccount } from "./registration-declaration";
 import {
@@ -144,6 +145,9 @@ export async function planSavIntake(
   let candidateTicketIds: string[] | undefined;
   let selectedEquivalent: string[] | undefined;
   const humanProof = input.humanResolution ? addEvidence("human-choice", "human_override", input.humanResolution.choiceId, input.humanResolution, input.humanResolution.at) : undefined;
+  // SAV-128: set once an acknowledgement goes to the CRM path for the ticket of its thread; any refusal on that path keeps today's acknowledgement_only.
+  let acknowledgementTicketId: string | null = null;
+  let acknowledgementOutcome: SavAckTicketOutcome | undefined;
   const finalize = (disposition: SavIntakeDecision["disposition"], progress: SavIntakeProgress = { kind: "processing", phase: "context", view: null }, supervisedResource?: PrivateResource): IntakePlan => {
     const decision = savIntakeDecisionSchema.parse({
       revision: SAV_INTAKE_CONTRACT_REVISION, messageId: message.id, latestInboundMessageId: input.latestInboundMessageId,
@@ -163,10 +167,20 @@ export async function planSavIntake(
       progress: savIntakeProgressSchema.parse(progress), noteText: finalNote, ...(supervisedResource ? { supervisedResource } : {}),
       ...(finalCreation ? { newTicket: finalCreation } : {}), ...((candidateContactIds ?? selectedEquivalent) ? { candidateContactIds:candidateContactIds ?? selectedEquivalent } : {}),
       originalThreadId: message.threadId, originalRecipientEmails: [message.fromEmail], referenceMode: input.mode,
-      readCalls: calls, effects: "not_connected",
+      readCalls: calls, ...(acknowledgementOutcome ? { acknowledgementTicket: acknowledgementOutcome } : {}), effects: "not_connected",
     };
   };
-  const context = (reason: ContextReason, choice?: "equivalent_contact_choice" | "equivalent_ticket_choice" | "same_issue_uncertain" | "request_scope_uncertain") => finalize(
+  /** Today's acknowledgement plan (no ticket, no step), with the reason it was not put into the thread's ticket when that was asked. */
+  const acknowledgementOnly = (reason?: SavAckTicketReason) => {
+    if (reason) acknowledgementOutcome = { outcome: "not_attached", reason };
+    acknowledgementTicketId = null;
+    return finalize({ kind: "no_ticket", reason: "acknowledgement_only", nextAction: "none", learning: "excluded", evidenceIds: [current] }, { kind: "processing", phase: "decision", view: null });
+  };
+  const context = (reason: ContextReason, choice?: "equivalent_contact_choice" | "equivalent_ticket_choice" | "same_issue_uncertain" | "request_scope_uncertain") => acknowledgementTicketId
+    // SAV-128: an acknowledgement is never parked for the team nor retried because its ticket could not be proven: it stays as today.
+    ? acknowledgementOnly(reason === "contact_ambiguous" ? "contact_ambiguous" : reason === "ticket_stage_unknown" ? "thread_ticket_stage_unknown"
+      : reason === "private_resource_unavailable" ? "multi_ticket_warning_unavailable" : "crm_incomplete")
+    : finalize(
     { kind: "collect_context", reasons: unique([reason, ...(!requests.length || requests.some(r => r.kind === "unknown") || classification === "mixed" ? ["classification_incomplete" as const] : [])]), evidenceIds: evidence.map(e => e.id).sort() },
     choice ? { kind: "human_choice", messageId: message.id, classification: classification === "cancellation" || classification === "finance" || classification === "support" ? classification : "unknown", questionCode: choice, investigation: "bounded_investigation_complete", evidenceIds: evidence.map(e => e.id).sort(), view: "to_validate" }
       : { kind: "processing", phase: reason.startsWith("classification") ? "classification" : "context", view: null },
@@ -343,7 +357,12 @@ export async function planSavIntake(
       // Recompute from the current message. An override is not a fabricated support request.
       return context("classification_incomplete");
     }
-    if (["other", "acknowledgement", "partnership", "commercial", "investor"].includes(classification)) {
+    // SAV-128 (Ugo 23/11): an acknowledgement goes into the ticket of its Gmail thread when the runtime gives that fact (never for a verified automatic
+    // reply, handled above). No thread ticket: today's plan, its reason recorded. Otherwise the contact is identified exactly as for a support follow-up.
+    const ackFact = classification === "acknowledgement" ? policy.acknowledgementTicket : undefined;
+    if (ackFact && !(ackFact.ticketId && /^\d{1,30}$/.test(ackFact.ticketId))) return acknowledgementOnly("no_thread_ticket");
+    if (ackFact) acknowledgementTicketId = ackFact.ticketId;
+    if (!acknowledgementTicketId && ["other", "acknowledgement", "partnership", "commercial", "investor"].includes(classification)) {
       const outside = classification as "other" | "acknowledgement" | "partnership" | "commercial" | "investor";
       let ruleId: string | undefined;
       if (outside === "other") {
@@ -423,6 +442,8 @@ export async function planSavIntake(
     const expectedHumanCandidates = input.humanResolution?.equivalentContactIds;
     if (expectedHumanCandidates?.some(id => !contacts.some(contact => contact.id === id))) return context("contact_ambiguous");
     if (!contacts.length) {
+      // SAV-128: never an identification email in answer to a thank-you (the thread's ticket was identified before).
+      if (acknowledgementTicketId) return acknowledgementOnly("contact_not_found");
       if (input.previousIdentification?.messageId === message.id && normalizeEmail(input.previousIdentification.address) === address) return context("history_incomplete");
       // Night V1 (D): never an automatic identification email to an address that declares it cannot receive replies
       // (RFC 3834 spirit). Nothing is discarded: a person qualifies the message (notification or real request).
@@ -436,6 +457,8 @@ export async function planSavIntake(
         permissionRequired: "send_identity_template", learning: "not_started", evidenceIds: identityEvidenceIds }, { kind: "processing", phase: "dispatch", view: null });
     }
     function contactEvidence(c: IntakeContact, observedAt: string) { return addEvidence(`contact-${c.id}`, "crm_contact", c.id, { ...c, emails: unique(c.emails.map(normalizeEmail)).sort() }, observedAt); }
+    // SAV-128: no identity model call nor operator choice for a thank-you.
+    if (contacts.length > 1 && acknowledgementTicketId) return acknowledgementOnly("contact_ambiguous");
     if (contacts.length > 1) {
       candidateContactIds = contacts.map(c => c.id);
       for (const c of contacts) contactEvidence(c, lookup.observedAt);
@@ -515,6 +538,8 @@ export async function planSavIntake(
     const collected: { ticket: IntakeTicket; history: z.infer<typeof intakeHistorySchema> }[] = [];
     for (const ticket of candidateTickets) {
       addEvidence(`ticket-${ticket.id}`, "crm_ticket", ticket.id, ticket, ticketObservedAt.get(ticket.id)!);
+      // SAV-128: an acknowledgement compares nothing: only its thread's ticket history is read.
+      if (acknowledgementTicketId && ticket.id !== acknowledgementTicketId) continue;
       const relevantHistory = await collectHistory(ticket.id);
       collected.push({ ticket, history: relevantHistory });
       for (const contactId of ticket.contactIds.filter(id => scopeContacts.some(c => c.contactId === id))) {
@@ -524,6 +549,35 @@ export async function planSavIntake(
       }
     }
     if (evidence.length > 95) return context("history_incomplete");
+    if (acknowledgementTicketId) {
+      // SAV-128: the thread's ticket, nothing else: it must be on the identified contact (or a directly associated one) and open. A closed ticket is
+      // never reopened by a thank-you (the team already closed it); any doubt keeps today's plan.
+      const ticketId: string = acknowledgementTicketId;
+      const threadTicket = tickets.get(ticketId);
+      if (!threadTicket) return acknowledgementOnly("thread_ticket_not_on_contact");
+      if (threadTicket.stage === "unknown") return acknowledgementOnly("thread_ticket_stage_unknown");
+      if (threadTicket.stage === "closed") return acknowledgementOnly("thread_ticket_closed");
+      const contactId = threadTicket.contactIds.includes(primary.id) ? primary.id : threadTicket.contactIds.filter(id => scopeContacts.some(c => c.contactId === id)).sort()[0];
+      if (!contactId) return acknowledgementOnly("thread_ticket_not_on_contact");
+      const openIds = candidateTickets.filter(t => t.stage !== "closed" && t.contactIds.includes(contactId)).map(t => t.id).sort();
+      const warning = openIds.length > 1 ? policy.resources.multiTicketWarning : undefined;
+      if (openIds.length > 1 && (!warning || createHash("sha256").update(warning.text).digest("hex") !== warning.sha256)) return acknowledgementOnly("multi_ticket_warning_unavailable");
+      const warningResource = warning ? savIntakePrivateResourceSchema.parse({ resourceId: warning.resourceId, revisionId: warning.revisionId, sha256: warning.sha256 }) : null;
+      const previousStage = threadTicket.stage === "new" ? "new" as const : "open" as const;
+      noteText = [warning?.text, savAckTicketNote(message.currentText, previousStage)].filter(Boolean).join("\n\n");
+      const binding = { ticketId, contactId, ticketEvidenceId: `ticket-${ticketId}`, contactAssociationEvidenceId: `membership-${ticketId}-${contactId}` };
+      const permissions: Extract<SavIntakeDecision["disposition"], { kind: "ticket" }>["requiredPermissions"] = ["link_ticket", "associate_email", "append_ticket_note"];
+      if (previousStage === "open") permissions.push("set_ticket_new");
+      acknowledgementOutcome = { outcome: "attached", ticketId };
+      return finalize({ kind: "ticket", target: { operation: "link", ...binding, alreadyNew: previousStage === "new" }, requestIds: requests.map(r => r.id),
+        contactScope: { primaryContactId: primary.id, contacts: scopeContacts, complete: true }, search: "complete", history: "complete",
+        identity: { kind: "unique_crm_match_for_intake", addressOrigin, scope: "intake_only", evidenceIds: identityEvidenceIds },
+        sameIssueEvidenceIds: unique([current, `ticket-${ticketId}`, `history-${ticketId}`]).sort(), requiredPermissions: permissions,
+        multiTicketNote: { openTicketIdsOnTargetContact: openIds },
+        note: { kind: "acknowledgement_summary", version: SAV_ACK_TICKET_NOTE_VERSION, previousStage, warningPrefix: warningResource ? { placement: "before_summary", resource: warningResource } : null,
+          sourceMessageId: message.id, sourceEvidenceIds: [current], renderedContentHash: sha(noteText), deduplication: "source_message_and_final_ticket" },
+        learning: "excluded", evidenceIds: [current, primaryProof] }, { kind: "processing", phase: "dispatch", view: null });
+    }
     const parsedAssessment = issueAssessmentSchema.safeParse(await bounded(signal => adapters.assessIssues({ message, requests: analysis.requests, tickets: collected, evidence: [...evidence], ...(initialProof ? { requestContext: initial } : {}) }, signal), "same_issue_unresolved", modelTimeoutMs));
     if (!parsedAssessment.success) return context("same_issue_unresolved");
     const assessment = parsedAssessment.data;

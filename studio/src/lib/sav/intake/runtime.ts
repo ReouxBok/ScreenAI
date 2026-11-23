@@ -54,7 +54,9 @@ export async function enqueueConfiguredSavIntake(messageId: string) {
 async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: IntakeRuntimeConfig,
   deps: { env?: () => Record<string, string | undefined>; network?: typeof fetch; downloadAttachments?: Parameters<typeof prepareIntakeAttachments>[3]; authenticateOther?: Parameters<typeof qualifyRuntimeOther>[3]; startReadRecovery?: (runId:string)=>Promise<unknown>; deadlineMs?: number;
     /** V2 (11/11): when the caller (a wake step) must be done; a V2 reply queued on this mail may then be sent at once. Absent in the shared worker. */
-    v2ImmediateDeadlineMs?: number } = {}) {
+    v2ImmediateDeadlineMs?: number;
+    /** SAV-128: the acknowledgement-into-ticket fact (`ack-ticket-store.ts`); injectable for tests. */
+    acknowledgementTicket?: typeof import("./ack-ticket-store").intakeAcknowledgementTicketFact } = {}) {
   const env = deps.env ?? (() => process.env), network = deps.network ?? fetch;
   const held: { cause?: Parameters<typeof intakeResumeHoldReason>[0] } = {};
   const lease = await claimSavIntakeRun(runId, config, new Date(), {
@@ -218,7 +220,11 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     });
     const otherPolicy = qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule" as const}} : { ...config.policy,
       otherRuleStatus: otherEvaluation.state === "qualified" ? undefined : otherEvaluation.state };
-    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, { ...otherPolicy, ...(quotedMailboxReply ? { quotedMailboxReply: true as const } : {}), ...(quotedTeamReply ? { quotedTeamReply: true as const } : {}) },
+    // SAV-128: an acknowledgement goes into its thread's ticket unless `SAV_ACK_CLOSE=on` or V2 owns the thread/ticket; unreadable: today's path.
+    const acknowledgementTicket = await (deps.acknowledgementTicket ?? (await import("./ack-ticket-store")).intakeAcknowledgementTicketFact)(
+      { threadId: lease.input.message.threadId, threadTicketId: lease.threadTicketId }, env()).catch(() => undefined);
+    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, { ...otherPolicy, ...(quotedMailboxReply ? { quotedMailboxReply: true as const } : {}), ...(quotedTeamReply ? { quotedTeamReply: true as const } : {}),
+      ...(acknowledgementTicket ? { acknowledgementTicket } : {}) },
       // SAV-92: CRM reads keep 10 s each; the model gets the whole shared AI allowance, exactly like the comparison campaign.
       { timeoutMs: 10_000, modelTimeoutMs: SAV_INTAKE_ANALYSIS_TIMING.modelMs }, () => new Date()));
     assertSavIntakeObservation(payload.plan);
