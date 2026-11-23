@@ -19,6 +19,9 @@ import { qualifyThreadlessTicket, readThreadlessTicket, threadlessAccessQualifie
 import { threadlessAutoSendProblem } from "./first-mail/first-mail-rights";
 import { buildNewThreadSendIntent, THREADLESS_MAILBOX, type createThreadlessTransport, type NewThreadAck, type NewThreadReceipt, type NewThreadSendIntent, type ThreadlessCrmAck } from "./threadless-transport";
 import type { CaseRuntimeDeps } from "./case-runtime-effects";
+import { enqueueCaseTicketStage } from "./case-ticket-stage-queue";
+import { recordCaseComponentOutcome } from "./case-component-outcome";
+import { isTerminalReply } from "./case-terminal-reply";
 
 const parents = savCaseEffectExecutions;
 const ledger = savIntakeEffects;
@@ -108,9 +111,10 @@ async function verifyAndPersist(parent: Parent, effect: Effect, deps: PassDeps, 
     }
     const payload = decryptSavPayload<Payload>(parent.payloadCiphertext);
     if (intent.kind === SEND_KIND && proof.kind === SEND_KIND) {
-      await persistVerifiedThread(tx, payload.proposal, intent, proof.receipt, current.id);
+      const threadId = await persistVerifiedThread(tx, payload.proposal, intent, proof.receipt, current.id);
       await confirmExecutionEffect(current, proof.receipt, proof.receipt, tx);
       await updateParent(tx, parent.id, "waiting", CRM_PENDING);
+      await queueWaitingCustomerStage(tx, parent, payload.proposal, threadId, proof.receipt.sentAt, deps.env);
     } else if (intent.kind === CRM_KIND && proof.kind === CRM_KIND) {
       const [message] = await tx.update(savMessages).set({ hubspotEmailId: proof.receipt.id }).where(and(
         eq(savMessages.mailboxId, intent.sent.mailboxId), eq(savMessages.gmailMessageId, intent.receipt.id), eq(savMessages.direction, "outbound"),
@@ -161,6 +165,25 @@ async function persistVerifiedThread(tx: ExecutionTx, proposal: CaseReplyProposa
       caseId: snapshot.caseId, expectedVersion: logged.version, actor: { type: "agent" }, phase: "awaiting_customer",
       body: { ...snapshot.body, waiting: { kind: "customer", reasonCode: "threadless_first_contact", since: receipt.sentAt } },
     }, tx);
+  return thread.id;
+}
+
+/**
+ * Ugo (23/11): the agent sent the customer a mail, so the ticket goes « En attente de contact », for the FIRST mail of a ticket exactly as for a thread reply
+ * (`case-effect-driver.ts::commitReceipt`): queued in the transaction that confirms the Gmail receipt (a confirmed first mail and its ticket state are born
+ * together; a replay or a recovery finds the same row), through the same queue and rule (`enqueueCaseTicketStage`: `SAV_V2_TICKET_STAGES=on`, the case still the
+ * agent's, not sensitive, no team part, no customer mail since), the same key (`case-stage:<case>:waiting_customer:<reply key>`), the same parent policy and the
+ * same journal entry. Its own pass moves the ticket under `set_case_ticket_stage` and the V2 owner check; nothing is sent from here. The HubSpot email log
+ * (`log_case_threadless_email`) is not a mail to the customer and never queues a stage.
+ */
+async function queueWaitingCustomerStage(tx: ExecutionTx, parent: Parent, proposal: CaseReplyProposal, threadId: string, sentAt: string, env: () => Record<string, string | undefined>) {
+  if (isTerminalReply(proposal.purpose)) return;
+  const snapshot = await lockCaseForWrite(tx, parent.caseId);
+  const stage = await enqueueCaseTicketStage(tx, {
+    snapshot, trigger: { kind: "reply_confirmed", replyKey: parent.replyKey, sentAt: new Date(sentAt).toISOString() },
+    policy: { id: parent.policyId, hash: parent.policyHash }, env, threadId,
+  });
+  await recordCaseComponentOutcome(tx, parent.id, "status", stage.ok ? { state: "queued", executionId: stage.executionId } : { state: stage.reason === "stages_disabled" ? "skipped" : "blocked", reason: stage.reason });
 }
 
 const canVerify = (effect: Effect) => effect.state !== "planned" && effect.state !== "confirmed"

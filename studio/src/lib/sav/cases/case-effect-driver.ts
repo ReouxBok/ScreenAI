@@ -7,9 +7,9 @@ import { closeAfterConfirmedJ2 } from "./j2-confirmed-closure";
 import { isTerminalReply, closingHandoffReplyEnabled } from "./case-terminal-reply";
 import { j2AutoGate } from "./j2-auto-reminder";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, lte, notLike, or } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savCaseEffectExecutions, savCases, savIntakeEffectJournal, savIntakeEffects } from "@/db/schema";
+import { savCaseEffectExecutions, savCases, savIntakeEffects } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { readSavAgentPause, SAV_AGENT_PAUSE_CODES, savAgentPauseCode, type SavAgentPauseState } from "../intake/agent-pause";
 import { readIntakeExecutionAuthority } from "../intake/execution-policy";
@@ -21,6 +21,7 @@ import { HANDOFF_NOTICE_KEY_PREFIX } from "./case-handoff-notice";
 import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, buildReplySendIntent, type CaseNoteCreateIntent } from "./case-effect-intents";
 import { recordConfirmedCaseReply } from "./case-effect-outcomes";
 import { enqueueCaseTicketStage } from "./case-ticket-stage-queue";
+import { recordCaseComponentOutcome } from "./case-component-outcome";
 import { enqueueCaseHandoffStage } from "./case-handoff-stage";
 import { caseHandoffStageEnabled, caseTicketStageKey } from "./customer-return";
 import { TICKET_STAGE_KEY_PREFIX } from "./case-ticket-stage";
@@ -133,19 +134,6 @@ async function commitReceipt(
     if (error instanceof ReceiptOwnerChanged) return fault("CANCELLED_OWNER_CHANGED");
     throw error;
   }
-}
-
-/** The execution lock held by the caller serializes these durable, deduplicated component outcomes. */
-async function recordCaseComponentOutcome(tx: ExecutionTx, executionId: string, component: "note" | "status", outcome: Record<string, string>) {
-  const kind = `case_component_${component}`;
-  const [last] = await tx.select({ payload: savIntakeEffectJournal.payloadCiphertext }).from(savIntakeEffectJournal)
-    .where(and(eq(savIntakeEffectJournal.executionId, executionId), eq(savIntakeEffectJournal.kind, kind)))
-    .orderBy(desc(savIntakeEffectJournal.createdAt), desc(savIntakeEffectJournal.id)).limit(1);
-  const previous = last ? decryptSavPayload<Record<string, string>>(last.payload) : null;
-  // Once queued, the linked execution and its ledger own the status outcome. A later
-  // configuration refusal must not hide an already confirmed (or engaged) effect.
-  if (component === "status" && previous?.executionId && !outcome.executionId) return;
-  if (!previous || JSON.stringify(previous) !== JSON.stringify(outcome)) await executionJournal(tx, executionId, kind, outcome);
 }
 
 /** The reason a verification-only pass leaves on an execution whose reply is confirmed and recorded while its note still waits for a supervised pass. */
