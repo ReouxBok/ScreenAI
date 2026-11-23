@@ -2,6 +2,7 @@ import "server-only";
 import { collectTicketCreationHistory, ticketCreationAssociations, ticketCreationHistorySchema, verifyTicketCreationHistory } from "../ticket-creation-history";
 import { z } from "zod";
 import { createSavHubspotTransport } from "../hubspot-transport";
+import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { requestSavGmail, parseGmailMessage } from "../gmail";
 import { readSavGmailPermissions } from "../gmail-permissions";
@@ -285,7 +286,7 @@ export function createIntakeExecutorAdapters(options: {
             else if (intent.kind === "stage_new")
                 result = await hub(`/crm/v3/objects/tickets/${id(intent.ticketId)}`, "PATCH", signal, {
                     properties: {
-                        hs_pipeline_stage: "1"
+                        hs_pipeline_stage: SAV_HUBSPOT_SUPPORT.stages.new
                     }
                 });
             else if (intent.kind === "owner_assign")
@@ -356,7 +357,7 @@ export function createIntakeExecutorAdapters(options: {
             if (intent.kind === "stage_new") {
                 // Stage only: the owner is whatever the team set, never ours to check (Ugo, 27/10).
                 const row = await read("tickets", id(intent.ticketId), signal);
-                const ok = row.id === intent.ticketId && row.properties.hs_pipeline === "0" && row.properties.hs_pipeline_stage === "1";
+                const ok = row.id === intent.ticketId && row.properties.hs_pipeline === SAV_HUBSPOT_SUPPORT.pipelineId && row.properties.hs_pipeline_stage === SAV_HUBSPOT_SUPPORT.stages.new;
                 return {
                     confirmed: ok, attributed: ok && Boolean(ack?.id === intent.ticketId), ack: {
                         id: row.id

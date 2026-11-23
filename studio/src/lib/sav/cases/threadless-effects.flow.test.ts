@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, like } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../../test/sav-db";
 
@@ -6,7 +6,7 @@ const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }))
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }));
 
-import { savCases, savCaseEffectExecutions, savCaseReplyValidations, savIntakeEffects, savIntakeExecutions, savMailboxes, savMessages, savThreads, staffUsers } from "@/db/schema";
+import { savCases, savCaseEffectExecutions, savCaseReplyValidations, savIntakeEffectJournal, savIntakeEffects, savIntakeExecutions, savMailboxes, savMessages, savThreads, staffUsers } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 import { createIntakeExecutorAdapters, type GmailRequest } from "../intake/execution-adapters";
@@ -14,10 +14,12 @@ import { approveIntakeExecutionPolicy, type ExecutionPolicy } from "../intake/ex
 import { savIntakeSourceSnapshot } from "../intake/runtime-store";
 import { ingestInboundMessage } from "../service";
 import type { AdmissionPolicyRecord } from "./admission-runtime";
-import type { CaseReplyProposal } from "./case-effects";
+import { caseReplyKey, SAV_CASE_EFFECT_PERMISSIONS, type CaseReplyProposal } from "./case-effects";
 import { decideCaseReply, enqueueApprovedCaseReply } from "./case-reply-store";
 import { runCaseEffectsPass } from "./case-runtime-effects";
-import { listCaseEvents, readCase, readCaseThreadlessSource } from "./case-store";
+import { listCaseEvents, readCase, readCaseThreadlessSource, transitionCaseOwner } from "./case-store";
+import { TICKET_STAGE_KEY_PREFIX } from "./case-ticket-stage";
+import { runCaseTicketStagePass } from "./case-ticket-stage-store";
 import { readCustomerReturnFacts, routeCustomerReturn } from "./customer-return-store";
 import { SAV_CASE_ACCESS_SCOPE_REVISION } from "./investigation-access-scope";
 import { caseInvestigationReturnAwareQualify, caseReturnContentRule } from "./investigation-return-qualify";
@@ -95,12 +97,19 @@ function fixture() {
     contacts: [CONTACT], existingCrmEmail: false, loseGmailAck: false, crmUnavailable: false,
     ticketAfterSend: null as "closed" | "unavailable" | null,
   };
-  const counts = { crmReads: 0, crmPosts: 0, gmailPosts: 0, gmailSearches: 0, gmailPermissions: 0 };
+  const counts = { crmReads: 0, crmPosts: 0, gmailPosts: 0, gmailSearches: 0, gmailPermissions: 0, stageWrites: [] as Record<string, string>[] };
   let storedCrmProperties: unknown, sentMail: { subject: string; rfcId: string; body: string; at: string } | undefined;
   const network: typeof fetch = async (url, init) => {
     const path = new URL(String(url)).pathname;
     if (init?.method === "GET") counts.crmReads++;
     const ticketPath = `/crm/v4/objects/tickets/${ticketId}/associations`;
+    // The ticket stage effect's one write (its own adapter): the pipeline stage only.
+    if (init?.method === "PATCH" && path === `/crm/v3/objects/tickets/${ticketId}`) {
+      const { properties } = JSON.parse(String(init.body)) as { properties: Record<string, string> };
+      counts.stageWrites.push(properties);
+      Object.assign(ticket.properties, properties);
+      return Response.json(ticket);
+    }
     if (path === `/crm/v3/objects/tickets/${ticketId}`) {
       if (sentMail && controls.ticketAfterSend === "unavailable") return Response.json({}, { status: 503 });
       if (sentMail && controls.ticketAfterSend === "closed")
@@ -427,5 +436,122 @@ describe("PORTE 2A (P1, risk of PORTE 1F): an Access first mail already queued n
     const s = fixture(), start = await approveAndQueue(s);
     expect((await s.run(start.executionId)).supervised).toMatchObject([{ state: "confirmed" }]);
     expect(s.counts).toMatchObject({ gmailPosts: 1, crmPosts: 1 });
+  });
+});
+
+describe("Ugo 23/11: the first mail of a ticket puts it « En attente de contact », exactly as a thread reply", () => {
+  const WAITING = SAV_HUBSPOT_SUPPORT.stages.awaitingContact;
+  const stagesOn = () => {
+    vi.stubEnv("SAV_V2_TICKET_STAGES", "on");
+    vi.stubEnv("SAV_V2_STAGE_WAITING_CUSTOMER", WAITING);
+    vi.stubEnv("SAV_V2_STAGE_CLOSED", SAV_HUBSPOT_SUPPORT.stages.closed);
+  };
+  /** The same signed policy plus the stage right the reply path already uses (`set_case_ticket_stage`): no new right. */
+  const grantStageRight = async () => {
+    executionPolicy = { ...executionPolicy, mutations: [...executionPolicy.mutations, SAV_CASE_EFFECT_PERMISSIONS.stage] };
+    grant = await approveIntakeExecutionPolicy(executionPolicy);
+    vi.stubEnv("SAV_INTAKE_EXECUTION_POLICY_ID", grant.id);
+    vi.stubEnv("SAV_INTAKE_EXECUTION_POLICY_SHA256", grant.policyHash);
+  };
+  const stageRows = (caseId: string) => f.db.select().from(savCaseEffectExecutions)
+    .where(and(eq(savCaseEffectExecutions.caseId, caseId), like(savCaseEffectExecutions.replyKey, `${TICKET_STAGE_KEY_PREFIX}%`)));
+  const statusJournal = async (executionId: string) => (await f.db.select().from(savIntakeEffectJournal)
+    .where(and(eq(savIntakeEffectJournal.executionId, executionId), eq(savIntakeEffectJournal.kind, "case_component_status"))))
+    .map(row => decryptSavPayload<Record<string, string>>(row.payloadCiphertext));
+  const runStages = (owner: "v2" | "human" = "v2") => runCaseTicketStagePass({
+    env, network: fetch, deadlineMs: Date.now() + 60_000, readTicketOwner: async () => owner,
+    context: { runtime: {} as never, policy: executionPolicy }, schemaInstalled: async () => true, limit: 5,
+  });
+
+  it("a confirmed first mail queues ONE « waiting » stage under the reply's key, the stage pass writes it once, and a replay changes nothing", async () => {
+    stagesOn();
+    await grantStageRight();
+    const s = fixture(), start = await approveAndQueue(s);
+    expect((await s.run(start.executionId)).supervised).toMatchObject([{ state: "confirmed" }]);
+    const [stage, ...others] = await stageRows(start.caseId);
+    expect(others).toEqual([]);
+    const thread = await threadFor(s);
+    expect(stage).toMatchObject({
+      replyKey: `${TICKET_STAGE_KEY_PREFIX}${start.caseId}:waiting_customer:${caseReplyKey(start.caseId, start.proposal.triggerEventId)}`,
+      threadId: thread!.id, policyId: grant.id, policyHash: grant.policyHash, state: "pending",
+    });
+    expect(await statusJournal(start.executionId)).toEqual([{ state: "queued", executionId: stage!.id }]);
+
+    const pass = await runStages();
+    expect(pass).toMatchObject({ skipped: null, processed: [{ executionId: stage!.id, state: "confirmed" }] });
+    expect(s.counts.stageWrites).toEqual([{ hs_pipeline_stage: WAITING }]);
+
+    // Replay: the confirmed first mail, the stage pass and the whole runtime again. One stage, one write, one journal entry.
+    await s.run(start.executionId);
+    await s.run();
+    await runStages();
+    expect((await stageRows(start.caseId)).map(row => row.id)).toEqual([stage!.id]);
+    expect(s.counts).toMatchObject({ gmailPosts: 1, crmPosts: 1, stageWrites: [{ hs_pipeline_stage: WAITING }] });
+    expect(await statusJournal(start.executionId)).toHaveLength(1);
+  });
+
+  it("with the stages off (production), the first mail leaves as today and nothing is queued (the same « skipped » entry as a reply)", async () => {
+    const s = fixture(), start = await approveAndQueue(s);
+    expect((await s.run(start.executionId)).supervised).toMatchObject([{ state: "confirmed" }]);
+    expect(s.counts).toMatchObject({ gmailPosts: 1, crmPosts: 1, stageWrites: [] });
+    expect(await stageRows(start.caseId)).toEqual([]);
+    expect(await statusJournal(start.executionId)).toEqual([{ state: "skipped", reason: "stages_disabled" }]);
+  });
+
+  it("a send not confirmed queues nothing; once the case went to a person, the late receipt queues nothing either (owner guard)", async () => {
+    stagesOn();
+    const s = fixture(), start = await approveAndQueue(s);
+    // The provider accepted the mail, the local receipt fails: the send stays unconfirmed.
+    const [unlinked] = await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: s.ack.threadId, customerEmail: CUSTOMER }).returning();
+    const [conflicting] = await f.db.insert(savMessages).values({
+      threadId: unlinked!.id, mailboxId, gmailMessageId: s.ack.id, direction: "inbound", fromEmail: CUSTOMER,
+      bodyCiphertext: encryptSavPayload({ text: "Synthetic conflict." }), receivedAt: new Date(),
+    }).returning();
+    await s.run(start.executionId);
+    expect((await effects(start.executionId)).map(row => row.state)).toEqual(["uncertain"]);
+    expect(await stageRows(start.caseId)).toEqual([]);
+    expect(await statusJournal(start.executionId)).toEqual([]);
+
+    // A person takes the case before the receipt is recovered.
+    const before = (await readCase(start.caseId))!;
+    await f.db.transaction(tx => transitionCaseOwner({ caseId: start.caseId, expectedVersion: before.version, transition: "handoff", actor: { type: "agent" },
+      commandKey: `fixture-handoff-${start.caseId}`, reason: "fixture_person_took_it" }, tx));
+    await f.db.delete(savMessages).where(eq(savMessages.id, conflicting!.id));
+    await makeReadsDue(start.executionId);
+    await s.run(start.executionId);
+    expect((await effects(start.executionId)).find(row => row.kind === "new_thread_send")?.state).toBe("confirmed");
+    expect(await readCase(start.caseId)).toMatchObject({ owner: "human" });
+    expect(await stageRows(start.caseId)).toEqual([]);
+    expect(await statusJournal(start.executionId)).toEqual([{ state: "blocked", reason: "owner_not_agent" }]);
+    expect(s.counts.stageWrites).toEqual([]);
+  });
+
+  it("the ticket left the V2 owner in HubSpot after the queue: the stage pass writes nothing", async () => {
+    stagesOn();
+    await grantStageRight();
+    const s = fixture(), start = await approveAndQueue(s);
+    await s.run(start.executionId);
+    const [stage] = await stageRows(start.caseId);
+    expect(stage).toBeDefined();
+    await runStages("human");
+    expect(s.counts.stageWrites).toEqual([]);
+    const [after] = await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.id, stage!.id));
+    expect(after!.state).not.toBe("confirmed");
+  });
+
+  it("the HubSpot email log (log_case_threadless_email) is not a mail to the customer: it never queues a stage", async () => {
+    const s = fixture(), start = await approveAndQueue(s);
+    s.controls.ticketAfterSend = "unavailable";
+    expect((await s.run(start.executionId)).supervised).toMatchObject([{ state: "waiting", reason: "new_thread_crm_pending" }]);
+    expect(await statusJournal(start.executionId)).toEqual([{ state: "skipped", reason: "stages_disabled" }]);
+    // The stages come on only now, before the CRM log: the log alone queues nothing.
+    stagesOn();
+    s.controls.ticketAfterSend = null;
+    expect((await s.run(start.executionId)).supervised).toMatchObject([{ state: "confirmed" }]);
+    expect((await effects(start.executionId)).map(row => [row.kind, row.state]).sort()).toEqual([
+      ["new_thread_crm_email", "confirmed"], ["new_thread_send", "confirmed"],
+    ]);
+    expect(await stageRows(start.caseId)).toEqual([]);
+    expect(await statusJournal(start.executionId)).toEqual([{ state: "skipped", reason: "stages_disabled" }]);
   });
 });
