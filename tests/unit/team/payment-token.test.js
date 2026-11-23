@@ -36,6 +36,14 @@ describe('payment token (browser.v3)', () => {
     expect(await paymentFingerprint('browser.batch', batch, webcrypto)).toBe(BATCH_FP);
   });
 
+  it('writes null for a batch step with no element, like the backend and Limova Desktop', async () => {
+    // The shared vector, pinned in the backend (test_browser_payment_and_router.py) and in
+    // Limova Desktop (payment.rs) too.
+    const batch = { tab_id: 812, snapshot_id: 's17', steps: [{ action: 'fill', element_id: 'e1', value: 'x' }, { action: 'key', key: 'Enter' }, { action: 'click', element_id: 'e3' }] };
+    expect(JSON.stringify(fingerprintInput('browser.batch', batch))).toBe('["limova-pay.v1","browser.batch",812,"s17",[["fill","e1"],["key",null],["click","e3"]]]');
+    expect(await paymentFingerprint('browser.batch', batch, webcrypto)).toBe('2605552893fccf94982c2517f9a5fe6ee2eeaf62906efa06e325a51f56c68d5f');
+  });
+
   it('accepts a valid token once', async () => {
     const check = verifier();
     expect(await check.verify('browser.click', clickArgs(clickToken()))).toEqual({ ok: true });
