@@ -100,6 +100,10 @@ export type EnginePolicy = {
   automatedReply?: { messageId: string; sourceHash: string; signals: string[] };
   /** SAV-92: set only by the runtime noise filter in "on" mode, never from model output or configuration alone. */
   noiseFilter?: { messageId: string; sourceHash: string; reason: string; signals: string[]; resource: PrivateResource };
+  /** SAV-128 (Ugo 23/11): per-mail runtime evidence, never configuration nor model output (`ack-ticket-store.ts`). Present: an acknowledgement goes into
+   * the ticket of its Gmail thread (`ticketId`, null when the thread has none). Absent (`SAV_ACK_CLOSE=on`, a V2 case on the thread or its ticket, an
+   * unreadable fact, the operator paths): today's acknowledgement_only. */
+  acknowledgementTicket?: { ticketId: string | null };
 };
 export type IntakeAdapters = {
   analyseMessage(input: { message: IntakeMessage; conversation: readonly IntakeMessage[]; identificationContinuation?: EngineInput["identificationContinuation"] }, signal: AbortSignal): Promise<MessageAnalysis>;
@@ -152,6 +156,8 @@ export type IntakePlan = {
   originalThreadId: string; originalRecipientEmails: string[];
   referenceMode: EngineInput["mode"];
   readCalls: number;
+  /** SAV-128: what became of an acknowledgement given `acknowledgementTicket` (outside the fingerprint; shown by the console). */
+  acknowledgementTicket?: import("./ack-ticket").SavAckTicketOutcome;
   effects: "not_connected";
 };
 export type EngineLimits = { readCalls: number; timeoutMs: number; contacts: number; tickets: number;
