@@ -21,6 +21,7 @@ import { observationConsoleCoverage, observationLimitsLabel, publicObservationSo
 import { readIntakeExecutionProgress } from "./executor";
 import { invalidIntakeAddressMetadata, SAV_INTAKE_INVALID_SOURCE } from "./source-validation";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
+import { intakeRoutingShadowLabel, savIntakeRoutingClassLabels } from "./routing-rules";
 export type ConsoleProjection = { view: SavIntakeView | null; status: string; reason: string | null };
 /** Runs only in the worker. CAS against the monotone source epoch means a new
  * inbound arriving during computation can never be cleared by an old result. */
@@ -35,6 +36,7 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
   let result: ConsoleProjection = { view: null, status: "processing", reason: null };
   // SAV-92: whether the current mail already has a V1 decision or execution (a sensitive dossier is then never left in a technical wait).
   let decided = false;
+  let routingNote: string | null = null;
   if (message && await readSavExternalCompletion(message)) result = { view: null, status: "external_completion_pending", reason: "Traitement externe enregistré ; les commandes et résultats restent à rapprocher avant clôture administrative." };
   else if (await intakeThreadHumanHeld(threadId)) result = { view: "to_validate", status: "human_hold", reason: "L’équipe garde la main sur ce dossier. L’automatisation reste en pause ; une décision humaine est attendue." };
   else if (message && await intakeMessageHistorical(message.id)) result = { view: "completed", status: "historical_outside_automation", reason: "Historique — hors automatisation. Le statut HubSpot et les preuves sont conservés." };
@@ -51,8 +53,19 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
     const progress = await readIntakeExecutionProgress(run.messageId);
     const local = await db.transaction(async tx => savIntakeSourceSnapshot(tx, message, new Date()));
     decided = Boolean(plan || progress);
+    // V1 routing (23/11): live receipts close the dossier; a shadow decision is only named (« aurait transféré à … »), nothing else changes.
+    const routing = payload.routing?.messageId === run.messageId ? payload.routing : undefined;
+    const routingFinal = routing?.mode === "live" && routing.action !== "keep" ? await (await import("./routing-store")).readIntakeRoutingFinal(run.messageId).catch(() => null) : null;
+    if (routing?.mode === "shadow") routingNote = intakeRoutingShadowLabel(routing);
+    const routingLabel = routing?.class ? savIntakeRoutingClassLabels[routing.class] : "";
     if (refused) result = { view: "to_validate", status: "human_refused", reason: "Proposition refusée par un opérateur" };
     else if (pending) result = { view: null, status: "human_revalidation", reason: "Choix enregistré, revalidation en cours" };
+    else if (routingFinal?.step === "confirmed" && routing?.action === "forward") result = { view: "completed", status: "routed_forwarded",
+      reason: `Transféré automatiquement à ${routing.recipient} (${routingLabel}) ; aucune réponse envoyée à l’expéditeur.` };
+    else if (routingFinal?.step === "confirmed" && routing?.action === "archive") result = { view: "other", status: "routed_archived",
+      reason: `Archivé automatiquement (${routingLabel}) ; aucune réponse envoyée à l’expéditeur.` };
+    else if (routingFinal?.step === "uncertain") result = { view: "to_validate", status: "routing_uncertain",
+      reason: "Transfert automatique incertain : vérifier la boîte d’envoi de contact@limova.ai avant toute action ; aucun renvoi automatique." };
     // An initial queued run has no recorded source to compare yet. Preserve
     // waiting/pending; a stored source or any plan/result still uses the guards below.
     else if (!run.sourceHash && run.attempts === 0 && !plan && !progress && ["pending", "waiting"].includes(run.state))
@@ -108,6 +121,7 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
     decided = siblings.some(s => { try { return Boolean(decryptSavPayload<IntakeRuntimePayload>(s.payload).plan); } catch { return false; } });
   }
   if (route && decided && await intakeDossierSensitive(threadId, thread?.hubspotTicketId ?? null)) result = route;
+  if (routingNote) result = { ...result, reason: [result.reason, routingNote].filter(Boolean).join(" · ") };
   await beforePublish?.();
   const published = await db.update(savIntakeConsole).set({ ...result, projectedEpoch: projection.epoch,
     messageId: message?.id ?? null, runId: run?.id ?? null, version: run?.version ?? null })

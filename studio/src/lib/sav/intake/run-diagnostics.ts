@@ -1,5 +1,6 @@
 import "server-only";
 import { SAV_INTAKE_NOISE_GUARDS, SAV_INTAKE_NOISE_REASONS } from "./noise-filter";
+import { publicIntakeRoutingDecision } from "./routing-rules";
 import { intakeAttemptExhaustion, intakeCountedAttemptsSql, intakeRunAnalysed, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS } from "./attempt-policy";
 import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -114,9 +115,9 @@ export function intakeDiagnosticPayload(ciphertext: string) {
         observations: (Array.isArray(read.observations) ? read.observations : []).slice(0, 100).map(raw => {
           const o = object(raw); return { status: code(o.status), reason: code(o.reason) };
         }) }, traces, tracesTruncated: Array.isArray(payload.traces) && payload.traces.length > 40,
-      noiseFilter: publicIntakeNoiseVerdict(payload.noise) };
+      noiseFilter: publicIntakeNoiseVerdict(payload.noise), routing: publicIntakeRoutingDecision(payload.routing) };
   } catch {
-    return { readable: false, reason: null, waitingCause: "unknown" as const, decision: null, budgetLimit: null, codeRevision: null, contextReasons: [], input: null, attachments: null, traces: [], tracesTruncated: false, noiseFilter: null };
+    return { readable: false, reason: null, waitingCause: "unknown" as const, decision: null, budgetLimit: null, codeRevision: null, contextReasons: [], input: null, attachments: null, traces: [], tracesTruncated: false, noiseFilter: null, routing: null };
   }
 }
 

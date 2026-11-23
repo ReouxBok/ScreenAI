@@ -15,6 +15,8 @@ const statuses: Record<string, string> = {
   context_required: "Contexte à compléter par l’équipe", crm_review_required: "Changement HubSpot à arbitrer",
   execution_superseded: "Ancienne exécution obsolète, décision attendue", followup_partial: "Suivi partiel (limite de couverture)",
   sensitive_team: "Dossier sensible : décision de l’équipe",
+  // V1 routing (23/11, live only).
+  routed_forwarded: "Transféré automatiquement à l’équipe", routed_archived: "Archivé automatiquement", routing_uncertain: "Transfert automatique à vérifier",
 };
 const reasons: Array<[RegExp, string]> = [
   [/FORWARDED_ORIGIN_UNVERIFIED/, "Mail transféré sans instruction de l’expéditeur. Identifier la demande originale et vérifier son ticket dans HubSpot."],

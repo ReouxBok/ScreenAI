@@ -13,6 +13,8 @@ import { intakeSchemaIssues } from "./schema-diagnostics";
 import { SAV_INTAKE_SIMPLE_REVISION } from "./simple-revision";
 import { simpleWireContract, simpleWireReferences, simpleWireValidationError } from "./simple-wire";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
+import { savIntakeRoutingAnalysisSchema } from "./routing-rules";
+import { savIntakeRoutingGuideline } from "./routing-guidelines";
 import { intakeResponseSchema, observeIntakeValidatedEvidence, type IntakeGeminiCall, type IntakeModelTrace, type IntakeValidatedEvidence, type SavIntakeSemanticReaders } from "./model-readers";
 import type { SavIntakeCrmReaders } from "./hubspot-readers";
 import type { prepareSavIntakeMessage } from "./message";
@@ -86,7 +88,7 @@ export async function readIntakeSimpleContext(crm: Crm, address: string, policy:
   return context;
 }
 
-function outputSchema(message: IntakeMessage, conversation: readonly IntakeMessage[], context: Context, visual?: SavPreparedAttachments) {
+function outputSchema(message: IntakeMessage, conversation: readonly IntakeMessage[], context: Context, visual?: SavPreparedAttachments, routing = false) {
   const sources = ["current", ...conversation.map(m => `message-${m.id}`), ...context.contacts.map(c => `contact-${c.id}`),
     ...context.tickets.flatMap(t => [`ticket-${t.ticket.id}`, `history-${t.ticket.id}`]), ...(visual?.selected.map(s => s.observation.sourceId) ?? [])];
   const sourceIds = z.array(ids(sources)).min(1).max(20);
@@ -103,6 +105,8 @@ function outputSchema(message: IntakeMessage, conversation: readonly IntakeMessa
       why: z.string().trim().min(1).max(500), sourceIds }).strict()).max(20),
     missing: z.array(z.object({ kind: z.enum(["image", "history", "contact", "other"]), why: z.string().trim().min(1).max(300) }).strict()).max(10),
     rationale: z.string().trim().min(1).max(500),
+    // V1 routing (23/11): requested only with SAV_INTAKE_ROUTING_MODE shadow|live; absent, the schema is unchanged.
+    ...(routing ? { routing: savIntakeRoutingAnalysisSchema.optional() } : {}),
   }).strict();
   // Unread files of a complete text (never content): one requirement per file.
   const unread = message.unreadAttachments;
@@ -114,7 +118,7 @@ function outputSchema(message: IntakeMessage, conversation: readonly IntakeMessa
     imageRequirements: z.array(z.object({ sourceId: ids(visual.selected.map(s => s.observation.sourceId)), role: z.enum(["accessory", "required", "unknown"]),
       textQuote: z.string().trim().min(1).max(500).optional() }).strict()).max(3) }) };
 }
-type SimpleOutput = z.infer<ReturnType<typeof outputSchema>["schema"]> & { images?: unknown; imageRequirements?: { sourceId: string; role: "accessory" | "required" | "unknown"; textQuote?: string }[];
+type SimpleOutput = z.infer<ReturnType<typeof outputSchema>["schema"]> & { routing?: z.infer<typeof savIntakeRoutingAnalysisSchema>; images?: unknown; imageRequirements?: { sourceId: string; role: "accessory" | "required" | "unknown"; textQuote?: string }[];
   unreadAttachmentRequirements?: { sourceId: string; role: "accessory" | "required" | "unknown"; textQuote?: string }[] };
 
 const INSTRUCTION = [
@@ -144,6 +148,8 @@ export function createSavIntakeSimpleReaders(options: {
   onJudgement?: (judgement: { rationale: string; missing: SimpleOutput["missing"]; identity: SimpleOutput["identity"]; tickets: SimpleOutput["tickets"] }) => void;
   /** Comparison only: the whole accepted judgement, before per-request summaries and sources are merged. */
   onValidatedEvidence?: (evidence: IntakeValidatedEvidence) => void;
+  /** V1 routing (23/11): `SAV_INTAKE_ROUTING_MODE` shadow|live only. Adds the routing guideline and the optional `routing` field; absent, the request is unchanged. */
+  routing?: boolean;
 }): SavIntakeSemanticReaders {
   if (!/^gemini-[A-Za-z0-9._-]{1,100}$/.test(options.model)) throw Error("SAV_INTAKE_CONFIGURED_MODEL_REQUIRED");
   let calls = 0;
@@ -152,7 +158,9 @@ export function createSavIntakeSimpleReaders(options: {
 
   async function judge(phase: "understanding" | "ticket_matching", message: IntakeMessage, conversation: readonly IntakeMessage[], context: Context,
     signal: AbortSignal, extra: Record<string, unknown> = {}, visual?: SavPreparedAttachments, requestsDecided = false, continuationInitialId?: string): Promise<SimpleOutput> {
-    const { schema, sources } = outputSchema(message, conversation, context, visual);
+    // The routing class is asked once, with the understanding of the mail (never in a focused ticket-matching call).
+    const routing = Boolean(options.routing) && phase === "understanding";
+    const { schema, sources } = outputSchema(message, conversation, context, visual, routing);
     const subject = options.provenance?.get(message.id)?.subject;
     const data = { message: { id: message.id, from: message.fromEmail, to: message.toEmails, receivedAt: message.receivedAt, ...(subject ? { subject } : {}),
         ...(message.operatorInformation ? { operatorInformation: message.operatorInformation } : {}) }, current: message.currentText,
@@ -172,12 +180,18 @@ export function createSavIntakeSimpleReaders(options: {
     const references = simpleWireReferences(hash({ phase, data }), message.id, [...new Set(sources)], context.tickets.map(t => t.ticket.id),
       [...new Set([...context.contacts.map(c => c.id), ...context.tickets.flatMap(t => t.ticket.contactIds)])]);
     const canonicalShape = schema.shape as Record<string, z.ZodType>;
-    const extras = Object.fromEntries(["images", "imageRequirements", "unreadAttachmentRequirements"].filter(key => canonicalShape[key]).map(key => [key, canonicalShape[key]]));
+    const extras = Object.fromEntries(["images", "imageRequirements", "unreadAttachmentRequirements", "routing"].filter(key => canonicalShape[key]).map(key => [key, canonicalShape[key]]));
+    // V1 routing: a malformed class never fails the judgement; it is dropped (no routing), never repaired.
+    const withoutInvalidRouting = (raw: unknown) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw) || !Object.hasOwn(raw, "routing")) return raw;
+      const { routing: value, ...rest } = raw as Record<string, unknown>;
+      return routing && savIntakeRoutingAnalysisSchema.safeParse(value).success ? raw : rest;
+    };
     const wire = simpleWireContract(references, schema, extras);
     const wireData = { ...data, outputReferences: references }, inputHash = hash(wireData);
     let repair = false;
     for (;;) {
-      const body = { systemInstruction: { parts: [{ text: `${INSTRUCTION}${repair ? "\nFORMAT REPAIR v1: the previous response did not match the required JSON schema. Read the SAME sources again and return one complete JSON object conforming exactly to it." : ""}` }] },
+      const body = { systemInstruction: { parts: [{ text: `${INSTRUCTION}${routing ? `\n${savIntakeRoutingGuideline()}` : ""}${repair ? "\nFORMAT REPAIR v1: the previous response did not match the required JSON schema. Read the SAME sources again and return one complete JSON object conforming exactly to it." : ""}` }] },
         contents: [{ role: "user" as const, parts: [{ text: JSON.stringify(wireData) }] }],
         // Optional nested wire bounds can expand the provider's constrained decoder.
         // Keep every server bound and the compact output instructions; omitting
@@ -197,13 +211,13 @@ export function createSavIntakeSimpleReaders(options: {
       try {
         const result = await options.call({ model: options.model, phase, promptRevision: SAV_INTAKE_SIMPLE_REVISION, signal, allowRetry: false, body,
           ...(visual ? { media: visual.uniqueImages, sanitizeResponse: (raw: unknown) => {
-            const value = wire.schema.parse(raw);
+            const value = wire.schema.parse(withoutInvalidRouting(raw));
             const safe = sanitizeVisual(wire.decode(value) as SimpleOutput);
             return { ...value, images: safe.images };
           } } : {}) });
         metadata = result.metadata;
         if (signal.aborted) throw Error("SAV_INTAKE_MODEL_CANCELLED");
-        const output = wire.decode(result.json) as SimpleOutput;
+        const output = wire.decode(withoutInvalidRouting(result.json)) as SimpleOutput;
         const discarded = validate(output, message, context, sources, requestsDecided, continuationInitialId);
         trace(true, null, { metadata, outputHash: hash(result.json), ...(discarded ? { normalization: { ...emptyIntakeOutputNormalization(), discardedRegistrations: 1 } } : {}) });
         options.onJudgement?.({ rationale: output.rationale, missing: output.missing, identity: output.identity, tickets: output.tickets });
@@ -235,6 +249,7 @@ export function createSavIntakeSimpleReaders(options: {
         primaryRequestId: actionable[0]?.id, ticketTitle: output.ticketTitle, language: "fr" } as never);
     const description = output.ticketDescription ?? output.requests.map(r => r.summary).join("\n");
     return messageAnalysisSchema.parse({ messageId: message.id, nature: output.nature, requests,
+      ...(output.routing ? { routing: output.routing } : {}),
       ...(output.registration ? { registration: { address: output.registration.address, sourceMessageId: message.id, quote: output.registration.quote } } : {}),
       ...(requests.length && description.trim() ? { ticketSummary: { title, description: description.trim().slice(0, 100_000), requestIds: requests.map(r => r.id) } } : {}),
       ...(output.unreadAttachmentRequirements ? { unreadAttachmentRequirements: output.unreadAttachmentRequirements.map(r => ({ sourceId: r.sourceId, role: r.role,
