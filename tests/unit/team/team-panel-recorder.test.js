@@ -121,3 +121,40 @@ describe('side panel « Montrer à Limova » (TEAM-731)', () => {
     ]));
   });
 });
+
+describe('side panel save-login notice (TEAM-757)', () => {
+  let chromeMock;
+  let state;
+  beforeEach(() => {
+    chromeMock = installChromeMock({ lang: 'fr-FR' });
+    Object.defineProperty(navigator, 'language', { value: 'fr-FR', configurable: true });
+    chromeMock.tabs = { query: vi.fn(async () => []) };
+    state = {
+      products: [{ id: 'limova_team', label: 'Limova Team', color: '#7C3AED', defaultEnvironment: 'production', environments: [{ id: 'production', label: 'Production' }], connection: CONNECTION }],
+      activity: [],
+      recorder: { status: 'idle', procedures: {}, steps: 0 },
+      login_offers: [{ id: 'offer-1', product: 'limova_team', site: 'subscribe.free.fr', origin: 'https://subscribe.free.fr', username: 'camille@example.com', update: false }]
+    };
+    chromeMock.runtime.sendMessage = vi.fn(async message => (message.type === 'TEAM_GET_STATE' ? { ok: true, state } : { ok: true }));
+    document.body.innerHTML = `<div id="headerMenu"></div><section id="teamPanel"><p id="teamFeedback"></p><div id="teamProducts"></div><ul id="teamActivity"></ul></section>`;
+    loadSidebarScript('src/sidebar/i18n.js');
+  });
+  afterEach(() => uninstallChromeMock());
+
+  it('shows the offer as a notice in the card, never a window, and answers from there', async () => {
+    loadSidebarScript('src/team/team-panel.js');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const notice = document.querySelector('[data-offer="offer-1"]');
+    expect(notice.textContent).toContain('Enregistrer cette connexion pour Limova ?');
+    expect(notice.textContent).toContain('subscribe.free.fr');
+    const user = notice.querySelector('input');
+    expect(user.value).toBe('camille@example.com');
+    user.value = 'camille.martin@example.com';
+    user.dispatchEvent(new Event('input'));
+    [...notice.querySelectorAll('button')].find(button => button.textContent === 'Enregistrer').click();
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({ type: 'TEAM_LOGIN_OFFER_DECIDE', id: 'offer-1', decision: 'save', username: 'camille.martin@example.com' });
+    [...notice.querySelectorAll('button')].find(button => button.textContent === 'Pas maintenant').click();
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({ type: 'TEAM_LOGIN_OFFER_DECIDE', id: 'offer-1', decision: 'later' });
+    expect(chromeMock.windows).toBeUndefined();
+  });
+});

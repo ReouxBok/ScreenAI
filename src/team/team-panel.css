@@ -92,3 +92,6 @@
 .team-record-param { padding: 6px 8px; font-size: 12px; }
 .team-record-delete:focus-visible { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { .team-record-dot { animation: none; } }
+
+/* TEAM-757: the save-login offer is a notice in the card, never a window. */
+.team-login-offer { display: grid; gap: 8px; padding: 10px 12px; border-radius: 10px; background: #F5F0FF; border: 1px solid #E4D8FD; font-size: 13px; }

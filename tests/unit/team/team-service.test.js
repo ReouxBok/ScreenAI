@@ -101,19 +101,39 @@ describe('team service', () => {
     expect(fromCallback).toEqual(expect.objectContaining({ ok: false, error: 'no_pending_pairing' }));
   });
 
-  it('lets only the approval window read and decide', async () => {
+  it('has no approval window any more: only the side panel decides a save-login notice (TEAM-757)', async () => {
     const chromeApi = fakeChrome(area());
     const service = createTeamService({ chromeApi, WebSocketImpl: FakeWebSocket, fetchImpl: vi.fn() });
-    const pending = service.approvals.request({ kind: 'action', productId: 'limova_team' }, { deadlineMs: Date.now() + 5_000 });
-    await new Promise(resolve => setTimeout(resolve, 0));
-    const approvalId = new URL(chromeApi.windows.create.mock.calls[0][0].url).searchParams.get('id');
     const sidebar = { url: 'chrome-extension://fpkgfhhomlijmhbgcpbpjnfafdedfccj/src/sidebar/sidebar.html' };
-    const popup = { url: `chrome-extension://fpkgfhhomlijmhbgcpbpjnfafdedfccj/src/team/approval.html?id=${approvalId}` };
-    expect((await service.handleMessage({ type: 'TEAM_APPROVAL_GET', id: approvalId }, sidebar)).ok).toBe(false);
-    expect((await service.handleMessage({ type: 'TEAM_APPROVAL_DECIDE', id: approvalId, decision: 'approve' }, sidebar)).ok).toBe(false);
-    expect((await service.handleMessage({ type: 'TEAM_APPROVAL_GET', id: approvalId }, popup)).ok).toBe(true);
-    expect((await service.handleMessage({ type: 'TEAM_APPROVAL_DECIDE', id: approvalId, decision: 'approve' }, popup)).ok).toBe(true);
-    expect(await pending).toEqual({ decision: 'approve' });
+    expect(isTeamMessage('TEAM_APPROVAL_GET')).toBe(false);
+    expect(isTeamMessage('TEAM_APPROVAL_DECIDE')).toBe(false);
+    expect(isTeamMessage('TEAM_LOGIN_OFFER_GET')).toBe(false);
+    expect(await service.handleMessage({ type: 'TEAM_APPROVAL_DECIDE', id: 'x', decision: 'approve' }, sidebar)).toEqual({ ok: false, error: 'unknown_message' });
+    // A web page, or any other extension page, cannot answer the notice.
+    const page = { url: 'https://evil.example/', tab: { id: 3 } };
+    const other = { url: 'chrome-extension://fpkgfhhomlijmhbgcpbpjnfafdedfccj/src/team/pair-callback.html' };
+    expect((await service.handleMessage({ type: 'TEAM_LOGIN_OFFER_DECIDE', id: 'x', decision: 'save' }, page)).ok).toBe(false);
+    expect((await service.handleMessage({ type: 'TEAM_LOGIN_OFFER_DECIDE', id: 'x', decision: 'save' }, other)).ok).toBe(false);
+    expect(await service.handleMessage({ type: 'TEAM_LOGIN_OFFER_DECIDE', id: 'x', decision: 'save' }, sidebar)).toEqual({ ok: false, error: 'expired' });
+    expect((await service.handleMessage({ type: 'TEAM_GET_STATE' }, sidebar)).state.login_offers).toEqual([]);
+    expect(chromeApi.windows.create).not.toHaveBeenCalled();
+  });
+
+  it('runs payments only with a token, bound to this connection’s device (TEAM-757)', async () => {
+    const chromeApi = fakeChrome(area({ [CONNECTIONS_STORAGE_KEY]: STORED }));
+    const service = createTeamService({ chromeApi, WebSocketImpl: FakeWebSocket, fetchImpl: vi.fn() });
+    await service.init();
+    const { controller, browser } = service.links.get('limova_team');
+    // The engine's checks pass (a live « Payer » button); only the token is missing.
+    browser.prepareAction = vi.fn(async (tool, args) => ({ plan: { tool, args, element: { name: 'Payer', role: 'button', page: { path: '/' } }, domain: 'shop.example', tab: { id: 812 } } }));
+    browser.executeAction = vi.fn(async () => ({ ok: true, data: {} }));
+    const result = await controller.handleCall({
+      call_id: 'c-pay', tool: 'browser.click', deadline_ms: Date.now() + 60_000,
+      args: { tab_id: 812, snapshot_id: 's17', element_id: 'e3', target: 'Payer', risk: 'risky', risk_reason: 'pay' }
+    });
+    expect(result.error.code).toBe('payment_confirmation_required');
+    expect(browser.executeAction).not.toHaveBeenCalled();
+    expect(chromeApi.windows.create).not.toHaveBeenCalled();
   });
 
   it('refuses environments outside the allowlist when connecting', async () => {

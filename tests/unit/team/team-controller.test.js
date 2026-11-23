@@ -1,19 +1,33 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTeamController } from '../../../src/team/team-controller.js';
+import { createPaymentVerifier } from '../../../src/team/payment-token.js';
 import { TEAM_PRODUCT } from './helpers.js';
 
-function setup({ autonomy = 'approve_for_me', paused = false, decide = async () => ({ decision: 'approve' }) } = {}) {
+// Fixed vectors, computed with Python's hashlib/hmac (see payment-token.test.js).
+const NOW = 1_795_680_000_000;
+const DEVICE = '22222222-2222-2222-2222-222222222222';
+const CLICK_TOKEN = {
+  v: 1, id: '11111111-1111-1111-1111-111111111111', device_id: DEVICE,
+  fp: '9474f5f427304641b28347f9a2011ddeebb45a9343fc157b76865353079aed7c', exp_ms: 1_795_680_120_000,
+  sig: '13b30f939f201faa2856f798fb3ac31b56df8a36a8a92dff035eb71bbb5265f5'
+};
+const BATCH_TOKEN = {
+  v: 1, id: '33333333-3333-3333-3333-333333333333', device_id: DEVICE,
+  fp: '7e80561e4f6ec6ebbdf05d6cb4e681620ebe7aa6ce5cd1308e49133439f1ce90', exp_ms: 1_795_680_120_000,
+  sig: '439447dedad1b8fa41d7ce9d8043a6aa4e6df367086b89cdd376a8755fb1fcdd'
+};
+
+function setup({ autonomy = 'approve_for_me', paused = false } = {}) {
   const browser = {
     runRead: vi.fn(async () => ({ ok: true, data: { tab: { domain: 'example.com' } } })),
     prepareAction: vi.fn(async (tool, args) => ({
       plan: { tool, args, element: { name: args.target, role: 'button', page: { path: '/' } }, domain: 'example.com', tab: { id: 1 } }
     })),
     executeAction: vi.fn(async () => ({ ok: true, data: { done: true, tab: { domain: 'example.com' } } })),
-    shareableTabs: vi.fn(async () => [{ tab_id: 3, domain: 'example.org' }]),
-    adoptTab: vi.fn(async tabId => ({ ok: true, data: { tab: { tab_id: tabId } } })),
+    adoptActiveTab: vi.fn(async () => ({ ok: true, data: { tab: { tab_id: 3, domain: 'example.org' } } })),
     setGroupTitle: vi.fn(async () => {})
   };
-  const approvals = { request: vi.fn(decide), denyAll: vi.fn() };
+  const payments = createPaymentVerifier({ deviceId: () => DEVICE, deviceToken: () => 'lmd_test', now: () => NOW });
   const store = { update: vi.fn(async () => ({})) };
   const socket = { sendState: vi.fn() };
   const order = [];
@@ -25,86 +39,95 @@ function setup({ autonomy = 'approve_for_me', paused = false, decide = async () 
     initial: { autonomy, paused },
     store,
     browser,
-    approvals,
+    payments,
     onActivity: entry => activity.push(entry),
     onBusyChange: info => busy.push(info)
   });
   controller.attachSocket(socket);
-  return { controller, browser, approvals, store, socket, activity, busy, order };
+  return { controller, browser, payments, store, socket, activity, busy, order };
 }
 
 const call = (tool, args = {}, extra = {}) => ({ call_id: `c-${Math.random()}`, tool, args, deadline_ms: Date.now() + 60_000, ...extra });
+const pay = (token, extra = {}) => call('browser.click', {
+  tab_id: 812, snapshot_id: 's17', element_id: 'e3', target: 'Payer 49 €', risk: 'risky', risk_reason: 'pay',
+  ...(token ? { payment_token: token } : {}), ...extra
+});
 const click = (target = 'Envoyer', risk = 'write', reason = null) => call('browser.click', {
   tab_id: 1, snapshot_id: 's1', element_id: 'e1', target, risk, risk_reason: reason
 });
 
-describe('team controller: autonomy and approvals', () => {
+describe('team controller: no prompt of its own, payments by token (browser.v3)', () => {
   it('runs reads at every level, without asking', async () => {
-    const { controller, approvals, activity } = setup({ autonomy: 'ask_every_time' });
+    const { controller, activity } = setup({ autonomy: 'ask_every_time' });
     const result = await controller.handleCall(call('browser.read_page', { tab_id: 1 }));
     expect(result.ok).toBe(true);
-    expect(approvals.request).not.toHaveBeenCalled();
     expect(activity[0]).toEqual(expect.objectContaining({ domain: 'example.com', label: 'Lecture de la page' }));
   });
 
-  it('never asks before routine or risky actions, at any autonomy level (browser.v2)', async () => {
+  it('never asks before routine or risky actions, at any autonomy level: the chat decides', async () => {
     for (const autonomy of ['ask_every_time', 'approve_for_me', 'full_access']) {
-      const { controller, approvals, browser } = setup({ autonomy });
+      const { controller, browser } = setup({ autonomy });
       const progress = vi.fn();
       expect((await controller.handleCall(click('Tarifs'), { progress })).ok).toBe(true);
       expect((await controller.handleCall(click('Envoyer', 'risky', 'send'), { progress })).ok).toBe(true);
       expect((await controller.handleCall(click('Supprimer le compte', 'risky', 'account'), { progress })).ok).toBe(true);
-      expect(approvals.request).not.toHaveBeenCalled();
-      expect(progress).not.toHaveBeenCalledWith('waiting_approval');
+      expect(progress).not.toHaveBeenCalled();
       expect(browser.executeAction).toHaveBeenCalledTimes(3);
     }
   });
 
-  it('still asks before paying, from the server reading or its own', async () => {
-    const fromServer = setup({ autonomy: 'full_access' });
-    const progress = vi.fn();
-    await fromServer.controller.handleCall(click('Continuer', 'risky', 'pay'), { progress });
-    expect(progress).toHaveBeenCalledWith('waiting_approval');
-    expect(fromServer.approvals.request).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'action', title: 'Limova Team veut cliquer sur « Continuer » sur example.com' }),
-      expect.objectContaining({ deadlineMs: expect.any(Number) })
-    );
-    // The server said « write », but the live button reads « Payer ».
+  it('refuses a payment without a valid token: payment_confirmation_required, nothing done', async () => {
+    for (const autonomy of ['ask_every_time', 'approve_for_me', 'full_access']) {
+      const { controller, browser } = setup({ autonomy });
+      const progress = vi.fn();
+      const result = await controller.handleCall(pay(null), { progress });
+      expect(result.error.code).toBe('payment_confirmation_required');
+      expect(progress).not.toHaveBeenCalled();
+      expect(browser.executeAction).not.toHaveBeenCalled();
+    }
+    // The server said « write », but the live button reads « Payer »: still a payment.
     const fromLocal = setup({ autonomy: 'full_access' });
-    await fromLocal.controller.handleCall(click('Payer 49 €', 'write', null));
-    expect(fromLocal.approvals.request).toHaveBeenCalledOnce();
+    expect((await fromLocal.controller.handleCall(call('browser.click', { tab_id: 1, snapshot_id: 's1', element_id: 'e1', target: 'Payer 49 €', risk: 'write', risk_reason: null }))).error.code)
+      .toBe('payment_confirmation_required');
+    expect(fromLocal.browser.executeAction).not.toHaveBeenCalled();
   });
 
-  it('answers denied_by_owner on refuse and approval_timeout at the deadline for a payment', async () => {
-    const denied = setup({ decide: async () => ({ decision: 'deny' }) });
-    expect((await denied.controller.handleCall(click('Payer', 'risky', 'pay'))).error.code).toBe('denied_by_owner');
-    expect(denied.browser.executeAction).not.toHaveBeenCalled();
-    const late = setup({ decide: async () => ({ decision: 'timeout' }) });
-    expect((await late.controller.handleCall(click('Payer', 'risky', 'pay'))).error.code).toBe('approval_timeout');
+  it('pays once with the token the server minted after the owner’s click in the chat', async () => {
+    const { controller, browser } = setup();
+    expect((await controller.handleCall(pay(CLICK_TOKEN))).ok).toBe(true);
+    expect(browser.executeAction).toHaveBeenCalledOnce();
+    // Single use.
+    expect((await controller.handleCall(pay(CLICK_TOKEN))).error.code).toBe('payment_confirmation_required');
+    // Another element, tab or snapshot: the fingerprint no longer matches.
+    const other = setup();
+    expect((await other.controller.handleCall(pay(CLICK_TOKEN, { element_id: 'e4' }))).error.code).toBe('payment_confirmation_required');
+    expect((await other.controller.handleCall(pay(CLICK_TOKEN, { tab_id: 813 }))).error.code).toBe('payment_confirmation_required');
+    expect(other.browser.executeAction).not.toHaveBeenCalled();
   });
 
-  it('asks once for a batch whose strictest step pays', async () => {
-    const { controller, browser, approvals } = setup();
-    browser.prepareAction.mockResolvedValueOnce({
-      plan: {
-        kind: 'batch',
-        local: { risk: 'risky', reason: 'pay' },
-        element: { name: 'Payer', role: 'button' },
-        steps: [{ action: 'fill', element: { name: 'E-mail' } }, { action: 'click', element: { name: 'Payer' } }],
-        domain: 'shop.example',
-        tab: { id: 1 }
-      }
-    });
-    await controller.handleCall(call('browser.batch', { tab_id: 1, snapshot_id: 's1', steps: [], risk: 'write', risk_reason: null }));
-    expect(approvals.request).toHaveBeenCalledOnce();
-    expect(approvals.request.mock.calls[0][0].lines[0].text).toContain('Payer');
+  it('pays a batch whose strictest step pays, with a token bound to its steps', async () => {
+    const { controller, browser } = setup();
+    const plan = {
+      kind: 'batch',
+      local: { risk: 'risky', reason: 'pay' },
+      element: { name: 'Payer', role: 'button' },
+      steps: [{ action: 'fill', element: { name: 'E-mail' } }, { action: 'click', element: { name: 'Payer' } }],
+      domain: 'shop.example',
+      tab: { id: 812 }
+    };
+    browser.prepareAction.mockResolvedValue({ plan });
+    const steps = [{ action: 'fill', element_id: 'e1', target: 'E-mail', value: 'a@b.c' }, { action: 'click', element_id: 'fr2.e3', target: 'Payer' }];
+    const args = { tab_id: 812, snapshot_id: 's17', steps, risk: 'write', risk_reason: null };
+    expect((await controller.handleCall(call('browser.batch', args))).error.code).toBe('payment_confirmation_required');
+    expect((await controller.handleCall(call('browser.batch', { ...args, payment_token: BATCH_TOKEN }))).ok).toBe(true);
+    expect(browser.executeAction).toHaveBeenCalledOnce();
   });
 
   it('returns the engine error without asking (sensitive field, stale snapshot…)', async () => {
-    const { controller, browser, approvals } = setup({ autonomy: 'ask_every_time' });
+    const { controller, browser } = setup({ autonomy: 'ask_every_time' });
     browser.prepareAction.mockResolvedValueOnce({ error: { ok: false, error: { code: 'sensitive_field', message: 'x' } } });
     expect((await controller.handleCall(call('browser.fill', { value: 'x' }))).error.code).toBe('sensitive_field');
-    expect(approvals.request).not.toHaveBeenCalled();
+    expect(browser.executeAction).not.toHaveBeenCalled();
   });
 
   it('refuses everything while paused and unknown tools', async () => {
@@ -114,11 +137,12 @@ describe('team controller: autonomy and approvals', () => {
     expect((await fresh.controller.handleCall(call('files.list'))).error.code).toBe('unsupported');
   });
 
-  it('asks the person to pick a tab for request_tab', async () => {
-    const { controller, approvals, browser } = setup({ autonomy: 'full_access', decide: async () => ({ decision: 'approve', tabId: 3 }) });
-    const result = await controller.handleCall(call('browser.request_tab', { reason: 'Pour lire ta facture' }));
-    expect(approvals.request.mock.calls[0][0]).toEqual(expect.objectContaining({ kind: 'request_tab', reason: 'Pour lire ta facture', tabs: [{ tab_id: 3, domain: 'example.org' }] }));
-    expect(browser.adoptTab).toHaveBeenCalledWith(3, true);
+  it('takes the person’s current tab for request_tab, without a picker', async () => {
+    const { controller, browser } = setup({ autonomy: 'full_access' });
+    const progress = vi.fn();
+    const result = await controller.handleCall(call('browser.request_tab', { reason: 'Pour lire ta facture' }), { progress });
+    expect(browser.adoptActiveTab).toHaveBeenCalledWith(true);
+    expect(progress).not.toHaveBeenCalled();
     expect(result.data.tab.tab_id).toBe(3);
     expect((await controller.handleCall(call('browser.request_tab', { reason: 'x'.repeat(201) }))).error.code).toBe('invalid_args');
   });
@@ -127,10 +151,9 @@ describe('team controller: autonomy and approvals', () => {
 describe('team controller: set_autonomy', () => {
   it('applies any level at once, without a window, then sends state before answering', async () => {
     for (const [from, to] of [['full_access', 'ask_every_time'], ['ask_every_time', 'full_access'], ['approve_for_me', 'full_access']]) {
-      const { controller, store, socket, approvals } = setup({ autonomy: from });
+      const { controller, store, socket } = setup({ autonomy: from });
       const answer = await controller.handleSetAutonomy({ autonomy: to });
       expect(answer).toEqual({ status: 'applied' });
-      expect(approvals.request).not.toHaveBeenCalled();
       expect(store.update).toHaveBeenCalledWith('limova_team', { autonomy: to });
       expect(socket.sendState).toHaveBeenCalledOnce();
       expect(controller.getState().autonomy).toBe(to);
@@ -149,7 +172,7 @@ describe('team controller: set_autonomy', () => {
   });
 
   it('starts at « Accès complet » when nothing is stored', () => {
-    const controller = createTeamController({ product: TEAM_PRODUCT, browser: {}, approvals: {} });
+    const controller = createTeamController({ product: TEAM_PRODUCT, browser: {} });
     expect(controller.getState().autonomy).toBe('full_access');
   });
 
@@ -193,9 +216,9 @@ describe('team controller: take-over, hand-back and « Tout arrêter »', () => 
     expect(controller.counts().held).toBe(0);
   });
 
-  it('« Tout arrêter » cancels running and held calls, refuses approvals, pauses and sends state', async () => {
+  it('« Tout arrêter » cancels running and held calls, pauses and sends state', async () => {
     let finishRead;
-    const { controller, browser, approvals, store, socket } = setup();
+    const { controller, browser, store, socket } = setup();
     browser.runRead.mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve; }));
     const runningCall = controller.handleCall(call('browser.read_page', { tab_id: 1 }));
     await vi.advanceTimersByTimeAsync(0);
@@ -206,7 +229,6 @@ describe('team controller: take-over, hand-back and « Tout arrêter »', () => 
     expect(answer).toEqual({ status: 'applied', control: 'owner', paused: true });
     expect((await runningCall).error.code).toBe('paused');
     expect((await heldCall).error.code).toBe('paused');
-    expect(approvals.denyAll).toHaveBeenCalledWith('limova_team');
     expect(store.update).toHaveBeenCalledWith('limova_team', { paused: true });
     expect(socket.sendState).toHaveBeenCalled();
     expect((await controller.handleCall(call('browser.list_tabs'))).error.code).toBe('paused');

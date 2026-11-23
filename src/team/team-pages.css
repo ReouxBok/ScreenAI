@@ -1,4 +1,5 @@
-/* Shared styles of the Limova Team extension pages (approval window, pairing callback). */
+/* Styles of the Limova Team pairing callback page. Since TEAM-757 the extension has no
+   approval or save-login window of its own: this is its only Team page. */
 :root {
   --product: #7C3AED;
   --ink: #1D1D1E;
@@ -8,34 +9,17 @@
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: var(--font); color: var(--ink); background: #FAFAFB; letter-spacing: -0.01em; }
-body.approval { min-height: 100vh; display: flex; }
 body.callback { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
-.card { width: 100%; max-width: 460px; margin: auto; background: #fff; padding: 22px 20px; display: flex; flex-direction: column; gap: 12px; }
-body.callback .card { border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 18px 45px rgba(29, 29, 30, .10); padding: 28px 24px; }
+.card { width: 100%; max-width: 460px; margin: auto; background: #fff; display: flex; flex-direction: column; gap: 12px; border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 18px 45px rgba(29, 29, 30, .10); padding: 28px 24px; }
 .product { display: inline-flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--product); }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--product); }
 h1 { font-size: 19px; line-height: 1.25; letter-spacing: -0.03em; }
 p { font-size: 13px; color: var(--muted); line-height: 1.45; }
-dl { display: grid; gap: 6px; }
-dl div { display: grid; gap: 2px; padding: 8px 10px; background: #F5F5F6; border-radius: 8px; }
-dt { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
-dd { font-size: 13px; word-break: break-word; white-space: pre-wrap; }
-.tabs { display: grid; gap: 6px; max-height: 280px; overflow: auto; }
-.tabs label { display: grid; grid-template-columns: auto 1fr; gap: 8px; align-items: center; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; font-size: 13px; }
-.tabs label:has(input:checked) { border-color: var(--product); background: #F5F0FF; }
-.tabs small { display: block; color: var(--muted); font-size: 11px; }
-.tabs .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.countdown { font-size: 11px; }
 .actions { display: flex; gap: 8px; margin-top: 4px; }
 button { flex: 1; border: 0; border-radius: 9px; padding: 11px 12px; font: 700 13px var(--font); cursor: pointer; }
 button.primary { background: var(--ink); color: #fff; }
 button.secondary { background: #F5F5F6; color: var(--ink); }
 button:disabled { opacity: .5; cursor: default; }
-button:focus-visible, .tabs label:focus-within { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 2px; }
+button:focus-visible { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 2px; }
 .status-ok { color: #246648; }
 .status-error { color: #B42318; }
-/* TEAM-729: « Enregistrer cette connexion pour Limova ? » window. */
-.field { display: grid; gap: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
-.field input { font: 400 14px var(--font); text-transform: none; letter-spacing: normal; color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; }
-.field input:focus-visible { outline: 3px solid rgba(124, 58, 237, .35); outline-offset: 1px; }
-button.link { flex: none; align-self: center; background: transparent; color: var(--muted); font-weight: 600; font-size: 12px; padding: 4px 6px; }

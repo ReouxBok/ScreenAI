@@ -33,7 +33,7 @@ export const PRODUCTS = Object.freeze({
         dashboard: 'https://staging.team.limova.ai'
       })
     }),
-    // Hosts the agent must never drive: the dashboard is where approvals and the
+    // Hosts the agent must never drive: the dashboard is where the chat's confirmations and the
     // autonomy level live, so Limova must not click there. Covers every Team
     // environment (app., api., staging., api.staging.).
     ownHosts: Object.freeze(['team.limova.ai'])

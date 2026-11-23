@@ -1,7 +1,7 @@
 // The offer to save a login, service-worker side (TEAM-729, docs/login-vault.md).
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  createLoginOffers, CAPTURE_TTL_MS, OFFER_PAGE, SUCCESS_WINDOW_MS, VAULT_PREFS_KEY, offerableOrigin
+  createLoginOffers, CAPTURE_TTL_MS, SUCCESS_WINDOW_MS, VAULT_PREFS_KEY, offerableOrigin
 } from '../../../src/team/login-offers.js';
 
 const EXT = 'chrome-extension://fpkgfhhomlijmhbgcpbpjnfafdedfccj/';
@@ -36,7 +36,7 @@ function setup({ tabUrl = `${ORIGIN}/login/`, groupId = 7, prefs, get = { status
     scripting: {
       executeScript: vi.fn(async ({ func, args }) => [{ result: func.name === 'probeLoginForm' ? { ...probeResult } : { ok: true, installed: true, args } }])
     },
-    windows: { create: vi.fn(async () => ({ id: 77 })), remove: vi.fn(async () => {}) },
+    // TEAM-757: no `windows` at all: the offer is a side-panel notice, so any window call would throw.
     webNavigation: nav
   };
   const fetchImpl = vi.fn(async (url, init) => {
@@ -49,13 +49,16 @@ function setup({ tabUrl = `${ORIGIN}/login/`, groupId = 7, prefs, get = { status
     browser: { currentGroupId: async () => 7 }
   };
   let ids = 0;
+  const onChange = vi.fn();
   const offers = createLoginOffers({
     chromeApi, fetchImpl, timers: globalThis, now: () => Date.now(),
-    randomId: () => `offer-${(ids += 1)}`, getLinks: () => [link]
+    randomId: () => `offer-${(ids += 1)}`, getLinks: () => [link], onChange
   });
   offers.attach();
   const sender = { id: chromeApi.runtime.id, tab: { id: 812 }, frameId: 0, origin: ORIGIN, url: tabUrl };
-  return { chromeApi, fetchImpl, offers, tabs, nav, sender, probeResult, local, link };
+  // How many notices were shown so far (one id per offer).
+  const shown = () => ids;
+  return { chromeApi, fetchImpl, offers, tabs, nav, sender, probeResult, local, link, shown, onChange };
 }
 
 const flush = async () => { for (let i = 0; i < 30; i += 1) await Promise.resolve(); };
@@ -71,17 +74,17 @@ describe('login offers', () => {
   beforeEach(() => vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] }));
   afterEach(() => vi.useRealTimers());
 
-  it('asks after a login that navigated, in a window whose URL holds an opaque id only', async () => {
+  it('asks after a login that navigated, in a side-panel notice that never holds the password', async () => {
     const ctx = setup();
     await submitAndNavigate(ctx);
     expect(ctx.fetchImpl).toHaveBeenCalledWith(
       'https://api.staging.team.limova.ai/api/v1/devices/me/login-secrets?origin=https%3A%2F%2Fsubscribe.free.fr',
       expect.objectContaining({ method: 'GET', credentials: 'omit', cache: 'no-store', headers: expect.objectContaining({ Authorization: `Device ${TOKEN}` }) })
     );
-    expect(ctx.chromeApi.windows.create).toHaveBeenCalledTimes(1);
-    const { url } = ctx.chromeApi.windows.create.mock.calls[0][0];
-    expect(url).toBe(`${EXT}${OFFER_PAGE}?id=offer-1`);
-    for (const secret of [PASSWORD, 'camille', 'free.fr']) expect(url).not.toContain(secret);
+    expect(ctx.shown()).toBe(1);
+    expect(ctx.onChange).toHaveBeenCalled();
+    expect(ctx.offers.listOffers()).toEqual([expect.objectContaining({ id: 'offer-1', product: 'limova_team', site: 'subscribe.free.fr', username: 'camille@example.com' })]);
+    expect(JSON.stringify(ctx.offers.listOffers())).not.toContain(PASSWORD);
     const details = ctx.offers.getOffer('offer-1');
     expect(details).toEqual(expect.objectContaining({ origin: ORIGIN, site: 'subscribe.free.fr', username: 'camille@example.com', update: false }));
     expect(JSON.stringify(details)).not.toContain(PASSWORD);
@@ -114,10 +117,10 @@ describe('login offers', () => {
     await ctx.offers.handlePageMessage({ type: 'TEAM_LOGIN_SUBMITTED', seq: 4, username: 'u', password: PASSWORD }, ctx.sender);
     await ctx.offers.handlePageMessage({ type: 'TEAM_LOGIN_FIELD_GONE', seq: 3 }, ctx.sender);
     await flush();
-    expect(ctx.chromeApi.windows.create).not.toHaveBeenCalled();
+    expect(ctx.shown()).toBe(0);
     await ctx.offers.handlePageMessage({ type: 'TEAM_LOGIN_FIELD_GONE', seq: 4 }, ctx.sender);
     await flush();
-    expect(ctx.chromeApi.windows.create).toHaveBeenCalledTimes(1);
+    expect(ctx.shown()).toBe(1);
   });
 
   it('drops a login that neither navigated nor removed the field within 10 s', async () => {
@@ -129,21 +132,21 @@ describe('login offers', () => {
     ctx.nav.onCommitted.fire({ tabId: 812, frameId: 0 });
     ctx.nav.onCompleted.fire({ tabId: 812, frameId: 0 });
     await flush();
-    expect(ctx.chromeApi.windows.create).not.toHaveBeenCalled();
+    expect(ctx.shown()).toBe(0);
   });
 
   it('drops a login whose form shows again after the navigation (wrong password)', async () => {
     const ctx = setup();
     ctx.probeResult.password_visible = true;
     await submitAndNavigate(ctx);
-    expect(ctx.chromeApi.windows.create).not.toHaveBeenCalled();
+    expect(ctx.shown()).toBe(0);
     expect(ctx.offers._peek(812)).toBeNull();
   });
 
   it('asks nothing, quietly, while the vault is off (404), and does not ask the server again for a while', async () => {
     const ctx = setup({ get: { status: 404, body: { detail: 'Not Found' } } });
     await submitAndNavigate(ctx);
-    expect(ctx.chromeApi.windows.create).not.toHaveBeenCalled();
+    expect(ctx.shown()).toBe(0);
     const calls = ctx.fetchImpl.mock.calls.length;
     await submitAndNavigate(ctx);
     expect(ctx.fetchImpl.mock.calls.length).toBe(calls);
@@ -154,21 +157,21 @@ describe('login offers', () => {
     ctx.link.features = { procedures: true, login_vault: false };
     await submitAndNavigate(ctx);
     expect(ctx.fetchImpl).not.toHaveBeenCalled();
-    expect(ctx.chromeApi.windows.create).not.toHaveBeenCalled();
+    expect(ctx.shown()).toBe(0);
     // An older server (no features) is asked as before.
     ctx.link.features = null;
     await submitAndNavigate(ctx);
-    expect(ctx.chromeApi.windows.create).toHaveBeenCalledTimes(1);
+    expect(ctx.shown()).toBe(1);
   });
 
   it('never watches the person\'s own tabs unless they opted in', async () => {
     const ctx = setup({ groupId: -1 });
     await submitAndNavigate(ctx);
     expect(ctx.offers.pendingCount()).toBe(0);
-    expect(ctx.chromeApi.windows.create).not.toHaveBeenCalled();
+    expect(ctx.shown()).toBe(0);
     await ctx.offers.setPrefs('limova_team', { offer_in_own_tabs: true });
     await submitAndNavigate(ctx);
-    expect(ctx.chromeApi.windows.create).toHaveBeenCalledTimes(1);
+    expect(ctx.shown()).toBe(1);
   });
 
   it('ignores http: pages, blocked sites, iframes, other extensions and a sender that is not the tab\'s page', async () => {
@@ -193,35 +196,35 @@ describe('login offers', () => {
     ctx.offers.noteVaultFill({ tabId: 812, origin: ORIGIN });
     await submitAndNavigate(ctx);
     expect(ctx.offers.pendingCount()).toBe(0);
-    expect(ctx.chromeApi.windows.create).not.toHaveBeenCalled();
+    expect(ctx.shown()).toBe(0);
     vi.advanceTimersByTime(2 * 60_000 + 1);
     await submitAndNavigate(ctx);
-    expect(ctx.chromeApi.windows.create).toHaveBeenCalledTimes(1);
+    expect(ctx.shown()).toBe(1);
   });
 
-  it('forgets the password two minutes after the submission, and closes the window', async () => {
+  it('forgets the password two minutes after the submission, and the notice goes away', async () => {
     const ctx = setup();
     await submitAndNavigate(ctx);
     await flush();
     expect(ctx.offers.offerIds()).toEqual(['offer-1']);
     vi.advanceTimersByTime(CAPTURE_TTL_MS);
     expect(ctx.offers.offerIds()).toEqual([]);
-    expect(ctx.chromeApi.windows.remove).toHaveBeenCalledWith(77);
+    expect(ctx.offers.listOffers()).toEqual([]);
     expect(await ctx.offers.decide('offer-1', 'save', {})).toEqual({ ok: false, error: 'expired' });
     expect(ctx.fetchImpl.mock.calls.filter(([, init]) => init.method === 'POST')).toHaveLength(0);
   });
 
-  it('closing the window is « Pas maintenant », and the site is not asked again for 10 minutes', async () => {
+  it('« Pas maintenant » dismisses the notice, and the site is not asked again for 10 minutes', async () => {
     const ctx = setup();
     await submitAndNavigate(ctx);
     await flush();
-    ctx.offers.windowClosed(77);
+    expect(await ctx.offers.decide('offer-1', 'later')).toEqual({ ok: true });
     expect(ctx.offers.offerIds()).toEqual([]);
     await submitAndNavigate(ctx);
-    expect(ctx.chromeApi.windows.create).toHaveBeenCalledTimes(1);
+    expect(ctx.shown()).toBe(1);
     vi.advanceTimersByTime(10 * 60_000 + 1);
     await submitAndNavigate(ctx);
-    expect(ctx.chromeApi.windows.create).toHaveBeenCalledTimes(2);
+    expect(ctx.shown()).toBe(2);
   });
 
   it('keeps one question per tab: a newer login replaces the open one', async () => {
@@ -231,7 +234,7 @@ describe('login offers', () => {
     await submitAndNavigate(ctx, { username: 'other@example.com' });
     await flush();
     expect(ctx.offers.offerIds()).toEqual(['offer-2']);
-    expect(ctx.chromeApi.windows.remove).toHaveBeenCalledWith(77);
+    expect(ctx.offers.listOffers().map(offer => offer.username)).toEqual(['other@example.com']);
   });
 
   it('« Jamais pour ce site » keeps the origin only, and no longer watches it', async () => {
@@ -243,7 +246,7 @@ describe('login offers', () => {
     expect(JSON.stringify(stored)).not.toContain('camille');
     await submitAndNavigate(ctx);
     expect(ctx.offers.pendingCount()).toBe(0);
-    expect(ctx.chromeApi.windows.create).toHaveBeenCalledTimes(1);
+    expect(ctx.shown()).toBe(1);
     await ctx.offers.setPrefs('limova_team', { remove_never: ORIGIN });
     expect((await ctx.offers.getPrefs('limova_team')).never_origins).toEqual([]);
   });
