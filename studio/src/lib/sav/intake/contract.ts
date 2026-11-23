@@ -88,6 +88,9 @@ export const savIntakeMutationSchema = z.enum([
   // SAV-95 (behind `SAV_ACK_CLOSE=on`): V1 moves the thread's Support ticket to « Fermé » with one note after a customer's acknowledgement the model judged
   // a confident close (`ack-closure.ts`); granted by no existing policy, so a renewal must add it explicitly.
   "close_acknowledged_ticket",
+  // V1 routing (23/11, behind `SAV_INTAKE_ROUTING_MODE=live`): forward a lead/application/investor/partnership mail to a team address, or archive a
+  // canvassing/automatic mail, then close the dossier (`routing-store.ts`); never a reply to the sender. Granted by no existing policy.
+  "route_intake_mail",
 ]);
 export type SavIntakeMutation = z.infer<typeof savIntakeMutationSchema>;
 

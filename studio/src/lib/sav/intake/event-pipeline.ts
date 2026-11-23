@@ -153,6 +153,8 @@ async function v2EntryRelayDeps(env: Record<string, string | undefined>) {
 export async function finishSavIntakeWake(runId: string) {
   const [run] = await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId));
   if (!run) return { projected: false, timings: null };
+  // V1 routing (23/11): forward or archive a routed mail before the projection shows it. Nothing unless SAV_INTAKE_ROUTING_MODE=live; never throws.
+  if (process.env.SAV_INTAKE_ROUTING_MODE === "live") await (await import("./routing-store")).syncIntakeRouting(run.messageId).catch(() => undefined);
   const projected = await projectIntakeThread(run.threadId).catch(() => false);
   // Read receipt failure never replays a confirmed CRM action.
   await (await import("./gmail-read")).syncHandledIntakeGmailRead(run.messageId).catch(() => {

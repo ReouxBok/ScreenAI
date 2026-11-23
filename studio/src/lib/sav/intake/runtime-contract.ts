@@ -10,6 +10,7 @@ import { SAV_ATTACHMENT_PDF_REVISION } from "../attachment-contract";
 import { SAV_INTAKE_NOISE_FILTER_REVISION, savIntakeNoiseFilterMode } from "./noise-filter";
 import { savAckClosureEnabled } from "./ack-closure-rules";
 import { SAV_ACK_CLOSURE_REVISION } from "./ack-closure-guidelines";
+import { SAV_INTAKE_ROUTING_REVISION, savIntakeRoutingMode } from "./routing-rules";
 
 export const SAV_INTAKE_RUNTIME_REVISION = "sav-intake-runtime-2026-10-21.v1";
 export const intakeRuntimeHash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -34,7 +35,10 @@ export type IntakeRuntimeConfig = z.infer<typeof savIntakeRuntimePins> & { mode:
   pdfReading?: boolean;
   /** SAV-92: automatic-mail filter before the model. Absent = off. "observe" changes no behaviour and stays outside
    * configHash; "on" routes to Autre and is inside configHash (a new launch configuration, like PDF reading). */
-  noiseFilter?: "observe" | "on" };
+  noiseFilter?: "observe" | "on";
+  /** V1 routing (23/11): absent = off. shadow records the decision only; live also forwards/archives through `routing-store.ts`. Both change the
+   * understanding prompt (the routing guideline), so both are inside configHash; off keeps the previous hash. */
+  routing?: "shadow" | "live" };
 export const SAV_INTAKE_PIPELINES = ["current", "simple"] as const;
 export type SavIntakePipeline = typeof SAV_INTAKE_PIPELINES[number];
 /** Absent means the current multi-call readers; any other value is a configuration error, never a silent default. */
@@ -63,6 +67,8 @@ export function intakeRuntimeConfigurationHash(p: z.infer<typeof savIntakeRuntim
     ...(savIntakeNoiseFilterMode(env) === "on" ? { noiseFilter: SAV_INTAKE_NOISE_FILTER_REVISION } : {}),
     // SAV-95: the closure guideline changes the understanding prompt, so `SAV_ACK_CLOSE=on` is a new launch configuration; off keeps the previous hash.
     ...(savAckClosureEnabled(env) ? { ackClosure: SAV_ACK_CLOSURE_REVISION } : {}),
+    // V1 routing: shadow and live add the routing guideline to the understanding prompt (a new launch configuration); off keeps the previous hash.
+    ...(savIntakeRoutingMode(env) !== "off" ? { routing: SAV_INTAKE_ROUTING_REVISION } : {}),
     accessBinding: intakeRuntimeHash({ model: env.SAV_GEMINI_API_KEY, crm: env.HUBSPOT_ACCESS_TOKEN }) });
 }
 /** No permissive defaults, campaign resets or hidden reuse of another budget. */
@@ -88,7 +94,8 @@ export function savIntakeRuntimeConfig(env: Record<string, string | undefined> =
     if (warning && createHash("sha256").update(warning.text).digest("hex") !== warning.sha256) throw Error();
     return { ...p, mode: "observe", policy, model: "gemini-3.6-flash", configHash: intakeRuntimeConfigurationHash(p, env), pipeline: savIntakePipeline(env),
       ...(savIntakePdfReading(env) ? { pdfReading: true } : {}),
-      ...(savIntakeNoiseFilterMode(env) !== "off" ? { noiseFilter: savIntakeNoiseFilterMode(env) as "observe" | "on" } : {}) };
+      ...(savIntakeNoiseFilterMode(env) !== "off" ? { noiseFilter: savIntakeNoiseFilterMode(env) as "observe" | "on" } : {}),
+      ...(savIntakeRoutingMode(env) !== "off" ? { routing: savIntakeRoutingMode(env) as "shadow" | "live" } : {}) };
   } catch { throw Error("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED"); }
 }
 export type IntakeRuntimeState = "pending" | "analysing" | "observed" | "waiting" | "uncertain" | "superseded";
@@ -98,6 +105,9 @@ export type IntakeRuntimePayload = {
   other?: import("./other-routing").IntakeOtherQualification;
   /** SAV-92: the noise filter's verdict (codes and message id only), in observe and on. */
   noise?: import("./noise-filter").SavIntakeNoiseVerdict & { mode: "observe" | "on"; messageId: string; routed: boolean };
+  /** V1 routing (23/11): the routing decision of this mail, in shadow and live (codes, class and team recipient only). `performed` stays false here:
+   * the live effect's receipts are audit rows (`routing-store.ts`). */
+  routing?: import("./routing-rules").SavIntakeRoutingDecision & { mode: "shadow" | "live"; performed: false };
   attachments?: import("./attachments").IntakeAttachmentState;
   configuration?: { configHash: string; resourcesHash: string; policyHash: string; codeRevision: string; model: string };
   semantics?:import("./semantic-records").AcceptedIntakeSemantics;

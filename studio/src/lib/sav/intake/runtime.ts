@@ -18,6 +18,8 @@ import { planSavIntake } from "./engine";
 import { intakeAutomationAdapters } from "./automated-message";
 import { SAV_INTAKE_NOISE_RESOURCE, savIntakeNoiseLogLine } from "./noise-filter";
 import { evaluateIntakeNoise } from "./noise-filter-runtime";
+import { decideIntakeRouting, intakeRoutingModelFromSemantics, intakeRoutingPlanFacts, savIntakeRoutingLogLine } from "./routing-rules";
+import type { IntakeLease } from "./runtime-store";
 import { intakeCrmEvidenceFingerprint, recordIntakeCrmReads } from "./crm-evidence-fingerprint";
 import { intakeResumeHoldReason, intakeResumeProof, newIntakeResumeObservation, observeIntakeReads } from "./resume-progress";
 import { probeIntakeResumeForRun } from "./resume-progress-store";
@@ -191,6 +193,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     // SAV-92: the ticket of the Gmail thread (or a person's choice) keeps the larger history share.
     const historyPriorityTicketIds = [lease.threadTicketId, lease.input.humanResolution?.ticketId];
     const semanticReader = simple ? createSavIntakeSimpleReaders({ model: config.model, call, crm: reads, policy: config.policy, provenance: lease.provenance, historyPriorityTicketIds,
+      ...(config.routing ? { routing: true } : {}),
       ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
         attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
         payload.attachments = attachments.state; checkpoint();
@@ -203,7 +206,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
       payload.attachments = attachments.state;
       checkpoint();
-    } } } : {}), ...(savAckClosureEnabled(env()) ? { ackClosure: true } : {}), model: config.model, call, provenance: lease.provenance, onValidatedEvidence: evidence => captureRequestQuotes(payload, evidence), onTrace: trace => {
+    } } } : {}), ...(savAckClosureEnabled(env()) ? { ackClosure: true } : {}), ...(config.routing ? { routing: true } : {}), model: config.model, call, provenance: lease.provenance, onValidatedEvidence: evidence => captureRequestQuotes(payload, evidence), onTrace: trace => {
       semanticFailureReason = trace.errorCode ?? undefined;
       if (trace.budgetLimit) readerBudgetLimit = trace.budgetLimit;
       traces.push(trace); checkpoint();
@@ -243,7 +246,11 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       const proof = intakeResumeProof(observation, { configHash: config.configHash, sourceHash: lease.sourceHash, incomplete: readFailure.reason ?? readFailure.operation });
       if (proof) payload.resumeProof = proof;
     }
+    // V1 routing (23/11). Off: nothing computed. Shadow and live: the decision is stored on the run and logged; it never changes this analysis. Only the
+    // live effect (`routing-store.ts`, after the projection) may forward or archive, and it re-reads every fact first.
+    if (config.routing) routeIntakeAnalysis(payload, lease, config.routing, state, Boolean(quotedMailboxReply || quotedTeamReply));
     await saveSavIntakeResult(lease, config, payload, state);
+    if (payload.routing) await (await import("./routing-store")).recordIntakeRoutingDecision(payload.routing).catch(() => undefined);
     // A provider outage is retried automatically at a durable due time, not left to wait.
     const transientRetry = state === "waiting" && !dispatcher.uncertain && payload.readRecovery?.state !== "scheduled" && intakeTransientFailure(payload.reason)
       ? await scheduleSavIntakeTransientRetry(runId, payload.reason!) : null;
@@ -312,6 +319,21 @@ export async function reconcileSavIntakeRuntime(options: { deadlineMs?: number }
     if (!catchUp) break;
   }
   return { mode: "observe", queued, legacyPauses, result, ...(catchUp ? { catchUp: { candidates: runs.length, analysed } } : {}), budget: await readSavIntakeBudget(config) };
+}
+
+/** V1 routing (23/11): the decision of this analysed mail, stored on the run and logged (codes, class and team recipient only). Pure apart from the log
+ * line; never throws (a failure only leaves the routing absent, i.e. today's path). */
+function routeIntakeAnalysis(payload: IntakeRuntimePayload, lease: Pick<IntakeLease, "run" | "input" | "threadTicketId">, mode: "shadow" | "live", state: "observed" | "waiting", quotedReply: boolean) {
+  try {
+    const messageId = lease.run.messageId, input = lease.input;
+    const decision = decideIntakeRouting({ messageId, analysisWaiting: state !== "observed",
+      model: intakeRoutingModelFromSemantics(payload.semantics, messageId), plan: intakeRoutingPlanFacts(payload.plan),
+      thread: { conversationLength: input.conversation.status === "complete" ? input.conversation.data.length : Number.POSITIVE_INFINITY,
+        ticketId: lease.threadTicketId ?? null, quotedReply,
+        humanContext: Boolean(input.message.operatorInformation || input.humanResolution || input.priorRequestReview || lease.run.humanChoiceCiphertext) } });
+    payload.routing = { ...decision, mode, performed: false };
+    console.info(savIntakeRoutingLogLine(mode, decision));
+  } catch { delete payload.routing; }
 }
 
 function attachmentFailureReason(reason:string|undefined,uncertain:boolean):import("../attachment-contract").SavAttachmentObservation["reason"] {

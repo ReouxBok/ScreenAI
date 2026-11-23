@@ -2,6 +2,7 @@ import { z } from "zod";
 import { savAttachmentObservationSchema, savAttachmentReasonSchema } from "../attachment-contract";
 import { intakeOperatorInformationSchema } from "./operator-information-contract";
 import { savAckClosureAnalysisSchema } from "./ack-closure-rules";
+import { savIntakeRoutingAnalysisSchema } from "./routing-rules";
 import type { SavIntakeDecision, SavIntakeMutation } from "./contract";
 
 const id = z.string().regex(/^\d{1,30}$/);
@@ -58,6 +59,8 @@ export const messageAnalysisSchema = z.object({
   ticketSummary: z.object({ title: z.string().trim().min(1).max(120), description: z.string().trim().min(1).max(100_000), requestIds: z.array(ref).min(1).max(15) }).strict().optional(),
   /** SAV-95: the model's closure decision on an acknowledgement, requested only when `SAV_ACK_CLOSE=on` (absent otherwise, and on every older record). */
   ackClosure: savAckClosureAnalysisSchema.optional(),
+  /** V1 routing (23/11): the model's dossier-level routing class, requested only when `SAV_INTAKE_ROUTING_MODE` is shadow or live (absent otherwise, and on every older record). */
+  routing: savIntakeRoutingAnalysisSchema.optional(),
 }).strict();
 export type MessageAnalysis = z.infer<typeof messageAnalysisSchema>;
 export const issueAssessmentSchema = z.object({
