@@ -1,7 +1,8 @@
 // V2 wake (local, OFF): the CANONICAL adapter of every port `runCaseV2Wake` needs, so the composition (nativebuild09) wires one function and no test double sits on the normal
 // path. Each adapter below is the real one; a port with no real implementation in the repo is NOT faked here: it is a REQUIRED argument that has no default (see CONTRAT.md §9).
 //   owner              A's `ticketOwnerPort` on a read-only HubSpot GET of the ticket's owner (real HubSpot, token from env)
-//   Slack              `createHandoffSlackAdapters` (default of `runHandoffNoticePass`), real Slack Web API, bot token and channel from env
+//   Slack              `createHandoffSlackAdapters` (default of `runHandoffNoticePass`), real Slack Web API, bot token and channel from env; optional `SAV_HANDOFF_SLACK_MENTIONS`
+//                      (comma-separated Slack user ids) adds one line of mentions on top of the posted notice, unset = text unchanged
 //   CRM reading        `createHandoffCrmReader` (read-only HubSpot), for the handoff notice
 //   CRM stage          `createCaseTicketStageAdapters` (default of `runCaseTicketStagePass`): PATCH stage only, GET to verify
 //   MIME send/verify   `createIntakeExecutorAdapters`: the existing executor's Gmail send / read-back and HubSpot reads

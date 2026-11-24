@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildHandoffNoticeIntent, HANDOFF_NOTICE_TITLE, HANDOFF_REASONS, HANDOFF_REASON_LABELS, handoffNoticeFacts, handoffNoticeKey, handoffNoticeMarker, handoffNoticeMarkerIn,
-  judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, resanitizeNoticeFacts, sanitizeNoticeText, scrubHandoffNoticeText, type HandoffCrmReading, type HandoffNoticeFacts, type HandoffNoticeTrigger,
+  handoffSlackMentionLine, judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, resanitizeNoticeFacts, sanitizeNoticeText, scrubHandoffNoticeText, type HandoffCrmReading, type HandoffNoticeFacts, type HandoffNoticeTrigger,
 } from "./case-handoff-notice";
 import { createHandoffSlackAdapters, SLACK_NOT_POSTED_PREFIX } from "./case-handoff-slack";
 import { createHandoffCrmReader, isHandoffCrmRead } from "./case-handoff-crm";
@@ -456,5 +456,65 @@ describe("signal d'analyse du relais", () => {
     expect(scrubbed).toContain("*Problème :* [code masqué]");
     expect(scrubbed).not.toContain(longCode);
     expect(scrubHandoffNoticeText(rendered.replace(line, `${line} ${longCode}`))).not.toContain(id);
+  });
+});
+
+describe("mentions of the team on the Slack notice (SAV_HANDOFF_SLACK_MENTIONS)", () => {
+  // Synthetic user ids: the real ones are injected configuration.
+  const PEOPLE = "USYNPERSON1,WSYNPERSON2", LINE = "<@USYNPERSON1> <@WSYNPERSON2>";
+  const signal = () => new AbortController().signal;
+  const post = async (env: Record<string, string | undefined>, intent = intentOf()) => {
+    const slack = fakeSlack(), a = createHandoffSlackAdapters({ network: slack.network, env: () => env });
+    await a.dispatch(intent, signal());
+    return { slack, a, intent, posted: String(slack.state.calls[0]!.body!.text) };
+  };
+
+  it("unset or empty: the posted text is byte-for-byte the text posted before (the scrubbed sealed text), with no mention", async () => {
+    for (const value of [undefined, "", "  ", " , ,"]) {
+      const { posted, intent } = await post({ ...ENV_ON, SAV_HANDOFF_SLACK_MENTIONS: value });
+      expect(posted).toBe(scrubHandoffNoticeText(intent.text, false));
+      expect(posted).toBe(intent.text);
+      expect(posted).not.toContain("<@");
+    }
+    expect(handoffSlackMentionLine({})).toBe("");
+  });
+
+  it("set: one line of mentions on top, exactly once, then the unchanged notice; the sealed intent carries no mention", async () => {
+    const { posted, intent } = await post({ ...ENV_ON, SAV_HANDOFF_SLACK_MENTIONS: ` ${PEOPLE} ` });
+    expect(posted).toBe(`${LINE}\n${intent.text}`);
+    expect(posted.split("\n")[0]).toBe(LINE);
+    expect(posted.match(/<@USYNPERSON1>/g)).toHaveLength(1);
+    expect(posted.match(/<@WSYNPERSON2>/g)).toHaveLength(1);
+    expect(intent.text).not.toContain("<@");
+  });
+
+  it("invalid entries are ignored with one warning per process; duplicates are posted once; nothing valid means no line", async () => {
+    vi.resetModules();
+    const fresh = await import("./case-handoff-notice");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      expect(fresh.handoffSlackMentionLine({ SAV_HANDOFF_SLACK_MENTIONS: "USYNPERSON1, bad, <@UEVIL00001>, usynlower1, U123, @USYNPERSON3, USYNPERSON1, CSYNCHANNEL1" })).toBe("<@USYNPERSON1>");
+      expect(fresh.handoffSlackMentionLine({ SAV_HANDOFF_SLACK_MENTIONS: "nope" })).toBe("");
+      expect(fresh.withHandoffSlackMentions("texte", { SAV_HANDOFF_SLACK_MENTIONS: "nope" })).toBe("texte");
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("UEVIL00001");
+    } finally { warn.mockRestore(); }
+  });
+
+  it("a mention written in the customer's free text is still neutralized; only the configured line pings", async () => {
+    const sealed = renderHandoffNotice(facts({ need: "Merci de prévenir <@UATTACK001> et <!here> @channel" }), VERIFIED, PORTAL);
+    expect(sealed.text).not.toMatch(/UATTACK001|<!here>|@channel/);
+    const forged = buildHandoffNoticeIntent({ render: { ...sealed, text: sealed.text.replace(/(\*Problème :\* ).*/, "$1<@UATTACK001> <!here>") }, caseId: CASE, ticketId: TICKET, channel: CHANNEL });
+    const { posted } = await post({ ...ENV_ON, SAV_HANDOFF_SLACK_MENTIONS: PEOPLE }, forged);
+    expect(posted).not.toMatch(/UATTACK001|<!here>/);
+    expect(posted.match(/<[@!][^>]*>/g)).toEqual(["<@USYNPERSON1>", "<@WSYNPERSON2>"]);
+  });
+
+  it("the already-posted verification still finds the notice by its marker and author, and never posts again", async () => {
+    const { slack, a, intent, posted } = await post({ ...ENV_ON, SAV_HANDOFF_SLACK_MENTIONS: PEOPLE });
+    expect(handoffNoticeMarkerIn(posted)).toBe(intent.marker);
+    const proof = await a.verify(intent, null, new Date(), signal());
+    expect(proof).toMatchObject({ confirmed: true, attributed: true, ack: { channel: CHANNEL, ts: slack.state.messages[0]!.ts } });
+    expect(slack.state.calls.filter(call => call.url.pathname === "/api/chat.postMessage")).toHaveLength(1);
   });
 });
