@@ -142,3 +142,22 @@ describe("comparaison avec l'équipe (interface non branchée)", () => {
     expect(smartJudgeRead(true, { better: "A" })).toEqual({ ok: false, problem: "output_invalid" });
   });
 });
+
+describe("v20 : le mail d'enquête avant passation (bug technique)", () => {
+  const INVESTIGATION = "Bonjour,\n\nJ'ai bien noté votre retour : votre routine ne part plus. Pour enquêter plus en profondeur : quel message s'affiche, et depuis quand ?\n\n"
+    + "Envoyez-nous aussi une capture du dernier problème et le lien de la conversation concernée : ouvrez-la dans Limova, cliquez dans la barre d'adresse de votre navigateur, copiez l'adresse et collez-la dans votre réponse.\n\nBelle journée.";
+  const ask = (extra: Record<string, unknown> = {}) => smartServerChecks({
+    decision: smartDecisionSchema.parse(smartGoodDecision({ outcome: "ask", reply: INVESTIGATION, coverage: [{ needId: "n1", status: "asked" }], facts: [],
+      memory: { question: "Message affiché, depuis quand, capture et lien de la conversation." }, ...extra })),
+    reading: smartReadingSchema.parse(smartReading({ needs: [{ id: "n1", ask: "faire repartir sa routine", alreadyDone: [], theme: "routine", search: "routine ne se lance plus" }] })),
+    customerText: "Bonjour, ma routine ne part plus depuis hier.", sources: [],
+  }).codes;
+  it("un « ask » sans fiche ni lien, sans délai ni promesse : aucun contrôle serveur ne le refuse", () => expect(ask()).toEqual([]));
+  it("le même texte avec une promesse de délai reste refusé ; la passation qui suit porte une note real_bug qui dit ce qui a été reçu", () => {
+    expect(ask({ reply: `${INVESTIGATION} Ce sera corrigé d'ici demain.` })).toContain("promise_unsourced");
+    const note = { raison: "real_bug", besoin: "faire repartir sa routine", compris: "URL de conversation reçue ; captures non reçues.", verifie: [], essaye: [], hypotheses: [],
+      prochaineVerification: "Ouvrir la conversation transmise et relire l'exécution de la routine.", ditAuClient: "L'équipe reprend." };
+    expect(smartDecisionSchema.parse(smartGoodDecision({ outcome: "handoff", teamNote: note, coverage: [{ needId: "n1", status: "handed" }], facts: [] })).teamNote)
+      .toMatchObject({ raison: "real_bug", compris: note.compris });
+  });
+});
