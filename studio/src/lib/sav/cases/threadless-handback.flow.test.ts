@@ -12,7 +12,7 @@ import { savCases, savCaseEffectExecutions, savCaseReplyValidations, savIntakeEf
 import { encryptSavPayload } from "../crypto";
 import type { EffectIntent } from "../intake/execution-types";
 import { enqueueHandoffNotices, runHandoffNoticePass } from "./case-handoff-notice-store";
-import { enqueueHandoffStages } from "./case-handoff-stage";
+import { enqueueHandoffStage, enqueueHandoffStages } from "./case-handoff-stage";
 import { SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { runCaseTicketStagePass } from "./case-ticket-stage-store";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
@@ -74,7 +74,7 @@ beforeEach(async () => {
     SAV_CODE_REVISION: CODE_REVISION, VERCEL_GIT_COMMIT_SHA: undefined, SAV_V2_SCOPE_MODE: undefined, SAV_V2_QUALIFICATION_SCOPE_JSON: undefined,
     SAV_TEST_MODE: "false", SAV_WRITES_DISABLED: "false", SAV_INTAKE_EXECUTION_KILL_SWITCH: "0",
     // The hand-back (SAV-99): the existing hand-over stage, its note and the Slack hand-over notice, under their own switches.
-    SAV_V2_TICKET_STAGES: "on", SAV_V2_STAGE_WAITING_CUSTOMER: "5", SAV_V2_STAGE_CLOSED: "4", SAV_V2_HANDOFF_STAGE: "on", SAV_V2_REPLY_NOTE: "on",
+    SAV_V2_TICKET_STAGES: "on", SAV_V2_STAGE_WAITING_CUSTOMER: "5", SAV_V2_STAGE_CLOSED: "4", SAV_V2_HANDOFF_STAGE: "on", SAV_V2_HANDOFF_STAGE_SINCE: before, SAV_V2_REPLY_NOTE: "on",
     SAV_HANDOFF_NOTICE: "on", SAV_HANDOFF_SLACK_BOT_TOKEN: "xoxb-" + "TEST".repeat(4), SAV_HANDOFF_SLACK_CHANNEL_ID: "CSYNCHANNEL1",
   })) vi.stubEnv(key, value);
 });
@@ -188,6 +188,17 @@ describe("SAV-99: an assigned ticket without mail, the category never decides", 
     expect(await f.db.select().from(savIntakeEffects).where(eq(savIntakeEffects.kind, "new_thread_send"))).toEqual([]);
     expect(await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, row!.id))).toEqual([]);
     expect([s.counts.gmail, s.counts.writes]).toEqual([0, 0]);
+  });
+
+  it("a SAV-99 handover before the stage bound does not queue its note or stage", async () => {
+    const s = ticket({ subject: "Export", content: "Comment exporter mes contacts ?" }, "");
+    vi.stubEnv("SAV_V2_HANDOFF_STAGE_SINCE", new Date(Date.parse(s.input.observedAt) + 1).toISOString());
+    expect(await startV2FromThreadlessTicket(s.input)).toMatchObject({ status: "human_wait" });
+    const row = await caseOf(s.input.ticketId);
+    expect(await enqueueHandoffStage({ caseId: row!.id, policy: { id: grant.id, hash: grant.policyHash }, env: () => process.env }))
+      .toEqual({ ok: false, reason: "handoff_before_since" });
+    const done = await runHandBack(() => "v2", s.input.ticketId);
+    expect([done.notes, s.counts.stageWrites]).toEqual([[], []]);
   });
 
   it("SAV-123 (N8): SAV_V2_ENTRY_SMART=on, a support ticket with no mail thread is admitted by the smart entry but goes to the team ONCE (`smart_no_thread`), never a mail", async () => {

@@ -1,14 +1,15 @@
 // SAV-92 (Ugo 17/11, local, OFF): the V2 hand-over gives the HubSpot ticket back to the team: stage « Nouveau » (V1's new stage) and NO owner, through the EXISTING
 // ticket-stage queue, executor, permission (`set_case_ticket_stage`) and HubSpot adapter. ONE stage per hand-over (key `case-stage:<case>:handoff:handoff-v<n>`, n = the
-// version of the `owner_changed` hand-over event), queued only once the hand-over is durable:
+// version of the event that recorded the hand-over), queued only once the hand-over is durable:
 //   - with a hand-over reply: in the reply's own receipt transaction (`case-effect-driver.ts`), so the owner is cleared only after the customer was told (the reply's
 //     executor needs the V2 owner on the ticket to send it);
 //   - without one (sensitive topic, `SAV_V2_CLOSING_HANDOFF_REPLY` off, a decision that sends nothing, a reply refused or revoked): by this sweep, from the stored case.
 // The two paths share the key: a replay, a second lap or both paths together queue it once. OFF unless `SAV_V2_HANDOFF_STAGE=on` AND `SAV_V2_TICKET_STAGES=on`.
 import "server-only";
 import { and, eq } from "drizzle-orm";
+import { z } from "zod";
 import { requireDb } from "@/db";
-import { savCaseEffectExecutions, savCaseReplyValidations } from "@/db/schema";
+import { savCaseEffectExecutions, savCaseEvents, savCaseReplyValidations } from "@/db/schema";
 import type { ExecutionTx } from "../intake/execution-store";
 import { caseReplyKey } from "./case-effects";
 import { nextSweepPage } from "./case-sweep-cursor";
@@ -21,11 +22,33 @@ import { caseHandoffStageEnabled, readCaseTicketStageConfig } from "./customer-r
 type Env = () => Record<string, string | undefined>;
 type Policy = Readonly<{ id: string; hash: string }>;
 
+const handoffStageSinceSchema = z.iso.datetime({ offset: true });
+let warnedAboutHandoffStageSince = false;
+
 /** Inside the caller's transaction, the case locked by the caller: queues the stage of the hand-over in force, if any. Writes nothing when the switch is off. */
 export async function enqueueCaseHandoffStage(tx: ExecutionTx, input: Readonly<{ snapshot: CaseSnapshot; policy: Policy; env: Env; threadId?: string }>): Promise<EnqueueTicketStageResult> {
-  if (!caseHandoffStageEnabled(input.env())) return { ok: false, reason: "handoff_stage_off" };
+  const env = input.env();
+  if (!caseHandoffStageEnabled(env)) return { ok: false, reason: "handoff_stage_off" };
+  const rawSince = env.SAV_V2_HANDOFF_STAGE_SINCE;
+  const parsed = handoffStageSinceSchema.safeParse(rawSince);
+  const since = parsed.success ? Date.parse(parsed.data) : NaN;
+  if (!parsed.success || !Number.isFinite(since)) {
+    if (!warnedAboutHandoffStageSince) {
+      warnedAboutHandoffStageSince = true;
+      console.warn("SAV_V2_HANDOFF_STAGE_SINCE is missing or invalid; handoff stage admission disabled");
+    }
+    return { ok: false, reason: rawSince ? "handoff_stage_since_invalid" : "handoff_stage_since_missing" };
+  }
   const version = await openHandoffVersion(tx, input.snapshot);
   if (version === undefined) return { ok: false, reason: "handoff_not_current" };
+  // Read the selected hand-over event, which can be crm_observed for SAV-99.
+  const [event] = await tx.select({ occurredAt: savCaseEvents.occurredAt }).from(savCaseEvents).where(and(
+    eq(savCaseEvents.caseId, input.snapshot.caseId), eq(savCaseEvents.caseVersion, version),
+  )).limit(1);
+  if (!event) return { ok: false, reason: "handoff_owner_event_missing" };
+  // Case events have millisecond precision. An ISO bound between two milliseconds starts at the next one.
+  const subMillisecond = /\.[0-9]{3}[0-9]*[1-9]/.test(parsed.data);
+  if (event.occurredAt.getTime() < since + Number(subMillisecond)) return { ok: false, reason: "handoff_before_since" };
   return enqueueCaseTicketStage(tx, { snapshot: input.snapshot, trigger: { kind: "handoff_recorded", caseVersion: version }, policy: input.policy, env: input.env,
     ...(input.threadId ? { threadId: input.threadId } : {}) });
 }
