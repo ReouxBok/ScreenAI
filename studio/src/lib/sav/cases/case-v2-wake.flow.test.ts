@@ -11,7 +11,7 @@ vi.mock("../hubspot-transport", async importOriginal => {
   return virtualSavHubspotTransportModule(await importOriginal<typeof import("../hubspot-transport")>());
 });
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }));
-import { savCaseEffectExecutions, savCaseReplyValidations, savIntakeEffectJournal, savIntakeEffects, savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
+import { savCaseEffectExecutions, savCaseReplyValidations, savCases, savIntakeEffectJournal, savIntakeEffects, savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { approveIntakeExecutionPolicy, type ExecutionPolicy } from "../intake/execution-policy";
@@ -28,7 +28,7 @@ import { TICKET_STAGE_KEY_PREFIX } from "./case-ticket-stage";
 import { createCaseTicketOwnerPort, createCaseV2WakeDeps } from "./case-v2-wake-ports";
 import { runCaseV2Wake, type CaseV2WakeDeps } from "./case-v2-wake";
 import { enqueueHandoffNotices } from "./case-handoff-notice-store";
-import { enqueueHandoffStages } from "./case-handoff-stage";
+import { enqueueHandoffStage, enqueueHandoffStages } from "./case-handoff-stage";
 import { recordConfirmedCaseReply } from "./case-effect-outcomes";
 import { applyProvenResolution, applyProvenResolutions } from "./case-resolution";
 import { HANDOFF_NOTICE_KEY_PREFIX, type HandoffCrmReading } from "./case-handoff-notice";
@@ -1014,7 +1014,59 @@ describe("SAV-92 (Ugo 17/11): a V2 hand-over gives the ticket back to the team, 
   };
   beforeEach(() => { environment = { ...environment, SAV_V2_CLOSING_HANDOFF_REPLY: "on", SAV_HANDOFF_NOTICE: undefined }; kb.cards = []; });
 
-  it("OFF (switch absent): the hand-over reply is sent and the ticket is not touched (owner and stage unchanged), as before", async () => {
+  it("SAV-133 rejects an earlier handoff and advances the sweep cursor", async () => {
+    const made = await newCase("gm-ho-before-since");
+    since = new Date();
+    expect(await investigate(made.caseId, [sensitiveHandoff])).toMatchObject({ outcome: "accepted" });
+    const handoff = (await listCaseEvents(made.caseId)).filter(event => event.kind === "owner_changed").at(-1)!;
+    environment.SAV_V2_HANDOFF_STAGE = "on";
+    environment.SAV_V2_HANDOFF_STAGE_SINCE = handoff.occurredAt.replace("Z", "1Z");
+    const input = { policy: { id: policyId, hash: policyHash }, env: () => environment };
+    expect(await enqueueHandoffStage({ ...input, caseId: made.caseId })).toEqual({ ok: false, reason: "handoff_before_since" });
+    expect(await enqueueHandoffStages({ ...input, since, limit: 1 })).toEqual({ examined: 1, created: 0, existing: 0,
+      refused: { handoff_before_since: 1 }, windowEnded: false, stoppedByDeadline: false });
+    expect(await enqueueHandoffStages({ ...input, since, limit: 1 })).toMatchObject({ examined: 0, refused: {}, windowEnded: true });
+    expect(await handoffStages(made.caseId)).toEqual([]);
+  });
+
+  it("SAV-133 confirms the handoff reply without queuing an earlier handoff from its receipt or the sweep", async () => {
+    const made = await newCase("gm-ho-receipt-before-since");
+    since = new Date();
+    expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
+    const event = (await listCaseEvents(made.caseId)).filter(event => event.kind === "owner_changed").at(-1)!;
+    environment.SAV_V2_HANDOFF_STAGE = "on";
+    environment.SAV_V2_HANDOFF_STAGE_SINCE = new Date(Date.parse(event.occurredAt) + 1).toISOString();
+    expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true } });
+
+    await runCaseEffectsPass(wakeDeps().replies);
+    expect(sends).toBe(1);
+    expect(await replyRows(made.caseId)).toMatchObject([{ state: "confirmed" }]);
+    expect(await handoffStages(made.caseId)).toEqual([]);
+    const result = await wake();
+    expect(result.failures).toEqual([]);
+    expect(result.handoffStages).toMatchObject({ created: 0, refused: { handoff_before_since: 1 } });
+    expect(ticketPatches(made.ticketId)).toEqual([]);
+  });
+
+  it("SAV-133 refuses missing or invalid bounds and warns once", async () => {
+    const made = await newCase("gm-ho-since-unconfigured");
+    since = new Date();
+    expect(await investigate(made.caseId, [sensitiveHandoff])).toMatchObject({ outcome: "accepted" });
+    environment.SAV_V2_HANDOFF_STAGE = "on";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const input = { policy: { id: policyId, hash: policyHash }, env: () => environment };
+    expect(await enqueueHandoffStage({ ...input, caseId: made.caseId })).toEqual({ ok: false, reason: "handoff_stage_since_missing" });
+    for (const invalid of ["11/24/2026", "2026-02-30T12:00:00Z", "2026-11-24T12:00:00", "2026-11-24T12:00:00+24:00"]) {
+      environment.SAV_V2_HANDOFF_STAGE_SINCE = invalid;
+      expect(await enqueueHandoffStage({ ...input, caseId: made.caseId })).toEqual({ ok: false, reason: "handoff_stage_since_invalid" });
+    }
+    expect(warn.mock.calls).toEqual([["SAV_V2_HANDOFF_STAGE_SINCE is missing or invalid; handoff stage admission disabled"]]);
+    expect(await handoffStages(made.caseId)).toEqual([]);
+  });
+
+  it("SAV-133 OFF (switch absent): the hand-over reply is sent and the ticket is not touched (owner and stage unchanged), as before", async () => {
+    const readSince = vi.fn(() => "invalid");
+    Object.defineProperty(environment, "SAV_V2_HANDOFF_STAGE_SINCE", { get: readSince });
     const made = await newCase("gm-ho-stage-off");
     expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
     expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true } });
@@ -1024,13 +1076,17 @@ describe("SAV-92 (Ugo 17/11): a V2 hand-over gives the ticket back to the team, 
     expect(await stageRows(made.caseId)).toHaveLength(0);
     expect(ticketPatches(made.ticketId)).toHaveLength(0);
     expect(ticketProps(made.ticketId)).toMatchObject({ hs_pipeline_stage: "1", hubspot_owner_id: V2_OWNER });
+    expect(readSince).not.toHaveBeenCalled();
   });
 
-  it("ON with the hand-over reply: the reply leaves first (the V2 owner is still there), then ONE stage: « 1 », owner cleared; replays add nothing", async () => {
+  it("SAV-133 ON with a hand-over after the bound: the reply leaves first, then ONE stage; replays add nothing", async () => {
     environment.SAV_V2_HANDOFF_STAGE = "on";
     const made = await newCase("gm-ho-stage-reply", "waiting");
     expect(ticketProps(made.ticketId).hs_pipeline_stage).toBe("2");
     expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
+    const event = (await listCaseEvents(made.caseId)).filter(event => event.kind === "owner_changed").at(-1)!;
+    environment.SAV_V2_HANDOFF_STAGE_SINCE = new Date(Date.parse(event.occurredAt) - 1).toISOString();
+    await f.db.update(savCases).set({ createdAt: new Date(Date.parse(event.occurredAt) - 86_400_000) }).where(eq(savCases.id, made.caseId));
     // The reply is still to come: the sweep waits for it (clearing the owner first would hold that reply for good).
     expect((await wake()).handoffStages).toMatchObject({ refused: { handoff_reply_pending: 1 } });
     expect(await handoffStages(made.caseId)).toHaveLength(0);
@@ -1052,10 +1108,12 @@ describe("SAV-92 (Ugo 17/11): a V2 hand-over gives the ticket back to the team, 
     expect(await readCase(made.caseId)).toMatchObject({ owner: "human", phase: "handoff_pending" });
   });
 
-  it("ON, sensitive hand-over: NO customer message, and still ONE stage « 1 » with the owner cleared; replays add nothing", async () => {
+  it("SAV-133 ON, sensitive hand-over exactly at the bound: no message and one stage; replays add nothing", async () => {
     environment.SAV_V2_HANDOFF_STAGE = "on";
     const made = await newCase("gm-ho-stage-sensitive");
     expect(await investigate(made.caseId, [sensitiveHandoff])).toMatchObject({ outcome: "accepted" });
+    const event = (await listCaseEvents(made.caseId)).filter(event => event.kind === "owner_changed").at(-1)!;
+    environment.SAV_V2_HANDOFF_STAGE_SINCE = event.occurredAt.replace("Z", "+00:00");
     expect(await readCase(made.caseId)).toMatchObject({ owner: "human", phase: "handoff_pending" });
     for (let n = 0; n < 3; n++) await wake();
     expect(sends).toBe(0);
@@ -1071,6 +1129,7 @@ describe("SAV-92 (Ugo 17/11): a V2 hand-over gives the ticket back to the team, 
 
   it("ON but a person took the case first, or the ticket is closed (stage 4): no owner cleared, no stage written", async () => {
     environment.SAV_V2_HANDOFF_STAGE = "on";
+    environment.SAV_V2_HANDOFF_STAGE_SINCE = since.toISOString();
     const taken = await newCase("gm-ho-stage-taken");
     expect(await investigate(taken.caseId, [sensitiveHandoff])).toMatchObject({ outcome: "accepted" });
     const current = (await readCase(taken.caseId))!;

@@ -7,8 +7,9 @@
 // The two paths share the key: a replay, a second lap or both paths together queue it once. OFF unless `SAV_V2_HANDOFF_STAGE=on` AND `SAV_V2_TICKET_STAGES=on`.
 import "server-only";
 import { and, eq } from "drizzle-orm";
+import { z } from "zod";
 import { requireDb } from "@/db";
-import { savCaseEffectExecutions, savCaseReplyValidations } from "@/db/schema";
+import { savCaseEffectExecutions, savCaseEvents, savCaseReplyValidations } from "@/db/schema";
 import type { ExecutionTx } from "../intake/execution-store";
 import { caseReplyKey } from "./case-effects";
 import { nextSweepPage } from "./case-sweep-cursor";
@@ -21,11 +22,33 @@ import { caseHandoffStageEnabled, readCaseTicketStageConfig } from "./customer-r
 type Env = () => Record<string, string | undefined>;
 type Policy = Readonly<{ id: string; hash: string }>;
 
+const handoffStageSinceSchema = z.iso.datetime({ offset: true });
+let warnedAboutHandoffStageSince = false;
+
 /** Inside the caller's transaction, the case locked by the caller: queues the stage of the hand-over in force, if any. Writes nothing when the switch is off. */
 export async function enqueueCaseHandoffStage(tx: ExecutionTx, input: Readonly<{ snapshot: CaseSnapshot; policy: Policy; env: Env; threadId?: string }>): Promise<EnqueueTicketStageResult> {
-  if (!caseHandoffStageEnabled(input.env())) return { ok: false, reason: "handoff_stage_off" };
+  const env = input.env();
+  if (!caseHandoffStageEnabled(env)) return { ok: false, reason: "handoff_stage_off" };
+  const rawSince = env.SAV_V2_HANDOFF_STAGE_SINCE;
+  const parsed = handoffStageSinceSchema.safeParse(rawSince);
+  const since = parsed.success ? Date.parse(parsed.data) : NaN;
+  if (!parsed.success || !Number.isFinite(since)) {
+    if (!warnedAboutHandoffStageSince) {
+      warnedAboutHandoffStageSince = true;
+      console.warn("SAV_V2_HANDOFF_STAGE_SINCE is missing or invalid; handoff stage admission disabled");
+    }
+    return { ok: false, reason: rawSince ? "handoff_stage_since_invalid" : "handoff_stage_since_missing" };
+  }
   const version = await openHandoffVersion(tx, input.snapshot);
   if (version === undefined) return { ok: false, reason: "handoff_not_current" };
+  // A threadless case can have a crm_observed version, but admission requires a recorded owner change.
+  const [event] = await tx.select({ occurredAt: savCaseEvents.occurredAt }).from(savCaseEvents).where(and(
+    eq(savCaseEvents.caseId, input.snapshot.caseId), eq(savCaseEvents.caseVersion, version), eq(savCaseEvents.kind, "owner_changed"),
+  )).limit(1);
+  if (!event) return { ok: false, reason: "handoff_owner_event_missing" };
+  // Case events have millisecond precision. An ISO bound between two milliseconds starts at the next one.
+  const subMillisecond = /\.[0-9]{3}[0-9]*[1-9]/.test(parsed.data);
+  if (event.occurredAt.getTime() < since + Number(subMillisecond)) return { ok: false, reason: "handoff_before_since" };
   return enqueueCaseTicketStage(tx, { snapshot: input.snapshot, trigger: { kind: "handoff_recorded", caseVersion: version }, policy: input.policy, env: input.env,
     ...(input.threadId ? { threadId: input.threadId } : {}) });
 }
