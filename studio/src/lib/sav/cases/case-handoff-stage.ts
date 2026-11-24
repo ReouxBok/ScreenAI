@@ -1,6 +1,6 @@
 // SAV-92 (Ugo 17/11, local, OFF): the V2 hand-over gives the HubSpot ticket back to the team: stage « Nouveau » (V1's new stage) and NO owner, through the EXISTING
 // ticket-stage queue, executor, permission (`set_case_ticket_stage`) and HubSpot adapter. ONE stage per hand-over (key `case-stage:<case>:handoff:handoff-v<n>`, n = the
-// version of the `owner_changed` hand-over event), queued only once the hand-over is durable:
+// version of the event that recorded the hand-over), queued only once the hand-over is durable:
 //   - with a hand-over reply: in the reply's own receipt transaction (`case-effect-driver.ts`), so the owner is cleared only after the customer was told (the reply's
 //     executor needs the V2 owner on the ticket to send it);
 //   - without one (sensitive topic, `SAV_V2_CLOSING_HANDOFF_REPLY` off, a decision that sends nothing, a reply refused or revoked): by this sweep, from the stored case.
@@ -41,9 +41,9 @@ export async function enqueueCaseHandoffStage(tx: ExecutionTx, input: Readonly<{
   }
   const version = await openHandoffVersion(tx, input.snapshot);
   if (version === undefined) return { ok: false, reason: "handoff_not_current" };
-  // A threadless case can have a crm_observed version, but admission requires a recorded owner change.
+  // Read the selected hand-over event, which can be crm_observed for SAV-99.
   const [event] = await tx.select({ occurredAt: savCaseEvents.occurredAt }).from(savCaseEvents).where(and(
-    eq(savCaseEvents.caseId, input.snapshot.caseId), eq(savCaseEvents.caseVersion, version), eq(savCaseEvents.kind, "owner_changed"),
+    eq(savCaseEvents.caseId, input.snapshot.caseId), eq(savCaseEvents.caseVersion, version),
   )).limit(1);
   if (!event) return { ok: false, reason: "handoff_owner_event_missing" };
   // Case events have millisecond precision. An ISO bound between two milliseconds starts at the next one.

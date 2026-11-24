@@ -12,7 +12,7 @@ import { savCases, savCaseEffectExecutions, savCaseReplyValidations, savIntakeEf
 import { encryptSavPayload } from "../crypto";
 import type { EffectIntent } from "../intake/execution-types";
 import { enqueueHandoffNotices, runHandoffNoticePass } from "./case-handoff-notice-store";
-import { enqueueHandoffStages } from "./case-handoff-stage";
+import { enqueueHandoffStage, enqueueHandoffStages } from "./case-handoff-stage";
 import { SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { runCaseTicketStagePass } from "./case-ticket-stage-store";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
@@ -157,16 +157,21 @@ describe("SAV-99: an assigned ticket without mail, the category never decides", 
     expect(s.counts).toMatchObject({ gmail: 0, writes: 0 });
   });
 
-  it("content outside Access with the category « Acces »: one Slack notice, no stage without an owner_changed event", async () => {
+  it("content outside Access with the category « Acces »: given back to the team ONCE (note, « Nouveau » with no owner, Slack), never a mail", async () => {
     const s = ticket({ subject: "Export de mes contacts", content: "Comment exporter la liste de mes contacts au format CSV ?" }, SAV_HUBSPOT_SUPPORT.categories.access);
     expect(await startV2FromThreadlessTicket(s.input)).toMatchObject({ status: "human_wait", reason: "no_block_match" });
     const row = await caseOf(s.input.ticketId);
     expect(await readCase(row!.id)).toMatchObject({ owner: "human", phase: "handoff_pending", threadIds: [], body: { handoff: { reason: "no_block_match" } } });
-    const first = await runHandBack(() => "v2", s.input.ticketId);
-    expect(first.stageQueue).toMatchObject({ created: 0, refused: { handoff_owner_event_missing: expect.any(Number) } });
-    // The stage execution also owns the HubSpot note for a ticket the agent did not take.
-    expect(first.notes).toEqual([]);
-    expect(s.counts.stageWrites).toEqual([]);
+    let owner: "v2" | "none" = "v2";
+    const first = await runHandBack(() => owner, s.input.ticketId);
+    // The note BEFORE the stage (the stage removes the V2 owner every write needs), then the stage: « Nouveau », owner cleared.
+    expect(first.notes.map(intent => intent.kind)).toEqual(["note_create", "note_associate"]);
+    const noteText = JSON.stringify(first.notes[0]);
+    expect(noteText).toContain("Ticket attribué à l'Agent SAV mais non pris en charge");
+    expect(noteText).toContain("Aucun mail envoyé au client");
+    expect(noteText).not.toContain("CSV");
+    expect(s.counts.stageWrites).toEqual([{ hs_pipeline_stage: SAV_HUBSPOT_SUPPORT.stages.new, hubspot_owner_id: "" }]);
+    owner = "none";
     // The Slack hand-over notice, once, its own fixed reason; no second HubSpot note from the notice.
     expect(first.slack).toHaveLength(1);
     const posted = JSON.stringify(first.slack[0]);
@@ -174,15 +179,26 @@ describe("SAV-99: an assigned ticket without mail, the category never decides", 
     expect(posted).toContain("Aucun mail n'a été envoyé au client");
     expect(posted).not.toContain("CSV");
     const executions = await executionsOf(row!.id);
-    expect(executions.map(execution => [execution.replyKey.split(":")[0], execution.threadId, execution.state])).toEqual([["handoff-notice", null, "confirmed"]]);
+    expect(executions.map(execution => [execution.replyKey.split(":")[0], execution.threadId, execution.state]).sort()).toEqual([["case-stage", null, "confirmed"], ["handoff-notice", null, "confirmed"]]);
     // Replays (the poll, the wake): nothing new anywhere.
-    expect(await startV2FromThreadlessTicket(s.input)).toMatchObject({ status: "existing_case" });
-    const again = await runHandBack(() => "v2", s.input.ticketId);
-    expect([again.notes, again.slack, s.counts.stageWrites]).toEqual([[], [], []]);
-    expect(await executionsOf(row!.id)).toHaveLength(1);
+    expect(await startV2FromThreadlessTicket(s.input)).toMatchObject({ status: "owner_changed" });
+    const again = await runHandBack(() => owner, s.input.ticketId);
+    expect([again.notes, again.slack, s.counts.stageWrites.length]).toEqual([[], [], 1]);
+    expect(await executionsOf(row!.id)).toHaveLength(2);
     expect(await f.db.select().from(savIntakeEffects).where(eq(savIntakeEffects.kind, "new_thread_send"))).toEqual([]);
     expect(await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, row!.id))).toEqual([]);
     expect([s.counts.gmail, s.counts.writes]).toEqual([0, 0]);
+  });
+
+  it("a SAV-99 handover before the stage bound does not queue its note or stage", async () => {
+    const s = ticket({ subject: "Export", content: "Comment exporter mes contacts ?" }, "");
+    vi.stubEnv("SAV_V2_HANDOFF_STAGE_SINCE", new Date(Date.parse(s.input.observedAt) + 1).toISOString());
+    expect(await startV2FromThreadlessTicket(s.input)).toMatchObject({ status: "human_wait" });
+    const row = await caseOf(s.input.ticketId);
+    expect(await enqueueHandoffStage({ caseId: row!.id, policy: { id: grant.id, hash: grant.policyHash }, env: () => process.env }))
+      .toEqual({ ok: false, reason: "handoff_before_since" });
+    const done = await runHandBack(() => "v2", s.input.ticketId);
+    expect([done.notes, s.counts.stageWrites]).toEqual([[], []]);
   });
 
   it("SAV-123 (N8): SAV_V2_ENTRY_SMART=on, a support ticket with no mail thread is admitted by the smart entry but goes to the team ONCE (`smart_no_thread`), never a mail", async () => {
@@ -191,9 +207,12 @@ describe("SAV-99: an assigned ticket without mail, the category never decides", 
     expect(await startV2FromThreadlessTicket(s.input)).toMatchObject({ status: "human_wait", reason: "smart_no_thread" });
     const row = await caseOf(s.input.ticketId);
     expect(await readCase(row!.id)).toMatchObject({ owner: "human", phase: "handoff_pending", threadIds: [], body: { handoff: { reason: "smart_no_thread" } } });
-    const first = await runHandBack(() => "v2", s.input.ticketId);
-    expect(first.notes).toEqual([]);
-    expect(s.counts.stageWrites).toEqual([]);
+    let owner: "v2" | "none" = "v2";
+    const first = await runHandBack(() => owner, s.input.ticketId);
+    expect(first.notes.map(intent => intent.kind)).toEqual(["note_create", "note_associate"]);
+    expect(JSON.stringify(first.notes[0])).toContain("aucun fil de mail n'est lié à ce ticket");
+    expect(s.counts.stageWrites).toEqual([{ hs_pipeline_stage: SAV_HUBSPOT_SUPPORT.stages.new, hubspot_owner_id: "" }]);
+    owner = "none";
     expect(first.slack).toHaveLength(1);
     expect(await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, row!.id))).toEqual([]);
     expect([s.counts.gmail, s.counts.writes]).toEqual([0, 0]);
@@ -210,12 +229,15 @@ describe("SAV-99: an assigned ticket without mail, the category never decides", 
     expect(await handBackOwnerHandoverTicket(s.input, "sensitive_request")).toEqual({ status: "existing_case" });
     const row = await caseOf(s.input.ticketId);
     expect(await readCase(row!.id)).toMatchObject({ owner: "human", phase: "handoff_pending", threadIds: [] });
-    const done = await runHandBack(() => "v2", s.input.ticketId);
-    expect(done.notes).toEqual([]);
-    expect(s.counts.stageWrites).toEqual([]);
+    let owner: "v2" | "none" = "v2";
+    const done = await runHandBack(() => owner, s.input.ticketId);
+    owner = "none";
+    expect(done.notes.map(intent => intent.kind)).toEqual(["note_create", "note_associate"]);
+    expect(JSON.stringify(done.notes[0])).toContain("demande sensible");
+    expect(s.counts.stageWrites).toEqual([{ hs_pipeline_stage: SAV_HUBSPOT_SUPPORT.stages.new, hubspot_owner_id: "" }]);
     expect(done.slack).toHaveLength(1);
-    const again = await runHandBack(() => "v2", s.input.ticketId);
-    expect([again.notes, again.slack, s.counts.stageWrites]).toEqual([[], [], []]);
+    const again = await runHandBack(() => owner, s.input.ticketId);
+    expect([again.notes, again.slack, s.counts.stageWrites.length]).toEqual([[], [], 1]);
     expect([s.counts.gmail, s.counts.writes]).toEqual([0, 0]);
   });
 
