@@ -727,9 +727,11 @@ describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case not
       const id = scenario === "sans identifiant" ? null : randomUUID();
       const staleTrace = scenario === "trace d'une version différente";
       const { execution, facts } = await prepare("real_bug", id, staleTrace);
+      if (scenario === "flag coupé") expect(facts).toMatchObject({ modelReason: "real_bug", conversationId: id });
       environment.SAV_HANDOFF_ANALYSIS_SIGNAL = scenario === "flag coupé" ? "off" : "on";
       const network = reactionNetwork(() => Response.json({ ok: true }));
       const background = afterResponse();
+      const scheduleAfterResponse = vi.spyOn(background, "scheduleAfterResponse");
       if (scenario === "faits anciens") {
         expect(facts).not.toHaveProperty("modelReason");
         expect(facts).not.toHaveProperty("conversationId");
@@ -740,6 +742,8 @@ describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case not
       expect(result).toMatchObject({ processed: [{ executionId: execution.id, state: "confirmed" }] });
       expect(messageOf().includes("*Conversation Limova :*")).toBe(staleTrace);
       expect(network.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual(["/api/chat.postMessage", "/api/auth.test", "/api/conversations.history"]);
+      expect(fetch).not.toHaveBeenCalled();
+      expect(scheduleAfterResponse).not.toHaveBeenCalled();
     });
 
     it.each(["already_reacted", "missing_scope", "network_error", "timeout"])("%s après la confirmation complète", async outcome => {

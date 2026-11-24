@@ -416,6 +416,8 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
       const { modelReason, conversationId } = payload.facts;
       if (addAnalysisReaction && modelReason === "real_bug" && conversationId) {
         try {
+          const config = readHandoffNoticeConfig(deps.env());
+          if (config.mode !== "on" || !config.analysisEmoji) return;
           scheduleAfterResponse(async () => {
             try {
               const config = readHandoffNoticeConfig(deps.env());
