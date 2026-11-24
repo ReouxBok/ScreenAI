@@ -10,13 +10,13 @@ const message: IntakeMessage = { id: MID, threadId: THREAD, fromEmail: "prospect
   currentText: "Bonjour, combien coûte votre offre pour 3 personnes ?", contentComplete: true, direction: "inbound", receivedAt: "2026-11-23T08:00:00.000Z" };
 const routing = { class: "lead_commercial", confidence: "high", justification: "Demande de prix avant achat." };
 
-function current(enabled: boolean | undefined, answer: unknown) {
+function current(enabled: boolean | undefined, answer: unknown, extra: Record<string, unknown> = {}) {
   const bodies: Parameters<IntakeGeminiCall>[0]["body"][] = [];
   const call: IntakeGeminiCall = async request => {
     bodies.push(request.body);
     const data = JSON.parse(request.body.contents[0].parts[0].text) as { citationCatalogue: { id: string; sourceId: string }[] };
     const quote = data.citationCatalogue.find(e => e.sourceId === "current")!.id;
-    return { json: { messageId: MID, nature: "request", requests: [{ id: "r1", kind: "commercial", currentMessageId: MID, quoteId: quote }], ...(answer === undefined ? {} : { routing: answer }) },
+    return { json: { messageId: MID, nature: "request", requests: [{ id: "r1", kind: "commercial", currentMessageId: MID, quoteId: quote }], ...(answer === undefined ? {} : { routing: answer }), ...extra },
       metadata: { inputTokens: 1, outputTokens: 1, thoughtTokens: 0, totalTokens: 2 } };
   };
   const readers = createSavIntakeSemanticReaders({ model: "gemini-fixture", call, ...(enabled === undefined ? {} : { routing: enabled }) });
@@ -51,6 +51,35 @@ describe("current pipeline", () => {
     const result = await current(true, answer).analyse();
     expect(result.routing).toBeUndefined();
     expect(result.requests).toHaveLength(1);
+  });
+  // Production 24/11 (shadow): with the routing field, a mail without any unread file came back with keys the wire contract never offers and the whole
+  // understanding analysis failed at decode (SAV_INTAKE_MODEL_CITATION_REJECTED / unknown_source), then fell to human qualification.
+  const strays: [string, Record<string, unknown>][] = [
+    ["an empty unreadAttachmentRequirements", { unreadAttachmentRequirements: [] }],
+    ["an invented unreadAttachmentRequirements", { unreadAttachmentRequirements: [{ sourceId: "a1", role: "accessory" }] }],
+    ["an attachmentObservations key", { attachmentObservations: [] }],
+  ];
+  it.each(strays)("on: %s on a mail without unread files never rejects the analysis; the class is kept", async (_name, extra) => {
+    const result = await current(true, routing, extra).analyse();
+    expect(result.routing).toEqual(routing);
+    expect(result.requests).toEqual([{ id: "r1", kind: "commercial", currentMessageId: MID }]);
+    expect(result.unreadAttachmentRequirements).toBeUndefined();
+    expect(result.attachmentObservations).toBeUndefined();
+  });
+  it("on: the wire contract no longer offers unreadAttachmentRequirements without an unread file", async () => {
+    const on = current(true, routing), off = current(undefined, undefined);
+    await on.analyse(); await off.analyse();
+    expect(JSON.stringify(on.bodies[0]!.generationConfig)).not.toContain("unreadAttachmentRequirements");
+    expect(JSON.stringify(off.bodies[0]!.generationConfig)).toContain("unreadAttachmentRequirements");
+  });
+  it.each(strays)("off: %s is still refused exactly as before routing", async (_name, extra) => {
+    await expect(current(undefined, undefined, extra).analyse()).rejects.toThrow("SAV_INTAKE_MODEL_CITATION_REJECTED");
+  });
+  it("on: a request citation outside the catalogue is still refused", async () => {
+    const readers = createSavIntakeSemanticReaders({ model: "gemini-fixture", routing: true, call: async () => ({
+      json: { messageId: MID, nature: "request", requests: [{ id: "r1", kind: "commercial", currentMessageId: MID, quoteId: "q-unknown" }], routing },
+      metadata: { inputTokens: 1, outputTokens: 1, thoughtTokens: 0, totalTokens: 2 } }) });
+    await expect(readers.analyseMessage({ message, conversation: [message] }, new AbortController().signal)).rejects.toThrow();
   });
 });
 

@@ -275,7 +275,11 @@ export function createSavIntakeSemanticReaders(options: {
       if (ackClosure) Object.assign(data, { lastOutboundSourceId: ackClosure.sourceId });
       const ackWireSchema = ackClosure ? savAckClosureAnalysisSchema.omit({ evidenceQuote: true }).extend({ lastOutboundMessageId: referenceIds([ackClosure.id]),
         evidenceQuoteId: catalogue.quoteIds(ackClosure.sourceId) }) : null;
-      const baseWireSchema = analysisSchema.omit({ attachmentObservations: true, imageRequirements: true, ackClosure: true, routing: true }).extend({ messageId: referenceIds([message.id]),
+      // V1 routing fix (24/11): with the switch on and no unread file, the wire contract no longer offers unreadAttachmentRequirements, a field the decoder
+      // refuses here (unknown_source); off keeps the exact pre-routing contract.
+      const routingNoUnread = Boolean(options.routing) && !message.unreadAttachments;
+      const baseWireSchema = analysisSchema.omit({ attachmentObservations: true, imageRequirements: true, ackClosure: true, routing: true,
+        ...(routingNoUnread ? { unreadAttachmentRequirements: true } : {}) }).extend({ messageId: referenceIds([message.id]),
         ...(ackWireSchema ? { ackClosure: ackWireSchema.optional() } : {}),
         ...(options.routing ? { routing: savIntakeRoutingAnalysisSchema.optional() } : {}),
         requests: z.array(analysisSchema.shape.requests.element.omit({ quote: true, originMessageId: true }).extend({ currentMessageId: referenceIds([message.id]),
@@ -367,6 +371,15 @@ export function createSavIntakeSemanticReaders(options: {
         if (withRouting && typeof withRouting === "object" && !Array.isArray(withRouting) && Object.hasOwn(withRouting, "routing")
           && !(options.routing && savIntakeRoutingAnalysisSchema.safeParse(withRouting.routing).success)) {
           const { routing: dropped, ...kept } = withRouting; void dropped; normalized.value = kept;
+        }
+        // V1 routing fix (24/11): with the switch on, the routing addition must never reject the analysis. Two keys the wire contract does not offer, and
+        // that would otherwise fail the whole analysis as unknown_source, are dropped: attachmentObservations (always server-built) and
+        // unreadAttachmentRequirements when the message has no unread file (no source it could cite). Every citation of the analysis stays strict.
+        const offered = normalized.value as Record<string, unknown> | null;
+        if (options.routing && offered && typeof offered === "object" && !Array.isArray(offered)) {
+          const { attachmentObservations: observations, unreadAttachmentRequirements: requirements, ...rest } = offered;
+          if (observations !== undefined || (requirements !== undefined && routingNoUnread))
+            normalized.value = { ...rest, ...(requirements === undefined || routingNoUnread ? {} : { unreadAttachmentRequirements: requirements }) };
         }
         // Before any wire schema (the visual sanitizer parses it first): an optional registration
         // whose anchor does not resolve to its own source is dropped under the discard rule.
