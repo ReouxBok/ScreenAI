@@ -79,7 +79,32 @@ describe("current pipeline", () => {
     const readers = createSavIntakeSemanticReaders({ model: "gemini-fixture", routing: true, call: async () => ({
       json: { messageId: MID, nature: "request", requests: [{ id: "r1", kind: "commercial", currentMessageId: MID, quoteId: "q-unknown" }], routing },
       metadata: { inputTokens: 1, outputTokens: 1, thoughtTokens: 0, totalTokens: 2 } }) });
-    await expect(readers.analyseMessage({ message, conversation: [message] }, new AbortController().signal)).rejects.toThrow();
+    await expect(readers.analyseMessage({ message, conversation: [message] }, new AbortController().signal)).rejects.toThrow("SAV_INTAKE_MODEL_CITATION_REJECTED");
+  });
+  describe("shadow + a mail WITH an unread file", () => {
+    const withFile: IntakeMessage = { ...message, unreadAttachments: [{ sourceId: "file-1", reason: "unsupported_type" }] };
+    const analyse = (textQuoteId: (quote: string) => string) => {
+      const bodies: Parameters<IntakeGeminiCall>[0]["body"][] = [];
+      const readers = createSavIntakeSemanticReaders({ model: "gemini-fixture", routing: true, call: async request => {
+        bodies.push(request.body);
+        const data = JSON.parse(request.body.contents[0].parts[0].text) as { citationCatalogue: { id: string; sourceId: string }[] };
+        const quote = data.citationCatalogue.find(e => e.sourceId === "current")!.id;
+        return { json: { messageId: MID, nature: "request", requests: [{ id: "r1", kind: "commercial", currentMessageId: MID, quoteId: quote }], routing,
+          unreadAttachmentRequirements: [{ sourceId: "file-1", role: "accessory", textQuoteId: textQuoteId(quote) }] },
+          metadata: { inputTokens: 1, outputTokens: 1, thoughtTokens: 0, totalTokens: 2 } };
+      } });
+      return { bodies, run: () => readers.analyseMessage({ message: withFile, conversation: [withFile] }, new AbortController().signal) };
+    };
+    it("keeps and validates unreadAttachmentRequirements, still offered on the wire", async () => {
+      const { bodies, run } = analyse(quote => quote);
+      const result = await run();
+      expect(JSON.stringify(bodies[0]!.generationConfig)).toContain("unreadAttachmentRequirements");
+      expect(result.routing).toEqual(routing);
+      expect(result.unreadAttachmentRequirements).toEqual([{ sourceId: "file-1", role: "accessory", textQuote: withFile.currentText }]);
+    });
+    it("still refuses an unknown textQuoteId", async () => {
+      await expect(analyse(() => "q-unknown").run()).rejects.toThrow("SAV_INTAKE_MODEL_CITATION_REJECTED");
+    });
   });
 });
 
