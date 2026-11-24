@@ -22,7 +22,7 @@ import { intakeExecutionConfig, readIntakeExecutionAuthority } from "../intake/e
 import { deferExecutionEffect, executionJournal, type ExecutionLease, type ExecutionTx } from "../intake/execution-store";
 import type { PassDriver } from "../intake/executor";
 import { executeIntakePass } from "../intake/executor";
-import type { Effect, EffectIntent, Execution, ExecutionOptions, ExecutionPayload, ExecutorAdapters } from "../intake/execution-types";
+import type { Effect, EffectAck, EffectIntent, Execution, ExecutionOptions, ExecutionPayload, ExecutorAdapters } from "../intake/execution-types";
 import { savIntakeRuntimeConfig } from "../intake/runtime-contract";
 import { ownedExecution, settleVerification } from "./case-effect-driver";
 import { caseEffectSchemaInstalled } from "./case-effect-recovery";
@@ -33,15 +33,17 @@ import {
   buildHandoffNoticeIntent, HANDOFF_NOTICE_CONTRACT, handoffNoteText, HANDOFF_NOTICE_KEY_PREFIX, awaitingHandoff, staleHandoffEventKinds, handoffNoticeFacts, handoffNoticeKey, handoffNoticeTrigger,
   agentNotTakenNoticeTrigger, judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, teamPartNoticeTriggers, type HandoffNoticeFacts, type HandoffNoticeTrigger,
 } from "./case-handoff-notice";
-import { createHandoffSlackAdapters, SLACK_NOT_POSTED_PREFIX } from "./case-handoff-slack";
-import type { CaseHandoffReceived } from "./case-handoff-summary";
+import { createHandoffSlackAdapters, SLACK_NOT_POSTED_PREFIX, type HandoffSlackAdapters } from "./case-handoff-slack";
+import { handoffConversationId, type CaseHandoffReceived } from "./case-handoff-summary";
 import { caseReceivedAttachments, type CaseStoredMailBody } from "./investigation-customer-attachments";
 import { caseCustomerOwnText } from "./investigation-customer-context";
 import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, type CaseNoteCreateIntent } from "./case-effect-intents";
 import { caseNoteAssociationKey, caseNoteKey, SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { createIntakeExecutorAdapters } from "../intake/execution-adapters";
-import { investigationHandoffCommand } from "./investigation-record";
+import { investigationHandoffCommand, readCaseInvestigationProgress } from "./investigation-record";
 import { lockCaseForWrite, listCaseEvents, readCase } from "./case-store";
+import { SAV_SMART_HANDOFF_REASONS } from "./smart/smart-contract";
+import { readSmartHandoffTraceReason } from "./smart/smart-trace-store";
 import { caseNotTakenWhy } from "./case-reply-summary-note";
 
 const LEASE_MS = 80_000;
@@ -54,7 +56,7 @@ const code = (error: unknown) => (error instanceof Error ? error.message : "UNKN
 export type HandoffNoticePayload = Readonly<{ contract: typeof HANDOFF_NOTICE_CONTRACT; key: string; facts: HandoffNoticeFacts; teamOwnerId: string | null;
   /** SAV-92: the HubSpot handoff note, sealed at admission (text and time never rebuilt). Absent from notices admitted before it existed. */
   note?: Readonly<{ interactionId: string; text: string; at: string }> }>;
-const ackOf = (effect: Effect) => effect.ackCiphertext ? decryptSavPayload<{ id?: string }>(effect.ackCiphertext) : null;
+const ackOf = (effect: Effect) => effect.ackCiphertext ? decryptSavPayload<EffectAck>(effect.ackCiphertext) : null;
 const NOTE_KINDS = new Set(["note_create", "note_associate"]);
 
 /**
@@ -125,19 +127,36 @@ export async function enqueueHandoffNotice(input: Readonly<{ caseId: string; pol
   if (!threadId && !(all.length === 1 && notTaken?.ok)) return { ok: false, code: "no_thread" };
   if (!threadId && !await ticketHandbackSchemaInstalled(requireDb())) return { ok: false, code: "no_thread", why: "schema_v11_missing" };
   const attachments = await readReceivedAttachments(snapshot.threadIds);
+  // The Smart trace already holds the note reason. Match the accepted proposal, including when its validation resumed later.
+  let modelReason: HandoffNoticeFacts["modelReason"];
+  if (config.analysisEmoji && trigger.ok) {
+    const read = readCaseInvestigationProgress(events, trigger.inputKey);
+    if (read.state === "found" && read.record.decision?.validation.outcome === "accepted"
+      && read.record.decision.validation.decision.nextAction.kind === "handoff") {
+      const { attempts, proposal } = read.record.progress;
+      const call = attempts.findLast(attempt => attempt.result === "validated");
+      if (proposal && call?.result === "validated" && call.outcome === "accepted") {
+        const reason = await readSmartHandoffTraceReason({ caseId: snapshot.caseId, inputKey: trigger.inputKey, call: call.call, caseVersion: proposal.proposedOn });
+        modelReason = SAV_SMART_HANDOFF_REASONS.find(value => value === reason);
+      }
+    }
+  }
+  const conversationId = config.analysisEmoji ? handoffConversationId(snapshot.body, attachments) : null;
   let first: EnqueueHandoffNoticeResult | null = null;
   for (const one of all) {
-    const result = await admitHandoffNotice(one, snapshot, threadId, attachments, config.teamOwnerId, input.policy);
+    const result = await admitHandoffNotice(one, snapshot, threadId, attachments, config.teamOwnerId, input.policy, { modelReason: one === trigger ? modelReason : undefined, conversationId });
     first ??= result;
   }
   return first!;
 }
 
 async function admitHandoffNotice(trigger: Extract<HandoffNoticeTrigger, { ok: true }>, snapshot: NonNullable<Awaited<ReturnType<typeof readCase>>>, threadId: string | null,
-  attachments: Awaited<ReturnType<typeof readReceivedAttachments>>, teamOwnerId: string | null, policy: Readonly<{ id: string; hash: string }>): Promise<EnqueueHandoffNoticeResult> {
+  attachments: Awaited<ReturnType<typeof readReceivedAttachments>>, teamOwnerId: string | null, policy: Readonly<{ id: string; hash: string }>, analysis: { modelReason?: HandoffNoticeFacts["modelReason"]; conversationId: string | null }): Promise<EnqueueHandoffNoticeResult> {
   const key = handoffNoticeKey(trigger.caseId, trigger.inputKey);
   // SAV-99: a ticket the agent did not take already gets its one short note from its hand-over stage (`case-ticket-stage-store.ts`): no second note here.
-  const facts = handoffNoticeFacts(trigger, snapshot.body, attachments), note = trigger.reason === "agent_not_taken" ? undefined : handoffNoteOf(facts, new Date().toISOString());
+  const { modelReason, conversationId } = analysis;
+  const facts = { ...handoffNoticeFacts(trigger, snapshot.body, attachments), ...(modelReason ? { modelReason } : {}), ...(conversationId ? { conversationId } : {}) };
+  const note = trigger.reason === "agent_not_taken" ? undefined : handoffNoteOf(facts, new Date().toISOString());
   const payload: HandoffNoticePayload = { contract: HANDOFF_NOTICE_CONTRACT, key, facts, teamOwnerId, ...(note ? { note } : {}) };
   return requireDb().transaction(async (tx): Promise<EnqueueHandoffNoticeResult> => {
     const [created] = await tx.insert(savCaseEffectExecutions).values({
@@ -184,6 +203,7 @@ export type HandoffNoticeDriverDeps = Readonly<{
   env: () => Record<string, string | undefined>;
   /** The read-only CRM reading that verifies the links; a failed reading holds the pass (it is read again), it never becomes « no contact ». */
   crm: HandoffCrmReader;
+  addAnalysisReaction?: HandoffSlackAdapters["addAnalysisReaction"];
 }>;
 
 export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDriver {
@@ -323,7 +343,7 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
       const [thread] = lease.row.threadId ? await requireDb().select({ customerEmail: savThreads.customerEmail }).from(savThreads).where(eq(savThreads.id, lease.row.threadId)) : [];
       // The CRM reading happens outside any transaction and BEFORE the plan: a failed reading holds the pass (read again later), it never plans an unverified link.
       const reading = await deps.crm({ ticketId: payload.facts.ticketId }, AbortSignal.any([options.signal, AbortSignal.timeout(20_000)]));
-      const render = renderHandoffNotice(payload.facts, judgeHandoffCrm(reading, { ticketId: payload.facts.ticketId, customerEmail: thread?.customerEmail ?? null }), config.portalId);
+      const render = renderHandoffNotice(payload.facts, judgeHandoffCrm(reading, { ticketId: payload.facts.ticketId, customerEmail: thread?.customerEmail ?? null }), config.portalId, Boolean(config.analysisEmoji));
       return buildHandoffNoticeIntent({ render, caseId: payload.facts.caseId, ticketId: payload.facts.ticketId, channel: config.channel });
     },
     async preflight(lease, options, intent) {
@@ -356,7 +376,7 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
     },
     async finish(lease, effects) {
       const payload = payloads.get(lease)!;
-      await requireDb().transaction(async tx => {
+      const receipt = await requireDb().transaction(async tx => {
         const owned = await ownedExecution(tx, lease);
         if (!owned) return fault("LEASE_LOST");
         const notice = effects.find(effect => effect.businessKey === payload.key);
@@ -370,7 +390,21 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
           .where(and(eq(savCaseEffectExecutions.id, lease.row.id), eq(savCaseEffectExecutions.leaseToken, lease.token)));
         await executionJournal(tx, lease.row.id, "execution_confirmed", { noticeEffectId: fresh.id,
           note: !note ? "none" : noteRows.length ? "confirmed" : "not_granted", ...(noteRows.length ? { noteEffectIds: noteRows.map(effect => effect.id) } : {}) });
+        return fresh;
       });
+      if (deps.addAnalysisReaction && payload.facts.modelReason === "real_bug" && payload.facts.conversationId) {
+        try {
+          const config = readHandoffNoticeConfig(deps.env());
+          if (config.mode !== "on" || !config.analysisEmoji) return;
+          const ack = ackOf(receipt);
+          if (typeof ack?.channel !== "string" || typeof ack.ts !== "string") throw Error("invalid_slack_receipt");
+          await deps.addAnalysisReaction({ channel: ack.channel, ts: ack.ts, emoji: config.analysisEmoji });
+        } catch (error) {
+          try {
+            await requireDb().transaction(tx => executionJournal(tx, lease.row.id, "analysis_signal_failed", { code: code(error) }, receipt.id));
+          } catch { /* The confirmed transfer is final even if its diagnostic cannot be written. */ }
+        }
+      }
     },
     async end(lease, state, reason) {
       await requireDb().transaction(async tx => {
@@ -416,7 +450,7 @@ export type HandoffNoticeRuntimeDeps = Readonly<{
   /** Tests inject the runtime pins / policy the V1 environment would provide; by default they are read exactly like the case effects pass. */
   context?: Pick<ExecutionOptions, "runtime" | "policy">;
   crm?: HandoffCrmReader;
-  adapters?: Pick<ExecutorAdapters, "dispatch" | "verify">;
+  adapters?: Pick<HandoffSlackAdapters, "dispatch" | "verify"> & Partial<Pick<HandoffSlackAdapters, "addAnalysisReaction">>;
   /** SAV-92: the HubSpot note's adapters (tests inject them); by default the existing executor adapters, built only when a note is dispatched or verified. */
   hubspot?: Pick<ExecutorAdapters, "dispatch" | "verify">;
   schemaInstalled?: () => Promise<boolean>;
@@ -464,7 +498,7 @@ export async function runHandoffNoticePass(deps: HandoffNoticeRuntimeDeps): Prom
     // The budget is spent: no new notice is started (the next pass lists it again; an engaged post is only verified then).
     if (Date.now() >= deps.deadlineMs) break;
     const options: ExecutionOptions = { config, ...context, env: deps.env, adapters, signal: AbortSignal.timeout(Math.max(1, deps.deadlineMs - Date.now())) };
-    await executeIntakePass(id, options, {}, createHandoffNoticeDriver({ env: deps.env, crm }));
+    await executeIntakePass(id, options, {}, createHandoffNoticeDriver({ env: deps.env, crm, addAnalysisReaction: slack.addAnalysisReaction }));
     const [row] = await db.select({ state: savCaseEffectExecutions.state, reason: savCaseEffectExecutions.reason }).from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.id, id));
     processed.push({ executionId: id, state: row?.state ?? "unknown", reason: row?.reason ?? null });
   }

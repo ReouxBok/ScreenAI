@@ -17,7 +17,7 @@ import type { CaseAdmissionInput } from "./admission-policy";
 import { pendingCaseEffectExecutions } from "./case-effect-driver";
 import { pendingCaseEffectRecoveries } from "./case-effect-recovery";
 import {
-  createHandoffNoticeDriver, enqueueHandoffNotice, enqueueHandoffNotices, HANDOFF_NOT_POSTED_RETRIES, pendingHandoffNoticeExecutions, runHandoffNoticePass,
+  createHandoffNoticeDriver, enqueueHandoffNotice, enqueueHandoffNotices, HANDOFF_NOT_POSTED_RETRIES, type HandoffNoticePayload, pendingHandoffNoticeExecutions, runHandoffNoticePass,
 } from "./case-handoff-notice-store";
 import { HANDOFF_NOTICE_KEY_PREFIX, handoffNoticeKey, type HandoffCrmReading } from "./case-handoff-notice";
 import { listCaseEvents, openCaseEvent, readCase, transitionCaseOwner } from "./case-store";
@@ -26,6 +26,8 @@ import { caseDedupeKey, caseRequestId, type CaseAdmissionQualification, type Cas
 import { selectCaseKnowledge } from "./investigation-knowledge";
 import { runCaseInvestigation, SAV_CASE_INVESTIGATION_MAX_CALLS, type CaseInvestigationModelRequest, type CaseInvestigationModelResult } from "./investigation-runner";
 import { caseInvestigationStorePorts } from "./investigation-store-ports";
+import { SAV_SMART_HANDOFF_REASONS } from "./smart/smart-contract";
+import { smartTraceKey } from "./smart/smart-trace-store";
 
 /*
  * The Slack handoff notice on the REAL pieces, SYN data only: B's real investigation runner and validator, pole A's real case store, the real effect ledger and the
@@ -606,6 +608,117 @@ describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case not
     try { return await run(); } finally { environment = before; }
   }
   const noteEffects = async (executionId: string) => (await effectsOf(executionId)).filter(effect => effect.kind === "note_create" || effect.kind === "note_associate");
+
+  describe("SAV-132 étape 6.5 : réaction après le transfert confirmé", () => {
+    async function prepare(reason: typeof SAV_SMART_HANDOFF_REASONS[number], conversationId: string | null, staleTrace = false) {
+      const made = await newCase(randomUUID());
+      crmReading = () => goodCrm(made.ticketId);
+      if (conversationId) {
+        const url = `https://new.limova.ai/organizations/${randomUUID()}/workspaces/${randomUUID()}/conversations/${conversationId}`;
+        await f.db.insert(savMessages).values({ mailboxId, threadId: made.threadId, direction: "inbound", fromEmail: CUSTOMER, toEmails: ["support@example.invalid"],
+          subject: "Signal synthétique", gmailMessageId: randomUUID(), receivedAt: new Date(), analysisStatus: "intake_execution_confirmed",
+          bodyCiphertext: encryptSavPayload({ attachments: [], headers: {}, text: `Voici le lien : ${url}` }) });
+      }
+      const result = await investigate(made.c.caseId, [], { callModel: async request => {
+        // The Smart provider already persists this reason in its encrypted trace before the runner validates and records the proposal.
+        const trace = { v: 1, caseId: request.caseId, inputKey: request.inputKey, call: request.call,
+          caseVersion: request.caseVersion - Number(staleTrace), kind: "turn", decision: { kind: "handoff", noteReason: reason } };
+        await f.db.insert(savSyncState).values({ key: smartTraceKey(trace), status: "done", cursor: encryptSavPayload(trace) });
+        return handoff()(request);
+      } });
+      expect(result).toMatchObject({ status: "recorded", outcome: "accepted" });
+      const [execution] = (await noticeRows()).filter(row => row.caseId === made.c.caseId);
+      return { ...made, execution: execution!, facts: decryptSavPayload<HandoffNoticePayload>(execution!.payloadCiphertext).facts };
+    }
+
+    const journalOf = (executionId: string, kind: string) =>
+      f.db.select().from(savIntakeEffectJournal).where(and(eq(savIntakeEffectJournal.executionId, executionId), eq(savIntakeEffectJournal.kind, kind)));
+    const reactionNetwork = (react: (init: RequestInit) => Response | Promise<Response>) => vi.fn<typeof fetch>(async (url, init) =>
+      new URL(String(url)).pathname === "/api/reactions.add" ? react(init!) : slack.network(url, init));
+    const reactionCalls = (network: ReturnType<typeof reactionNetwork>) =>
+      network.mock.calls.filter(([url]) => new URL(String(url)).pathname.includes("/reactions."));
+
+    it.each(SAV_SMART_HANDOFF_REASONS)("évalue la raison %s avec un identifiant", async reason => {
+      environment.SAV_HANDOFF_ANALYSIS_SIGNAL = "on";
+      const id = randomUUID();
+      const { execution, facts } = await prepare(reason, id);
+      const network = reactionNetwork(() => Response.json({ ok: true }));
+      expect(await pass({ network })).toMatchObject({ processed: [{ executionId: execution.id, state: "confirmed" }] });
+      const reactions = reactionCalls(network);
+      if (reason === "real_bug") {
+        expect(reactions.map(([url, init]) => [new URL(String(url)).pathname, init?.method, JSON.parse(String(init?.body))]))
+          .toEqual([["/api/reactions.add", "POST", { channel: CHANNEL, timestamp: slack.state.messages[0]!.ts, name: "mag" }]]);
+      } else {
+        expect(reactions).toEqual([]);
+      }
+      expect(facts).toMatchObject({ modelReason: reason, conversationId: id });
+      expect(messageOf()).toContain(`*Conversation Limova :* \`${id}\``);
+      expect(await pass({ network })).toEqual({ skipped: "nothing_due" });
+      expect(reactionCalls(network)).toHaveLength(reactions.length);
+    });
+
+    it.each(["sans identifiant", "flag coupé", "faits anciens", "trace d'une version différente"])("%s", async scenario => {
+      environment.SAV_HANDOFF_ANALYSIS_SIGNAL = scenario === "faits anciens" ? "off" : "on";
+      const id = scenario === "sans identifiant" ? null : randomUUID();
+      const staleTrace = scenario === "trace d'une version différente";
+      const { execution, facts } = await prepare("real_bug", id, staleTrace);
+      environment.SAV_HANDOFF_ANALYSIS_SIGNAL = scenario === "flag coupé" ? "off" : "on";
+      const network = reactionNetwork(() => Response.json({ ok: true }));
+      if (scenario === "faits anciens") {
+        expect(facts).not.toHaveProperty("modelReason");
+        expect(facts).not.toHaveProperty("conversationId");
+      }
+      if (staleTrace) expect(facts).not.toHaveProperty("modelReason");
+      const result = await pass({ network });
+      expect(result).toMatchObject({ processed: [{ executionId: execution.id, state: "confirmed" }] });
+      expect(messageOf().includes("*Conversation Limova :*")).toBe(staleTrace);
+      expect(network.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual(["/api/chat.postMessage", "/api/auth.test", "/api/conversations.history"]);
+    });
+
+    it.each(["already_reacted", "missing_scope", "network_error", "timeout"])("%s après la confirmation complète", async outcome => {
+      environment.SAV_HANDOFF_ANALYSIS_SIGNAL = "on";
+      environment.SAV_HANDOFF_ANALYSIS_EMOJI = "synthetic_mag";
+      const { execution, c } = await prepare("real_bug", randomUUID());
+      const hub: Hub = { calls: [], failCreate: false };
+      const readExecution = async () => (await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.id, execution.id)))[0];
+      let atReaction: { execution: Awaited<ReturnType<typeof readExecution>>; effects: Awaited<ReturnType<typeof effectsOf>>; case: Awaited<ReturnType<typeof readCase>> } | undefined;
+      let confirmedJournal: unknown;
+      const timeout = AbortSignal.timeout.bind(AbortSignal);
+      const timer = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => timeout(ms === 5_000 ? 10 : ms));
+      const network = reactionNetwork(async init => {
+        atReaction = { execution: await readExecution(), effects: await effectsOf(execution.id), case: await readCase(c.caseId) };
+        const confirmed = await journalOf(execution.id, "execution_confirmed");
+        confirmedJournal = confirmed.map(entry => decryptSavPayload(entry.payloadCiphertext));
+        if (outcome === "network_error") throw Error("SYNTHETIC_NETWORK");
+        if (outcome === "timeout") {
+          const signal = init.signal!;
+          if (signal.aborted) throw signal.reason;
+          return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+        }
+        return Response.json({ ok: false, error: outcome });
+      });
+      await granting(async () => {
+        expect(await pass({ network, hubspot: fakeHub(hub) as never })).toMatchObject({ processed: [{ executionId: execution.id, state: "confirmed", reason: null }] });
+        expect(reactionCalls(network).map(([, init]) => JSON.parse(String(init?.body)))).toEqual([
+          { channel: CHANNEL, timestamp: slack.state.messages[0]!.ts, name: "synthetic_mag" },
+        ]);
+        expect(timer).toHaveBeenCalledWith(5_000);
+        expect(confirmedJournal).toEqual([expect.objectContaining({ note: "confirmed" })]);
+        expect(atReaction?.execution?.state).toBe("confirmed");
+        expect(atReaction?.effects.map(effect => [effect.kind, effect.state]).sort()).toEqual(
+          [["handoff_notify", "confirmed"], ["note_associate", "confirmed"], ["note_create", "confirmed"]],
+        );
+        expect(atReaction?.case?.owner).toBe("human");
+        expect(await readExecution()).toEqual(atReaction?.execution);
+        expect(await effectsOf(execution.id)).toEqual(atReaction?.effects);
+        expect(await readCase(c.caseId)).toEqual(atReaction?.case);
+        const failures = await journalOf(execution.id, "analysis_signal_failed");
+        expect(failures.map(entry => decryptSavPayload(entry.payloadCiphertext))).toEqual(outcome === "already_reacted" ? [] : [{ code: outcome }]);
+        expect(await pass({ network, hubspot: fakeHub(hub) as never })).toEqual({ skipped: "nothing_due" });
+        expect(reactionCalls(network)).toHaveLength(1);
+      });
+    });
+  });
 
   it("granted: after the confirmed post, one note on the case's ticket with the synthesis (create then associate), confirmed; nothing more on later passes", async () => {
     const hub: Hub = { calls: [], failCreate: false };

@@ -137,6 +137,35 @@ export function customerLinkScan(texts: readonly string[], max: number = CASE_HA
 /** The distinct safe links found in these texts, in order, at most `max`. */
 export const customerLinksOf = (texts: readonly string[], max: number = CASE_HANDOFF_SUMMARY_LIMITS.links): string[] => customerLinkScan(texts, max).links;
 
+function customerLinkTexts(said: readonly { text: string }[], received?: CaseHandoffReceived | null) {
+  return [...(received?.linkTexts ?? []), ...said.map(fact => fact.text)];
+}
+
+/** The first conversation UUID from the same customer texts as the handoff link scan. */
+export function handoffConversationId(input: Pick<CaseBody, "facts">, received?: CaseHandoffReceived | null): string | null {
+  try {
+    const said = input.facts.filter(fact => fact.kind === "customer_statement").sort((a, b) => a.at.localeCompare(b.at));
+    for (const text of customerLinkTexts(said, received)) {
+      for (const match of text.matchAll(RAW_LINK)) {
+        const raw = match[0].replace(/[.,;:!?)»"'…]+$/u, "");
+        if (raw.length > 2_000 || text[match.index + match[0].length] === "\\") continue;
+        // Match the raw authority and path: URL normalization can erase :443 and dot segments.
+        const parts = /^https:\/\/([a-z0-9-]+(?:\.[a-z0-9-]+)+)(\/[^?#]*)(?:[?#].*)?$/i.exec(raw);
+        if (!parts) continue;
+        const [, host, path] = parts;
+        if (!allowedHost(host!.toLowerCase()) || host!.split(".").some(label => AUTH_WORD.test(label) || AUTH_HOST_LABEL.test(label)) || AUTH_WORD.test(path!)) continue;
+        const segments = path!.slice(1).split("/");
+        const legacy = segments.length === 2 && /^(?:conversation|chat|thread|share)$/.test(segments[0]!);
+        const v3 = segments.length === 6 && segments[0] === "organizations" && UUID_SEGMENT.test(segments[1]!)
+          && segments[2] === "workspaces" && UUID_SEGMENT.test(segments[3]!) && segments[4] === "conversations";
+        const id = segments.at(-1)!;
+        if ((legacy || v3) && UUID_SEGMENT.test(id)) return id;
+      }
+    }
+  } catch { return null; }
+  return null;
+}
+
 /** The synthesis of the stored case, masked and bounded. Never throws on a valid body. */
 export function buildCaseHandoffSummary(input: Partial<Pick<CaseBody, "openRequests" | "facts" | "questions" | "trials">>,
   received?: CaseHandoffReceived | null): CaseHandoffSummary {
@@ -166,7 +195,7 @@ export function buildCaseHandoffSummary(input: Partial<Pick<CaseBody, "openReque
   let links = 0;
   const said = byTime(body.facts.filter(row => row.kind === "customer_statement"));
   // SAV-92 (16/11): the links of the stored mails first (the customer's own text), then those the case's statements quote; cleaned again (idempotent), distinct, bounded.
-  const { links: urls, masked: urlsMasked } = customerLinkScan([...(received?.linkTexts ?? []), ...said.map(fact => fact.text)]);
+  const { links: urls, masked: urlsMasked } = customerLinkScan(customerLinkTexts(said, received));
   for (const fact of said) {
     for (const match of fact.text.matchAll(URL_IN_TEXT)) {
       links += 1;

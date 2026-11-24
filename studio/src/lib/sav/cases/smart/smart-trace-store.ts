@@ -63,6 +63,17 @@ const readable = (cursor: string | null): SmartCaseTrace | null => {
   try { const value = decryptSavPayload<SmartCaseTrace>(cursor ?? ""); return value && value.v === 1 ? value : null; } catch { return null; }
 };
 
+/** Reason of the exact model call that produced the accepted handoff proposal. */
+export async function readSmartHandoffTraceReason(call: Pick<SmartCaseTrace, "caseId" | "inputKey" | "call" | "caseVersion">) {
+  try {
+    const [row] = await requireDb().select({ cursor: savSyncState.cursor }).from(savSyncState)
+      .where(eq(savSyncState.key, smartTraceKey(call)));
+    const trace = readable(row?.cursor ?? null);
+    if (trace?.caseVersion === call.caseVersion && trace.kind === "turn" && trace.decision.kind === "handoff") return trace.decision.noteReason;
+  } catch { /* A missing or unreadable trace cannot qualify a signal. */ }
+  return null;
+}
+
 /** The stored traces of some cases, oldest first, at most `SAV_SMART_TRACE_READ_PER_CASE` (the latest) per case. Read only. */
 export async function readSmartCaseTraces(caseIds: readonly string[]): Promise<Map<string, SmartCaseTrace[]>> {
   const out = new Map<string, SmartCaseTrace[]>();
