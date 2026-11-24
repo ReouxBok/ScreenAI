@@ -59,6 +59,30 @@ export function readHandoffNoticeConfig(env: Readonly<Record<string, string | un
   return { ...(analysisEmoji ? { analysisEmoji } : {}), mode: "on", channel: env.SAV_HANDOFF_SLACK_CHANNEL_ID!, teamOwnerId: owner ? owner : null, portalId: portal ? portal : null };
 }
 
+const SLACK_USER = /^[UW][A-Z0-9]{6,12}$/;
+let warnedAboutHandoffSlackMentions = false;
+/**
+ * The people the notice pings, as one line of Slack mentions (`<@U…> <@U…>`), built ONLY from `SAV_HANDOFF_SLACK_MENTIONS` (comma-separated Slack user ids, injected
+ * configuration): never from a mail, the CRM or the model. An entry that is not a strict user id is ignored (one warning per process). Unset, empty or nothing valid: "".
+ */
+export function handoffSlackMentionLine(env: Readonly<Record<string, string | undefined>>): string {
+  const entries = (env.SAV_HANDOFF_SLACK_MENTIONS ?? "").split(",").map(entry => entry.trim()).filter(Boolean);
+  const valid = entries.filter(entry => SLACK_USER.test(entry));
+  if (valid.length !== entries.length && !warnedAboutHandoffSlackMentions) {
+    warnedAboutHandoffSlackMentions = true;
+    console.warn("SAV_HANDOFF_SLACK_MENTIONS holds invalid Slack user ids; they are ignored", { ignored: entries.length - valid.length });
+  }
+  return [...new Set(valid)].map(id => `<@${id}>`).join(" ");
+}
+/**
+ * The text that leaves for Slack: the mention line on top of the notice, added AFTER the last look (`scrubHandoffNoticeText`), which still strips every mention the
+ * sealed text could carry. Not sealed in the intent: the ledger row stays the same with or without mentions, and the verification ties the message by its marker only.
+ */
+export function withHandoffSlackMentions(text: string, env: Readonly<Record<string, string | undefined>>): string {
+  const line = handoffSlackMentionLine(env);
+  return line ? `${line}\n${text}` : text;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // The trigger
 // ---------------------------------------------------------------------------------------------------------------------------------

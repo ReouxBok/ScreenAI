@@ -5,7 +5,7 @@
 // answer we do not understand may have posted: it stays uncertain and is only verified.
 // The bot token comes from the injected environment and appears nowhere else (not in an intent, a ledger row, an error or a log). Nothing here reads a mail or the CRM.
 import type { EffectAck, EffectIntent, ExecutorAdapters } from "../intake/execution-types";
-import { handoffNoticeMarkerIn, readHandoffNoticeConfig, scrubHandoffNoticeText } from "./case-handoff-notice";
+import { handoffNoticeMarkerIn, readHandoffNoticeConfig, scrubHandoffNoticeText, withHandoffSlackMentions } from "./case-handoff-notice";
 
 const SLACK_API = "https://slack.com/api/";
 const TIMEOUT_MS = 10_000;
@@ -69,8 +69,10 @@ export function createHandoffSlackAdapters(deps: HandoffSlackDeps): HandoffSlack
       if (intent.kind !== "handoff_notify" || typeof intent.text !== "string" || !intent.text || typeof intent.channel !== "string" || typeof intent.marker !== "string" || !handoffNoticeMarkerIn(intent.text)) return fault("SAV_HANDOFF_SLACK_INTENT_INVALID");
       let response: Response;
       try {
-        const config = readHandoffNoticeConfig(deps.env());
-        response = await call(deps, "chat.postMessage", { http: "POST", body: { channel: intent.channel, text: scrubHandoffNoticeText(intent.text, config.mode === "on" && Boolean(config.analysisEmoji)), mrkdwn: true, unfurl_links: false, unfurl_media: false, link_names: false } }, signal);
+        const env = deps.env(), config = readHandoffNoticeConfig(env);
+        // The configured mentions go on top AFTER the last look, which strips any mention from the sealed text.
+        const text = withHandoffSlackMentions(scrubHandoffNoticeText(intent.text, config.mode === "on" && Boolean(config.analysisEmoji)), env);
+        response = await call(deps, "chat.postMessage", { http: "POST", body: { channel: intent.channel, text, mrkdwn: true, unfurl_links: false, unfurl_media: false, link_names: false } }, signal);
       } catch (error) {
         // A missing token fails before any request: nothing left. A transport error may have happened after Slack accepted the message.
         if (error instanceof Error && error.message === "SAV_HANDOFF_SLACK_TOKEN_MISSING") throw error;
