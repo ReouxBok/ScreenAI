@@ -4,6 +4,7 @@ import { v2DailyReport, v2DailyReportInput } from "@/lib/sav/cases/v2-daily-repo
 import { listV2Cases, v2InventoryInput } from "@/lib/sav/cases/v2-inventory";
 import { readSmartTraceSummaries, readSmartTracesForThread } from "@/lib/sav/cases/smart/smart-trace-store";
 import { readSmartShadowReport, smartShadowReportInput } from "@/lib/sav/cases/smart/smart-shadow-report";
+import { readSmartReplayReport, smartReplayReportInput } from "@/lib/sav/cases/smart/smart-shadow-replay-report";
 import type { SavClerkUser } from "@/lib/sav/intake/console-auth";
 import { listIntakeConsole } from "@/lib/sav/intake/console-store";
 import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
@@ -149,7 +150,15 @@ const v2ShadowReportTool = { name: "v2_shadow_report", title: "Rapport du shadow
     if (context.staff.role !== "admin") return refused("SAV_V2_SHADOW_REPORT_FORBIDDEN", "Rapport du shadow réservé aux administrateurs.");
     return done(await readSmartShadowReport(input));
   } };
-const listV2CasesTool = { name: "list_v2_cases", title: "Inventaire des dossiers V2", write: false,
+const v2ShadowReplayReportTool = { name: "v2_shadow_replay_report", title: "Rejeu du shadow de l’agent SAV", write: false,
+  description: "Rapport administrateur d’un rejeu borné du shadow (SAV_V2_SMART_SHADOW_REPLAY), AVEC contenu client comme smartTrace de get_dossier. replayId : identifiant du run. summary : mails rejoués, coût en micro-USD, issues v20 (rejeu) et v19 (shadow normal du même mail), transitions v19->v20, écartés par V1, révisions ; run : mails réservés et dépense du registre du rejeu. cases : un mail par ligne, du plus ancien reçu au plus récent, 10 par défaut, 20 maximum (offset, nextOffset ; outcome filtre la liste sur l’issue v20) : messageId, threadId pour get_dossier, et pour v19 puis v20 les codes du rapport shadow (issue, motifs, raison de transfert, raison et compteurs de la note, refus, fiches, outils, appels, coût, révision) et texts : replyProposed (réponse que le client aurait reçue), replyRefused (réponse refusée par les contrôles, jamais envoyée), teamNote (texte de la note équipe). Lecture seule.",
+  input: smartReplayReportInput,
+  async run(context: StudioMcpContext, input: z.infer<typeof smartReplayReportInput>) {
+    // Customer text, like get_dossier's smartTrace: role admin exactly.
+    if (context.staff.role !== "admin") return refused("SAV_V2_SHADOW_REPLAY_REPORT_FORBIDDEN", "Rejeu du shadow réservé aux administrateurs.");
+    return done(await readSmartReplayReport(input));
+  } };
+const listV2CasesTool = {name: "list_v2_cases", title: "Inventaire des dossiers V2", write: false,
   description: "Inventaire V2 réservé aux administrateurs, sans contenu client. from/until : dates ISO inclusives de création du dossier, jusqu’à min(until, snapshotAt) ; state filtre uniquement l’affichage : processing, awaiting_customer, reply_sent, handed_to_team, failed, paused. 25 dossiers parcourus par défaut, 100 maximum. Réutiliser le curseur et les mêmes filtres : borne snapshotAt figée, insertions ultérieures exclues ; attendus reste le total du périmètre immuable. statesFilterApplied indique si le filtre d’état est appliqué ; filteredOut compte les dossiers masqués sur chaque page. Contrôlés = lignes listées + filteredOut cumulés ; continuer tant que nextCursor existe, même avec une page vide. Une suppression ou un commit tardif ajoutant un dossier antérieur à snapshotAt invalide le parcours (SAV_V2_INVENTORY_MEMBERSHIP_CHANGED) : relancer alors le parcours depuis le début, sans curseur. Valeurs relues par page. outcomes expose séparément mail, note et statut par exécution : confirmed exige une preuve du registre, uncertain impose une vérification, blocked/skipped donne un motif lisible. Un mail confirmé ne prouve ni la note ni le statut. hubspot est le résumé historique ; consulter outcomes pour les refus et incertitudes. Coûts en micro-USD ; usage inconnu conservé en réservé. Curseur keyset compact. questions compte séparément asked, answered et open, sans texte client. replyDelaySeconds mesure le délai jusqu’à la confirmation de l’envoi. Historiques limités à 1000 entrées par dossier (dépassement explicite), registres à 1000 et 1 Mio chacun (coûts inconnus au-delà).",
   input: v2InventoryInput,
   async run(context: StudioMcpContext, input: z.infer<typeof v2InventoryInput>) {
@@ -171,4 +180,4 @@ const whoami = { name: "whoami", title: "Identité Studio", write: false,
   async run(context: StudioMcpContext) { return done({ email: context.staff.email, role: context.staff.role, name: context.staff.name }); } };
 
 /** Read-only tools of this lot. Write tools (SAV-27 to SAV-30) register with write: true. */
-export const studioMcpTools: StudioMcpTool[] = [whoami, listDossiers, listV2CasesTool, v2DailyReportTool, v2ShadowReportTool, getDossier, getDiagnostics, getBudget] as unknown as StudioMcpTool[];
+export const studioMcpTools: StudioMcpTool[] = [whoami, listDossiers, listV2CasesTool, v2DailyReportTool, v2ShadowReportTool, v2ShadowReplayReportTool, getDossier, getDiagnostics, getBudget] as unknown as StudioMcpTool[];
