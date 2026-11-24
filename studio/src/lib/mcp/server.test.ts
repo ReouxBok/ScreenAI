@@ -82,7 +82,7 @@ it("SAV-24 refuses browsers: cross-origin requests and preflights", async () => 
   expect(preflight.status).toBe(403); expect(preflight.headers.get("access-control-allow-origin")).toBeNull();
 });
 it("SAV-24 lists read tools only while writes are off; with writes on, write tools carry write annotations", async () => {
-  const read = ["get_agent_pause", "get_budget", "get_diagnostics", "get_dossier", "get_fiche", "list_dossiers", "list_v2_cases", "search_fiches", "v2_daily_report", "v2_shadow_report", "whoami"];
+  const read = ["get_agent_pause", "get_budget", "get_diagnostics", "get_dossier", "get_fiche", "list_dossiers", "list_v2_cases", "search_fiches", "v2_daily_report", "v2_shadow_replay_report", "v2_shadow_report", "whoami"];
   const write = ["classify_invalid_source_other", "classify_other", "close_handled_outside", "continue_dossier", "reconcile_effect", "reconcile_identification", "reconcile_note",
     "propose_fiche", "propose_fiche_update", "publish_fiche", "record_choice", "release_hold", "request_reinvestigation", "set_agent_pause"];
   const list = async (flags: Record<string, string>) => ((await (await rpc("tools/list", {}, { env: flags })).json()) as { result: { tools: { name: string; annotations: { readOnlyHint: boolean; destructiveHint: boolean } }[] } }).result.tools;
@@ -306,5 +306,51 @@ describe("v2_shadow_report", () => {
     for (let n = 0; n < 53; n++) await storeShadow("2026-11-22", "done", shadowRow(crypto.randomUUID(), "handoff", { costMicroUsd: n }));
     const data = (await callTool("v2_shadow_report", args)).result?.structuredContent?.data as { cases: unknown[]; casesTotal: number; casesTruncated: boolean };
     expect(data.cases).toHaveLength(50); expect(data).toMatchObject({ casesTotal: 53, casesTruncated: true, summary: { support: { mails: 53 } } });
+  });
+});
+
+/*
+ * v2_shadow_replay_report (25/11): one replay run of the shadow, v19 (the shadow's row) next to v20 (the replay's row), WITH the texts Ugo reads
+ * (proposed reply, refused reply, team note), at get_dossier's smartTrace level: administrators only. FICTIONAL rows.
+ */
+describe("v2_shadow_replay_report", () => {
+  const RUN = "v20-replay-fixture";
+  async function storeReplay(result: SmartShadowStored) {
+    await f.db.insert(savSyncState).values({ key: `sav-v2-smart-shadow-replay.v1:${RUN}:item:mail:${result.messageId}`, status: "done", startedAt: new Date("2026-11-25T09:00:00.000Z"),
+      cursor: encryptSavPayload({ version: 1, scope: RUN, reservedMicroUsd: 10_000, costMicroUsd: result.costMicroUsd, result: { ...result, runId: RUN } }) });
+  }
+  beforeEach(async () => {
+    vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "mcp-shadow-report-fixture-key-32chars!!");
+    await f.db.delete(savSyncState);
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("is administrator-only: owner and member are refused", async () => {
+    await storeReplay(shadowRow(crypto.randomUUID(), "handoff", { revision: "smart-v20" }));
+    for (const other of [reouven, contact]) {
+      current = other;
+      const refusal = await callTool("v2_shadow_replay_report", { replayId: RUN });
+      expect(refusal.result?.structuredContent).toMatchObject({ outcome: "refused", code: "SAV_V2_SHADOW_REPLAY_REPORT_FORBIDDEN" });
+      expect(JSON.stringify(refusal)).not.toContain("MARKER_");
+    }
+  });
+  it("refuses a malformed run id or page", async () => {
+    for (const bad of [{}, { replayId: "AB" }, { replayId: "v20 replay" }, { replayId: RUN, limit: 21 }, { replayId: RUN, offset: -1 }, { replayId: RUN, extra: true }])
+      expect((await callTool("v2_shadow_replay_report", bad)).result?.isError).toBe(true);
+  });
+  it("gives v19 next to v20 with the texts for administrators; the shadow report stays without customer text", async () => {
+    const messageId = crypto.randomUUID();
+    await storeShadow("2026-11-24", "done", shadowRow(messageId, "reply"), messageId);
+    await storeReplay(shadowRow(messageId, "handoff", { revision: "smart-v20" }));
+    const response = await callTool("v2_shadow_replay_report", { replayId: RUN });
+    const data = response.result?.structuredContent?.data as { summary: Record<string, unknown>; cases: Array<{ v19: Record<string, unknown>; v20: Record<string, unknown> }> };
+    expect(data.summary).toMatchObject({ mails: 1, outcomesV19: { reply: 1 }, outcomesV20: { handoff: 1 }, transitions: { "reply->handoff": 1 } });
+    expect(data.cases[0]!.v19).toMatchObject({ status: "done", outcome: "reply", revision: { prompt: "smart-v19" }, texts: { replyProposed: "MARKER_REPLY avec pied", teamNote: null } });
+    expect(data.cases[0]!.v20).toMatchObject({ outcome: "handoff", handoffReason: "no_source", revision: { prompt: "smart-v20" },
+      texts: { replyProposed: "MARKER_REPLY avec pied", replyRefused: null, teamNote: "MARKER_NOTE texte rendu" } });
+    // Only the texts are added: never the mail, the subject, the reading, the facts or the memory.
+    for (const marker of ["MARKER_MAIL_BODY", "MARKER_SUBJECT", "MARKER_READING", "MARKER_FACT", "MARKER_MEMORY", "MARKER_THINKING"]) expect(JSON.stringify(response)).not.toContain(marker);
+    const shadow = await callTool("v2_shadow_report", { from: "2026-11-24", until: "2026-11-25" });
+    for (const marker of LEAK) expect(JSON.stringify(shadow)).not.toContain(marker);
   });
 });
