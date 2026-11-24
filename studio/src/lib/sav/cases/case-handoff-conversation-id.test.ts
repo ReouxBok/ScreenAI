@@ -18,6 +18,9 @@ describe("identifiant de conversation transmis par le client", () => {
     ["hôte d'authentification", legacy.replace("limova.ai", "auth.limova.ai")],
     ["hôte d'identité", legacy.replace("limova.ai", "id.limova.ai")],
     ["chemin de connexion", legacy.replace("/thread/", "/login/../thread/")],
+    ["paramètre de jeton", `https://limova.ai/share/${id}?token=synthetic`],
+    ["fragment de connexion", `https://limova.ai/share/${id}#%256cogin`],
+    ["jeton magique V3", `${v3}?magic_token=synthetic`],
     ["HTTP", legacy.replace("https:", "http:")],
     ["port", legacy.replace("limova.ai", "limova.ai:8443")],
     ["port HTTPS explicite", legacy.replace("limova.ai", "limova.ai:443")],
@@ -29,6 +32,11 @@ describe("identifiant de conversation transmis par le client", () => {
     ["double encodage", legacy.replace("/thread/", "/%2574hread/")],
   ])("écarte %s", (_label, text) => {
     expect(extract(text)).toBeNull();
+  });
+
+  it("ignore un lien d'authentification avant un lien valide", () => {
+    const validId = randomUUID();
+    expect(extract(`${legacy}?token=synthetic ${v3.replace(id, validId)}`)).toBe(validId);
   });
 
   it("garde le premier identifiant et lit aussi les propos enregistrés", () => {

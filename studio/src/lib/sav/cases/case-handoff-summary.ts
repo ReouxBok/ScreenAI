@@ -87,6 +87,10 @@ type LinkVerdict = Readonly<{ ok: true; link: string }> | Readonly<{ ok: false }
 function judgeCustomerLink(raw: string): LinkVerdict {
   try { return judgeCustomerLinkUnsafe(raw); } catch { return { ok: false }; }
 }
+function hasAuthenticationSuffix(url: URL): boolean {
+  const fragment = decodeStable(url.hash);
+  return fragment === null || AUTH_WORD.test(fragment) || [...url.searchParams.keys()].some(name => AUTH_WORD.test(name));
+}
 function judgeCustomerLinkUnsafe(raw: string): LinkVerdict {
   const no = { ok: false } as const;
   const trimmed = raw.trim().replace(/[.,;:!?)»"'…]+$/u, "");
@@ -99,10 +103,10 @@ function judgeCustomerLinkUnsafe(raw: string): LinkVerdict {
   // Review Astra of e9f2f89: an authentication host (auth.limova.ai, sso., id., account.) is masked like an authentication path.
   if (host.split(".").some(label => AUTH_WORD.test(label) || AUTH_HOST_LABEL.test(label))) return no;
   // Decoded until stable (3 passes at most): `%256cogin` is `login`. A `%` left after that is masked, never guessed.
-  const path = decodeStable(url.pathname), fragment = decodeStable(url.hash);
-  if (path === null || fragment === null || path.includes("%")) return no;
+  const path = decodeStable(url.pathname);
+  if (path === null || path.includes("%")) return no;
   const segments = path.split("/").filter(Boolean);
-  if (segments.some(segment => AUTH_WORD.test(segment)) || AUTH_WORD.test(fragment) || [...url.searchParams.keys()].some(name => AUTH_WORD.test(name))) return no;
+  if (segments.some(segment => AUTH_WORD.test(segment)) || hasAuthenticationSuffix(url)) return no;
   // Only the one useful shape of a Limova link: /conversation|chat|thread|share/<id>. Any other path is masked.
   if (segments.length !== 2 || !CONVERSATION_SEGMENT.test(segments[0]!)) return no;
   const id = segments[1]!;
@@ -159,7 +163,7 @@ export function handoffConversationId(input: Pick<CaseBody, "facts">, received?:
         const v3 = segments.length === 6 && segments[0] === "organizations" && UUID_SEGMENT.test(segments[1]!)
           && segments[2] === "workspaces" && UUID_SEGMENT.test(segments[3]!) && segments[4] === "conversations";
         const id = segments.at(-1)!;
-        if ((legacy || v3) && UUID_SEGMENT.test(id)) return id;
+        if ((legacy || v3) && UUID_SEGMENT.test(id) && !hasAuthenticationSuffix(new URL(raw))) return id;
       }
     }
   } catch { return null; }

@@ -408,7 +408,7 @@ const UNVERIFIED_LABELS: Record<Extract<HandoffContactVerdict, { status: "unveri
 
 export type HandoffNoticeRender = Readonly<{ text: string; marker: string; key: string }>;
 
-const CONVERSATION_LINE_PREFIX = "*Conversation Limova :* ";
+export const CONVERSATION_LINE_PREFIX = "*Conversation Limova :* ";
 
 /** The notice, deterministic for its inputs: a verification compares the marker, never the text. */
 export function renderHandoffNotice(sealed: HandoffNoticeFacts, crm: HandoffCrmVerdict, portalId: string | null, analysisSignal = false): HandoffNoticeRender {

@@ -27,7 +27,7 @@ import { selectCaseKnowledge } from "./investigation-knowledge";
 import { runCaseInvestigation, SAV_CASE_INVESTIGATION_MAX_CALLS, type CaseInvestigationModelRequest, type CaseInvestigationModelResult } from "./investigation-runner";
 import { caseInvestigationStorePorts } from "./investigation-store-ports";
 import { SAV_SMART_HANDOFF_REASONS } from "./smart/smart-contract";
-import { smartTraceKey } from "./smart/smart-trace-store";
+import * as smartTraceStore from "./smart/smart-trace-store";
 
 /*
  * The Slack handoff notice on the REAL pieces, SYN data only: B's real investigation runner and validator, pole A's real case store, the real effect ledger and the
@@ -623,7 +623,7 @@ describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case not
         // The Smart provider already persists this reason in its encrypted trace before the runner validates and records the proposal.
         const trace = { v: 1, caseId: request.caseId, inputKey: request.inputKey, call: request.call,
           caseVersion: request.caseVersion - Number(staleTrace), kind: "turn", decision: { kind: "handoff", noteReason: reason } };
-        await f.db.insert(savSyncState).values({ key: smartTraceKey(trace), status: "done", cursor: encryptSavPayload(trace) });
+        await f.db.insert(savSyncState).values({ key: smartTraceStore.smartTraceKey(trace), status: "done", cursor: encryptSavPayload(trace) });
         return handoff()(request);
       } });
       expect(result).toMatchObject({ status: "recorded", outcome: "accepted" });
@@ -637,13 +637,78 @@ describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case not
       new URL(String(url)).pathname === "/api/reactions.add" ? react(init!) : slack.network(url, init));
     const reactionCalls = (network: ReturnType<typeof reactionNetwork>) =>
       network.mock.calls.filter(([url]) => new URL(String(url)).pathname.includes("/reactions."));
+    function afterResponse() {
+      const tasks: Array<() => Promise<void>> = [];
+      return { scheduleAfterResponse: (task: () => Promise<void>) => { tasks.push(task); },
+        finish: async () => { for (const task of tasks.splice(0)) await task(); } };
+    }
+
+    it("confirme les deux avis avant une réaction lente et refusée", async () => {
+      environment.SAV_HANDOFF_ANALYSIS_SIGNAL = "on";
+      const first = await prepare("real_bug", randomUUID());
+      const second = await prepare("no_source", randomUUID());
+      crmReading = () => ({ ticket: null, contacts: [] });
+      const network = reactionNetwork(async () => {
+        await new Promise(resolve => setTimeout(resolve, 1_600));
+        return Response.json({ ok: false, error: "missing_scope" });
+      });
+      const background = afterResponse();
+      expect(await pass({ network, deadlineMs: Date.now() + 1_400, scheduleAfterResponse: background.scheduleAfterResponse })).toMatchObject({ processed: [
+        { executionId: first.execution.id, state: "confirmed" },
+        { executionId: second.execution.id, state: "confirmed" },
+      ] });
+      expect(reactionCalls(network)).toHaveLength(0);
+      await background.finish();
+      expect(reactionCalls(network)).toHaveLength(1);
+      const failures = await journalOf(first.execution.id, "analysis_signal_failed");
+      expect(failures.map(entry => decryptSavPayload(entry.payloadCiphertext))).toEqual([{ code: "missing_scope" }]);
+    });
+
+    it.each(["sans UUID", "lecture lente", "lecture rejetée"])("admet sans motif avec %s", async scenario => {
+      environment.SAV_HANDOFF_ANALYSIS_SIGNAL = "on";
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      let readSettled = false;
+      const read = vi.spyOn(smartTraceStore, "readSmartHandoffTraceReason").mockImplementation(async () => {
+        if (scenario === "lecture rejetée") throw Error("SYNTHETIC_TRACE_ERROR");
+        await new Promise(resolve => setTimeout(resolve, 900));
+        readSettled = true;
+        return "real_bug";
+      });
+      const { execution, facts } = await prepare("real_bug", scenario === "sans UUID" ? null : randomUUID());
+      expect(execution.state).toBe("pending");
+      expect(read).toHaveBeenCalledTimes(scenario === "sans UUID" ? 0 : 1);
+      expect(readSettled).toBe(false);
+      expect(facts).not.toHaveProperty("modelReason");
+      if (scenario !== "sans UUID") {
+        expect(warn).toHaveBeenCalledWith("sav_handoff_trace_read_failed", expect.objectContaining({
+          code: scenario === "lecture lente" ? "timeout" : "read_failed",
+        }));
+      }
+    });
+
+    it("ne réagit pas si le texte scellé ne contient pas la ligne UUID", async () => {
+      environment.SAV_HANDOFF_ANALYSIS_SIGNAL = "on";
+      const { execution } = await prepare("real_bug", randomUUID());
+      environment.SAV_HANDOFF_ANALYSIS_SIGNAL = "off";
+      const background = afterResponse();
+      const network = reactionNetwork(() => Response.json({ ok: true }));
+      expect(await pass({ network, scheduleAfterResponse: background.scheduleAfterResponse })).toMatchObject({
+        processed: [{ executionId: execution.id, state: "confirmed" }],
+      });
+      environment.SAV_HANDOFF_ANALYSIS_SIGNAL = "on";
+      await background.finish();
+      expect(messageOf()).not.toContain("*Conversation Limova :*");
+      expect(reactionCalls(network)).toHaveLength(0);
+    });
 
     it.each(SAV_SMART_HANDOFF_REASONS)("évalue la raison %s avec un identifiant", async reason => {
       environment.SAV_HANDOFF_ANALYSIS_SIGNAL = "on";
       const id = randomUUID();
       const { execution, facts } = await prepare(reason, id);
       const network = reactionNetwork(() => Response.json({ ok: true }));
-      expect(await pass({ network })).toMatchObject({ processed: [{ executionId: execution.id, state: "confirmed" }] });
+      const background = afterResponse();
+      expect(await pass({ network, scheduleAfterResponse: background.scheduleAfterResponse })).toMatchObject({ processed: [{ executionId: execution.id, state: "confirmed" }] });
+      await background.finish();
       const reactions = reactionCalls(network);
       if (reason === "real_bug") {
         expect(reactions.map(([url, init]) => [new URL(String(url)).pathname, init?.method, JSON.parse(String(init?.body))]))
@@ -664,12 +729,14 @@ describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case not
       const { execution, facts } = await prepare("real_bug", id, staleTrace);
       environment.SAV_HANDOFF_ANALYSIS_SIGNAL = scenario === "flag coupé" ? "off" : "on";
       const network = reactionNetwork(() => Response.json({ ok: true }));
+      const background = afterResponse();
       if (scenario === "faits anciens") {
         expect(facts).not.toHaveProperty("modelReason");
         expect(facts).not.toHaveProperty("conversationId");
       }
       if (staleTrace) expect(facts).not.toHaveProperty("modelReason");
-      const result = await pass({ network });
+      const result = await pass({ network, scheduleAfterResponse: background.scheduleAfterResponse });
+      await background.finish();
       expect(result).toMatchObject({ processed: [{ executionId: execution.id, state: "confirmed" }] });
       expect(messageOf().includes("*Conversation Limova :*")).toBe(staleTrace);
       expect(network.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual(["/api/chat.postMessage", "/api/auth.test", "/api/conversations.history"]);
@@ -698,7 +765,9 @@ describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case not
         return Response.json({ ok: false, error: outcome });
       });
       await granting(async () => {
-        expect(await pass({ network, hubspot: fakeHub(hub) as never })).toMatchObject({ processed: [{ executionId: execution.id, state: "confirmed", reason: null }] });
+        const background = afterResponse();
+        expect(await pass({ network, hubspot: fakeHub(hub) as never, scheduleAfterResponse: background.scheduleAfterResponse })).toMatchObject({ processed: [{ executionId: execution.id, state: "confirmed", reason: null }] });
+        await background.finish();
         expect(reactionCalls(network).map(([, init]) => JSON.parse(String(init?.body)))).toEqual([
           { channel: CHANNEL, timestamp: slack.state.messages[0]!.ts, name: "synthetic_mag" },
         ]);

@@ -14,6 +14,7 @@
 import "server-only";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, eq, gt, inArray, isNull, like, lt, lte, notExists, or, sql } from "drizzle-orm";
+import { after } from "next/server";
 import { requireDb } from "@/db";
 import { savCaseEffectExecutions, savCaseEvents, savIntakeEffectJournal, savIntakeEffects, savMessages, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
@@ -30,7 +31,7 @@ import { ticketHandbackSchemaInstalled } from "./case-schema-v11";
 import { createHandoffCrmReader, type HandoffCrmReader } from "./case-handoff-crm";
 import { nextSweepPage } from "./case-sweep-cursor";
 import {
-  buildHandoffNoticeIntent, HANDOFF_NOTICE_CONTRACT, handoffNoteText, HANDOFF_NOTICE_KEY_PREFIX, awaitingHandoff, staleHandoffEventKinds, handoffNoticeFacts, handoffNoticeKey, handoffNoticeTrigger,
+  buildHandoffNoticeIntent, CONVERSATION_LINE_PREFIX, HANDOFF_NOTICE_CONTRACT, handoffNoteText, HANDOFF_NOTICE_KEY_PREFIX, awaitingHandoff, staleHandoffEventKinds, handoffNoticeFacts, handoffNoticeKey, handoffNoticeTrigger,
   agentNotTakenNoticeTrigger, judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, teamPartNoticeTriggers, type HandoffNoticeFacts, type HandoffNoticeTrigger,
 } from "./case-handoff-notice";
 import { createHandoffSlackAdapters, SLACK_NOT_POSTED_PREFIX, type HandoffSlackAdapters } from "./case-handoff-slack";
@@ -43,7 +44,7 @@ import { createIntakeExecutorAdapters } from "../intake/execution-adapters";
 import { investigationHandoffCommand, readCaseInvestigationProgress } from "./investigation-record";
 import { lockCaseForWrite, listCaseEvents, readCase } from "./case-store";
 import { SAV_SMART_HANDOFF_REASONS } from "./smart/smart-contract";
-import { readSmartHandoffTraceReason } from "./smart/smart-trace-store";
+import { readSmartHandoffTraceReason, SMART_HANDOFF_TRACE_TIMEOUT_MS } from "./smart/smart-trace-store";
 import { caseNotTakenWhy } from "./case-reply-summary-note";
 
 const LEASE_MS = 80_000;
@@ -127,21 +128,37 @@ export async function enqueueHandoffNotice(input: Readonly<{ caseId: string; pol
   if (!threadId && !(all.length === 1 && notTaken?.ok)) return { ok: false, code: "no_thread" };
   if (!threadId && !await ticketHandbackSchemaInstalled(requireDb())) return { ok: false, code: "no_thread", why: "schema_v11_missing" };
   const attachments = await readReceivedAttachments(snapshot.threadIds);
+  const conversationId = config.analysisEmoji ? handoffConversationId(snapshot.body, attachments) : null;
   // The Smart trace already holds the note reason. Match the accepted proposal, including when its validation resumed later.
   let modelReason: HandoffNoticeFacts["modelReason"];
-  if (config.analysisEmoji && trigger.ok) {
+  if (conversationId && trigger.ok && all.includes(trigger)) {
     const read = readCaseInvestigationProgress(events, trigger.inputKey);
     if (read.state === "found" && read.record.decision?.validation.outcome === "accepted"
       && read.record.decision.validation.decision.nextAction.kind === "handoff") {
       const { attempts, proposal } = read.record.progress;
       const call = attempts.findLast(attempt => attempt.result === "validated");
       if (proposal && call?.result === "validated" && call.outcome === "accepted") {
-        const reason = await readSmartHandoffTraceReason({ caseId: snapshot.caseId, inputKey: trigger.inputKey, call: call.call, caseVersion: proposal.proposedOn });
-        modelReason = SAV_SMART_HANDOFF_REASONS.find(value => value === reason);
+        const controller = new AbortController();
+        const expiresAt = performance.now() + SMART_HANDOFF_TRACE_TIMEOUT_MS;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          // The deadline also covers waiting for a connection, before PostgreSQL can enforce its timeout.
+          const deadline = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => { controller.abort(); reject(controller.signal.reason); }, SMART_HANDOFF_TRACE_TIMEOUT_MS);
+          });
+          const reason = await Promise.race([
+            readSmartHandoffTraceReason({ caseId: snapshot.caseId, inputKey: trigger.inputKey, call: call.call, caseVersion: proposal.proposedOn }, expiresAt, controller.signal),
+            deadline,
+          ]);
+          modelReason = SAV_SMART_HANDOFF_REASONS.find(value => value === reason);
+        } catch {
+          console.warn("sav_handoff_trace_read_failed", { caseId: snapshot.caseId, code: controller.signal.aborted || performance.now() >= expiresAt ? "timeout" : "read_failed" });
+        } finally {
+          clearTimeout(timer);
+        }
       }
     }
   }
-  const conversationId = config.analysisEmoji ? handoffConversationId(snapshot.body, attachments) : null;
   let first: EnqueueHandoffNoticeResult | null = null;
   for (const one of all) {
     const result = await admitHandoffNotice(one, snapshot, threadId, attachments, config.teamOwnerId, input.policy, { modelReason: one === trigger ? modelReason : undefined, conversationId });
@@ -199,11 +216,14 @@ export async function enqueueHandoffNotices(input: Readonly<{ policy: Readonly<{
 // Driver
 // ---------------------------------------------------------------------------------------------------------------------------------
 
+type ScheduleAfterResponse = (task: () => Promise<void>) => void;
+
 export type HandoffNoticeDriverDeps = Readonly<{
   env: () => Record<string, string | undefined>;
   /** The read-only CRM reading that verifies the links; a failed reading holds the pass (it is read again), it never becomes « no contact ». */
   crm: HandoffCrmReader;
   addAnalysisReaction?: HandoffSlackAdapters["addAnalysisReaction"];
+  scheduleAfterResponse?: ScheduleAfterResponse;
 }>;
 
 export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDriver {
@@ -392,17 +412,26 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
           note: !note ? "none" : noteRows.length ? "confirmed" : "not_granted", ...(noteRows.length ? { noteEffectIds: noteRows.map(effect => effect.id) } : {}) });
         return fresh;
       });
-      if (deps.addAnalysisReaction && payload.facts.modelReason === "real_bug" && payload.facts.conversationId) {
+      const { addAnalysisReaction, scheduleAfterResponse = after } = deps;
+      const { modelReason, conversationId } = payload.facts;
+      if (addAnalysisReaction && modelReason === "real_bug" && conversationId) {
         try {
-          const config = readHandoffNoticeConfig(deps.env());
-          if (config.mode !== "on" || !config.analysisEmoji) return;
-          const ack = ackOf(receipt);
-          if (typeof ack?.channel !== "string" || typeof ack.ts !== "string") throw Error("invalid_slack_receipt");
-          await deps.addAnalysisReaction({ channel: ack.channel, ts: ack.ts, emoji: config.analysisEmoji });
-        } catch (error) {
-          try {
-            await requireDb().transaction(tx => executionJournal(tx, lease.row.id, "analysis_signal_failed", { code: code(error) }, receipt.id));
-          } catch { /* The confirmed transfer is final even if its diagnostic cannot be written. */ }
+          scheduleAfterResponse(async () => {
+            try {
+              const config = readHandoffNoticeConfig(deps.env());
+              if (config.mode !== "on" || !config.analysisEmoji) return;
+              if (!effectIntent(receipt).text?.split("\n").includes(`${CONVERSATION_LINE_PREFIX}\`${conversationId}\``)) return;
+              const ack = ackOf(receipt);
+              if (typeof ack?.channel !== "string" || typeof ack.ts !== "string") throw Error("invalid_slack_receipt");
+              await addAnalysisReaction({ channel: ack.channel, ts: ack.ts, emoji: config.analysisEmoji });
+            } catch (error) {
+              try {
+                await requireDb().transaction(tx => executionJournal(tx, lease.row.id, "analysis_signal_failed", { code: code(error) }, receipt.id));
+              } catch { /* The confirmed transfer is final even if its diagnostic cannot be written. */ }
+            }
+          });
+        } catch {
+          console.warn("sav_handoff_analysis_schedule_failed", { executionId: lease.row.id });
         }
       }
     },
@@ -451,6 +480,7 @@ export type HandoffNoticeRuntimeDeps = Readonly<{
   context?: Pick<ExecutionOptions, "runtime" | "policy">;
   crm?: HandoffCrmReader;
   adapters?: Pick<HandoffSlackAdapters, "dispatch" | "verify"> & Partial<Pick<HandoffSlackAdapters, "addAnalysisReaction">>;
+  scheduleAfterResponse?: ScheduleAfterResponse;
   /** SAV-92: the HubSpot note's adapters (tests inject them); by default the existing executor adapters, built only when a note is dispatched or verified. */
   hubspot?: Pick<ExecutorAdapters, "dispatch" | "verify">;
   schemaInstalled?: () => Promise<boolean>;
@@ -498,7 +528,7 @@ export async function runHandoffNoticePass(deps: HandoffNoticeRuntimeDeps): Prom
     // The budget is spent: no new notice is started (the next pass lists it again; an engaged post is only verified then).
     if (Date.now() >= deps.deadlineMs) break;
     const options: ExecutionOptions = { config, ...context, env: deps.env, adapters, signal: AbortSignal.timeout(Math.max(1, deps.deadlineMs - Date.now())) };
-    await executeIntakePass(id, options, {}, createHandoffNoticeDriver({ env: deps.env, crm, addAnalysisReaction: slack.addAnalysisReaction }));
+    await executeIntakePass(id, options, {}, createHandoffNoticeDriver({ env: deps.env, crm, addAnalysisReaction: slack.addAnalysisReaction, scheduleAfterResponse: deps.scheduleAfterResponse }));
     const [row] = await db.select({ state: savCaseEffectExecutions.state, reason: savCaseEffectExecutions.reason }).from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.id, id));
     processed.push({ executionId: id, state: row?.state ?? "unknown", reason: row?.reason ?? null });
   }
