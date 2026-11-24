@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   buildHandoffNoticeIntent, HANDOFF_NOTICE_TITLE, HANDOFF_REASONS, HANDOFF_REASON_LABELS, handoffNoticeFacts, handoffNoticeKey, handoffNoticeMarker, handoffNoticeMarkerIn,
@@ -407,5 +408,53 @@ describe("review A10: no one-time code, token, link, address or number reaches S
     expect(posted).toContain("[adresse masquée]");
     expect(posted).toContain(`record/0-5/${TICKET}|ticket ${TICKET}>`);
     expect(handoffNoticeMarkerIn(posted)).toBe(intent.marker);
+  });
+});
+
+describe("signal d'analyse du relais", () => {
+  const id = randomUUID();
+  const longCode = `synthetic-${randomUUID()}`;
+  const before = [
+    "*Nouveau ticket à transmettre à l'équipe*",
+    `*Client :* Camille Synthétique — <https://app.hubspot.com/contacts/${PORTAL}/record/0-1/777|fiche contact HubSpot>`,
+    "*Problème :* Le client n'arrive plus à se connecter.",
+    "*Ce que l'agent a tenté et le résultat :*",
+    "• Procédure syn-login : échec",
+    "• 2 question(s) posée(s) au client",
+    "• Attendu : Accès à la plateforme",
+    "• Constaté : Écran de connexion bloqué",
+    "• Hypothèse : Compte désactivé",
+    "*Motif du relais :* aucune fiche de connaissance ne couvre la demande",
+    `*Ticket HubSpot :* <https://app.hubspot.com/contacts/${PORTAL}/record/0-5/${TICKET}|ticket ${TICKET}>`,
+    "*Prochaine action proposée :* Vérifier le compte et rappeler le client.. Informations manquantes : Date de la dernière connexion",
+    `_Réf. ${handoffNoticeMarker(handoffNoticeKey(CASE, INPUT))}_`,
+  ].join("\n");
+
+  it("configure le signal uniquement avec on et un emoji valide", () => {
+    const on = { ...ENV_ON, SAV_HANDOFF_ANALYSIS_SIGNAL: "on" };
+    expect(readHandoffNoticeConfig(on)).toMatchObject({ analysisEmoji: "mag" });
+    expect(readHandoffNoticeConfig({ ...on, SAV_HANDOFF_ANALYSIS_EMOJI: "test_1+-" })).toMatchObject({ analysisEmoji: "test_1+-" });
+    for (const emoji of ["", "MAG", "🔍", "x".repeat(41), "mag\n"]) {
+      expect(readHandoffNoticeConfig({ ...on, SAV_HANDOFF_ANALYSIS_EMOJI: emoji })).toEqual(readHandoffNoticeConfig(ENV_ON));
+    }
+    expect(readHandoffNoticeConfig({ ...on, SAV_HANDOFF_ANALYSIS_SIGNAL: "ON" })).toEqual(readHandoffNoticeConfig(ENV_ON));
+  });
+
+  it("SAV-132 étape 6.1 et 6.6 : reproduit les octets du rendu initial", () => {
+    expect(renderHandoffNotice(facts(), VERIFIED, PORTAL).text).toBe(before);
+    expect(renderHandoffNotice({ ...facts(), conversationId: id, modelReason: "real_bug" }, VERIFIED, PORTAL, false).text).toBe(before);
+    expect(renderHandoffNotice(facts(), VERIFIED, PORTAL, true).text).toBe(before);
+  });
+
+  it("SAV-132 étape 6.2 : conserve la seule ligne UUID et masque les autres codes", () => {
+    const rendered = renderHandoffNotice({ ...facts(), conversationId: id }, VERIFIED, PORTAL, true).text;
+    const ticket = before.split("\n").find(line => line.startsWith("*Ticket HubSpot :*"))!;
+    const line = `*Conversation Limova :* \`${id}\``;
+    expect(rendered).toContain(`${ticket}\n${line}\n*Prochaine action proposée :*`);
+    const scrubbed = scrubHandoffNoticeText(rendered.replace("*Problème :* ", `*Problème :* ${longCode} `));
+    expect(scrubbed).toContain(line);
+    expect(scrubbed).toContain("*Problème :* [code masqué]");
+    expect(scrubbed).not.toContain(longCode);
+    expect(scrubHandoffNoticeText(rendered.replace(line, `${line} ${longCode}`))).not.toContain(id);
   });
 });

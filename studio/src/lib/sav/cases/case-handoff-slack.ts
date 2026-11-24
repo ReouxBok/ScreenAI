@@ -5,10 +5,11 @@
 // answer we do not understand may have posted: it stays uncertain and is only verified.
 // The bot token comes from the injected environment and appears nowhere else (not in an intent, a ledger row, an error or a log). Nothing here reads a mail or the CRM.
 import type { EffectAck, EffectIntent, ExecutorAdapters } from "../intake/execution-types";
-import { handoffNoticeMarkerIn, scrubHandoffNoticeText } from "./case-handoff-notice";
+import { handoffNoticeMarkerIn, readHandoffNoticeConfig, scrubHandoffNoticeText } from "./case-handoff-notice";
 
 const SLACK_API = "https://slack.com/api/";
 const TIMEOUT_MS = 10_000;
+const REACTION_TIMEOUT_MS = 5_000;
 /** Slack errors that say the message was not posted (authentication, the channel, the request itself, the rate limit): safe to plan again later. Anything else may have posted. */
 export const SLACK_NOT_POSTED_ERRORS: ReadonlySet<string> = new Set([
   "invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired", "missing_scope", "no_permission", "access_denied", "restricted_action",
@@ -41,14 +42,35 @@ async function json(response: Response): Promise<Record<string, unknown> | null>
   try { const value = await response.json() as unknown; return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null; } catch { return null; }
 }
 
+export type HandoffSlackAdapters = Pick<ExecutorAdapters, "dispatch" | "verify"> & {
+  addAnalysisReaction(input: { channel: string; ts: string; emoji: string }): Promise<void>;
+};
+
 /** Only the adapters the notice needs; every other port of the executor is absent on purpose (the driver of a notice never reads the CRM or Gmail through them). */
-export function createHandoffSlackAdapters(deps: HandoffSlackDeps): Pick<ExecutorAdapters, "dispatch" | "verify"> {
+export function createHandoffSlackAdapters(deps: HandoffSlackDeps): HandoffSlackAdapters {
   return {
+    async addAnalysisReaction({ channel, ts, emoji }) {
+      if (!stamp(ts)) return fault("invalid_message_ts");
+      const signal = AbortSignal.timeout(REACTION_TIMEOUT_MS);
+      let response: Response;
+      try {
+        response = await call(deps, "reactions.add", { http: "POST", body: { channel, timestamp: ts, name: emoji } }, signal);
+      } catch {
+        return fault(signal.aborted ? "timeout" : "network_error");
+      }
+      const body = await json(response);
+      if (signal.aborted) return fault("timeout");
+      if (response.ok && (body?.ok === true || (body?.ok === false && body.error === "already_reacted"))) return;
+      if (typeof body?.error === "string" && /^[a-z0-9_]{1,60}$/.test(body.error)) return fault(body.error);
+      return fault(response.ok ? "invalid_response" : `http_${response.status}`);
+    },
+
     async dispatch(intent: EffectIntent, signal: AbortSignal): Promise<EffectAck> {
       if (intent.kind !== "handoff_notify" || typeof intent.text !== "string" || !intent.text || typeof intent.channel !== "string" || typeof intent.marker !== "string" || !handoffNoticeMarkerIn(intent.text)) return fault("SAV_HANDOFF_SLACK_INTENT_INVALID");
       let response: Response;
       try {
-        response = await call(deps, "chat.postMessage", { http: "POST", body: { channel: intent.channel, text: scrubHandoffNoticeText(intent.text), mrkdwn: true, unfurl_links: false, unfurl_media: false, link_names: false } }, signal);
+        const config = readHandoffNoticeConfig(deps.env());
+        response = await call(deps, "chat.postMessage", { http: "POST", body: { channel: intent.channel, text: scrubHandoffNoticeText(intent.text, config.mode === "on" && Boolean(config.analysisEmoji)), mrkdwn: true, unfurl_links: false, unfurl_media: false, link_names: false } }, signal);
       } catch (error) {
         // A missing token fails before any request: nothing left. A transport error may have happened after Slack accepted the message.
         if (error instanceof Error && error.message === "SAV_HANDOFF_SLACK_TOKEN_MISSING") throw error;

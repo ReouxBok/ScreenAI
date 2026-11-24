@@ -14,6 +14,7 @@ import { caseRequestSearchText, caseTeamPartRequests, SAV_CASE_AGENT_REQUESTS_PE
 import { SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { buildCaseHandoffSummary, caseHandoffSummaryLines, type CaseHandoffSummary } from "./case-handoff-summary";
 import { investigationHandoffCommand, readCaseInvestigationProgress, SAV_CASE_INVESTIGATION_RECORD_KIND, type CaseInvestigationJournalEvent } from "./investigation-record";
+import type { SAV_SMART_HANDOFF_REASONS } from "./smart/smart-contract";
 
 export const HANDOFF_NOTICE_CONTRACT = "sav-v2-handoff-notice.v1";
 export const HANDOFF_NOTICE_TITLE = "Nouveau ticket à transmettre à l'équipe";
@@ -39,7 +40,7 @@ export const handoffNoticeMarkerIn = (text: string): string | null => MARKER.exe
 
 export type HandoffNoticeConfig =
   | Readonly<{ mode: "off"; why: "disabled" | "token_missing" | "channel_invalid" | "owner_invalid" | "portal_invalid" }>
-  | Readonly<{ mode: "on"; channel: string; teamOwnerId: string | null; portalId: string | null }>;
+  | Readonly<{ mode: "on"; channel: string; teamOwnerId: string | null; portalId: string | null; analysisEmoji?: string }>;
 const SLACK_CHANNEL = /^C[A-Z0-9]{8,14}$/, NUMERIC = /^[0-9]{1,30}$/, SLACK_BOT_TOKEN = /^xoxb-[A-Za-z0-9-]{10,200}$/;
 
 /**
@@ -53,7 +54,9 @@ export function readHandoffNoticeConfig(env: Readonly<Record<string, string | un
   const owner = env.SAV_HANDOFF_TEAM_OWNER_ID, portal = env.HUBSPOT_PORTAL_ID;
   if (owner !== undefined && owner !== "" && !NUMERIC.test(owner)) return { mode: "off", why: "owner_invalid" };
   if (portal !== undefined && portal !== "" && !NUMERIC.test(portal)) return { mode: "off", why: "portal_invalid" };
-  return { mode: "on", channel: env.SAV_HANDOFF_SLACK_CHANNEL_ID!, teamOwnerId: owner ? owner : null, portalId: portal ? portal : null };
+  const emoji = env.SAV_HANDOFF_ANALYSIS_EMOJI ?? "mag";
+  const analysisEmoji = env.SAV_HANDOFF_ANALYSIS_SIGNAL === "on" && /^[a-z0-9_+-]{1,40}$/.test(emoji) ? emoji : undefined;
+  return { ...(analysisEmoji ? { analysisEmoji } : {}), mode: "on", channel: env.SAV_HANDOFF_SLACK_CHANNEL_ID!, teamOwnerId: owner ? owner : null, portalId: portal ? portal : null };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -333,6 +336,8 @@ export type HandoffNoticeFacts = Readonly<{
   trials: ReadonlyArray<Readonly<{ knowledgeId: string; outcome: CaseTrial["outcome"] }>>; questionsAsked: number;
   /** SAV-92: the synthesis of the stored case (`case-handoff-summary.ts`), masked and bounded. Absent from notices sealed before it existed. */
   summary?: CaseHandoffSummary;
+  modelReason?: typeof SAV_SMART_HANDOFF_REASONS[number];
+  conversationId?: string;
 }>;
 
 /** The synthesis never blocks a notice: a body it cannot read gives a notice without it (the template alone, as before SAV-92). */
@@ -403,8 +408,10 @@ const UNVERIFIED_LABELS: Record<Extract<HandoffContactVerdict, { status: "unveri
 
 export type HandoffNoticeRender = Readonly<{ text: string; marker: string; key: string }>;
 
-/** The notice, deterministic for its inputs: the same sealed facts and the same CRM verdict give the same bytes (a verification compares the marker, never the text). */
-export function renderHandoffNotice(sealed: HandoffNoticeFacts, crm: HandoffCrmVerdict, portalId: string | null): HandoffNoticeRender {
+export const CONVERSATION_LINE_PREFIX = "*Conversation Limova :* ";
+
+/** The notice, deterministic for its inputs: a verification compares the marker, never the text. */
+export function renderHandoffNotice(sealed: HandoffNoticeFacts, crm: HandoffCrmVerdict, portalId: string | null, analysisSignal = false): HandoffNoticeRender {
   // Facts sealed under an older rule are cleaned again here: the text that leaves is never older than the rule.
   const facts = resanitizeNoticeFacts(sealed);
   const key = handoffNoticeKey(facts.caseId, facts.inputKey), marker = handoffNoticeMarker(key);
@@ -433,6 +440,7 @@ export function renderHandoffNotice(sealed: HandoffNoticeFacts, crm: HandoffCrmV
     `*Ce que l'agent a tenté et le résultat :*\n${tried.join("\n")}`,
     `*Motif du relais :* ${HANDOFF_REASON_LABELS[facts.reason]}`,
     `*Ticket HubSpot :* ${ticket}`,
+    ...(analysisSignal && UUID.test(facts.conversationId ?? "") ? [`${CONVERSATION_LINE_PREFIX}\`${facts.conversationId}\``] : []),
     `*Prochaine action proposée :* ${next.join(". ")}`,
     // SAV-92: after the existing template, so a cut only ever shortens the synthesis.
     ...(facts.summary ? [`*Synthèse du dossier :*\n${caseHandoffSummaryLines(facts.summary, HANDOFF_REASON_LABELS[facts.reason], sanitizeNoticeText).join("\n")}`] : []),
@@ -511,8 +519,15 @@ const INTERNAL_LINK = /<https:\/\/app\.hubspot\.com\/contacts\/[0-9]{1,20}\/reco
  * The last look before Slack, on the text exactly as it is about to leave (including an intent sealed in the ledger BEFORE a rule existed): the free-text lines are made
  * safe again, and any `<...>` that is not one of our own CRM links is removed (mentions, other links). The marker, the structured lines and the internal links are kept.
  */
-export function scrubHandoffNoticeText(text: string): string {
-  const lines = text.split("\n").map(line => {
+export function scrubHandoffNoticeText(text: string, analysisSignal = true): string {
+  const lines = text.split("\n").flatMap((line, index, original) => {
+    if (line.startsWith(CONVERSATION_LINE_PREFIX)) {
+      const value = line.slice(CONVERSATION_LINE_PREFIX.length);
+      if (original[index - 1]?.startsWith("*Ticket HubSpot :* ") && value.startsWith("`") && value.endsWith("`") && UUID.test(value.slice(1, -1))) {
+        return analysisSignal ? [line] : [];
+      }
+      return `${CONVERSATION_LINE_PREFIX}${sanitizeNoticeText(value, 1000)}`;
+    }
     const free = FREE_TEXT_LINE.exec(line);
     return free ? `${free[1]}${sanitizeNoticeText(free[2]!, 1000)}` : line;
   });

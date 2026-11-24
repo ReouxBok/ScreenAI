@@ -21,6 +21,7 @@ export const SAV_SMART_TRACE_PRUNE_KEY = "sav-v2-smart-trace-prune.v1";
 export const SAV_SMART_TRACE_PRUNE_EVERY_MS = 3_600_000;
 /** Traces read per case (the latest ones). */
 export const SAV_SMART_TRACE_READ_PER_CASE = 12;
+export const SMART_HANDOFF_TRACE_TIMEOUT_MS = 500;
 
 export const smartTraceKey = (trace: Pick<SmartCaseTrace, "caseId" | "inputKey" | "call">) => `${SAV_SMART_TRACE_PREFIX}:${trace.caseId}:${trace.inputKey}:call${trace.call}`;
 
@@ -62,6 +63,21 @@ export function smartCaseTraceStore(deps: Readonly<{ env: () => Env; now?: () =>
 const readable = (cursor: string | null): SmartCaseTrace | null => {
   try { const value = decryptSavPayload<SmartCaseTrace>(cursor ?? ""); return value && value.v === 1 ? value : null; } catch { return null; }
 };
+
+/** Reason of the exact model call that produced the accepted handoff proposal. */
+export async function readSmartHandoffTraceReason(call: Pick<SmartCaseTrace, "caseId" | "inputKey" | "call" | "caseVersion">, expiresAt: number, signal: AbortSignal) {
+  const [row] = await requireDb().transaction(async tx => {
+    signal.throwIfAborted();
+    const remaining = Math.ceil(expiresAt - performance.now());
+    if (remaining <= 0) throw Error("SAV_HANDOFF_TRACE_DEADLINE");
+    await tx.execute(sql`select set_config('statement_timeout', ${String(remaining)}, true)`);
+    signal.throwIfAborted();
+    return tx.select({ cursor: savSyncState.cursor }).from(savSyncState).where(eq(savSyncState.key, smartTraceKey(call)));
+  });
+  const trace = row ? decryptSavPayload<SmartCaseTrace>(row.cursor ?? "") : null;
+  if (trace?.v === 1 && trace.caseVersion === call.caseVersion && trace.kind === "turn" && trace.decision.kind === "handoff") return trace.decision.noteReason;
+  return null;
+}
 
 /** The stored traces of some cases, oldest first, at most `SAV_SMART_TRACE_READ_PER_CASE` (the latest) per case. Read only. */
 export async function readSmartCaseTraces(caseIds: readonly string[]): Promise<Map<string, SmartCaseTrace[]>> {
