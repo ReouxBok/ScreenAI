@@ -20,7 +20,7 @@ import { executeIntakePass } from "../intake/executor";
 import { getExecutionEffects } from "../intake/execution-store";
 import type { ExecutionOptions, ExecutorAdapters } from "../intake/execution-types";
 import { listCaseEvents, listCaseTimers, openCaseEvent, readCase, transitionCaseOwner } from "./case-store";
-import { caseDedupeKey } from "./case-types";
+import { caseDedupeKey, smartSupportProvenance } from "./case-types";
 import { createCaseEffectDriver } from "./case-effect-driver";
 import { listV2Cases, v2InventoryInput } from "./v2-inventory";
 import { pendingCaseEffectRecoveries } from "./case-effect-recovery";
@@ -54,6 +54,8 @@ const ADMITTED = {
   qualification: { requests: [{ requestId: "r1", family: "access" as const, provenance: { kind: "human" as const, staffUserId: staff.staffUserId, at: AT } }],
     identity: { status: "confirmed" as const, source: { type: "hubspot_object" as const, id: "contact-1" } }, crmContext: "complete" as const, teamSignals: [] },
 };
+/** SAV-123: a case the smart entry admitted (family `other`, the smart block's provenance, no approved policy). */
+const SMART_ADMITTED = { policy: null, qualification: { ...ADMITTED.qualification, requests: [{ requestId: "r1", family: "other" as const, provenance: smartSupportProvenance(AT) }] } };
 const driver = () => createCaseEffectDriver({ env: () => environment, readTicketOwner: async () => "v2" as const, currentPolicyRevision: async () => POLICY });
 const setPause = async (agent: "intake" | "v2", level: "actions_paused" | "fully_paused" | null) => {
   await f.db.delete(savSyncState).where(eq(savSyncState.key, `sav-agent-pause.v1:${agent}`));
@@ -62,14 +64,14 @@ const setPause = async (agent: "intake" | "v2", level: "actions_paused" | "fully
 };
 
 /** A stored customer mail in a stored thread, an admitted case on it, and the synthetic provider that knows it. The reply text is B's DRAFT: no mention yet. */
-async function scenario(purpose: "question" | "answer" = "question") {
+async function scenario(purpose: "question" | "answer" = "question", admission: typeof ADMITTED | typeof SMART_ADMITTED = ADMITTED) {
   const gmailThreadId = `gmail-thread-${randomUUID()}`, gmailMessageId = `gm-${randomUUID()}`, ticketId = String(++ticketSeq);
   const thread = (await f.db.insert(savThreads).values({ mailboxId, gmailThreadId, customerEmail: "customer@example.invalid" }).returning())[0]!;
   const message = (await f.db.insert(savMessages).values({
     threadId: thread.id, mailboxId, direction: "inbound", gmailMessageId, fromEmail: "Customer@Example.invalid", toEmails: ["support@example.invalid"], subject: "Synthetic connection failure",
     bodyCiphertext: encryptSavPayload({ text: "The synthetic connection fails.", headers: { "message-id": "<incoming@example.invalid>" }, attachments: [] }), receivedAt: new Date("2026-10-28T07:00:00.000Z"),
   }).returning())[0]!;
-  const { case: opened } = await openCaseEvent({ ticketId, threadId: thread.id, admission: ADMITTED, kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(gmailMessageId), sourceRef: { type: "email", id: gmailMessageId }, occurredAt: "2026-10-28T07:00:00.000Z" });
+  const { case: opened } = await openCaseEvent({ ticketId, threadId: thread.id, admission, kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(gmailMessageId), sourceRef: { type: "email", id: gmailMessageId }, occurredAt: "2026-10-28T07:00:00.000Z" });
   p = executionProvider(); p.setGmail(gmailMessageId, gmailThreadId); p.seedTicket({ id: ticketId });
   sends = 0; loseAck = false; counts = {};
   const gmail: GmailRequest = async <T>(mailbox: string, path: string, init?: RequestInit) => {
@@ -1379,15 +1381,18 @@ describe("reply summary note (SAV_V2_REPLY_NOTE=on, policy grants append_case_no
 // with synthetic Gmail/HubSpot adapters only. Provenance is a port here (tested separately).
 describe("automatic J2 production and sending", () => {
   const RULE = "30000000-0000-4000-8000-000000000042";
-  async function waiting(procedure = false) {
+  async function waiting(procedure = false, smart = false) {
     environment = { ...environment, SAV_V2_J2_AUTO: "on", SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: RULE };
     await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-block-switch.v1:access"));
-    await f.db.insert(savSyncState).values({ key: "sav-block-switch.v1:access", status: "installed", cursor: encryptSavPayload({
+    await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-block-switch.v1:smart-support"));
+    // SAV-123: a smart case needs the smart switches only; the Access block's row is absent, so it cannot be what lets the reminder through.
+    if (smart) { environment = { ...environment, SAV_V2_ENTRY_SMART: "on", SAV_V2_SMART_SUPPORT_MODE: "auto" }; vi.stubEnv("SAV_V2_ENTRY_SMART", "on"); }
+    else await f.db.insert(savSyncState).values({ key: "sav-block-switch.v1:access", status: "installed", cursor: encryptSavPayload({
       revision: "sav-block-switch.v1", blockId: "access", mode: "auto", paused: false, setBy: "fixture@example.invalid", setAt: AT, reason: "synthetic" }) });
-    const s = await scenario(procedure ? "answer" : "question");
+    const s = await scenario(procedure ? "answer" : "question", smart ? SMART_ADMITTED : ADMITTED);
     const opened = (await readCase(s.caseId))!;
     const withRequest = await updateCaseRecord({ caseId: s.caseId, expectedVersion: opened.version, actor: { type: "agent" },
-      body: { ...opened.body, openRequests: [{ id: "r1", summary: "Synthetic access request", family: "access", status: "open", openedAt: AT }] } });
+      body: { ...opened.body, openRequests: [{ id: "r1", summary: "Synthetic request", family: smart ? "other" : "access", status: "open", openedAt: AT }] } });
     s.draft = { ...s.draft, decidedOn: withRequest.version };
     if (procedure) s.draft = { ...s.draft, reply: { purpose: "answer", text: "Synthetic procedure.", procedures: [{ requestId: "r1", procedure: { knowledgeId: randomUUID(), contentVersionId: randomUUID() } }] } };
     const proposed = await propose(s); await approve(proposed.validationId);
@@ -1453,6 +1458,52 @@ describe("automatic J2 production and sending", () => {
     if (reason === "off") delete environment.SAV_V2_J2_AUTO;
     if (reason === "pause") await setPause("intake", "actions_paused");
     if (reason === "slot") vi.setSystemTime(new Date("2026-11-21T12:00:00Z"));
+    await run(id);
+    expect(sends).toBe(1);
+  });
+
+  // SAV-123: a case decided by the smart Agent SAV gets its J2 exactly like an Access case, under the smart reply's own switches.
+  const j2Validations = async (w: Awaited<ReturnType<typeof waiting>>) =>
+    (await f.db.select().from(savCaseReplyValidations)).filter(r => r.replyKey === `reply:${w.s.caseId}:timer:${w.timer.id}`);
+  it.each([false, true])("smart case, switches on: authors, approves and sends one reminder, replay included; procedure=%s", async procedure => {
+    const w = await waiting(procedure, true);
+    const id = await queued(w);
+    expect(await enqueueApprovedJ2(w.timer, (await readCase(w.s.caseId))!.version, w.policy, storeDeps())).toBe("already_queued");
+    const [validation] = await j2Validations(w);
+    expect(validation).toMatchObject({ state: "approved", decidedBy: RULE, authorizationBasis: "auto_access.v1" });
+    expect(decryptSavPayload<{proposal: CaseReplyProposal}>((await execution(id)).payloadCiphertext).proposal).toMatchObject({ purpose: "reminder", text: J2_REMINDER_TEXT });
+    expect(await run(id)).toMatchObject({ state: "confirmed" });
+    await run(id);
+    expect(sends).toBe(2); // initial reply + ONE J2
+    expect(await listCaseTimers(w.s.caseId)).toHaveLength(1);
+    expect(await produceAutoJ2(w.timer, (await readCase(w.s.caseId))!.version, storeDeps())).toBe("reminder_origin_unproven");
+  });
+  it.each([["entry_off", "smart_auto_off"], ["mode_off", "smart_auto_off"], ["global_off", "j2_auto_off"], ["block_draft", "block_draft"], ["block_paused", "block_paused"]])(
+    "smart case, %s: no reminder is authored (%s)", async (reason, code) => {
+      const w = await waiting(false, true);
+      if (reason === "entry_off") delete environment.SAV_V2_ENTRY_SMART;
+      if (reason === "mode_off") delete environment.SAV_V2_SMART_SUPPORT_MODE;
+      if (reason === "global_off") delete environment.SAV_V2_AUTO_REPLY;
+      if (reason === "block_draft" || reason === "block_paused") await f.db.insert(savSyncState).values({ key: "sav-block-switch.v1:smart-support", status: "installed", cursor: encryptSavPayload({
+        revision: "sav-block-switch.v1", blockId: "smart-support", mode: reason === "block_draft" ? "draft" : "auto", paused: reason === "block_paused", setBy: "fixture@example.invalid", setAt: AT, reason: "synthetic" }) });
+      expect(await produceAutoJ2(w.timer, (await readCase(w.s.caseId))!.version, storeDeps())).toBe(code);
+      expect(await j2Validations(w)).toHaveLength(0);
+      expect(sends).toBe(1);
+    });
+  it.each(["sensitive", "owner", "crm_owner"])("smart case, %s: no reminder, as for Access", async reason => {
+    const w = await waiting(false, true);
+    if (reason === "owner") await takeover(w.s.caseId);
+    if (reason === "sensitive") await openCaseEvent({ ticketId: w.s.ticketId, threadId: w.s.thread.id,
+      kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(`finance-${randomUUID()}`), sourceRef: {type:"email",id:"synthetic-finance"}, occurredAt: new Date().toISOString(),
+      admission: { ...SMART_ADMITTED, qualification: { ...SMART_ADMITTED.qualification, requests: [{ ...SMART_ADMITTED.qualification.requests[0]!, family: "finance" as never }] } } });
+    expect(await produceAutoJ2(w.timer, (await readCase(w.s.caseId))!.version, reason === "crm_owner" ? { ...storeDeps(), readTicketOwner: async () => "human" as const } : storeDeps())).not.toBe("approved");
+    expect(await j2Validations(w)).toHaveLength(0);
+    expect(sends).toBe(1);
+  });
+  it.each(["entry_off", "mode_off"])("smart case: a queued reminder is held at the final send fence when %s", async reason => {
+    const w = await waiting(false, true); const id = await queued(w);
+    if (reason === "entry_off") delete environment.SAV_V2_ENTRY_SMART;
+    if (reason === "mode_off") delete environment.SAV_V2_SMART_SUPPORT_MODE;
     await run(id);
     expect(sends).toBe(1);
   });

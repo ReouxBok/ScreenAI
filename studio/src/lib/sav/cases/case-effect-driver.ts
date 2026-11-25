@@ -203,11 +203,12 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     const payload = payloads.get(lease)!;
     const { proposal } = payload;
     if (phase === "reply" && isTerminalReply(proposal.purpose) && !closingHandoffReplyEnabled(deps.env())) return fault("HOLD_EFFECTS_OFF");
+    const facts = await readCaseReplyFacts(tx, proposal, policyRevision, { lockCase: true });
+    // SAV-123: the reminder's gate reads the case's admission (a smart case is gated by the smart switches and block, any other by the Access block).
     if (phase === "reply" && proposal.purpose === "reminder") {
-      const blocked = await j2AutoGate(deps.env(), tx);
+      const blocked = await j2AutoGate(deps.env(), tx, facts.admissionRecord as Parameters<typeof j2AutoGate>[2]);
       if (blocked) return fault(`HOLD_${blocked.toUpperCase()}`);
     }
-    const facts = await readCaseReplyFacts(tx, proposal, policyRevision, { lockCase: true });
     // SAV-80, under the case lock, at every look before a NEW plan, marker or send: outside the qualification scope or after it expired the
     // effect is cancelled; an unreadable scope or binding holds it. A verification of an engaged effect never comes here: it stays possible.
     const scoped = await savV2QualificationCaseAllowed(deps.env(), proposal.caseId, new Date(), tx);

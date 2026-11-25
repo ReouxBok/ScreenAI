@@ -5,14 +5,16 @@ import { savCaseEffectExecutions, savIntakeEffects, savMessages } from "@/db/sch
 import { decryptSavPayload } from "../crypto";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { readSavBlockSwitch, savBlockReplyGate } from "./block-switch";
-import { SAV_CASE_ACCESS_BLOCK_ID } from "./case-types";
+import { SAV_CASE_ACCESS_BLOCK_ID, SAV_SMART_ENTRY_BLOCK_ID } from "./case-types";
 import { caseReplyKey, caseReplyQuestions, type CaseReplyProposal } from "./case-effects";
 import type { CaseReplySendIntent } from "./case-effect-intents";
 import type { CaseEffectPayload } from "./case-reply-store";
 import { renderSavOutboundReply } from "../reply-format";
 import { caseReplyTextSafetyProblems } from "./decision-validator";
 import { caseReplyEditableBody, prepareCaseReplyText } from "./case-reply-outbound";
-import { readAccessAutoApprovalConfig } from "./customer-return";
+import { ACCESS_AUTO_APPROVAL_BASIS, readAccessAutoApprovalConfig } from "./customer-return";
+import { smartSwitchProblem } from "./smart-support-scope";
+import { smartAdmission, type Admission } from "./smart/smart-send-fence";
 import { readRequestSubjects } from "./intake-boundary";
 import { listCaseTimers, readCase } from "./case-store";
 import { revalidateJ2Timer } from "./timer-store";
@@ -107,12 +109,17 @@ export async function readJ2ReminderText(caseId: string, triggerEventId: string,
   return timer && current ? J2_REMINDER_TEXT : null;
 }
 
-export async function j2AutoGate(env: Record<string, string | undefined>, db: Parameters<typeof readSavBlockSwitch>[0] & Parameters<typeof readSavAgentPause>[0] = requireDb()): Promise<string | null> {
-  if (env.SAV_V2_J2_AUTO !== "on" || readAccessAutoApprovalConfig(env).mode !== "on") return "j2_auto_off";
-  const block = await readSavBlockSwitch(db, SAV_CASE_ACCESS_BLOCK_ID);
-  // The inherited shared switch has a permissive default: J2 requires an explicit setting.
+/** `admission`: the case's admission record. A smart one (SAV-123) is gated like the smart reply: the smart switches (`smartSwitchProblem`, as for a rule's
+ * approval) and the smart block's switch, whose `auto` comes from `SAV_V2_SMART_SUPPORT_MODE=auto` (a row only restricts). Any other: the Access block, as before. */
+export async function j2AutoGate(env: Record<string, string | undefined>, db: Parameters<typeof readSavBlockSwitch>[0] & Parameters<typeof readSavAgentPause>[0] = requireDb(), admission?: Admission): Promise<string | null> {
+  const auto = readAccessAutoApprovalConfig(env);
+  if (env.SAV_V2_J2_AUTO !== "on" || auto.mode !== "on") return "j2_auto_off";
+  const smart = smartAdmission(admission);
+  if (smart && smartSwitchProblem({ env, admission, basis: ACCESS_AUTO_APPROVAL_BASIS, approvedBy: auto.approverId })) return "smart_auto_off";
+  const block = await readSavBlockSwitch(db, smart ? SAV_SMART_ENTRY_BLOCK_ID : SAV_CASE_ACCESS_BLOCK_ID, env);
+  // The inherited shared Access switch has a permissive default: J2 requires an explicit setting there.
   const gate = savBlockReplyGate(block);
-  if (!block.setting || gate.send !== "rule") return gate.send === "rule" ? "block_off" : gate.code;
+  if ((!smart && !block.setting) || gate.send !== "rule") return gate.send === "rule" ? "block_off" : gate.code;
   for (const agent of ["intake", "v2"] as const) {
     const pause = await readSavAgentPause(db, agent);
     if (pause.invalid || pause.level !== "running") return "paused";

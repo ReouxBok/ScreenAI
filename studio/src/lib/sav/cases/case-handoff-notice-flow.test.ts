@@ -20,6 +20,7 @@ import {
   createHandoffNoticeDriver, enqueueHandoffNotice, enqueueHandoffNotices, HANDOFF_NOT_POSTED_RETRIES, type HandoffNoticePayload, pendingHandoffNoticeExecutions, runHandoffNoticePass,
 } from "./case-handoff-notice-store";
 import { HANDOFF_NOTICE_KEY_PREFIX, handoffNoticeKey, type HandoffCrmReading } from "./case-handoff-notice";
+import { enqueueHandoffStage } from "./case-handoff-stage";
 import { listCaseEvents, openCaseEvent, readCase, transitionCaseOwner } from "./case-store";
 import { SAV_CASE_TEAM_PART_WAIT_BOUNDS, settleCaseTeamPartWait } from "./case-team-part-wait";
 import { caseDedupeKey, caseRequestId, type CaseAdmissionQualification, type CaseRequestSubject, type CaseSnapshot, type KnowledgeRef } from "./case-types";
@@ -961,5 +962,77 @@ describe("SAV-92 counter-review of 66e648a: the bound of the team-part wait, on 
     expect(text).not.toMatch(/a répondu/);
     const rows = (await noticeRows()).filter(row => row.caseId === c.caseId);
     expect(rows.map(row => row.state).sort()).toEqual(["confirmed", "refused"]);
+  });
+});
+
+describe("Ugo 25/11: a technical dead end goes to the team through the existing hand-over, never abandoned", () => {
+  const failed: Answer = () => ({ status: "failed", uncertain: false, diagnostic: { stage: "http", code: "http_rejected", networkAttempted: true, httpStatus: 503 } });
+  const transfersOf = async (caseId: string) => (await listCaseEvents(caseId, { limit: 500 })).filter(event => event.kind === "owner_changed" && event.detail?.transition === "handoff");
+
+  it("technical_exhausted: every allowed call failed -> owner transfer, one notice with the fixed note and the code, no customer mail; a second pass changes nothing", async () => {
+    const made = await newCase("gm-tech-exhausted");
+    crmReading = () => goodCrm(made.ticketId);
+    // technical_wait keeps retrying, unchanged: the case stays with the agent and nothing is noticed until the last allowed call.
+    for (let call = 1; call < SAV_CASE_INVESTIGATION_MAX_CALLS; call++) {
+      expect(await investigate(made.c.caseId, [failed])).toMatchObject({ status: "technical_wait", modelCalls: call });
+      expect((await readCase(made.c.caseId))!.owner).toBe("agent");
+      expect(await transfersOf(made.c.caseId)).toHaveLength(0);
+      expect((await noticeRows()).filter(row => row.caseId === made.c.caseId)).toHaveLength(0);
+    }
+    expect(await investigate(made.c.caseId, [failed])).toMatchObject({ status: "technical_exhausted", modelCalls: SAV_CASE_INVESTIGATION_MAX_CALLS });
+    const after = (await readCase(made.c.caseId))!;
+    expect({ owner: after.owner, phase: after.phase, handoff: after.body.handoff }).toEqual({ owner: "human", phase: "handoff_pending", handoff: { reason: "technical_exhausted" } });
+    expect(await transfersOf(made.c.caseId)).toHaveLength(1);
+    const rows = (await noticeRows()).filter(row => row.caseId === made.c.caseId);
+    expect(rows).toHaveLength(1);
+    // Only the team notice: no reply execution, so no customer mail.
+    expect((await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, made.c.caseId))).map(r => r.replyKey.split(":")[0])).toEqual(["handoff-notice"]);
+    const payload = decryptSavPayload<HandoffNoticePayload>(rows[0]!.payloadCiphertext);
+    expect(payload.facts.reason).toBe("technical_exhausted");
+    expect(payload.note?.text).toContain("Panne technique : l'agent n'a pas pu traiter ce message (appels permis épuisés). Rien n'a été envoyé au client. Code : technical_exhausted.");
+    // Never a raw error or diagnostic.
+    expect(JSON.stringify(payload)).not.toMatch(/http_rejected|httpStatus/);
+    await pass();
+    const text = messageOf();
+    expect(text).toContain("*Motif du relais :* panne technique, les appels permis de l'agent sont épuisés (code technical_exhausted)");
+    expect(text).toContain("rien ne lui a été envoyé par l'agent");
+    expect(posts()).toHaveLength(1);
+    // The existing hand-over stage gives the HubSpot ticket back (« Nouveau », no owner): one execution keyed on the transfer's version, queued once.
+    const transfer = (await transfersOf(made.c.caseId))[0]!;
+    const stageEnv = () => ({ ...environment, SAV_V2_TICKET_STAGES: "on", SAV_V2_STAGE_WAITING_CUSTOMER: "2", SAV_V2_STAGE_CLOSED: "4", SAV_V2_HANDOFF_STAGE: "on",
+      SAV_V2_HANDOFF_STAGE_SINCE: new Date(Date.parse(transfer.occurredAt) - 60_000).toISOString() });
+    const stageKey = `case-stage:${made.c.caseId.toLowerCase()}:handoff:handoff-v${transfer.caseVersion}`;
+    expect(await enqueueHandoffStage({ caseId: made.c.caseId, policy: { id: policyId, hash: policyHash }, env: stageEnv })).toMatchObject({ ok: true, created: true, key: stageKey });
+    expect(await enqueueHandoffStage({ caseId: made.c.caseId, policy: { id: policyId, hash: policyHash }, env: stageEnv })).toMatchObject({ ok: true, created: false, key: stageKey });
+    expect((await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, made.c.caseId))).map(r => r.replyKey).filter(key => key.startsWith("case-stage:"))).toEqual([stageKey]);
+
+    // A second pass (or a concurrent one after it): the case is the team's, nothing is called, transferred or noticed again.
+    expect(await investigate(made.c.caseId, [failed])).toMatchObject({ status: "skipped", modelCalls: 0 });
+    expect(await enqueue(made.c.caseId)).toMatchObject({ ok: true, created: false });
+    await enqueueHandoffNotices({ policy: { id: policyId, hash: policyHash }, env: () => environment, since: testStart });
+    expect(await transfersOf(made.c.caseId)).toHaveLength(1);
+    expect((await noticeRows()).filter(row => row.caseId === made.c.caseId)).toHaveLength(1);
+    await pass();
+    expect(posts()).toHaveLength(1);
+  });
+
+  it("the ledger already holds every call (a crash lost them): technical_exhausted in one pass, handed over once", async () => {
+    const made = await newCase("gm-tech-subject");
+    expect(await investigate(made.c.caseId, [], { callModel: () => ({ status: "subject_exhausted" }) })).toMatchObject({ status: "technical_exhausted" });
+    expect((await readCase(made.c.caseId))!.body.handoff).toEqual({ reason: "technical_exhausted" });
+    expect(await transfersOf(made.c.caseId)).toHaveLength(1);
+    expect((await noticeRows()).filter(row => row.caseId === made.c.caseId)).toHaveLength(1);
+  });
+
+  it("usage_uncertain still waits for the ledger and case_budget still waits: no transfer, no notice", async () => {
+    const uncertain = await newCase("gm-tech-uncertain");
+    expect(await investigate(uncertain.c.caseId, [() => ({ status: "failed", uncertain: true })])).toMatchObject({ status: "usage_uncertain" });
+    const budget = await newCase("gm-tech-budget");
+    expect(await investigate(budget.c.caseId, [() => ({ status: "case_budget_exhausted", retryAt: new Date(Date.now() + 3_600_000).toISOString() })])).toMatchObject({ status: "case_budget_exhausted" });
+    for (const made of [uncertain, budget]) {
+      expect((await readCase(made.c.caseId))!.owner).toBe("agent");
+      expect(await transfersOf(made.c.caseId)).toHaveLength(0);
+      expect((await noticeRows()).filter(row => row.caseId === made.c.caseId)).toHaveLength(0);
+    }
   });
 });

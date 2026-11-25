@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CaseInvestigationProgress } from "./investigation-runner";
 import {
-  caseInvestigationObservationRecord, readCaseInvestigationProgress, SAV_CASE_INVESTIGATION_RECORD_KIND, type CaseInvestigationJournalEvent,
+  caseInvestigationObservationRecord, caseTechnicalHandoffWait, readCaseInvestigationProgress, SAV_CASE_INVESTIGATION_RECORD_KIND, type CaseInvestigationJournalEvent,
 } from "./investigation-record";
 import { caseInvestigationWaitLabels } from "./investigation-waits";
 
@@ -70,4 +70,17 @@ it("round-trips closed transport diagnostics durably and reads old records witho
   expect(readCaseInvestigationProgress([observed(5, structuredClone(stored))], "in:e3")).toMatchObject({ state: "found", record: { progress: { attempts: [{ diagnostic }], waiting: { diagnostic } } } });
   expect(readCaseInvestigationProgress([observed(4, caseInvestigationObservationRecord("in:e3", progress(), null))], "in:e3").state).toBe("found");
   expect(() => caseInvestigationObservationRecord("in:e3", { ...value, waiting: { ...value.waiting!, diagnostic: { ...diagnostic, secret: "forbidden" } } } as never, null)).toThrow("SAV_CASE_INVESTIGATION_RECORD_INVALID");
+});
+
+it("Ugo 25/11: only the technical dead ends a person must look at hand the case to the team; every retrying or waiting reason keeps it", () => {
+  const at = (reason: NonNullable<CaseInvestigationProgress["waiting"]>["reason"], recordedOn: number | null = null) =>
+    caseTechnicalHandoffWait(progress({ waiting: { reason, since: "2026-10-28T10:00:00.000Z", caseVersion: 4 }, recordedOn }));
+  for (const reason of ["technical_exhausted", "context_invalid", "knowledge_request_invalid"] as const) {
+    expect(at(reason)).toBe(reason);
+    expect(caseInvestigationWaitLabels[reason].needsPerson).toBe(true);
+    // A decision already recorded for this input is never handed over a second time by a wait.
+    expect(at(reason, 4)).toBeNull();
+  }
+  for (const reason of ["technical_wait", "usage_uncertain", "deferred_budget", "case_budget", "paused", "knowledge_changed", "decision_refused"] as const) expect(at(reason)).toBeNull();
+  expect(caseTechnicalHandoffWait(progress({ waiting: null }))).toBeNull();
 });

@@ -3,7 +3,7 @@ import { describeCaseModelTransportDiagnostic } from "@/lib/sav/cases/investigat
 import { caseAwaitsV2Attribution, caseRequestSubject, currentCaseFacts, SAV_CASE_ADMISSION_REASON_LABELS, type CaseAdmissionReason, type CaseEvent, type CaseSnapshot, type CaseTimer, type KnowledgeRef } from "@/lib/sav/cases/case-types";
 import { caseDecisionProposalSchema, caseDecisionRejectionLabels, caseDecisionSignalLabels, caseDecisionUnverifiedLabels, type CaseDecisionProposal } from "@/lib/sav/cases/decision-contract";
 import { caseDecisionNextStepLabels } from "@/lib/sav/cases/decision-recovery";
-import { readCaseInvestigationProgress } from "@/lib/sav/cases/investigation-record";
+import { caseTechnicalHandoffWait, investigationHandoffCommand, readCaseInvestigationProgress } from "@/lib/sav/cases/investigation-record";
 import { latestInvestigationInput } from "@/lib/sav/cases/investigation-runner";
 import { caseInvestigationWaitLabels } from "@/lib/sav/cases/investigation-waits";
 import { describeJ2Timer } from "@/lib/sav/cases/timer-lifecycle";
@@ -226,12 +226,29 @@ export const caseBlockHoldLabels: Record<string, string> = {
 export type CasePilotBlockHold = Readonly<{ blockId: string; reason: string; since: string }> | null;
 /** SAV-92 (review batch 3, B1): a reply naming a team part whose notice could not be queued (`team_part_handoff_unavailable`). */
 export type CasePilotTeamPartWait = Readonly<{ code: string; detail: string; passes: number; since: string; handedToTeam: string | null }> | null;
+/**
+ * Ugo (25/11): the input whose stored investigation the page reads. After the store handed a technical dead end to the team, the latest input is that transfer
+ * (`back:<event>`), which has no record: the page then reads the record the transfer followed, so the wait, its code and its counts stay visible to the team.
+ * Any other case (a decision's hand-over included) is unchanged.
+ */
+function investigationProgressKey(events: readonly CaseEvent[]): string | null {
+  const key = latestInvestigationInput([...events]);
+  if (!key?.startsWith("back:")) return key;
+  const transfer = events.find(event => event.id === key.slice("back:".length));
+  if (transfer?.kind !== "owner_changed" || transfer.detail?.transition !== "handoff" || transfer.dedupeKey !== `cmd:${investigationHandoffCommand(transfer.caseVersion - 1)}`) return key;
+  const recorded = events.find(event => event.caseVersion === transfer.caseVersion - 1 && event.kind === "observation_recorded");
+  const inputKey = (recorded?.detail?.record as { inputKey?: unknown } | undefined)?.inputKey;
+  if (typeof inputKey !== "string") return key;
+  const read = readCaseInvestigationProgress(events, inputKey);
+  return read.state === "found" && read.caseVersion === recorded!.caseVersion && read.record.decision === null && caseTechnicalHandoffWait(read.record.progress) === transfer.detail.reason ? inputKey : key;
+}
+
 export function buildCasePilotView(input: { snapshot: CaseSnapshot; events: readonly CaseEvent[]; timers: readonly CaseTimer[]; pause: SavAgentPauseState; now: Date; blockHold?: CasePilotBlockHold;
   continuationStop?: ContinuationStop | null; teamPartWait?: CasePilotTeamPartWait }) {
   const { snapshot, events, timers, pause, now } = input, body = snapshot.body;
   const firstInbound = [...events].sort((a, b) => a.caseVersion - b.caseVersion).find(event => event.kind === "inbound_confirmed") ?? null;
 
-  const progressKey = latestInvestigationInput([...events]);
+  const progressKey = investigationProgressKey(events);
   const read = progressKey ? readCaseInvestigationProgress(events, progressKey) : { state: "none" as const };
   let proposal: CasePilotProposal = { state: "none" };
   if (read.state === "unreadable") proposal = { state: "unreadable", recordedOn: read.caseVersion };

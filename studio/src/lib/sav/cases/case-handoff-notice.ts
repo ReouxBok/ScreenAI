@@ -13,7 +13,7 @@ import type { EffectIntent } from "../intake/execution-types";
 import { caseRequestSearchText, caseTeamPartRequests, SAV_CASE_AGENT_REQUESTS_PER_MAIL, type CaseSnapshot, type CaseTrial } from "./case-types";
 import { SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { buildCaseHandoffSummary, caseHandoffSummaryLines, type CaseHandoffSummary } from "./case-handoff-summary";
-import { investigationHandoffCommand, readCaseInvestigationProgress, SAV_CASE_INVESTIGATION_RECORD_KIND, type CaseInvestigationJournalEvent } from "./investigation-record";
+import { caseTechnicalHandoffWait, investigationHandoffCommand, readCaseInvestigationProgress, SAV_CASE_INVESTIGATION_RECORD_KIND, type CaseInvestigationJournalEvent, type CaseTechnicalHandoffWait } from "./investigation-record";
 import type { SAV_SMART_HANDOFF_REASONS } from "./smart/smart-contract";
 
 export const HANDOFF_NOTICE_CONTRACT = "sav-v2-handoff-notice.v1";
@@ -98,7 +98,10 @@ export const HANDOFF_REASONS = ["explicit_human_request", "sensitive_request", "
   "team_part_handoff_unavailable",
   // SAV-99 (Ugo 19/11): not a model reason. A person gave the ticket to the agent, which did not take it (outside its blocks, sensitive, unreadable,
   // contact not found, ambiguous thread...): the case was born with the team, the ticket goes back to « Nouveau » with no owner, and no mail was sent.
-  "agent_not_taken"] as const;
+  "agent_not_taken",
+  // Ugo (25/11): not model reasons. A technical dead end of the investigation (`SAV_CASE_TECHNICAL_HANDOFF_WAITS`, investigation-record.ts): the store gives the
+  // case to the team, no mail sent. Written out, not spread: `technicalHandoffTrigger` only compiles while every dead end is one of these reasons.
+  "technical_exhausted", "context_invalid", "knowledge_request_invalid"] as const;
 export type HandoffReason = typeof HANDOFF_REASONS[number];
 export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
   explicit_human_request: "le client demande à parler à une personne",
@@ -112,11 +115,16 @@ export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
   decision_refused: "le validateur a refusé deux fois la décision de l'agent pour ce message",
   outside_active_blocks: "cette partie du message est laissée à l'équipe : aucun bloc actif de l'agent ne la couvre, ou elle dépasse la limite de demandes d'une réponse",
   team_part_handoff_unavailable: "la partie équipe du message n'a pas pu être signalée à temps : le mail entier revient à l'équipe",
+  technical_exhausted: "panne technique, les appels permis de l'agent sont épuisés (code technical_exhausted)",
+  context_invalid: "panne technique, le dossier n'a pas pu être préparé pour l'agent (code context_invalid)",
+  knowledge_request_invalid: "panne technique, la recherche de connaissances a été refusée avant tout appel (code knowledge_request_invalid)",
 };
 /** SAV-92: the fixed next human action of a team part. The agent keeps the rest of the case. */
 export const HANDOFF_TEAM_PART_INTERVENTION = "Reprendre uniquement la partie ci-dessus. L'agent V2 garde les autres demandes du même message ; sa réponse au client indique que cette partie est transmise à l'équipe.";
 /** The fixed next human action after the bound of a team-part wait: the agent sent nothing, the team takes the whole mail. */
 export const HANDOFF_WHOLE_MAIL_INTERVENTION = "Mail entier à reprendre, aucune réponse envoyée : l'agent n'a rien répondu au client. Reprendre toutes les demandes du message.";
+/** The fixed next human action of a technical dead end: never an error message. */
+export const HANDOFF_TECHNICAL_INTERVENTION = "Reprendre le message et répondre au client : rien ne lui a été envoyé par l'agent. Signaler la panne à l'équipe technique.";
 /** The fixed next human action of a refused decision: never model text. */
 export const HANDOFF_REFUSED_INTERVENTION = "Reprendre le dossier : vérifier les faits constatés et la demande, puis répondre au client. Aucune réponse n'a été envoyée par l'agent.";
 
@@ -228,7 +236,7 @@ export function handoffNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ti
   const read = readCaseInvestigationProgress(events, inputKey);
   if (read.state !== "found" || read.caseVersion !== latest.caseVersion) return { ok: false, why: "no_record" };
   const decision = read.record.decision;
-  if (!decision) return { ok: false, why: "no_decision" };
+  if (!decision) return technicalHandoffTrigger(snapshot, events, inputKey, read.caseVersion, caseTechnicalHandoffWait(read.record.progress));
   // Ugo (14/11): a decision the validator refused twice is handed over like an accepted handoff, with a report built from the STORED case (verified
   // facts, trials, requests) and our own fixed refusal labels; never from the refused model output.
   const refused = decision.validation.outcome === "needs_review" && decision.refusalHandoff?.reason === "decision_refused" ? decision.validation : null;
@@ -255,6 +263,26 @@ export function handoffNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ti
   return { ok: true, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion, reason: action.reason,
     report: { need: report.need, expected: report.expected, observed: report.observed, trialIds: report.trialIds, hypotheses: report.hypotheses,
       missingInformation: report.missingInformation, expectedIntervention: report.expectedIntervention } };
+}
+
+/**
+ * Ugo (25/11): the notice of a technical dead end. No decision was recorded, so the trigger is the store's own committed transfer right after the record (same
+ * command key as a decision's transfer, the wait code as reason), the case still waiting for the team. The report is the stored requests and our fixed words only:
+ * never a diagnostic or an error message. Without that transfer (a record written before this rule, a person since): no notice.
+ */
+function technicalHandoffTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ticketId" | "body" | "owner" | "phase">, events: readonly CaseInvestigationJournalEvent[], inputKey: string,
+  recordedVersion: number, reason: CaseTechnicalHandoffWait | null): HandoffNoticeTrigger {
+  if (!reason) return { ok: false, why: "no_decision" };
+  if (snapshot.body.handoff?.humanSince) return { ok: false, why: "taken_by_person" };
+  const transferred = events.find(event => event.caseVersion === recordedVersion + 1 && event.kind === "owner_changed" && event.dedupeKey === "cmd:" + investigationHandoffCommand(recordedVersion)
+    && event.detail?.transition === "handoff" && event.detail.reason === reason);
+  if (!transferred || !awaitingHandoff(snapshot, reason)) return { ok: false, why: "no_decision" };
+  const stale = staleHandoffEventKinds(true, reason);
+  if (events.some(event => event.caseVersion > transferred.caseVersion && stale.includes(event.kind))) return { ok: false, why: "stale_input" };
+  if (!INPUT_KEY.test(inputKey)) return { ok: false, why: "no_record" };
+  const need = snapshot.body.openRequests.filter(row => row.status === "open").map(row => caseRequestSearchText(row) ?? row.summary).join(" ; ") || "voir le mail du client";
+  return { ok: true, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion: transferred.caseVersion, reason,
+    report: { need, expected: null, observed: null, trialIds: [], hypotheses: [], missingInformation: [], expectedIntervention: HANDOFF_TECHNICAL_INTERVENTION } };
 }
 
 /** SAV-99: the fixed next human action of a ticket the agent did not take. */
@@ -492,6 +520,10 @@ const NOTE_REASON_SENTENCES: Record<HandoffReason, string> = {
   outside_active_blocks: "Cette partie de la demande relève de l'équipe ; je continue de traiter le reste du message.",
   team_part_handoff_unavailable: "Aucune réponse ne lui a été envoyée : tout le message est à reprendre.",
   agent_not_taken: "Je n'ai pas pris ce ticket en charge et aucun mail n'a été envoyé au client.",
+  // Ugo (25/11): fixed words and the closed code, never an error message. Neutral: the calls may be model or embedding calls, or lost in a crash.
+  technical_exhausted: "Panne technique : l'agent n'a pas pu traiter ce message (appels permis épuisés). Rien n'a été envoyé au client. Code : technical_exhausted.",
+  context_invalid: "Panne technique : l'agent n'a pas pu préparer le dossier de ce message. Rien n'a été envoyé au client. Code : context_invalid.",
+  knowledge_request_invalid: "Panne technique : la recherche de connaissances de ce message a été refusée. Rien n'a été envoyé au client. Code : knowledge_request_invalid.",
 };
 const NOTE_TRIAL_OUTCOMES: Record<CaseTrial["outcome"], string> = {
   failed: "le problème persiste", pending: "nous attendons son retour", succeeded: "le client indique que cela a fonctionné", unknown: "nous ne savons pas encore si cela a suffi",
