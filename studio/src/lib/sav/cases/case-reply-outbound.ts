@@ -67,7 +67,11 @@ export function prepareCaseReplyText(draft: string, language: CaseReplyLanguage 
   if (!body) throw new Error("SAV_REPLY_EMPTY");
   // ONE follow-up per reply (Ugo 11/11): a `question` reply IS its follow-up (the tracked question, which J2 follows), so the standard line is not stacked after it.
   // Closing/handoff acknowledgements need no new diagnostic question. Answers and reminders keep the standard line once.
-  return renderSavOutboundReply(purpose === "question" || purpose === "closing" || purpose === "handoff" ? body : `${body}\n\n${caseReplyHelpLine(language)}`, language, mode);
+  // 25/11 (Agent SAV in production): never in an `automated` reply. Its AI notice (`SAV_REPLY_NOTICE`, reply-format.ts) already asks the customer to reply
+  // with what still blocks, and the smart brain's reply carries its own next step, so the line only repeated, after a complete answer, a request the reply
+  // and its notice already made. The human-validated modes are unchanged.
+  const helpLine = mode !== "automated" && purpose !== "question" && purpose !== "closing" && purpose !== "handoff";
+  return renderSavOutboundReply(helpLine ? `${body}\n\n${caseReplyHelpLine(language)}` : body, language, mode);
 }
 
 /**

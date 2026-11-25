@@ -271,7 +271,9 @@ describe("SAV-96 B : le premier mail d'un ticket sans fil, écrit par le modèle
     expect(proposal.triggerEventId).toMatch(/^ticket:/);
     expect(readCaseReplyDisclosure(proposal.text)?.mode).toBe("automated");
     expect(proposal.text).toContain("Suite à votre demande concernant");
-    expect(proposal.text).toContain("Pour nous aider à vous répondre");
+    // 25/11: an automated reply carries no standard help line; its AI notice asks what still blocks.
+    expect(proposal.text).not.toContain("Pour nous aider à vous répondre");
+    expect(proposal.text).toContain("précisant ce qui bloque");
     expect(proposal.text).not.toContain(NOTE);
     expect(proposal.text).not.toBe(finalizeCaseReplyProposal({ ...proposal, text: THREADLESS_ACCESS_DRAFT }, { language: "fr", validation: "human" }).text);
 

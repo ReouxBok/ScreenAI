@@ -1,5 +1,6 @@
 import { caseRequestSearchText, type CaseEvent, type CaseSnapshot } from "../case-types";
 import type { CaseDecisionProposal } from "../decision-contract";
+import { SAV_CASE_LEXICAL_RECALL } from "../investigation-knowledge";
 import type { CaseInvestigationModelRequest } from "../investigation-runner";
 import type { CaseV2ModelTransport, CaseV2SpendUsage } from "../investigation-v2-spend";
 import { SAV_SMART_ENTRY_ADMISSION, savV2EntrySmartOn } from "../smart-entry-switch";
@@ -57,16 +58,23 @@ export function smartTurnInputFromCase(request: CaseInvestigationModelRequest): 
   return { subject: latest.subject ?? "", body: latest.text, thread, memory: smartMemoryFromCase(request.snapshot, request.events) };
 }
 
-/** The brain's knowledge port on the cards the circuit already retrieved: no index, no embedding. Each card may serve every need of this mail. */
-export function smartCaseKnowledge(request: Pick<CaseInvestigationModelRequest, "knowledge">): SmartKnowledgePort {
+/**
+ * The brain's knowledge port on the cards the circuit already retrieved: no index, no embedding. Each card may serve every need of this mail.
+ * A card the circuit kept by its lexical recall only (`knowledge_lexical_recall` on its request's coverage) is marked low relevance: the model reads
+ * « verify before citing » on it (`SMART_LOW_RELEVANCE_NOTE`), and the trace gets the code `lexical_recall`.
+ */
+export function smartCaseKnowledge(request: Pick<CaseInvestigationModelRequest, "knowledge"> & Partial<Pick<CaseInvestigationModelRequest, "coverage">>): SmartKnowledgePort {
+  const recalled = new Set((request.coverage ?? []).filter(row => row.limitations.includes(SAV_CASE_LEXICAL_RECALL))
+    .flatMap(row => row.knowledge.map(ref => `${ref.knowledgeId}:${ref.contentVersionId}`)));
   return async needs => {
     const needIds = needs.map(need => need.id);
     const sources: SmartSource[] = request.knowledge.map(card => ({
+      ...(recalled.has(`${card.id}:${card.contentVersionId}`) ? { lowRelevance: true } : {}),
       cardId: card.id, version: card.contentVersionId, title: card.title, content: card.content,
       steps: Array.isArray(card.resolution?.steps) ? (card.resolution!.steps as unknown[]).filter((step): step is string => typeof step === "string") : [],
       needIds, validUntil: typeof card.resolution?.validUntil === "string" && card.resolution.validUntil ? card.resolution.validUntil : null,
     }));
-    return { status: "ok", sources, codes: sources.length ? ["circuit_cards"] : ["no_circuit_card"] };
+    return { status: "ok", sources, codes: [...(sources.length ? ["circuit_cards"] : ["no_circuit_card"]), ...(sources.some(card => card.lowRelevance) ? ["lexical_recall"] : [])] };
   };
 }
 

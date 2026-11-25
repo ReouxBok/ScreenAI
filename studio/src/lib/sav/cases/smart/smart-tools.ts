@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { normalizeSavEvidenceText } from "../../evidence-text";
 import type { SmartKnowledgePort, SmartKnowledgeResult } from "./smart-agent";
-import type { SmartSource } from "./smart-checks";
+import { smartRelevanceView, type SmartSource } from "./smart-checks";
 import type { SmartToolCall } from "./smart-contract";
 import type { AcademyTool, AcademyToolResult } from "./tools/academy";
 
@@ -77,7 +77,7 @@ export function smartAcademyText(summary: string): string {
 function boundedCards(cards: readonly SmartSource[], max: number) {
   let room = 1_200;
   const view = () => cards.map(card => ({ cardId: card.cardId, version: card.version, title: card.title, content: card.content.slice(0, room), steps: card.steps.slice(0, 8).map(step => step.slice(0, 200)),
-    ...(card.validUntil ? { validUntil: card.validUntil } : {}) }));
+    ...(card.validUntil ? { validUntil: card.validUntil } : {}), ...smartRelevanceView(card) }));
   let rows = view();
   while (bytesOf(rows) > max - 400 && room > 100) { room = Math.floor(room / 2); rows = view(); }
   while (bytesOf(rows) > max - 400 && rows.length) rows = rows.slice(0, -1);

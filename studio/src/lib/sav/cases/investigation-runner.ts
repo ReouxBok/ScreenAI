@@ -225,7 +225,7 @@ export type CaseInvestigationPorts = {
    * `stopped` (budgeted search): the pause, the owner, a newer version, the budget or an uncertain paid call stopped it
    * before or instead of an embedding call. `context.inputKey` is the input the search is paid for.
    */
-  knowledge(snapshot: CaseSnapshot, context?: { inputKey: string; customerWords?: string | null }): Promise<SavRetrievalCandidate[] | CaseKnowledgeRead>;
+  knowledge(snapshot: CaseSnapshot, context?: { inputKey: string; customerWords?: string | null; lexicalRecall?: boolean }): Promise<SavRetrievalCandidate[] | CaseKnowledgeRead>;
   /**
    * SAV-92: the customer's own context, read from what V1 stored (mails, CRM snapshot), masked and bounded. Must not throw; if it does, the
    * run goes on with a context that says it could not be read. Absent: no context, no customer-words query (pre-SAV-92 behaviour).
@@ -467,7 +467,8 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
     const customerContext = ports.customerContext
       ? await Promise.resolve().then(() => ports.customerContext!(snapshot, events)).catch(() => caseCustomerContextUnavailable()) : undefined;
     const customerWords = caseCustomerSearchText(customerContext);
-    const fetched = await ports.knowledge(snapshot, { inputKey, ...(customerWords ? { customerWords } : {}) });
+    // 25/11: the smart brain's case (no block scope) keeps the cards its words hold when the floor would leave it none (`selectCaseKnowledge`).
+    const fetched = await ports.knowledge(snapshot, { inputKey, ...(customerWords ? { customerWords } : {}), ...(smartCase ? { lexicalRecall: true } : {}) });
     if (!Array.isArray(fetched) && fetched.status === "stopped") {
       const stop = fetched.stop;
       switch (stop.reason) {

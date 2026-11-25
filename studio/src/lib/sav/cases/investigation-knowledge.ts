@@ -1,3 +1,4 @@
+import { savLexicalRank } from "../knowledge-lexical";
 import { assessSavKnowledgeValidity, retrieveSavKnowledgeByRequest, savRetrievalRanking, SAV_RETRIEVAL_LIMITS, type SavRetrievalBackend, type SavRetrievalCandidate } from "../request-retrieval";
 import { caseRequestSearchText, caseRequestSubject, SAV_CASE_SENSITIVE_FAMILIES, type CaseRequestFamily, type CaseSnapshot } from "./case-types";
 import type { CaseKnowledgeCoverage, CaseKnowledgeCoverageStatus } from "./decision-contract";
@@ -105,8 +106,23 @@ function mergeCustomerWords(subject: { query: string; cards: SavRetrievalCandida
   return [...(pinned ? [pinned] : []), ...rest].slice(0, SAV_RETRIEVAL_LIMITS.sourcesPerRequest);
 }
 
+/**
+ * 25/11 (Agent SAV in production): a request searched on the customer's words ALONE (V1 gave it no subject) lost every card to the absolute floor, which
+ * reads only the vector score of a whole mail, so a mail asking two things (« messages LinkedIn » and « programmer des posts ») got no card although the
+ * search's own lexical half had returned the LinkedIn and post cards. Only when that request would otherwise have NO card, and only when the caller asks
+ * for it (`lexicalRecall`: the smart brain's cases, which have no block scope), the valid candidates the search already returned for the words are kept
+ * when their title or symptoms hold at least one of the words (any term, accents, case and plurals folded, `savLexicalRank`), best first, within the
+ * per-request source limit. No new search, no new call; the brain still judges each card and the validator still checks every citation.
+ */
+export const SAV_CASE_LEXICAL_RECALL = "knowledge_lexical_recall";
+const lexicalRecall = (words: string, candidates: readonly SavRetrievalCandidate[], context: Readonly<{ locale: string; audience: string; now: Date }>) =>
+  savLexicalRank(words, [...new Map(candidates.filter(card => assessSavKnowledgeValidity(card, context.locale, context.audience, context.now).eligible)
+    .map(card => [cardKeyOf(card), card])).values()], card => ({ title: card.title, body: card.content,
+    symptoms: Array.isArray(card.resolution?.symptoms) ? card.resolution.symptoms.filter((value): value is string => typeof value === "string") : [] }),
+  { limit: SAV_RETRIEVAL_LIMITS.sourcesPerRequest, minStrong: 1 });
+
 export async function selectCaseKnowledge(snapshot: CaseSnapshot, backend: SavRetrievalBackend,
-  scope: { locale: string; audience: "support" | "lead"; now: Date; customerWords?: string | null }, subjectOf: CaseSubjectPort = caseRequestSearchText): Promise<CaseKnowledgeRead> {
+  scope: { locale: string; audience: "support" | "lead"; now: Date; customerWords?: string | null; lexicalRecall?: boolean }, subjectOf: CaseSubjectPort = caseRequestSearchText): Promise<CaseKnowledgeRead> {
   const open = snapshot.body.openRequests.filter(row => row.status === "open" && !sensitive(row.family));
   const subjects = new Map(open.map(row => [row, subjectOf(row)?.trim().slice(0, SUMMARY_MAX) ?? null]));
   // The relay's label is never a subject, whatever the port says (contract v10 §9.2).
@@ -143,6 +159,7 @@ export async function selectCaseKnowledge(snapshot: CaseSnapshot, backend: SavRe
   const cards = new Map<string, SavRetrievalCandidate>(), relevance: CaseKnowledgeRelevance[] = [], pool: CaseKnowledgePoolEntry[] = [];
   const wordsFound = wordsSearched ? result.requests.find(entry => entry.requestId === WORDS_ALIAS) : undefined;
   const context = { locale: scope.locale, audience: scope.audience, now: scope.now };
+  let recalledFor: string | null = null;
   const selectedOf = (keys: readonly string[]) => keys.flatMap(key => { const card = returned.get(key); return card ? [card] : []; });
   const coverage = open.map((row): CaseKnowledgeCoverage => {
     const plan = searched.find(entry => entry.row === row), found = plan && result.requests.find(entry => entry.requestId === plan.alias);
@@ -156,6 +173,12 @@ export async function selectCaseKnowledge(snapshot: CaseSnapshot, backend: SavRe
     if (withWords) {
       const wordsSelected = selectedOf(wordsFound!.candidateKeys);
       selected = mergeCustomerWords(subject, { query: words, cards: wordsSelected, verdicts: caseRequestCardRelevance(words, wordsSelected, byQuery.get(words) ?? [], context) });
+      if (!selected.length && scope.lexicalRecall) {
+        const recalled = lexicalRecall(words, byQuery.get(words) ?? [], context);
+        const verdicts = caseRequestCardRelevance(words, recalled, byQuery.get(words) ?? [], context);
+        selected = recalled.map((card, index) => ({ card, verdict: verdicts[index]! }));
+        recalledFor = recalled.length ? row.id : recalledFor;
+      }
     } else selected = subject!.cards.map((card, index) => ({ card, verdict: subject!.verdicts[index]! }));
     for (const { card } of selected) cards.set(cardKeyOf(card), card);
     const knowledge = selected.map(({ card }) => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId }));
@@ -175,7 +198,7 @@ export async function selectCaseKnowledge(snapshot: CaseSnapshot, backend: SavRe
     const status: CaseKnowledgeCoverageStatus = knowledge.length ? "covered" : nothing && !incomplete ? "no_applicable_knowledge" : "not_searched";
     const limitations = [...(found ? found.limitations : unsearchedBecause(row, subjects.get(row) ?? null)),
       ...(withWords ? ["customer_words_searched", ...wordsFound!.limitations.filter(code => !(found?.limitations ?? []).includes(code))] : []), ...wordsNote,
-      ...(incomplete ? ["knowledge_source_incomplete"] : [])];
+      ...(incomplete ? ["knowledge_source_incomplete"] : []), ...(recalledFor === row.id ? [SAV_CASE_LEXICAL_RECALL] : [])];
     return { requestId: row.id, family: row.family, status, knowledge, limitations };
   });
   return { status: "ready", selection: { revision: result.revision, cards: [...cards.values()], coverage, alerts: result.alerts, relevance, pool }, currentRevision: () => backend.readRevision() };

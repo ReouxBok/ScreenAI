@@ -44,7 +44,8 @@ describe("prepareCaseReplyText: the final V2 text, prepared once before validati
       expect(readCaseReplyDisclosure(question)).toEqual({ mode, language: "fr" });
       for (const purpose of ["answer", "reminder", undefined] as const) {
         const answer = prepareCaseReplyText(BODY, "fr", mode, purpose);
-        expect(answer.split(line).length - 1).toBe(1);
+        // 25/11: never in an automated reply, whose AI notice already asks what still blocks.
+        expect(answer.split(line).length - 1).toBe(mode === "automated" ? 0 : 1);
         expect(prepareCaseReplyText(answer, "fr", mode, purpose)).toBe(answer);
       }
       // a draft that already carries the line (an older proposal) is re-prepared as a question without it, never with two
@@ -156,12 +157,14 @@ describe("ROOT contract: automated is format only, the default stays the human v
 describe("help line of a V2 access reply (Ugo, 4/11)", () => {
   const count = (text: string, part: string) => text.split(part).length - 1;
 
-  it("FR/EN, assisted and automatic: exactly once, between the content and the unchanged signature and AI mention", () => {
-    for (const language of ["fr", "en"] as const) for (const mode of ["manual_reviewed", "automated"] as const) {
-      const text = prepareCaseReplyText(BODY, language, mode);
-      expect(text).toBe(`${BODY}\n\n${caseReplyHelpLine(language)}\n\n${savReplyFooter(language, mode)}`);
+  it("FR/EN, assisted: exactly once, between the content and the unchanged signature and AI mention; automatic (25/11): never, its AI notice asks what still blocks", () => {
+    for (const language of ["fr", "en"] as const) {
+      const text = prepareCaseReplyText(BODY, language, "manual_reviewed");
+      expect(text).toBe(`${BODY}\n\n${caseReplyHelpLine(language)}\n\n${savReplyFooter(language, "manual_reviewed")}`);
       expect(count(text, caseReplyHelpLine(language))).toBe(1);
+      expect(prepareCaseReplyText(BODY, language, "automated")).toBe(`${BODY}\n\n${savReplyFooter(language, "automated")}`);
     }
+    expect(savReplyFooter("fr", "automated")).toContain(SAV_REPLY_NOTICE);
     expect(caseReplyHelpLine("unknown")).toBe(caseReplyHelpLine("fr"));
   });
 

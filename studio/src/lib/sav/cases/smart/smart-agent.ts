@@ -1,5 +1,5 @@
 import { savReplyFooter } from "../../reply-format";
-import { smartRepairFactSources, smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
+import { smartRelevanceView, smartRepairFactSources, smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
 import {
   parseSmartOutput, SAV_SMART_VERIFY_CODES, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchema,
   type SmartCallKind, type SmartCheckCode, type SmartDecision, type SmartReading, type SmartTeamNote, type SmartTurnOutcome, type SmartVerdict,
@@ -115,7 +115,7 @@ const mergeSources = (given: readonly SmartSource[], found: readonly SmartSource
   return out;
 };
 const cardView = (card: SmartSource) => ({ cardId: card.cardId, version: card.version, title: card.title, content: card.content, steps: card.steps, needIds: card.needIds,
-  ...(card.validUntil ? { validUntil: card.validUntil } : {}) });
+  ...(card.validUntil ? { validUntil: card.validUntil } : {}), ...smartRelevanceView(card) });
 
 /*
  * The problems a narrowing correction may fix (bench 22/11): grounding and coverage only. Anything else (links, secrets, promises, account actions,

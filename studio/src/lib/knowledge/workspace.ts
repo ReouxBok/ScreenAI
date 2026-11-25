@@ -2,6 +2,7 @@ import { readSavDeliveryEnvelope } from "./delivery-envelope";
 import "server-only";
 import { and, desc, eq, or, sql } from "drizzle-orm";
 import { savResolutionIsCurrent } from "@/lib/search";
+import { savLexicalTerms } from "@/lib/sav/knowledge-lexical";
 import { requireDb } from "@/db";
 import { auditLogs, contentItems, contentVersions, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates, knowledgeProjections, savKnowledgeActivations, savKnowledgeProposalDrafts, savLearningCandidates } from "@/db/schema";
 import { assertSavActor } from "@/lib/sav/access";
@@ -73,12 +74,31 @@ const actions: Record<string, string> = { production: "Consulter la version acti
 function rowDto(raw: Record<string, unknown>): SavKnowledgeRow {
   return { id: String(raw.id), kind: raw.kind as SavKnowledgeRow["kind"], itemId: raw.item_id as string | null, candidateId: raw.candidate_id as string | null, draftId: raw.draft_id as string | null, learningCandidateId: raw.learning_candidate_id as string | null, familyId: raw.family_id as string | null, title: String(raw.title || "Brouillon sans titre"), summary: String(raw.summary), origin: raw.origin as SavKnowledgeOrigin, state: String(raw.state), version: raw.version == null ? null : Number(raw.version), updatedAt: new Date(String(raw.updated_at)), sourceLabel: String(raw.source_label), activeVersionId: raw.active_version_id as string | null, publishedVersionId: raw.published_version_id as string | null, hasPendingUpdate: raw.has_pending_update === true, nextAction: actions[String(raw.state)] ?? "Consulter le détail" };
 }
+// Accents and case folded on both sides (no extension needed): the query's terms are folded by `savLexicalTerms`, the columns by this translation.
+const FOLD_FROM = "àâäáãåçéèêëíìîïñóòôöõúùûüýÿ", FOLD_TO = "aaaaaaceeeeiiiinooooouuuuyy";
+const folded = (column: string) => sql`translate(lower(coalesce(${sql.raw(column)},'')), ${FOLD_FROM}, ${FOLD_TO})`;
+const likeEscape = (value: string) => value.replace(/[\\%_]/g, "\\$&");
+/**
+ * 25/11: the search of the Connaissances page and of the MCP `search_fiches`. Before, the whole query was ONE substring (« programmer posts LinkedIn »
+ * found nothing). Now a row matches the whole query as before (title, summary or label; ranked first), OR any of its terms in its title or summary
+ * (accents, case and plurals folded: « posts » finds « post »), ranked by the number of terms it holds. Null: no query, every row.
+ */
+function savKnowledgeSearch(raw: string) {
+  const q = raw.trim().slice(0, 200);
+  if (!q) return null;
+  const phrase = `%${likeEscape(q)}%`;
+  const whole = sql`(title ILIKE ${phrase} OR summary ILIKE ${phrase} OR source_label ILIKE ${phrase})`;
+  const terms = savLexicalTerms(q).slice(0, 12).map(term => `%${likeEscape(term)}%`);
+  const hits = terms.map(term => sql`(CASE WHEN ${folded("title")} LIKE ${term} OR ${folded("summary")} LIKE ${term} THEN 1 ELSE 0 END)`);
+  const score = sql`((CASE WHEN ${whole} THEN 100 ELSE 0 END)${hits.length ? sql` + ${sql.join(hits, sql` + `)}` : sql``})`;
+  return { filter: sql`${score} > 0`, score };
+}
 export async function paginateSavKnowledge(input: { tab?: SavKnowledgeTab | "proposals"; q?: string; status?: string; page?: number; pageSize?: number } = {}) {
   const db = requireDb();
   const tab = ["production", "automatic", "human", "proposals"].includes(input.tab ?? "") ? input.tab! : "production";
   const pageSize = Math.min(50, Math.max(1, Math.floor(input.pageSize ?? 20) || 20));
-  const q = (input.q ?? "").trim().slice(0, 200).replace(/[\\%_]/g, "\\$&");
-  const search = q ? sql`(title ILIKE ${`%${q}%`} OR summary ILIKE ${`%${q}%`} OR source_label ILIKE ${`%${q}%`})` : sql`TRUE`;
+  const found = savKnowledgeSearch(input.q ?? "");
+  const search = found ? found.filter : sql`TRUE`;
   const originFilter = tab === "proposals" ? sql`TRUE` : tab === "human" ? sql`origin='human'` : sql`origin IN ('automatic','unknown')`;
   const tabFilter = tab === "production" ? sql`kind='item' AND state='production'` : sql`state NOT IN ('production','superseded') AND ${originFilter}`;
   const status = input.status && Object.hasOwn(actions, input.status) ? input.status : "all";
@@ -89,7 +109,7 @@ export async function paginateSavKnowledge(input: { tab?: SavKnowledgeTab | "pro
    count(*) FILTER(WHERE state NOT IN ('production','superseded') AND origin='human')::int AS human FROM catalogue WHERE ${search}`));
   const [{ total }] = resultRows<{ total: number }>(await db.execute(sql`${workspaceRows} SELECT count(*)::int AS total FROM catalogue WHERE ${filter}`));
   const page = Math.max(1, Math.min(Math.ceil(total / pageSize) || 1, Math.floor(input.page ?? 1) || 1));
-  const rows = resultRows<Record<string, unknown>>(await db.execute(sql`${workspaceRows} SELECT * FROM catalogue WHERE ${filter} ORDER BY updated_at DESC,id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`));
+  const rows = resultRows<Record<string, unknown>>(await db.execute(sql`${workspaceRows} SELECT * FROM catalogue WHERE ${filter} ORDER BY ${found ? sql`${found.score} DESC,` : sql``} updated_at DESC,id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`));
   return { rows: rows.map(rowDto), total, page, pageSize, counts: countsRows[0] };
 }
 export async function searchSavKnowledgeTargets(q = "", page = 1) {
