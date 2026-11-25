@@ -8,7 +8,7 @@ import { smartGoodDecision, smartReading } from "./smart-test-doubles";
 
 describe("prompt figé (lot B)", () => {
   it("révision et empreinte figées ensemble ; toute modification du texte fait échouer ce test", () => {
-    expect(SAV_SMART_PROMPT_REVISION).toBe("sav-smart-prompt-2026-11-24.v20");
+    expect(SAV_SMART_PROMPT_REVISION).toBe("sav-smart-prompt-2026-11-25.v21");
     expect(smartPromptSha256()).toBe(SAV_SMART_PROMPT_SHA256);
     expect(smartPromptPinned()).toBe(true);
   });
@@ -17,7 +17,9 @@ describe("prompt figé (lot B)", () => {
     expect(bytes.decide).toBeLessThanOrEqual(SAV_SMART_PROMPT_MAX_BYTES);
     // v20 (24/11): the investigation rule pushes the correction prompt (decide + instruction) to 9 534 bytes; the 9 000 ceiling (ARCHITECTURE 3) is the
     // decide prompt's. Arbitration pending with Ugo: accept, or trim 534 bytes elsewhere in a v21.
-    expect(bytes).toEqual({ decide: 8985, understand: 4805, verify: 3919, correct: 9534 });
+    // v21 (25/11): the unsourced-guarantee rule fits in the decide prompt by dropping the « jai suivi le tuto » example (covered by the memory rule,
+    // the investigation rule and its example) and three redundant clauses; the correction prompt grows with its unsourced_claim clause (same arbitration).
+    expect(bytes).toEqual({ decide: 8998, understand: 4805, verify: 4374, correct: 9692 });
   });
   it("porte les grandes règles d'Ugo (section 4)", () => {
     const decide = smartDecidePrompt();
