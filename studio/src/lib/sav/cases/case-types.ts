@@ -452,6 +452,8 @@ export const caseRelayProofSchema = z.discriminatedUnion("kind", [
   // V1 classified it as an acknowledgement needing no CRM effect; its thread already
   // belongs to exactly one case, which is the one fed.
   z.object({ kind: z.literal("acknowledgement_on_case_thread"), messageId: uuid, intakeRunId: uuid, intakeRunVersion: z.number().int().min(1), sourceHash: ref }).strict(),
+  // 25/11 (`SAV_V2_CASE_THREAD_REPLY=on`): V1 found the thread owned by exactly one case and left the reply's scope to it (`v2_case_thread`, no CRM effect).
+  z.object({ kind: z.literal("case_thread_reply"), messageId: uuid, intakeRunId: uuid, intakeRunVersion: z.number().int().min(1), sourceHash: ref }).strict(),
   // SAV-99 (Ugo 19/11): V1 never executed this mail (the team made the ticket outside the Studio) and a person gave the ticket to the V2 agent: the
   // assignment, read again now, is the proof; the mail's reading is the handover's own (stored in the case's admission), never V1's.
   z.object({ kind: z.literal("owner_handover_mail"), messageId: uuid, ticketId: z.string().regex(/^[0-9]{1,30}$/) }).strict(),

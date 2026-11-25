@@ -257,3 +257,35 @@ describe("revue R03 : ordre explicite des mails d'un dossier", () => {
     expect(decideCustomerReturn(closed({ v1Target: "pending" }))).toEqual({ route: "wait", reason: "v1_pending" });
   });
 });
+
+// 25/11 (`SAV_V2_CASE_THREAD_REPLY=on`): V1 left a reply to the thread's case (`v2_case_thread`); without that fact every route is unchanged.
+describe("V2 case thread reply on a closed case", () => {
+  const DAY = 86_400_000;
+  const reply = (overrides: Partial<CustomerReturnFacts> = {}) => closed({ caseThreadReply: true, caseThreadReplyAgeMs: 2 * DAY, ...overrides });
+  it("a closed case reopens on V1's v2_case_thread, after the same owner checks; without it, it still waits for V1", () => {
+    expect(decideCustomerReturn(reply())).toEqual({ route: "reopen", reason: "case_thread_reply" });
+    expect(decideCustomerReturn(reply({ case: { owner: "agent", phase: "closed_no_reply", sensitivity: "none" } }))).toEqual({ route: "reopen", reason: "case_thread_reply" });
+    expect(decideCustomerReturn(closed())).toEqual({ route: "wait", reason: "v1_pending" });
+    expect(decideCustomerReturn(closed({ caseThreadReply: false }))).toEqual({ route: "wait", reason: "v1_pending" });
+    expect(decideCustomerReturn(reply({ ownerNow: "unknown" }))).toEqual({ route: "wait", reason: "owner_unread" });
+    expect(decideCustomerReturn(reply({ paused: true }))).toEqual({ route: "wait", reason: "paused" });
+    expect(decideCustomerReturn(reply({ ownerNow: "human" }))).toEqual({ route: "hand_to_team", reason: "human_owner" });
+    expect(decideCustomerReturn(reply({ v1Target: "pending" }))).toEqual({ route: "wait", reason: "v1_pending" });
+    expect(decideCustomerReturn(reply({ v1Target: "same_ticket" }))).toEqual({ route: "reopen", reason: "same_incident_v1_confirmed" });
+  });
+  it("reopens only within V1's 15-day window; past it or with an unreadable date (a race with V1's bound) it goes to the team, never waits for V1", () => {
+    expect(decideCustomerReturn(reply({ caseThreadReplyAgeMs: 15 * DAY }))).toEqual({ route: "reopen", reason: "case_thread_reply" });
+    for (const caseThreadReplyAgeMs of [15 * DAY + 1, undefined, Number.NaN])
+      expect(decideCustomerReturn(reply({ caseThreadReplyAgeMs }))).toEqual({ route: "hand_to_team", reason: "case_thread_reply_outside_window" });
+    // Without V1's v2_case_thread, a closed case still waits for V1 as today.
+    expect(decideCustomerReturn(closed({ caseThreadReplyAgeMs: 30 * DAY }))).toEqual({ route: "wait", reason: "v1_pending" });
+  });
+  it("a sensitive case goes to the team; a case on system hold or with the team is left to its owner", () => {
+    expect(decideCustomerReturn(reply({ case: { owner: "agent", phase: "resolved", sensitivity: "finance" } }))).toEqual({ route: "hand_to_team", reason: "sensitive" });
+    expect(decideCustomerReturn(reply({ case: { owner: "system_hold", phase: "resolved", sensitivity: "none" } }))).toEqual({ route: "leave_to_owner", reason: "case_on_hold" });
+    expect(decideCustomerReturn(reply({ case: { owner: "human", phase: "resolved", sensitivity: "none" } }))).toEqual({ route: "leave_to_owner", reason: "case_with_team" });
+  });
+  it("an open agent case continues as before", () => {
+    expect(decideCustomerReturn({ ...open, caseThreadReply: true })).toEqual({ route: "continue", reason: "open_case_v2_owner" });
+  });
+});

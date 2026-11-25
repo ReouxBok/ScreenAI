@@ -481,3 +481,80 @@ describe("v10: a searchable subject per relayed request, from V1's accepted anal
       expect(await subject(preFix)).toEqual({ status: "absent", reason: "source_invalid" });
   });
 });
+
+// 25/11 (`SAV_V2_CASE_THREAD_REPLY=on`): a reply V1 left to the thread's case (`v2_case_thread`) reaches that case, whoever holds it, with its own proof.
+describe("V2 case thread reply relay", () => {
+  const caseThread = () => vi.fn(async (messageId: string) => ({ ...await ackRun(messageId), decision: { classification: "unknown", requests: [{ id: "r0", kind: "unknown" }] } as never, reason: "v2_case_thread" as const }));
+  it("reaches a case held by the agent, as case_thread_reply, with no execution and no new admission", async () => {
+    const { source, c } = await agentCase(), messageId = await bareMessage(source.threadId);
+    const result = await recordCaseAfterConfirmedIntake(messageId, { ...noProgress, readAcknowledgement: caseThread() });
+    expect(result).toMatchObject({ caseId: c.caseId, created: false, appended: true, version: c.version + 1, owner: "agent", relay: "case_thread_reply" });
+    const event = (await listCaseEvents(c.caseId)).at(-1)!;
+    expect(event).toMatchObject({ kind: "inbound_confirmed", direction: "customer_inbound", dedupeKey: `inbound:gm-${messageId}` });
+    expect(event.detail).toMatchObject({ messageId, relay: { kind: "case_thread_reply", messageId, intakeRunVersion: runSeq, sourceHash: "source-hash-fixture" } });
+    expect(await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, messageId))).toEqual([]);
+  });
+  // V1 gives the fact only for an agent case; a team that takes the case after V1's analysis still finds the reply on it (it is never dropped).
+  it("reaches a case the team took after V1's analysis, which stays the team's", async () => {
+    const human = await intake();
+    await recordCaseAfterConfirmedIntake(human.messageId, confirmed(human.ticketId));
+    const reply = await bareMessage(human.threadId);
+    expect(await recordCaseAfterConfirmedIntake(reply, { ...noProgress, readAcknowledgement: caseThread() })).toMatchObject({ appended: true, owner: "human", relay: "case_thread_reply" });
+    expect((await readCaseByTicket(human.ticketId))!).toMatchObject({ owner: "human", phase: "handoff_pending" });
+  });
+  it("readIntakeAcknowledgement accepts V1's v2_case_thread record and says so; the default relay then uses its proof", async () => {
+    const { savIntakeSourceSnapshot } = await import("../intake/runtime-store");
+    const { source } = await agentCase(), messageId = await bareMessage(source.threadId);
+    const [message] = await f.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+    const snapshot = await f.db.transaction(async tx => savIntakeSourceSnapshot(tx as never, message!, new Date()));
+    const [run] = await f.db.insert(savIntakeRuns).values({ threadId: source.threadId, messageId, version: 21, isCurrent: false, state: "observed", configHash: "c21", policyHash: "fixture",
+      sourceHash: snapshot.sourceHash, payloadCiphertext: encryptSavPayload({ revision: "fixture", plan: { decision: { classification: "unknown", requests: [], disposition: { kind: "no_ticket", reason: "v2_case_thread" } } } }) }).returning();
+    expect(await readIntakeAcknowledgement(messageId)).toMatchObject({ runId: run!.id, runVersion: 21, reason: "v2_case_thread" });
+    expect(await recordCaseAfterConfirmedIntake(messageId, noProgress)).toMatchObject({ appended: true, relay: "case_thread_reply" });
+  });
+});
+
+// 25/11 (`SAV_V2_CASE_THREAD_REPLY=on`): production path of the V2 entry on a closed case, on the real tables. V1's own record of the mail (`v2_case_thread`,
+// sources matching) is read back by the customer return (`readCustomerReturnFacts` → `readIntakeAcknowledgement`), and the case reopens within V1's
+// 15-day window; older, the mail waits for V1 as today. Only the HubSpot owner is a simulated port.
+describe("V2 case thread reply after closure, from V1's real record", () => {
+  const V2_OWNER = "900001";
+  const entryEnv = { SAV_CASE_RECORDING: "on", SAV_V2_ENTRY: "on", SAV_V2_CASE_THREAD_REPLY: "on", SAV_V2_HUBSPOT_OWNER_ID: V2_OWNER, HUBSPOT_SAV_OWNER_ID: "900000" };
+  async function closedAgentCase() {
+    const { source, c } = await agentCase();
+    await updateCaseRecord({ caseId: c.caseId, expectedVersion: c.version, actor: { type: "agent" }, phase: "resolved",
+      body: { ...c.body, waiting: null, cycle: { number: 1, endedBy: "resolved" } } });
+    return { source, caseId: c.caseId };
+  }
+  async function v1CaseThreadRecord(threadId: string, messageId: string) {
+    const { savIntakeSourceSnapshot } = await import("../intake/runtime-store");
+    const [message] = await f.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+    const snapshot = await f.db.transaction(async tx => savIntakeSourceSnapshot(tx as never, message!, new Date()));
+    await f.db.insert(savIntakeRuns).values({ threadId, messageId, version: 31, isCurrent: true, state: "observed", configHash: "c-thread", policyHash: "fixture", sourceHash: snapshot.sourceHash,
+      payloadCiphertext: encryptSavPayload({ revision: "fixture", plan: { decision: { classification: "unknown", requests: [{ id: "r0", kind: "unknown" }], disposition: { kind: "no_ticket", reason: "v2_case_thread" } } } }) });
+  }
+  const route = async (messageId: string) => {
+    const { routeCustomerReturn } = await import("./customer-return-store");
+    return routeCustomerReturn(messageId, { env: entryEnv, readTicketOwner: vi.fn(async () => V2_OWNER), readAdmissionPolicy: async () => POLICY as never });
+  };
+  it("reopens the closed agent case on V1's v2_case_thread, read from V1's record", async () => {
+    const { source, caseId } = await closedAgentCase(), reply = await bareMessage(source.threadId, "2026-10-28T09:30:00.000Z");
+    await v1CaseThreadRecord(source.threadId, reply);
+    expect(await route(reply)).toMatchObject({ route: { route: "reopen", reason: "case_thread_reply" }, written: true });
+    expect(await readCase(caseId)).toMatchObject({ owner: "agent", phase: "queued", body: { cycle: { number: 2 } } });
+    expect((await listCaseEvents(caseId)).map(event => event.dedupeKey)).toContain(`inbound:gm-${reply}`);
+  });
+  it("past V1's 15-day window (a race with V1's own bound): the mail goes to the team with the case, never left waiting for V1", async () => {
+    const { source, caseId } = await closedAgentCase(), late = await bareMessage(source.threadId, "2026-11-12T08:00:00.000Z");
+    await v1CaseThreadRecord(source.threadId, late);
+    expect(await route(late)).toMatchObject({ route: { route: "hand_to_team", reason: "case_thread_reply_outside_window" }, written: true });
+    expect(await readCase(caseId)).toMatchObject({ owner: "human" });
+    expect((await listCaseEvents(caseId)).map(event => event.dedupeKey)).toContain(`inbound:gm-${late}`);
+  });
+  it("V1's case fact applies the same window on the real tables: inside, the case; past it, nothing", async () => {
+    const { intakeV2CaseThreadFact } = await import("../intake/ack-ticket-store");
+    const { source, caseId } = await closedAgentCase();
+    expect(await intakeV2CaseThreadFact({ threadId: source.threadId, receivedAt: "2026-10-28T09:30:00.000Z" }, entryEnv)).toEqual({ caseId });
+    expect(await intakeV2CaseThreadFact({ threadId: source.threadId, receivedAt: "2026-11-12T08:00:00.000Z" }, entryEnv)).toBeUndefined();
+  });
+});

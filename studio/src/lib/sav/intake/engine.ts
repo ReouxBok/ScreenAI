@@ -176,11 +176,20 @@ export async function planSavIntake(
     acknowledgementTicketId = null;
     return finalize({ kind: "no_ticket", reason: "acknowledgement_only", nextAction: "none", learning: "excluded", evidenceIds: [current] }, { kind: "processing", phase: "decision", view: null });
   };
+  /** 25/11 (`SAV_V2_CASE_THREAD_REPLY=on`): the thread maps to one V2 case (runtime fact) and the model left the scope uncertain: the case's agent or team reads
+   * the reply in the case's own context, never « À valider ». Never for finance or cancellation, a person's choice or manual override, or earlier mails awaiting review. */
+  const caseThreadReply = (choice: string | undefined) => {
+    const fact = policy.v2CaseThread;
+    if (!fact || choice !== "request_scope_uncertain" || input.humanResolution || policy.manualSupportOverride || input.priorRequestReview
+      || classification === "finance" || classification === "cancellation" || requests.some(r => r.kind === "finance" || r.kind === "cancellation")) return null;
+    const proof = addEvidence("v2-case-thread", "v2_case", fact.caseId, { caseId: fact.caseId, threadId: message.threadId });
+    return finalize({ kind: "no_ticket", reason: "v2_case_thread", nextAction: "none", learning: "excluded", evidenceIds: [current, proof] }, { kind: "processing", phase: "decision", view: null });
+  };
   const context = (reason: ContextReason, choice?: "equivalent_contact_choice" | "equivalent_ticket_choice" | "same_issue_uncertain" | "request_scope_uncertain") => acknowledgementTicketId
     // SAV-128: an acknowledgement is never parked for the team nor retried because its ticket could not be proven: it stays as today.
     ? acknowledgementOnly(reason === "contact_ambiguous" ? "contact_ambiguous" : reason === "ticket_stage_unknown" ? "thread_ticket_stage_unknown"
       : reason === "private_resource_unavailable" ? "multi_ticket_warning_unavailable" : "crm_incomplete")
-    : finalize(
+    : caseThreadReply(choice) ?? finalize(
     { kind: "collect_context", reasons: unique([reason, ...(!requests.length || requests.some(r => r.kind === "unknown") || classification === "mixed" ? ["classification_incomplete" as const] : [])]), evidenceIds: evidence.map(e => e.id).sort() },
     choice ? { kind: "human_choice", messageId: message.id, classification: classification === "cancellation" || classification === "finance" || classification === "support" ? classification : "unknown", questionCode: choice, investigation: "bounded_investigation_complete", evidenceIds: evidence.map(e => e.id).sort(), view: "to_validate" }
       : { kind: "processing", phase: reason.startsWith("classification") ? "classification" : "context", view: null },

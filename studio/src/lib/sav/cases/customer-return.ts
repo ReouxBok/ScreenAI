@@ -9,6 +9,7 @@ import { closingHandoffReplyEnabled, isTerminalReply } from "./case-terminal-rep
 import type { CaseEffectLedgerState } from "./case-effects";
 import type { CaseOwner, CasePhase, CaseSensitivity } from "./case-types";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
+import { SAV_TICKET_RETURN_WINDOW_MS } from "../ticket-lifecycle";
 
 export const CUSTOMER_RETURN_REVISION = "sav-v2-customer-return.v1";
 
@@ -29,6 +30,10 @@ export type CustomerReturnFacts = Readonly<{
   automated: boolean;
   /** V1 accepted an acknowledgement-only analysis of this very mail (a « merci »). */
   acknowledgement: boolean;
+  /** 25/11 (`SAV_V2_CASE_THREAD_REPLY=on`): V1 accepted a `v2_case_thread` analysis of this very mail: the reply is the case's, V1 opens no ticket for it. */
+  caseThreadReply?: boolean;
+  /** 25/11: on a closed case, how long after the case's last activity this reply came (ms). Bounds the `case_thread_reply` reopen by V1's 15-day window. */
+  caseThreadReplyAgeMs?: number;
   /** V1's CONFIRMED ticket for this mail: the case's ticket (linked or reopened), another ticket (a new subject), or none yet.
    * `pending`: V1 holds an execution of this mail that is not confirmed: its ticket is not known yet, so the mail is nobody's to consume. */
   v1Target: "same_ticket" | "other_ticket" | "none" | "pending";
@@ -40,11 +45,16 @@ export type CustomerReturnFacts = Readonly<{
   paused: boolean;
 }>;
 
+/** 25/11: V1's 15-day same-subject window, applied to a `v2_case_thread` reply on a closed case (age from `savCaseLastActivity`). Unreadable: outside. */
+export const caseThreadReplyWithinWindow = (ageMs: number | undefined) => ageMs !== undefined && Number.isFinite(ageMs) && ageMs <= SAV_TICKET_RETURN_WINDOW_MS;
+
 export type CustomerReturnRoute =
   /** Open case of the agent, ticket still the V2 owner's: the same case goes on, nothing recreated or reclassified. */
   | Readonly<{ route: "continue"; reason: "open_case_v2_owner" }>
   /** Closed case, V1 confirmed this mail on the same ticket (its 15-day same-subject reopen): the incident is still there, a new cycle starts. */
   | Readonly<{ route: "reopen"; reason: "same_incident_v1_confirmed" }>
+  /** 25/11: closed case, V1 left this reply to it (`v2_case_thread`): a new cycle starts, the agent reads it with the case's context. */
+  | Readonly<{ route: "reopen"; reason: "case_thread_reply" }>
   /** Not V2's to continue: V1's normal intake and relay decide (a new ticket opens a new case with its own admission). */
   | Readonly<{ route: "normal_admission"; reason: "no_case" | "several_cases" | "new_subject" | "before_case" }>
   /** Closed case: a thanks or an automatic reply is kept in V1's records and reopens nothing. */
@@ -55,6 +65,9 @@ export type CustomerReturnRoute =
   | Readonly<{ route: "leave_to_owner"; reason: "case_with_team" | "case_on_hold" }>
   /** The ticket left the V2 owner (a person took it, or nobody owns it now): the case goes to the team with the mail; the ticket is not touched. */
   | Readonly<{ route: "hand_to_team"; reason: "human_owner" | "v2_owner_removed" | "sensitive" }>
+  /** 25/11: V1 left this reply to a closed case (`v2_case_thread`) but the case is now past the 15-day window (a race with V1's own bound): V1 will not run again,
+   * so the mail goes to the team with the case rather than wait forever. */
+  | Readonly<{ route: "hand_to_team"; reason: "case_thread_reply_outside_window" }>
   /** Nothing decided yet; the mail is kept and the next pass decides again. */
   | Readonly<{ route: "wait"; reason: "owner_unread" | "paused" | "v1_pending" }>
   /** A late delivery of an older mail: the newer input stays the one to answer and whatever it set (a J2 included) stays. Nothing written; the mail stays stored in its thread. */
@@ -81,18 +94,24 @@ export function decideCustomerReturn(facts: CustomerReturnFacts): CustomerReturn
   if (facts.olderThanLatest) return { route: "keep_latest", reason: "older_than_latest" };
   // An agent case is never sensitive (finance and cancellation are the team's); kept as a fence, not a path.
   if (current.sensitivity !== "none") return { route: "hand_to_team", reason: "sensitive" };
+  // 25/11: V1's `v2_case_thread` reopens a closed case only within V1's own 15-day same-subject window (V1 applies the same bound before concluding it).
+  const threadReply = facts.caseThreadReply === true && facts.v1Target === "none";
+  const threadReplyInWindow = threadReply && (!caseReturnPhaseClosed(current.phase) || caseThreadReplyWithinWindow(facts.caseThreadReplyAgeMs));
   if (caseReturnPhaseClosed(current.phase)) {
     if (facts.automated) return { route: "keep_closed", reason: "automated" };
     if (facts.acknowledgement) return { route: "keep_closed", reason: "acknowledgement" };
-    // Same incident or new subject is V1's confirmed decision on this very mail, never guessed here.
-    if (facts.v1Target === "none" || facts.v1Target === "pending") return { route: "wait", reason: "v1_pending" };
+    // Same incident or new subject is V1's confirmed decision on this very mail, never guessed here. 25/11: V1's `v2_case_thread` is that decision.
+    // Past the window (or unreadable) after V1 concluded: V1 never runs again for this mail, so it is never left waiting for V1.
+    if (threadReply && !threadReplyInWindow) return { route: "hand_to_team", reason: "case_thread_reply_outside_window" };
+    if (facts.v1Target === "pending" || (facts.v1Target === "none" && !threadReply)) return { route: "wait", reason: "v1_pending" };
   } else if (facts.automated) return { route: "ignore_automated", reason: "automated" };
   else if (facts.v1Target === "pending") return { route: "wait", reason: "v1_pending" };
   if (facts.paused) return { route: "wait", reason: "paused" };
   if (facts.ownerNow === "unknown") return { route: "wait", reason: "owner_unread" };
   if (facts.ownerNow === "human") return { route: "hand_to_team", reason: "human_owner" };
   if (facts.ownerNow === "none") return { route: "hand_to_team", reason: "v2_owner_removed" };
-  return caseReturnPhaseClosed(current.phase) ? { route: "reopen", reason: "same_incident_v1_confirmed" } : { route: "continue", reason: "open_case_v2_owner" };
+  if (!caseReturnPhaseClosed(current.phase)) return { route: "continue", reason: "open_case_v2_owner" };
+  return threadReplyInWindow ? { route: "reopen", reason: "case_thread_reply" } : { route: "reopen", reason: "same_incident_v1_confirmed" };
 }
 
 /** Whether the route needs the owner read now (one CRM GET), so nothing is read for a mail that another fact already routes. */

@@ -108,7 +108,8 @@ export function caseQualificationPrecheck(snapshot: Pick<CaseSnapshot, "admissio
   if (!relay.success || event.detail?.messageId !== relay.data.messageId || event.sourceRef?.type !== "email")
     return { outcome: "blocked", block: "relay_proof_invalid", inputKey, inputVersion };
   // SAV-99: a mail a person's assignment handed over (V1 never executed it) is an input like a V1-confirmed one; its reading is the handover's own.
-  if (relay.data.kind === "acknowledgement_on_case_thread") return { outcome: "blocked", block: "acknowledgement_input", inputKey, inputVersion };
+  // 25/11: a reply V1 left to the case (`case_thread_reply`) has no execution either.
+  if (relay.data.kind === "acknowledgement_on_case_thread" || relay.data.kind === "case_thread_reply") return { outcome: "blocked", block: "acknowledgement_input", inputKey, inputVersion };
   return { outcome: "eligible", inputKey, inputVersion, event, relay: relay.data, gmailMessageId: event.sourceRef.id };
 }
 

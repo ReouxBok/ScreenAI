@@ -948,3 +948,63 @@ describe("Orientation commercial vs customer follow-up", () => {
     expect(o.target.operation).not.toBe("reopen");
   });
 });
+
+// 25/11 (`SAV_V2_CASE_THREAD_REPLY=on`): a thank-you reported as nature acknowledgement is an acknowledgement; a reply on a thread one V2 case owns, whose scope the
+// model left uncertain, goes to that case instead of « À valider ». Finance and cancellation never do; without the fact nothing changes.
+describe("V2 case thread reply", () => {
+  const caseId = "30000000-0000-4000-8000-000000000001";
+  const toValidate = (p: IntakePlan) => {
+    expect(p.decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining(["classification_incomplete"]) });
+    expect(p.progress).toMatchObject({ kind: "human_choice", questionCode: "request_scope_uncertain", view: "to_validate" });
+  };
+  it("nature acknowledgement on a plain thank-you gives acknowledgement_only, with one model call", async () => {
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = "Merci, cela semble ok."; f.analysis.nature = "acknowledgement";
+    const plan = await f.run();
+    expect(plan.decision.disposition).toMatchObject({ kind: "no_ticket", reason: "acknowledgement_only" });
+    expect(plan.progress.view).toBeNull(); expect(f.calls).toEqual(["analyse"]);
+  });
+  it("nature request on the same thank-you still goes to « À valider » (SAV-73 kept)", async () => {
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = "Merci, cela semble ok."; f.analysis.nature = "request";
+    toValidate(await f.run());
+  });
+  it("the case fact and an uncertain scope give v2_case_thread, no « À valider » view, no step", async () => {
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = "Merci, cela semble ok."; f.analysis.nature = "request";
+    f.policy.v2CaseThread = { caseId };
+    const plan = await f.run();
+    expect(plan.decision.disposition).toMatchObject({ kind: "no_ticket", reason: "v2_case_thread", nextAction: "none" });
+    expect(plan.decision.evidence).toEqual(expect.arrayContaining([expect.objectContaining({ id: "v2-case-thread", source: "v2_case", sourceId: caseId })]));
+    expect(plan.progress).toEqual({ kind: "processing", phase: "decision", view: null }); expect(plan.steps).toEqual([]); expect(f.calls).toEqual(["analyse"]);
+  });
+  it("an unknown request on a case thread goes to the case too", async () => {
+    const f = fixture(["unknown"]); f.policy.v2CaseThread = { caseId };
+    expect((await f.run()).decision.disposition).toMatchObject({ kind: "no_ticket", reason: "v2_case_thread" });
+  });
+  it.each([["finance"], ["cancellation"]] as const)("%s with the case fact stays in « À valider »", async kind => {
+    const f = fixture([kind, "unknown"]); f.policy.v2CaseThread = { caseId };
+    const plan = await f.run();
+    expect(plan.decision.disposition).toMatchObject({ kind: "collect_context" }); expect(plan.progress.view).toBe("to_validate");
+  });
+  it("a person's classification choice or the operator's manual override is never overridden by the case fact", async () => {
+    const f = fixture(["unknown"]); f.policy.v2CaseThread = { caseId };
+    f.input.humanResolution = { choiceId: "choice-1", at, classification: "unknown" };
+    expect((await f.run()).decision.disposition).toMatchObject({ kind: "collect_context" });
+    const manual = fixture(["unknown"]); manual.policy.v2CaseThread = { caseId }; manual.policy.manualSupportOverride = resource;
+    expect((await manual.run()).decision.disposition).toMatchObject({ kind: "collect_context" });
+  });
+  // Golden values taken on origin/main 78160e60 (before this change) with the same fixtures: switch off, the plans are byte-identical to the old code's.
+  it("switch off (no fact, nature never acknowledgement): fingerprint and decision identical to origin/main 78160e60", async () => {
+    const digest = (p: IntakePlan) => createHash("sha256").update(JSON.stringify(p.decision)).digest("hex");
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = "Merci, cela semble ok."; f.analysis.nature = "request";
+    const today = await f.run();
+    toValidate(today);
+    expect(today.fingerprint).toBe("7_9FL-M1epJ3T_1vfng_GdqrLDH2o4mf0VgCbce79ks");
+    expect(digest(today)).toBe("a4a6545594e3bb8971a7dda554f71962c7fcbc48a2bdbc615ca86482c817d7fa");
+    const support = fixture(["support"]); support.tickets.push(ticket("201"));
+    const linked = await support.run();
+    expect(linked.fingerprint).toBe("dM8iKoPrVNaEPgL8O99Hyltxlsv1KMbC44maqJLGrD0");
+    expect(digest(linked)).toBe("9dcf51a31051304dc87fceb5bccd215b43b55cc5a6102bf958cca57eba7e8de5");
+    // A support follow-up keeps its ticket path with the case fact too: the fact acts only on an uncertain scope.
+    const withFact = fixture(["support"]); withFact.tickets.push(ticket("201")); withFact.policy.v2CaseThread = { caseId };
+    expect((await withFact.run()).fingerprint).toBe(linked.fingerprint);
+  });
+});

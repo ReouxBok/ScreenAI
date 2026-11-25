@@ -11,8 +11,9 @@ import type { ExecutionPayload } from "../intake/execution-types";
 import type { CaseAdmissionInput } from "./admission-policy";
 import { CaseVersionStaleError, listCaseEvents, readCase, recordCustomerReturn, savCaseRecordingEnabled, type CaseTx, type CustomerReturnRecord } from "./case-store";
 import { caseDedupeKey } from "./case-types";
+import { savCaseLastActivity } from "./case-activity-store";
 import {
-  customerMailOrder, customerReturnNeedsOwner, decideAccessAutoApproval, decideCustomerReturn, readAccessAutoApprovalConfig,
+  caseReturnPhaseClosed, customerMailOrder, customerReturnNeedsOwner, decideAccessAutoApproval, decideCustomerReturn, readAccessAutoApprovalConfig,
   type AccessAutoApprovalFacts, type CustomerReturnFacts, type CustomerReturnOwnerNow, type CustomerReturnRoute,
 } from "./customer-return";
 import type { CaseReplyAuthorizationRequest, CaseReplyAuthorizer } from "./case-reply-validation";
@@ -32,6 +33,8 @@ export type CustomerReturnDeps = {
   fence?: (tx: CaseTx) => Promise<void>;
   /** Defaults read V1's own records: its accepted acknowledgement, its confirmed execution, the stored Gmail headers. */
   readAcknowledgement?: (messageId: string) => Promise<boolean>;
+  /** 25/11: V1 left this reply to the thread's case (`v2_case_thread`). Default: V1's accepted analysis, read once with the acknowledgement. */
+  readCaseThreadReply?: (messageId: string) => Promise<boolean>;
   readV1Target?: (messageId: string, caseTicketId: string) => Promise<CustomerReturnFacts["v1Target"]>;
   readAutomated?: (messageId: string) => Promise<boolean>;
 };
@@ -117,11 +120,16 @@ export async function readCustomerReturnFacts(messageId: string, deps: CustomerR
   const [recorded] = await db.select({ id: savCaseEvents.id }).from(savCaseEvents)
     .where(and(eq(savCaseEvents.caseId, current.caseId), eq(savCaseEvents.dedupeKey, caseDedupeKey.inbound(message.gmailMessageId))));
   const [first] = await db.select({ at: min(savCaseEvents.occurredAt) }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, current.caseId), eq(savCaseEvents.kind, "inbound_confirmed")));
+  const v1Acknowledgement = deps.readAcknowledgement ? null : await readIntakeAcknowledgement(message.id);
+  const caseThreadReply = deps.readCaseThreadReply ? await deps.readCaseThreadReply(message.id) : v1Acknowledgement?.reason === "v2_case_thread";
   const facts: CustomerReturnFacts = {
     link: "one_case", case: { owner: current.owner, phase: current.phase, sensitivity: current.sensitivity }, alreadyRecorded: Boolean(recorded),
     beforeCase: Boolean(first?.at && message.receivedAt < new Date(first.at)),
     automated: await (deps.readAutomated ?? readAutomated)(message.id),
-    acknowledgement: await (deps.readAcknowledgement ?? (async (id: string) => await readIntakeAcknowledgement(id) !== null))(message.id),
+    acknowledgement: deps.readAcknowledgement ? await deps.readAcknowledgement(message.id) : v1Acknowledgement !== null && v1Acknowledgement.reason !== "v2_case_thread",
+    caseThreadReply,
+    // Read only for V1's `v2_case_thread` on a closed case: nothing more is read on any other path.
+    ...(caseThreadReply && caseReturnPhaseClosed(current.phase) ? { caseThreadReplyAgeMs: message.receivedAt.getTime() - await savCaseLastActivity(current.caseId, message.receivedAt, db) } : {}),
     v1Target: await (deps.readV1Target ?? readV1Target)(message.id, current.ticketId),
     olderThanLatest: !recorded && await olderThanRecorded(message, current.caseId),
     ownerNow: "unknown", paused: await relayPaused(db),

@@ -11,6 +11,7 @@ import { SAV_INTAKE_NOISE_FILTER_REVISION, savIntakeNoiseFilterMode } from "./no
 import { savAckClosureEnabled } from "./ack-closure-rules";
 import { SAV_ACK_CLOSURE_REVISION } from "./ack-closure-guidelines";
 import { SAV_INTAKE_ROUTING_REVISION, savIntakeRoutingMode } from "./routing-rules";
+import { SAV_V2_CASE_THREAD_REPLY_REVISION, savV2CaseThreadReplyEnabled } from "./case-thread-reply";
 
 export const SAV_INTAKE_RUNTIME_REVISION = "sav-intake-runtime-2026-10-21.v1";
 export const intakeRuntimeHash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -69,6 +70,8 @@ export function intakeRuntimeConfigurationHash(p: z.infer<typeof savIntakeRuntim
     ...(savAckClosureEnabled(env) ? { ackClosure: SAV_ACK_CLOSURE_REVISION } : {}),
     // V1 routing: shadow and live add the routing guideline to the understanding prompt (a new launch configuration); off keeps the previous hash.
     ...(savIntakeRoutingMode(env) !== "off" ? { routing: SAV_INTAKE_ROUTING_REVISION } : {}),
+    // 25/11: `SAV_V2_CASE_THREAD_REPLY=on` adds nature acknowledgement and its sentence to the understanding prompt (a new launch configuration); off keeps the previous hash.
+    ...(savV2CaseThreadReplyEnabled(env) ? { caseThreadReply: SAV_V2_CASE_THREAD_REPLY_REVISION } : {}),
     accessBinding: intakeRuntimeHash({ model: env.SAV_GEMINI_API_KEY, crm: env.HUBSPOT_ACCESS_TOKEN }) });
 }
 /** No permissive defaults, campaign resets or hidden reuse of another budget. */
