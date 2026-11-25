@@ -1,4 +1,6 @@
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
+import { savV2EntrySmartOn } from "./smart-entry-switch";
+import { threadlessReplySubject } from "./threadless-config";
 
 /*
  * SAV-138 (Ugo 25/11): HubSpot tickets created from the Limova app (no mail thread) are picked up by the existing reconcile pass (`app-tickets.ts`).
@@ -13,6 +15,10 @@ import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
  * `SAV_APP_TICKETS_SOURCE_TYPES`: comma-separated HubSpot `source_type` values the app's tickets carry (e.g. the value shadow shows for them). `EMAIL` (V1's
  *   tickets) is never accepted. Shadow ignores it (it records every non-mail source type, so Ugo can see which one the app uses).
  * `SAV_APP_TICKETS_LOOKBACK_MINUTES`: how far before its first run each mode looks (default 60, max 1440). Never a replay of old tickets.
+ *
+ * First mail (Ugo 25/11): in `live`, and ONLY for a case this path opened (its owner transition key starts with `hubspot-app-ticket:`, stored on the case's
+ * ticket event), the smart brain may answer the ticket's first turn: the case is opened with the agent instead of `smart_no_thread`, and its first mail leaves
+ * on a new Gmail thread from contact@ to the HubSpot contact (SAV-96's circuit), under the smart reply's own rights. Any other value of the mode: nothing sent.
  *
  * Category gate (Ugo 25/11, overrides the 19/11 rule for these two categories only): a ticket whose HubSpot category contains « Facturation » or
  * « Résiliation » is never touched: no assignment, no model, no Slack notice, no customer message; it stays with the team.
@@ -41,3 +47,24 @@ export function appTicketCategoryGated(categories: string | null | undefined): b
 
 /** A HubSpot source type as recorded (never free text): the value itself when it looks like an enum, else `OTHER`; none: `NONE`. */
 export const appTicketSourceLabel = (value: string | null | undefined) => !value ? "NONE" : SOURCE_TYPE.test(value) ? value : "OTHER";
+
+/** The owner transition key prefix of a ticket this path assigned: the durable marker of an app ticket case. */
+export const APP_TICKET_TRANSITION_PREFIX = "hubspot-app-ticket:";
+export const isAppTicketTransition = (key: string | null | undefined) => typeof key === "string" && key.startsWith(APP_TICKET_TRANSITION_PREFIX);
+
+/** Whether the smart brain may write the first mail of this ticket case NOW: an app ticket case, the mode `live`, the smart entry on. Read at every step. */
+export const appTicketSmartFirstMail = (env: Env, ownerTransitionKey: string | null | undefined) =>
+  isAppTicketTransition(ownerTransitionKey) && savAppTicketsMode(env) === "live" && savV2EntrySmartOn(env);
+
+/** The first mail's subject: the ticket's own (one clean line, no « Re: », 200 characters at most), else « Votre demande Limova ». */
+export const APP_TICKET_DEFAULT_SUBJECT = "Votre demande Limova";
+export function appTicketReplySubject(subject: string | null | undefined): string {
+  let line = (subject ?? "").replace(/[\p{Cc}\p{Cs}\u2028\u2029]+/gu, " ").replace(/\s+/g, " ").trim();
+  while (/^(?:re|fw|fwd|tr)\s*:/i.test(line)) line = line.replace(/^(?:re|fw|fwd|tr)\s*:\s*/i, "");
+  line = line.slice(0, 200).trim();
+  return line || APP_TICKET_DEFAULT_SUBJECT;
+}
+
+/** The subject a first mail of this stored ticket must carry: an app ticket case's own (above), any other ticket's SAV-96 Access subject, unchanged. */
+export const threadlessExpectedReplySubject = (stored: Readonly<{ ownerTransitionKey: string; source: Readonly<{ ticketId: string; subject: string }> }>) =>
+  isAppTicketTransition(stored.ownerTransitionKey) ? appTicketReplySubject(stored.source.subject) : threadlessReplySubject(stored.source.ticketId);

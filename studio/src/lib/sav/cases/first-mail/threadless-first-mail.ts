@@ -23,7 +23,11 @@ import { pilotProvenanceGate, readPilotReplyProvenance, type PilotProvenanceDeps
 import { savV2NewThreadAutoEnabled, threadlessReplySubject } from "../threadless-config";
 import { threadlessInputKey } from "../threadless-provenance";
 import { threadlessRequestId, threadlessTicketPlainDescription, threadlessTicketSourceRef, type ThreadlessTicketSource } from "../threadless-source";
-import { threadlessAutoSendProblem } from "./first-mail-rights";
+import { smartFirstMailAutoProblem, threadlessAutoSendProblem } from "./first-mail-rights";
+import { appTicketReplySubject, appTicketSmartFirstMail } from "../app-tickets-config";
+import { SAV_SMART_ENTRY_FAMILY } from "../smart-entry-switch";
+import { smartSupportStampInForce } from "../smart-support-scope";
+import { smartAdmission } from "../smart/smart-send-fence";
 import { firstMailSkillPinned, SAV_FIRST_MAIL_PROMPT_SUFFIX } from "./first-mail-skill";
 
 /*
@@ -75,6 +79,7 @@ export function threadlessFirstMailContext(source: ThreadlessTicketSource, obser
 }
 
 /** Hands the whole ticket to the team (same transition as the B entry's wait), nothing for the customer. Idempotent on the command key. */
+export async function handThreadlessFirstMailToTeam(caseId: string, reason: string) { await handToTeam(caseId, reason); }
 async function handToTeam(caseId: string, reason: string) {
   await requireDb().transaction(async tx => {
     const snapshot = await lockCaseForWrite(tx, caseId);
@@ -86,21 +91,25 @@ async function handToTeam(caseId: string, reason: string) {
 
 export async function composeThreadlessFirstMail(caseId: string, deps: ThreadlessFirstMailDeps): Promise<ThreadlessFirstMailResult> {
   const env = deps.env();
-  if (!savV2NewThreadAutoEnabled(env)) return { status: "fallback", reason: "new_thread_auto_off" };
-  if (!firstMailSkillPinned()) return { status: "fallback", reason: "first_mail_skill_unpinned" };
   const stored = await readCaseThreadlessSource(requireDb(), caseId);
   const opened = await readCase(caseId);
+  // SAV-138 (Ugo 25/11): an app ticket case (its key's marker), mode `live`, admitted by the smart entry: the smart brain writes the first mail, under the
+  // smart reply's own rights (`smartFirstMailAutoProblem`), as on a mail. Any other ticket: SAV-96 B's Access first mail, unchanged.
+  const smart = Boolean(stored && opened && smartAdmission(opened.admission) && appTicketSmartFirstMail(env, stored.ownerTransitionKey));
+  if (!smart && !savV2NewThreadAutoEnabled(env)) return { status: "fallback", reason: "new_thread_auto_off" };
+  if (!firstMailSkillPinned()) return { status: "fallback", reason: "first_mail_skill_unpinned" };
   if (!stored?.source.contact || !opened || opened.owner !== "agent" || opened.threadIds.length) return { status: "fallback", reason: "case_not_first_mail" };
   const source = stored.source, request = opened.body.openRequests.find(row => row.status === "open");
   if (!request || opened.body.openRequests.filter(row => row.status === "open").length !== 1) return { status: "fallback", reason: "request_unproven" };
 
   // 1. Sensitive first. The kernel needs no call; the judge and its counter-read are SAV-97's, on the ticket's own words.
-  if (accessSkillKernelHits(source.subject, threadlessTicketPlainDescription(source)).length) {
+  // A smart case is judged like a mail's: the smart brain reads sensitivity itself and hands it to the team (no word list at the door, contract V1 -> V2).
+  if (!smart && accessSkillKernelHits(source.subject, threadlessTicketPlainDescription(source)).length) {
     await handToTeam(caseId, "sensitive_request");
     return { status: "team", reason: "kernel_phrase" };
   }
   if (request.id !== threadlessRequestId(source)) return { status: "fallback", reason: "request_unproven" };
-  if (readAccessSkillMode(env) === "on") {
+  if (!smart && readAccessSkillMode(env) === "on") {
     const reading = await deps.accessSkill(source)
       .catch((): AccessSkillReading => ({ status: "unavailable", reason: "store_failed" }));
     if (reading.status !== "ready" || reading.verdict.outcome !== "admit" || reading.verdict.requests[request.id] !== "access") {
@@ -137,12 +146,13 @@ export async function composeThreadlessFirstMail(caseId: string, deps: Threadles
     await handToTeam(caseId, "first_mail_handoff");
     return { status: "team", reason: "decision_handoff" };
   }
-  const scope = await readCaseDecisionScopes(deps.provenance.accessScope, await deps.provenance.currentPolicyRevision(), decision);
-  const draft = caseDecisionDraft(caseId, read.record, events, { accessScope: scope.ok ? caseAccessScopeStamp(scope.scope) : null }, env);
+  // A smart decision has no block scope: its stamp is in force while the smart entry is on (`smart-support-scope.ts`), as on a mail.
+  const scope = smart ? null : await readCaseDecisionScopes(deps.provenance.accessScope, await deps.provenance.currentPolicyRevision(), decision);
+  const draft = caseDecisionDraft(caseId, read.record, events, { accessScope: !scope ? smartSupportStampInForce(env) : scope.ok ? caseAccessScopeStamp(scope.scope) : null }, env);
   if (!draft?.reply || draft.triggerEventId !== `ticket:${stored.eventId}`) return { status: "fallback", reason: draft?.replyLimit ?? "decision_not_accepted" };
   const reply = draft.reply;
-  // OUR text never carries a kernel phrase: refused, the ticket goes to the team, nothing is proposed.
-  if (accessSkillKernelHits(caseReplyEditableBody(reply.text)).length) {
+  // OUR text never carries a kernel phrase: refused, the ticket goes to the team, nothing is proposed. A smart text gets the smart send fence instead.
+  if (!smart && accessSkillKernelHits(caseReplyEditableBody(reply.text)).length) {
     await handToTeam(caseId, "reply_sensitive_wording");
     return { status: "team", reason: "reply_sensitive_wording" };
   }
@@ -152,14 +162,14 @@ export async function composeThreadlessFirstMail(caseId: string, deps: Threadles
     caseId, caseVersion: snapshot.version, triggerEventId: draft.triggerEventId, inboundMessageId: null,
     ticketSource: { kind: "hubspot_ticket", version: caseEffectHash(source), origin: "model" }, purpose: reply.purpose,
     ...(reply.purpose === "question" && reply.question ? { question: reply.question } : {}),
-    recipient: source.contact!.email, subject: threadlessReplySubject(source.ticketId),
+    recipient: source.contact!.email, subject: smart ? appTicketReplySubject(source.subject) : threadlessReplySubject(source.ticketId),
   };
 
   // 4. Automated only on every proof, read now; otherwise a person validates the same text under the human mention.
   const store: CaseReplyStoreDeps = { env: deps.env, currentPolicyRevision: deps.provenance.currentPolicyRevision, readTicketOwner: deps.readTicketOwner,
     pilotProvenance: pilotProvenanceGate(deps.provenance) };
   const automated = finalizeCaseReplyProposal({ ...shape, text: reply.text }, { language: "unknown", validation: "automated" });
-  const reasons = await autoReasons(snapshot, automated, deps);
+  const reasons = await autoReasons(snapshot, automated, deps, smart);
   const proposal = reasons.length ? finalizeCaseReplyProposal({ ...shape, text: reply.text }, { language: "unknown", validation: "human" }) : automated;
   const submitted = await submitCaseReplyProposal(proposal, store);
   if (!submitted.ok) return { status: "fallback", reason: `proposal_${submitted.code}` };
@@ -169,7 +179,7 @@ export async function composeThreadlessFirstMail(caseId: string, deps: Threadles
   if (submitted.state === "proposed") {
     const decided = await decideCaseReply({ action: "approve", validationId: submitted.id, approverId: config.approverId, deps: store,
       seen: { payloadHash: submitted.storedPayloadHash ?? caseReplyPayloadHash(proposal), caseVersion: proposal.caseVersion, recipient: proposal.recipient },
-      authorizer: firstMailAuthorizer(caseId, proposal, deps) });
+      authorizer: firstMailAuthorizer(caseId, proposal, deps, smart) });
     if (!decided.ok) return { status: "awaiting_person", validationId: submitted.id, reasons: [decided.code, ...(decided.detail ? [decided.detail] : [])] };
   } else if (submitted.state !== "approved") return { status: "awaiting_person", validationId: submitted.id, reasons: [`validation_${submitted.state}`] };
   const queued = await queueValidatedCaseReply({ validationId: submitted.id, policy: deps.executionPolicy, deps: store });
@@ -178,15 +188,17 @@ export async function composeThreadlessFirstMail(caseId: string, deps: Threadles
 }
 
 /** Why the first mail may not be approved automatically now (empty: every proof holds). Facts read now, never from the caller. */
-async function autoReasons(snapshot: CaseSnapshot, proposal: CaseReplyProposal, deps: ThreadlessFirstMailDeps): Promise<string[]> {
+async function autoReasons(snapshot: CaseSnapshot, proposal: CaseReplyProposal, deps: ThreadlessFirstMailDeps, smart: boolean): Promise<string[]> {
   const env = deps.env(), reasons: string[] = [];
-  const problem = await threadlessAutoSendProblem(requireDb(), env, { proposal, decidedBy: null, admissionRecord: snapshot.admission });
+  const rights = smart ? smartFirstMailAutoProblem : threadlessAutoSendProblem;
+  const problem = await rights(requireDb(), env, { proposal, decidedBy: null, admissionRecord: snapshot.admission });
   if (problem) reasons.push(problem);
   if (!deps.executionPolicy) reasons.push("execution_policy_absent");
   if (!caseAdmissionStatus(snapshot, await deps.provenance.currentPolicyRevision()).admitted) reasons.push("case_not_admitted");
   if (snapshot.sensitivity !== "none") reasons.push("sensitive");
   const open = snapshot.body.openRequests.filter(row => row.status === "open");
-  if (!open.length || open.some(row => row.family !== "access")) reasons.push("not_access_only");
+  const family = smart ? SAV_SMART_ENTRY_FAMILY : "access";
+  if (!open.length || open.some(row => row.family !== family)) reasons.push("not_access_only");
   const owner = await judgeCurrentTicketOwner(deps.readTicketOwner, snapshot.ticketId);
   if (!owner.ok) reasons.push(owner.code);
   let proven = false;
@@ -201,11 +213,11 @@ async function autoReasons(snapshot: CaseSnapshot, proposal: CaseReplyProposal, 
  * (`accessAutoReplyAuthorizer`, `auto_access.v1`) on facts read now: admitted agent case, access only, the recorded decision accepted on THIS ticket
  * input, every shown source proven, the CRM owner V2.
  */
-function firstMailAuthorizer(caseId: string, proposal: CaseReplyProposal, deps: ThreadlessFirstMailDeps) {
+function firstMailAuthorizer(caseId: string, proposal: CaseReplyProposal, deps: ThreadlessFirstMailDeps, smart: boolean) {
   return async (request: Parameters<ReturnType<typeof accessAutoReplyAuthorizer>>[0]) => {
     const snapshot = await readCase(caseId);
     if (!snapshot) return { allowed: false as const, reason: "case_missing" };
-    const reasons = await autoReasons(snapshot, proposal, deps);
+    const reasons = await autoReasons(snapshot, proposal, deps, smart);
     if (reasons.length) return { allowed: false as const, reason: reasons[0]! };
     return accessAutoReplyAuthorizer({ env: deps.env(), readFacts: async () => {
       const events = await listCaseEvents(caseId), read = readCaseInvestigationProgress(events, threadlessInputKey(proposal.triggerEventId.slice("ticket:".length)));
@@ -215,7 +227,7 @@ function firstMailAuthorizer(caseId: string, proposal: CaseReplyProposal, deps: 
       return { case: { owner: snapshot.owner, sensitivity: snapshot.sensitivity, admitted: caseAdmissionStatus(snapshot, await deps.provenance.currentPolicyRevision()).admitted },
         openFamilies: snapshot.body.openRequests.filter(row => row.status === "open").map(row => row.family),
         decision: { accepted: true, scopeCurrent: true, shownSourcesVerified: true, nextAction: decision.validation.decision.nextAction.kind },
-        ownerNow: owner.ok ? "v2" : "unknown" };
+        ownerNow: owner.ok ? "v2" : "unknown", ...(smart ? { smartSupport: true } : {}) };
     } })(request);
   };
 }

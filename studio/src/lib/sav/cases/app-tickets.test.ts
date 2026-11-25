@@ -42,7 +42,7 @@ function hubspot(tickets: Ticket[], options: { fullPages?: boolean } = {}) {
   });
   const assign = vi.fn(async (id: string, owner: string) => { tickets.find(item => item.id === id)!.ownerId = owner; });
   const enter = vi.fn(async (input: { ticketId: string }): Promise<ThreadlessEntryResult> => ({ status: "human_wait", caseId: crypto.randomUUID(), reason: `team:${input.ticketId}` }));
-  const handBack = vi.fn(async (): Promise<ThreadlessEntryResult> => ({ status: "human_wait", caseId: crypto.randomUUID(), reason: "app_ticket_entry_unavailable" }));
+  const handBack = vi.fn<(input: unknown, reason: string) => Promise<ThreadlessEntryResult>>(async () => ({ status: "human_wait", caseId: crypto.randomUUID(), reason: "app_ticket_entry_unavailable" }));
   const entryAvailable = vi.fn(async () => true);
   const deps: AppTicketsDeps = { search, readTicket, assign, enter, handBack, entryAvailable, deadlineMs: Date.now() + 240_000 };
   return { deps, search, readTicket, assign, enter, handBack, entryAvailable, searches };

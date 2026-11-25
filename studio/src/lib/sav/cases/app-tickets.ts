@@ -5,7 +5,7 @@ import { requireDb } from "@/db";
 import { savSyncState } from "@/db/schema";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 import { requestSavHubspot } from "../hubspot-transport";
-import { appTicketCategoryGated, appTicketSourceLabel, savAppTicketsMode, savAppTicketsSourceTypes } from "./app-tickets-config";
+import { APP_TICKET_TRANSITION_PREFIX, appTicketCategoryGated, appTicketSourceLabel, savAppTicketsMode, savAppTicketsSourceTypes } from "./app-tickets-config";
 import { hasLocalThreadForTicket, savCaseRecordingEnabled } from "./case-store";
 import { v2HubspotOwnerId } from "./intake-boundary";
 import { THREADLESS_ADMIT_PERMISSION } from "./threadless-config";
@@ -260,7 +260,7 @@ async function decide(context: Context, ticketId: string, createdAt: number | un
       await writeRow(key, row, final ? "left_entry_unavailable" : "waiting", detail, attempts, context.clock(), "entry_unavailable");
       return final ? "left_entry_unavailable" : "waiting";
     }
-    const transition = { key: `hubspot-app-ticket:${ticketId}:${Date.parse(observedAt)}:${context.owner}`, observedAt };
+    const transition = { key: `${APP_TICKET_TRANSITION_PREFIX}${ticketId}:${Date.parse(observedAt)}:${context.owner}`, observedAt };
     // The claim: only the pass that writes `assigning` from the state it read may assign.
     if (!await writeRow(key, row, "assigning", { ...detail, transition }, row?.processedCount ?? 0, context.clock())) return "seen";
     row = (await readRow(key))!;

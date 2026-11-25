@@ -5,7 +5,11 @@ import { readSavBlockSwitch, savBlockReplyGate } from "../block-switch";
 import type { CaseReplyProposal } from "../case-effects";
 import { caseReplyEditableBody } from "../case-reply-outbound";
 import { SAV_CASE_ACCESS_BLOCK_ID } from "../case-types";
-import { readAccessAutoApprovalConfig } from "../customer-return";
+import { ACCESS_AUTO_APPROVAL_BASIS, readAccessAutoApprovalConfig } from "../customer-return";
+import { savAppTicketsMode } from "../app-tickets-config";
+import { SAV_SMART_ENTRY_BLOCK_ID } from "../smart-entry-switch";
+import { smartSwitchProblem } from "../smart-support-scope";
+import { smartSendProblem } from "../smart/smart-send-fence";
 import { savV2NewThreadAutoEnabled } from "../threadless-config";
 import { firstMailSkillPinned } from "./first-mail-skill";
 
@@ -40,5 +44,26 @@ export async function threadlessAutoSendProblem(db: Reader, env: Env, input: Rea
   const text = threadlessAutoTextProblem(env, input.proposal, input.admissionRecord);
   if (text) return text;
   const gate = savBlockReplyGate(await readSavBlockSwitch(db, SAV_CASE_ACCESS_BLOCK_ID));
+  return gate.send === "rule" ? null : gate.code;
+}
+
+/**
+ * SAV-138 (Ugo 25/11): the rights an AUTOMATED first mail of an app ticket rests on when the SMART brain wrote it. No new right: the smart reply's own, as on
+ * a mail (`smartSwitchProblem`: smart entry on, `SAV_V2_SMART_SUPPORT_MODE=auto`, the global automatic reply and its approver; the smart send fence on OUR
+ * text; the smart block switch at `rule`), plus `SAV_APP_TICKETS_MODE=live`. Read at the approval and again at the send gate, under the same locks.
+ */
+export async function smartFirstMailAutoProblem(db: Reader, env: Env, input: Readonly<{ proposal: Pick<CaseReplyProposal, "text" | "purpose">; decidedBy: string | null; admissionRecord: unknown }>): Promise<string | null> {
+  const config = readAccessAutoApprovalConfig(env);
+  if (config.mode !== "on") return `auto_${config.why}`;
+  if (input.decidedBy !== null && input.decidedBy.toLowerCase() !== config.approverId) return "approver_not_rule";
+  if (savAppTicketsMode(env) !== "live") return "app_tickets_not_live";
+  const admission = input.admissionRecord as Parameters<typeof smartSendProblem>[0]["admission"];
+  const switched = smartSwitchProblem({ env, admission, basis: ACCESS_AUTO_APPROVAL_BASIS, approvedBy: config.approverId });
+  if (switched) return switched.toLowerCase();
+  let body: string;
+  try { body = caseReplyEditableBody(input.proposal.text); } catch { return "reply_unreadable"; }
+  const fence = smartSendProblem({ admission, body, purpose: input.proposal.purpose });
+  if (fence) return fence.toLowerCase();
+  const gate = savBlockReplyGate(await readSavBlockSwitch(db, SAV_SMART_ENTRY_BLOCK_ID, env));
   return gate.send === "rule" ? null : gate.code;
 }

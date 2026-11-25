@@ -4,7 +4,9 @@ import { caseEffectHash, type CaseReplyProposal } from "./case-effects";
 import { finalizeCaseReplyProposal } from "./case-reply-outbound";
 import { readCaseThreadlessSource } from "./case-store";
 import { readPilotReplyProvenance, type PilotProvenanceDeps } from "./pilot-passage-provenance";
-import { savV2NewThreadAutoEnabled, savV2NewThreadEnabled, THREADLESS_ACCESS_DRAFT, threadlessReplyShape, threadlessReplySubject } from "./threadless-config";
+import { savV2NewThreadAutoEnabled, savV2NewThreadEnabled, THREADLESS_ACCESS_DRAFT, threadlessReplyShape } from "./threadless-config";
+import { appTicketSmartFirstMail, threadlessExpectedReplySubject } from "./app-tickets-config";
+import { isSmartSupportProvenance } from "./case-types";
 import { threadlessAccessRevision } from "./threadless-guard";
 import { qualifyThreadlessTicket, threadlessAccessQualified } from "./threadless-source";
 
@@ -20,8 +22,17 @@ export async function readThreadlessReplyProvenance(proposal: CaseReplyProposal,
   deps?: PilotProvenanceDeps) {
   if (!savV2NewThreadEnabled(env) || !threadlessReplyShape(proposal)) return "threadless_off_or_invalid";
   const row = await readCaseThreadlessSource(requireDb(), proposal.caseId, proposal.triggerEventId);
-  if (!row?.source.contact || row.source.contact.email !== proposal.recipient || proposal.subject !== threadlessReplySubject(row.source.ticketId)
+  if (!row?.source.contact || row.source.contact.email !== proposal.recipient || proposal.subject !== threadlessExpectedReplySubject(row)
       || caseEffectHash(row.source) !== proposal.ticketSource?.version) return "threadless_source_changed";
+  // SAV-138 (Ugo 25/11): the smart first mail of an app ticket (mode `live`, smart entry on, read now): the ticket still qualifies smart, and only a model
+  // draft, proven like a thread reply (its smart stamp in force, every shown source active and fresh). Never the Access checks below.
+  if (appTicketSmartFirstMail(env, row.ownerTransitionKey)) {
+    const qualification = await qualifyThreadlessTicket(row.source, env);
+    if (qualification.status !== "admitted" || !qualification.admission.qualification.requests.some(request => isSmartSupportProvenance(request.provenance))) return "threadless_smart_unproven";
+    if (proposal.ticketSource?.origin !== "model" || !deps) return "threadless_model_draft_unproven";
+    const read = await readPilotReplyProvenance(proposal, deps, { humanCorrection, reminderInputKey: threadlessInputKey(row.eventId) });
+    return read.status === "proven" ? null : `threadless_reply_unproven:${[...read.reasons].sort().join(",")}`;
+  }
   if (!threadlessAccessQualified(await qualifyThreadlessTicket(row.source, env)) || !await threadlessAccessRevision(env)) return "threadless_access_unproven";
   // SAV-96 B: decided by the STORED origin of the draft, never by its text. The fixed draft (lot B, no decision, no card): its exact text, or a Studio
   // correction of it, as before. A model draft: proven like a thread reply, a correction skipping the text comparison only.
