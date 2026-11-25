@@ -496,10 +496,10 @@ export function renderHandoffNotice(sealed: HandoffNoticeFacts, crm: HandoffCrmV
     `*Prochaine action proposée :* ${next.join(". ")}`,
     // SAV-92: after the existing template, so a cut only ever shortens the synthesis.
     ...(facts.summary ? [`*Synthèse du dossier :*\n${caseHandoffSummaryLines(facts.summary, HANDOFF_REASON_LABELS[facts.reason], sanitizeNoticeText).join("\n")}`] : []),
-  ].join("\n");
-  // The marker always survives the cut: the verification ties the posted message to its key by it.
+  ].join("\n\n");
+  // The marker always survives the cut: the verification ties the posted message to its key by it. Sections are one blank line apart (readable in Slack); the lists inside a section stay on consecutive lines.
   const reference = `_Réf. ${marker}_`;
-  const text = `${body.slice(0, NOTICE_LIMITS.text - reference.length - 1)}\n${reference}`;
+  const text = `${body.slice(0, NOTICE_LIMITS.text - reference.length - 2).trimEnd()}\n\n${reference}`;
   return { text, marker, key };
 }
 
@@ -579,7 +579,9 @@ export function scrubHandoffNoticeText(text: string, analysisSignal = true): str
   const lines = text.split("\n").flatMap((line, index, original) => {
     if (line.startsWith(CONVERSATION_LINE_PREFIX)) {
       const value = line.slice(CONVERSATION_LINE_PREFIX.length);
-      if (original[index - 1]?.startsWith("*Ticket HubSpot :* ") && value.startsWith("`") && value.endsWith("`") && UUID.test(value.slice(1, -1))) {
+      // The nearest line above that is not blank: sections are separated by a blank line (a notice sealed with single line breaks reads the same).
+      const previous = original.slice(0, index).reverse().find(candidate => candidate.trim() !== "");
+      if (previous?.startsWith("*Ticket HubSpot :* ") && value.startsWith("`") && value.endsWith("`") && UUID.test(value.slice(1, -1))) {
         return analysisSignal ? [line] : [];
       }
       return `${CONVERSATION_LINE_PREFIX}${sanitizeNoticeText(value, 1000)}`;
