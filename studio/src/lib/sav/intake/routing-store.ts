@@ -111,11 +111,13 @@ export async function readIntakeRoutingFacts(messageId: string): Promise<IntakeR
   const latestInbound = all.find(row => row.direction === "inbound");
   const [v2] = await db.select({ id: savCases.id }).from(savCases)
     .where(thread.hubspotTicketId ? sql`${savCases.ticketId} = ${thread.hubspotTicketId} or ${thread.id}::uuid = any(${savCases.threadIds})` : sql`${thread.id}::uuid = any(${savCases.threadIds})`).limit(1);
-  const input = payload?.input as { message?: { operatorInformation?: unknown; currentText?: string; fromEmail?: string }; humanResolution?: unknown; priorRequestReview?: unknown } | undefined;
+  const input = payload?.input as { message?: { operatorInformation?: unknown; currentText?: string; fromEmail?: string; unreadAttachments?: unknown[]; attachmentInputs?: { sourceId: string }[] };
+    humanResolution?: unknown; priorRequestReview?: unknown } | undefined;
   const stored = payload?.routing ?? null;
   const model = intakeRoutingModelFromSemantics(payload?.semantics, messageId);
   // SAV-139: the same server-checked safe-archive facts as the analysis, only with `SAV_INTAKE_SAFE_ARCHIVE=on`.
-  const analysed = typeof input?.message?.currentText === "string" && typeof input.message.fromEmail === "string" ? { currentText: input.message.currentText, fromEmail: input.message.fromEmail, subject: message.subject } : null;
+  const analysed = typeof input?.message?.currentText === "string" && typeof input.message.fromEmail === "string" ? { currentText: input.message.currentText,
+    fromEmail: input.message.fromEmail, subject: message.subject, unreadAttachments: input.message.unreadAttachments, attachmentInputs: input.message.attachmentInputs } : null;
   const safeArchive = savIntakeSafeArchiveEnabled(process.env) ? savIntakeSafeArchiveFacts({ plan: payload?.plan, message: analysed, routing: model }) : null;
   return {
     stored,

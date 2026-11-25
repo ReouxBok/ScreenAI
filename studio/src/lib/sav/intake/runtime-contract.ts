@@ -11,7 +11,8 @@ import { SAV_INTAKE_NOISE_FILTER_REVISION, savIntakeNoiseFilterMode } from "./no
 import { savAckClosureEnabled } from "./ack-closure-rules";
 import { SAV_ACK_CLOSURE_REVISION } from "./ack-closure-guidelines";
 import { SAV_INTAKE_ROUTING_REVISION, savIntakeRoutingMode } from "./routing-rules";
-import { SAV_INTAKE_SAFE_ARCHIVE_REVISION, savIntakeSafeArchiveEnabled } from "./to-validate-rules";
+import { SAV_INTAKE_BOUNDED_CONVERSATION_REVISION, SAV_INTAKE_CITATION_REPAIR_REVISION, SAV_INTAKE_SAFE_ARCHIVE_REVISION, savIntakeBoundedConversationEnabled,
+  savIntakeCitationRepairEnabled, savIntakeSafeArchiveEnabled } from "./to-validate-rules";
 
 export const SAV_INTAKE_RUNTIME_REVISION = "sav-intake-runtime-2026-10-21.v1";
 export const intakeRuntimeHash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -72,6 +73,9 @@ export function intakeRuntimeConfigurationHash(p: z.infer<typeof savIntakeRuntim
     ...(savIntakeRoutingMode(env) !== "off" ? { routing: SAV_INTAKE_ROUTING_REVISION } : {}),
     // SAV-139: the safe-archive guideline changes the understanding prompt, only with routing on; off keeps the previous hash.
     ...(savIntakeRoutingMode(env) !== "off" && savIntakeSafeArchiveEnabled(env) ? { routingSafeArchive: SAV_INTAKE_SAFE_ARCHIVE_REVISION } : {}),
+    // SAV-139 phase 3: both change what the model is sent.
+    ...(savIntakeCitationRepairEnabled(env) ? { citationRepair: SAV_INTAKE_CITATION_REPAIR_REVISION } : {}),
+    ...(savIntakeBoundedConversationEnabled(env) ? { boundedConversation: SAV_INTAKE_BOUNDED_CONVERSATION_REVISION } : {}),
     accessBinding: intakeRuntimeHash({ model: env.SAV_GEMINI_API_KEY, crm: env.HUBSPOT_ACCESS_TOKEN }) });
 }
 /** No permissive defaults, campaign resets or hidden reuse of another budget. */

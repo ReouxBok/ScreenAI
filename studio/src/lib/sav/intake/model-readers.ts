@@ -23,6 +23,7 @@ import { savAckClosureAnalysisSchema, type SavAckClosureAnalysis } from "./ack-c
 import { savAckClosureGuideline } from "./ack-closure-guidelines";
 import { savIntakeRoutingAnalysisSchema, savIntakeRoutingWireSchemaFor, type SavIntakeRoutingAnalysis } from "./routing-rules";
 import { savIntakeRoutingGuideline } from "./routing-guidelines";
+import { savIntakeCitationRepairText } from "./to-validate-rules";
 import { addIntakeOutputNormalization, emptyIntakeOutputNormalization, intakeOutputNormalized, normalizeIntakeAnalysisOutput, INTAKE_OUTPUT_LIMITS_INSTRUCTION, INTAKE_VISUAL_LIMITS_INSTRUCTION, type IntakeOutputNormalization, type IntakeOutputStage } from "./output-normalization";
 
 export const SAV_INTAKE_MODEL_REVISION = "sav-intake-semantic-2026-10-31.v11";
@@ -138,10 +139,13 @@ export function createSavIntakeSemanticReaders(options: {
   routing?: boolean;
   /** SAV-139: `SAV_INTAKE_SAFE_ARCHIVE=on` with routing only. Adds the phishing class and the customer-signal judgement to the routing field and guideline. */
   routingSafeArchive?: boolean;
+  /** SAV-139 phase 3: `SAV_INTAKE_CITATION_REPAIR=on`. A refused citation gets one repair call naming the failed check (today: never repaired). */
+  citationRepair?: boolean;
 }): SavIntakeSemanticReaders {
   if (!/^gemini-[A-Za-z0-9._-]{1,100}$/.test(options.model)) throw Error("SAV_INTAKE_CONFIGURED_MODEL_REQUIRED");
   let calls = 0;
   let repairIssues = publicIntakeSchemaIssues(options.repairIssues);
+  let citationRepair: string | null = null;
   let visualObservations: SavAttachmentObservation[] = structuredClone(options.acceptedImages ?? []);
   // Catalogue creation and source-specific enums happen before generate().
   // Keep their failures visible without persisting any source text in a trace.
@@ -172,7 +176,7 @@ export function createSavIntakeSemanticReaders(options: {
     return candidateBytes < sourceBytes && candidateWireBytes < sourceWireBytes ? candidate : data;
   }
   function requestBody(instruction: string, data: Record<string, unknown>, schema: z.ZodType, repair = false): Parameters<IntakeGeminiCall>[0]["body"] {
-    return { systemInstruction: { parts: [{ text: `${common}\n${instruction}${repair ? "\nFORMAT REPAIR v1: the previous response could not be decoded with the required output schema. Read the SAME evidence again and return a new complete JSON object conforming exactly to responseSchema: required keys and enum values, no extra keys. Omit optional keys rather than returning null. All quotation, identity and financial rules remain mandatory. Do not infer missing facts or claim any action happened. Known rejected fields: " + JSON.stringify(repairIssues) : ""}` }] },
+    return { systemInstruction: { parts: [{ text: `${common}\n${instruction}${repair ? "\nFORMAT REPAIR v1: the previous response could not be decoded with the required output schema. Read the SAME evidence again and return a new complete JSON object conforming exactly to responseSchema: required keys and enum values, no extra keys. Omit optional keys rather than returning null. All quotation, identity and financial rules remain mandatory. Do not infer missing facts or claim any action happened. Known rejected fields: " + JSON.stringify(repairIssues) : ""}${repair && citationRepair ? citationRepair : ""}` }] },
       contents: [{ role: "user", parts: [{ text: JSON.stringify(data) }] }], generationConfig: { maxOutputTokens: 8192, responseMimeType: "application/json", responseSchema: intakeResponseSchema(schema) } };
   }
   function boundedBody(phase: "understanding" | "ticket_matching", instruction: string, data: Record<string, unknown>, schema: z.ZodType,
@@ -248,8 +252,10 @@ export function createSavIntakeSemanticReaders(options: {
       // uncertain call. Its exact body/hash differs and is cached on resume.
       // Citations, identity checks, outages and exhausted budgets are not repaired
       // here. The existing three-call envelope remains unchanged.
+      const repairable = options.citationRepair && error instanceof IntakeEvidenceError ? savIntakeCitationRepairText(error.diagnostic) : null;
+      if (repairable) citationRepair = repairable;
       const malformed = error instanceof z.ZodError || code === "SAV_INTAKE_MODEL_OUTPUT_REJECTED"
-        || code === "SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED";
+        || code === "SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED" || Boolean(repairable);
       // The visual budget authorizes one image call per analysis attempt. A
       // malformed visual response resumes in a fresh, fenced second attempt;
       // it must never bypass that budget by making another image call here.
@@ -351,8 +357,10 @@ export function createSavIntakeSemanticReaders(options: {
         if (value.registration) {
           const source = [message, ...conversation].find(m => m.id === value.registration!.sourceMessageId);
           if (!source || source.direction !== "inbound" || source.fromEmail.toLowerCase() !== message.fromEmail.toLowerCase()
-            || !source.currentText.includes(value.registration.quote) || !value.registration.quote.toLowerCase().includes(value.registration.address.toLowerCase())
+            || !(options.citationRepair ? savEvidenceContains(source.currentText, value.registration.quote) : source.currentText.includes(value.registration.quote)) || !value.registration.quote.toLowerCase().includes(value.registration.address.toLowerCase())
             || !savIntakeDeclaredAccount(source.currentText, value.registration.address, { continuation: Boolean(identificationContinuation) && source.id === message.id })) {
+            // SAV-139 phase 3 (SAV_INTAKE_CITATION_REPAIR): the registration quote is compared like every other quote (savEvidenceContains: spaces,
+            // typographic quotes), not byte for byte; it must still be in the mail.
             // An optional declaration the evidence does not support (citation or account role) is
             // dropped, never adopted; the sender's own record is then looked up. A written address
             // with an account statement stays strict, so an ambiguous one fails closed.

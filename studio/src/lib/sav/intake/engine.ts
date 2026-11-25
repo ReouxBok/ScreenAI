@@ -8,7 +8,7 @@ import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "../ticket-r
 import { SAV_ACK_TICKET_NOTE_VERSION, savAckTicketNote, type SavAckTicketOutcome, type SavAckTicketReason } from "./ack-ticket";
 import { savEvidenceContains } from "../evidence-text";
 import { savIntakeAccountConflict, savIntakeDeclaredAccount } from "./registration-declaration";
-import { savIntakeSenderContact, savIntakeSupportDefaultApplies, type SavIntakeSenderContact } from "./to-validate-rules";
+import { savIntakeDecideTicketChoice, savIntakeSenderContact, savIntakeSupportDefaultApplies, type SavIntakeSenderContact } from "./to-validate-rules";
 import {
   intakeMessageSchema, intakeContactSchema, intakeAssociationSchema, intakeTicketSchema, intakeHistorySchema,
   messageAnalysisSchema, issueAssessmentSchema, identityAssessmentSchema,
@@ -152,6 +152,8 @@ export async function planSavIntake(
   // SAV-139: switches and facts of `to-validate-rules.ts`; absent, none of the code below them runs.
   const toValidate = policy.toValidate;
   let senderContact: SavIntakeSenderContact | undefined;
+  // SAV-139 review: a thanks admitted by SAV_INTAKE_THREAD_ACK for its thread's TICKET that cannot be attached to it goes to the team.
+  let threadAckViaTicket = false;
   const finalize = (disposition: SavIntakeDecision["disposition"], progress: SavIntakeProgress = { kind: "processing", phase: "context", view: null }, supervisedResource?: PrivateResource): IntakePlan => {
     const decision = savIntakeDecisionSchema.parse({
       revision: SAV_INTAKE_CONTRACT_REVISION, messageId: message.id, latestInboundMessageId: input.latestInboundMessageId,
@@ -175,9 +177,14 @@ export async function planSavIntake(
     };
   };
   /** Today's acknowledgement plan (no ticket, no step), with the reason it was not put into the thread's ticket when that was asked. */
-  const acknowledgementOnly = (reason?: SavAckTicketReason) => {
+  const acknowledgementOnly = (reason?: SavAckTicketReason): IntakePlan => {
     if (reason) acknowledgementOutcome = { outcome: "not_attached", reason };
     acknowledgementTicketId = null;
+    if (reason && threadAckViaTicket) {
+      // The model called it a request: it is never closed silently when it does not reach the thread's ticket.
+      classification = "unknown"; requests = requests.map(r => ({ ...r, kind: "unknown" as const }));
+      return context("classification_incomplete", "request_scope_uncertain");
+    }
     return finalize({ kind: "no_ticket", reason: "acknowledgement_only", nextAction: "none", learning: "excluded", evidenceIds: [current] }, { kind: "processing", phase: "decision", view: null });
   };
   const context = (reason: ContextReason, choice?: "equivalent_contact_choice" | "equivalent_ticket_choice" | "same_issue_uncertain" | "request_scope_uncertain") => acknowledgementTicketId
@@ -332,7 +339,8 @@ export async function planSavIntake(
       if (!toValidate?.supportDefault || input.humanResolution || policy.manualSupportOverride || continuation) return false;
       if (requests.some(r => !["unknown", "support", "other", "acknowledgement"].includes(r.kind))) return false;
       const routing = analysis.routing;
-      if (!routing || !savIntakeSupportDefaultApplies(routing, routing.class === "support" ? "unknown" : await lookupSender())) return false;
+      const firstMail = input.conversation.data.length === 1 && !toValidate.threadTicketId;
+      if (!routing || !savIntakeSupportDefaultApplies(routing, routing.class === "support" || !firstMail ? "unknown" : await lookupSender(), firstMail)) return false;
       requests = requests.length ? requests.map(r => ({ ...r, kind: "support" as const })) : [{ id: "default-support", kind: "support" as const, evidenceIds: [current] }];
       analysis.requests = requests.map(r => ({ ...(analysis.requests.find(a => a.id === r.id) ?? { currentMessageId: message.id }), id: r.id, kind: "support" as const }));
       classification = "support";
@@ -359,6 +367,7 @@ export async function planSavIntake(
         classification = "unknown"; requests = requests.map(r => ({ ...r, kind: "unknown" as const }));
         return context("classification_incomplete", "request_scope_uncertain");
       }
+      threadAckViaTicket = threadAck && Boolean(policy.acknowledgementTicket?.ticketId);
     }
     if (message.attachmentInputs?.length) {
       const observations = analysis.attachmentObservations;
@@ -648,7 +657,9 @@ export async function planSavIntake(
     const threadTicket = threadTicketId ? tickets.get(threadTicketId) : undefined;
     const undecided = !assessment.investigationComplete || assessment.tickets.some(t => t.relation === "unknown" || t.relation === "partial")
       || assessment.tickets.filter(t => t.relation === "same" && tickets.get(t.ticketId)?.stage !== "closed").length > 1;
-    if (threadTicket && undecided && ["open", "new"].includes(threadTicket.stage) && threadTicket.contactIds.some(id => scopeContacts.some(c => c.contactId === id))) {
+    const threadRelation = threadTicket ? assessment.tickets.find(t => t.ticketId === threadTicket.id)?.relation : undefined;
+    if (threadTicket && undecided && threadRelation !== undefined && threadRelation !== "different" && classification !== "finance" && classification !== "cancellation"
+      && ["open", "new"].includes(threadTicket.stage) && threadTicket.contactIds.some(id => scopeContacts.some(c => c.contactId === id))) {
       const proof = addEvidence("thread-ticket", "crm_ticket", threadTicket.id, { threadId: message.threadId, ticketId: threadTicket.id }, ticketObservedAt.get(threadTicket.id)!);
       for (const match of assessment.tickets) {
         if (match.ticketId === threadTicket.id) Object.assign(match, { relation: "same", requestIds: requests.map(r => r.id), evidenceIds: unique([...match.evidenceIds, proof]) });
@@ -656,6 +667,9 @@ export async function planSavIntake(
       }
       assessment.investigationComplete = true;
     }
+    // SAV-139 phase 3 (SAV_INTAKE_TICKET_DECIDE): an unambiguous model judgement decides « quel ticket ? » (one open ticket the same, or none).
+    if (toValidate?.ticketDecide && !humanTicketId && classification !== "finance" && classification !== "cancellation")
+      savIntakeDecideTicketChoice(assessment, id => tickets.get(id)?.stage);
     // A comparison can be undecided even though every source was read. Offer a
     // choice only when every destination is an open, evidenced candidate for
     // every request. An invalid assessment or a failed read never reaches here.

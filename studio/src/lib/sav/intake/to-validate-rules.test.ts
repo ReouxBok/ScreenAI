@@ -99,6 +99,17 @@ describe("SAV-139 server checks behind the safe-archive facts", () => {
     expect(savIntakeSafeArchiveFacts({ plan: { decision: { requests: [], disposition: { kind: "collect_context", reasons: ["classification_incomplete"] } } }, message, routing: model() })?.sender).toBe("unknown");
     expect(savIntakeSafeArchiveFacts({ plan: null, message, routing: model() })).toBeNull();
   });
+  it("review A4: a mail with an unread attachment is never archived", () => {
+    const plan = { decision: { requests: [], disposition: { kind: "collect_context", reasons: ["classification_incomplete"] }, evidence: [{ id: "current", source: "current_message" }] }, senderContact: "none" as const };
+    const unread = savIntakeSafeArchiveFacts({ plan, message: { currentText: newsletter, fromEmail: "news@exemple.invalid", unreadAttachments: [{ sourceId: "f1" }] }, routing: model() })!;
+    expect(unread.unreadAttachment).toBe(true);
+    expect(route({ safeArchive: unread })).toMatchObject({ action: "keep", reason: "safe_archive_unread_attachment" });
+    const notAnalysed = savIntakeSafeArchiveFacts({ plan, message: { currentText: newsletter, fromEmail: "news@exemple.invalid", attachmentInputs: [{ sourceId: "f2" }] }, routing: model() })!;
+    expect(route({ safeArchive: notAnalysed })).toMatchObject({ action: "keep", reason: "safe_archive_unread_attachment" });
+    const analysed = savIntakeSafeArchiveFacts({ plan: { ...plan, decision: { ...plan.decision, evidence: [...plan.decision.evidence, { id: "f2", source: "current_attachment" }] } },
+      message: { currentText: newsletter, fromEmail: "news@exemple.invalid", attachmentInputs: [{ sourceId: "f2" }] }, routing: model() })!;
+    expect(route({ safeArchive: analysed })).toMatchObject({ action: "archive" });
+  });
   it("refusal: absent facts are exactly today's reason", () => {
     expect(savIntakeSafeArchiveRefusal({ model: model() })).toBe("v1_collect_context");
     expect(savIntakeSafeArchiveRefusal({ model: model(), safeArchive: safe() })).toBeNull();
@@ -109,7 +120,11 @@ describe("SAV-139 switches, prompt and launch configuration", () => {
   it("switches: only the exact value « on »; none set means no engine policy at all", () => {
     expect(savIntakeToValidatePolicy({})).toBeUndefined();
     expect(savIntakeToValidatePolicy({ SAV_INTAKE_SAFE_ARCHIVE: "true", SAV_INTAKE_SUPPORT_DEFAULT: "1", SAV_INTAKE_THREAD_ACK: "ON", SAV_INTAKE_THREAD_TICKET_LINK: "" })).toBeUndefined();
-    expect(savIntakeToValidatePolicy({ SAV_INTAKE_SAFE_ARCHIVE: "on" }, { threadTicketId: "301" })).toEqual({ senderLookup: true, threadTicketId: "301" });
+    expect(savIntakeToValidatePolicy({ SAV_INTAKE_SAFE_ARCHIVE: "on", SAV_INTAKE_ROUTING_MODE: "shadow" }, { threadTicketId: "301" })).toEqual({ senderLookup: true, threadTicketId: "301" });
+    // Review A5: no HubSpot lookup while the routing (and so its field) is off.
+    expect(savIntakeToValidatePolicy({ SAV_INTAKE_SAFE_ARCHIVE: "on" }, { threadTicketId: "301" })).toEqual({ threadTicketId: "301" });
+    expect(savIntakeToValidatePolicy({ SAV_INTAKE_SUPPORT_DEFAULT: "on", SAV_INTAKE_ROUTING_MODE: "off" })).toEqual({ supportDefault: true, threadTicketId: null });
+    expect(savIntakeToValidatePolicy({ SAV_INTAKE_TICKET_DECIDE: "on" })).toEqual({ ticketDecide: true, threadTicketId: null });
     expect(savIntakeToValidatePolicy({ SAV_INTAKE_THREAD_TICKET_LINK: "on" }, { threadTicketId: "x1" })).toEqual({ threadTicketLink: true, threadTicketId: null });
   });
   it("guideline and wire field: off unchanged; on adds phishing and the customer signal", () => {
@@ -134,8 +149,11 @@ describe("SAV-139 switches, prompt and launch configuration", () => {
   });
   it("support default: support class always; an unknown class only for a known contact; never a thanks, finance, cancellation, mixed or outside", () => {
     expect(savIntakeSupportDefaultApplies({ class: "support" }, "none")).toBe(true);
-    expect(savIntakeSupportDefaultApplies({ class: "acknowledgement" }, "known")).toBe(false);
-    expect(savIntakeSupportDefaultApplies({ class: "unknown" }, "known")).toBe(true);
+    expect(savIntakeSupportDefaultApplies({ class: "acknowledgement" }, "known", true)).toBe(false);
+    expect(savIntakeSupportDefaultApplies({ class: "unknown" }, "known", true)).toBe(true);
+    // Review A2: only for a first mail of a thread without a ticket.
+    expect(savIntakeSupportDefaultApplies({ class: "unknown" }, "known", false)).toBe(false);
+    expect(savIntakeSupportDefaultApplies({ class: "support" }, "none", false)).toBe(true);
     expect(savIntakeSupportDefaultApplies({ class: "acknowledgement" }, "none")).toBe(false);
     expect(savIntakeSupportDefaultApplies({ class: "unknown" }, "unknown")).toBe(false);
     for (const cls of ["finance", "cancellation", "mixed", "lead_commercial", "partenariat", "demarchage", "notification_auto", "phishing"] as const)
@@ -209,6 +227,21 @@ describe("SAV-139 engine: thanks in a known thread (part 3)", () => {
     const plan = await thanks({ toValidate: { threadAck: true, threadV2Case: true } });
     expect(plan.decision.disposition).toMatchObject({ kind: "no_ticket", reason: "acknowledgement_only" });
   });
+  it("review A1: admitted for the thread's ticket but not attachable to it: back to the team, never closed as a thanks", async () => {
+    const policy = { acknowledgementTicket: { ticketId: "301" }, toValidate: { threadAck: true as const, threadTicketId: "301" } };
+    const notOnContact = await engine({ text: "ok merci", analysis: analysis("acknowledgement", { class: "acknowledgement" }), contacts: [contact()], tickets: [ticket("302")], policy }).run();
+    expect(notOnContact.decision.disposition).toMatchObject({ kind: "collect_context", reasons: ["classification_incomplete"] });
+    expect(notOnContact.progress).toMatchObject({ kind: "human_choice", questionCode: "request_scope_uncertain" });
+    expect(notOnContact.acknowledgementTicket).toEqual({ outcome: "not_attached", reason: "thread_ticket_not_on_contact" });
+    for (const contacts of [[], [contact("101"), contact("102")]]) {
+      const plan = await engine({ text: "ok merci", analysis: analysis("acknowledgement", { class: "acknowledgement" }), contacts, tickets: [ticket("301")], policy }).run();
+      expect(plan.decision.disposition).toMatchObject({ kind: "collect_context", reasons: ["classification_incomplete"] });
+    }
+    // Without the switch, the same refusal keeps today's acknowledgement path (SAV-128, nature not « request »).
+    const today = await engine({ text: "ok merci", analysis: analysis("acknowledgement", { class: "acknowledgement" }, "information"), contacts: [contact()], tickets: [ticket("302")],
+      policy: { acknowledgementTicket: { ticketId: "301" } } }).run();
+    expect(today.decision.disposition).toMatchObject({ kind: "no_ticket", reason: "acknowledgement_only" });
+  });
   it("on, but a written request marker: never treated as a thanks", async () => {
     const plan = await thanks({ acknowledgementTicket: { ticketId: "301" }, toValidate: { threadAck: true, threadTicketId: "301" } }, "merci mais ça ne marche toujours pas, pouvez-vous regarder ?");
     expect(plan.decision.disposition).toMatchObject({ kind: "collect_context" });
@@ -229,8 +262,18 @@ describe("SAV-139 engine: « Quelle demande ? » on a real customer mail (part 4
     expect(plan.decision.classification).toBe("support");
     expect(plan.decision.disposition).toMatchObject({ kind: "ticket", target: { operation: "create", contactId: "101" } });
   });
-  it("trap: a known client writing short with no clear request (class unknown) goes to support, not to the team nor the archive", async () => {
-    const plan = await unknownMail({ class: "unknown", confidence: "low" }, [contact()], undefined, "unknown", "Re: et donc ?");
+  it("trap (review A2): a known client's short reply « Re: et donc ? » in an existing exchange stays with the team, never archived", async () => {
+    const prior = { id: "10000000-0000-4000-8000-000000000238", threadId: thread, receivedAt: "2026-11-24T10:00:00.000Z", fromEmail: "contact@exemple.invalid", toEmails: [sender],
+      direction: "outbound" as const, currentText: "Bonjour, pouvez-vous préciser ?", contentComplete: true };
+    const message = { id: mid, threadId: thread, receivedAt: at, fromEmail: sender, toEmails: ["contact@exemple.invalid"], direction: "inbound" as const, currentText: "Re: et donc ?", contentComplete: true };
+    const plan = await engine({ text: "Re: et donc ?", analysis: analysis("unknown", { class: "unknown", confidence: "low" }), contacts: [contact()], tickets: [],
+      conversation: [prior, message], policy: { toValidate: { supportDefault: true, senderLookup: true } } }).run();
+    expect(plan.decision.disposition).toMatchObject({ kind: "collect_context", reasons: ["classification_incomplete"] });
+    const withTicket = await unknownMail({ class: "unknown" }, [contact()], { toValidate: { supportDefault: true, senderLookup: true, threadTicketId: "301" } });
+    expect(withTicket.decision.disposition.kind).toBe("collect_context");
+  });
+  it("a known client's first mail of a thread, class unknown, goes to support", async () => {
+    const plan = await unknownMail({ class: "unknown", confidence: "low" }, [contact()], undefined, "unknown", "Bonjour, je reviens vers vous.");
     expect(plan.decision.classification).toBe("support");
     expect(plan.decision.disposition.kind).toBe("ticket");
   });
@@ -287,6 +330,21 @@ describe("SAV-139 engine: « Déjà couvert ? lequel ? » answered by the thread
       policy: { toValidate: { threadTicketLink: true, threadTicketId: "303" } } }).run();
     expect(closed.decision.disposition.kind).toBe("collect_context");
     expect((await two({ toValidate: { threadTicketLink: true, threadTicketId: "999" } })).decision.disposition.kind).toBe("collect_context");
+  });
+  it("review A3: never links to the thread's ticket when the model judged it different", async () => {
+    const plan = await two({ toValidate: { threadTicketLink: true, threadTicketId: "302" } }, { "301": "partial", "302": "different" });
+    expect(plan.decision.disposition.kind).toBe("collect_context");
+    expect(plan.decision.evidence.some(e => e.id === "thread-ticket")).toBe(false);
+  });
+  it("review A3: finance and cancellation are never linked by the thread rule", async () => {
+    for (const kind of ["finance", "cancellation"] as const) {
+      const on = await engine({ text: "Question sur ma facture.", analysis: analysis(kind, { class: kind }), contacts: [contact()], tickets: [ticket("301"), ticket("302")],
+        relations: { "301": "partial", "302": "partial" }, policy: { toValidate: { threadTicketLink: true, threadTicketId: "302" } } }).run();
+      const off = await engine({ text: "Question sur ma facture.", analysis: analysis(kind, { class: kind }), contacts: [contact()], tickets: [ticket("301"), ticket("302")],
+        relations: { "301": "partial", "302": "partial" } }).run();
+      expect(on.decision).toEqual(off.decision);
+      expect(on.decision.evidence.some(e => e.id === "thread-ticket")).toBe(false);
+    }
   });
   it("on, an already decided comparison is not overridden", async () => {
     expect((await two({ toValidate: { threadTicketLink: true, threadTicketId: "302" } }, { "301": "same", "302": "different" })).decision.disposition).toMatchObject({ target: { ticketId: "301" } });

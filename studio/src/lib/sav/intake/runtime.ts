@@ -19,7 +19,7 @@ import { intakeAutomationAdapters } from "./automated-message";
 import { SAV_INTAKE_NOISE_RESOURCE, savIntakeNoiseLogLine } from "./noise-filter";
 import { evaluateIntakeNoise } from "./noise-filter-runtime";
 import { decideIntakeRouting, intakeRoutingModelFromSemantics, intakeRoutingPlanFacts, savIntakeRoutingLogLine } from "./routing-rules";
-import { savIntakeSafeArchiveEnabled, savIntakeSafeArchiveFacts, savIntakeToValidatePolicy } from "./to-validate-rules";
+import { savIntakeBoundedConversationEnabled, savIntakeCitationRepairEnabled, savIntakeSafeArchiveEnabled, savIntakeSafeArchiveFacts, savIntakeToValidatePolicy } from "./to-validate-rules";
 import type { IntakeLease } from "./runtime-store";
 import { intakeCrmEvidenceFingerprint, recordIntakeCrmReads } from "./crm-evidence-fingerprint";
 import { intakeResumeHoldReason, intakeResumeProof, newIntakeResumeObservation, observeIntakeReads } from "./resume-progress";
@@ -197,6 +197,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     const historyPriorityTicketIds = [lease.threadTicketId, lease.input.humanResolution?.ticketId];
     const semanticReader = simple ? createSavIntakeSimpleReaders({ model: config.model, call, crm: reads, policy: config.policy, provenance: lease.provenance, historyPriorityTicketIds,
       ...(config.routing ? { routing: true, ...(savIntakeSafeArchiveEnabled(env()) ? { routingSafeArchive: true } : {}) } : {}),
+      ...(savIntakeCitationRepairEnabled(env()) ? { citationRepair: true } : {}), ...(savIntakeBoundedConversationEnabled(env()) ? { boundedConversation: true } : {}),
       ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
         attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
         payload.attachments = attachments.state; checkpoint();
@@ -209,7 +210,8 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
       payload.attachments = attachments.state;
       checkpoint();
-    } } } : {}), ...(savAckClosureEnabled(env()) ? { ackClosure: true } : {}), ...(config.routing ? { routing: true, ...(savIntakeSafeArchiveEnabled(env()) ? { routingSafeArchive: true } : {}) } : {}), model: config.model, call, provenance: lease.provenance, onValidatedEvidence: evidence => captureRequestQuotes(payload, evidence), onTrace: trace => {
+    } } } : {}), ...(savAckClosureEnabled(env()) ? { ackClosure: true } : {}), ...(config.routing ? { routing: true, ...(savIntakeSafeArchiveEnabled(env()) ? { routingSafeArchive: true } : {}) } : {}),
+      ...(savIntakeCitationRepairEnabled(env()) ? { citationRepair: true } : {}), model: config.model, call, provenance: lease.provenance, onValidatedEvidence: evidence => captureRequestQuotes(payload, evidence), onTrace: trace => {
       semanticFailureReason = trace.errorCode ?? undefined;
       if (trace.budgetLimit) readerBudgetLimit = trace.budgetLimit;
       traces.push(trace); checkpoint();

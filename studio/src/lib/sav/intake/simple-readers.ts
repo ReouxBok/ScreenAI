@@ -15,6 +15,7 @@ import { simpleWireContract, simpleWireReferences, simpleWireValidationError } f
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 import { savIntakeRoutingAnalysisSchema, savIntakeRoutingWireSchemaFor } from "./routing-rules";
 import { savIntakeRoutingGuideline } from "./routing-guidelines";
+import { savIntakeBoundConversation, savIntakeCitationRepairText } from "./to-validate-rules";
 import { intakeResponseSchema, observeIntakeValidatedEvidence, type IntakeGeminiCall, type IntakeModelTrace, type IntakeValidatedEvidence, type SavIntakeSemanticReaders } from "./model-readers";
 import type { SavIntakeCrmReaders } from "./hubspot-readers";
 import type { prepareSavIntakeMessage } from "./message";
@@ -152,6 +153,10 @@ export function createSavIntakeSimpleReaders(options: {
   routing?: boolean;
   /** SAV-139: `SAV_INTAKE_SAFE_ARCHIVE=on` with routing only. Adds the phishing class and the customer-signal judgement to the routing field and guideline. */
   routingSafeArchive?: boolean;
+  /** SAV-139 phase 3: `SAV_INTAKE_CITATION_REPAIR=on`. The one repair call of a refused citation names the failed check. */
+  citationRepair?: boolean;
+  /** SAV-139 phase 3: `SAV_INTAKE_BOUNDED_CONVERSATION=on`. Only the newest messages of a long thread are sent. */
+  boundedConversation?: boolean;
 }): SavIntakeSemanticReaders {
   if (!/^gemini-[A-Za-z0-9._-]{1,100}$/.test(options.model)) throw Error("SAV_INTAKE_CONFIGURED_MODEL_REQUIRED");
   let calls = 0;
@@ -163,12 +168,15 @@ export function createSavIntakeSimpleReaders(options: {
     // The routing class is asked once, with the understanding of the mail (never in a focused ticket-matching call).
     const routing = Boolean(options.routing) && phase === "understanding";
     const safeArchive = routing && Boolean(options.routingSafeArchive);
-    const { schema, sources } = outputSchema(message, conversation, context, visual, routing, safeArchive);
+    // SAV-139 phase 3: a long thread is bounded to its newest messages (the continuation's first request stays citable).
+    const shown = options.boundedConversation ? savIntakeBoundConversation(conversation, [continuationInitialId]) : { messages: [...conversation], omitted: 0 };
+    const { schema, sources } = outputSchema(message, shown.messages, context, visual, routing, safeArchive);
     const subject = options.provenance?.get(message.id)?.subject;
     const data = { message: { id: message.id, from: message.fromEmail, to: message.toEmails, receivedAt: message.receivedAt, ...(subject ? { subject } : {}),
         ...(message.operatorInformation ? { operatorInformation: message.operatorInformation } : {}) }, current: message.currentText,
       ...(message.unreadAttachments ? { unreadAttachments: message.unreadAttachments, unreadAttachmentInstructions: "These files of the current message were NOT read: never infer or confirm their content. Return one unreadAttachmentRequirements entry per sourceId: accessory only when the written requests are complete without the file (textQuote copied verbatim from current), required when the text needs the file, unknown otherwise." } : {}),
-      conversation: conversation.map(m => ({ sourceId: `message-${m.id}`, direction: m.direction, from: m.fromEmail, receivedAt: m.receivedAt, text: m.currentText })),
+      conversation: shown.messages.map(m => ({ sourceId: `message-${m.id}`, direction: m.direction, from: m.fromEmail, receivedAt: m.receivedAt, text: m.currentText })),
+      ...(shown.omitted ? { conversationNotice: `${shown.omitted} older messages of this thread are not shown; decide on the messages shown.` } : {}),
       contacts: context.contacts.map(c => ({ sourceId: `contact-${c.id}`, contactId: c.id, emails: c.emails,
         ...(context.linked.some(l => l.contactId === c.id) ? { linkedFrom: context.linked.find(l => l.contactId === c.id)!.fromContactId } : {}) })),
       // SAV-92: bounded, explicit history per ticket (history-budget.ts); every ticket is still shown.
@@ -193,8 +201,9 @@ export function createSavIntakeSimpleReaders(options: {
     const wire = simpleWireContract(references, schema, extras);
     const wireData = { ...data, outputReferences: references }, inputHash = hash(wireData);
     let repair = false;
+    let citationRepair: string | null = null;
     for (;;) {
-      const body = { systemInstruction: { parts: [{ text: `${INSTRUCTION}${routing ? `\n${savIntakeRoutingGuideline(safeArchive)}` : ""}${repair ? "\nFORMAT REPAIR v1: the previous response did not match the required JSON schema. Read the SAME sources again and return one complete JSON object conforming exactly to it." : ""}` }] },
+      const body = { systemInstruction: { parts: [{ text: `${INSTRUCTION}${routing ? `\n${savIntakeRoutingGuideline(safeArchive)}` : ""}${repair ? "\nFORMAT REPAIR v1: the previous response did not match the required JSON schema. Read the SAME sources again and return one complete JSON object conforming exactly to it." : ""}${repair && citationRepair ? citationRepair : ""}` }] },
         contents: [{ role: "user" as const, parts: [{ text: JSON.stringify(wireData) }] }],
         // Optional nested wire bounds can expand the provider's constrained decoder.
         // Keep every server bound and the compact output instructions; omitting
@@ -233,7 +242,10 @@ export function createSavIntakeSimpleReaders(options: {
           ...(error instanceof z.ZodError ? { validationFailure: { reason: "output_schema_invalid", path: intakeSchemaIssues(simpleWireValidationError(error))[0]?.path ?? "output", issues: intakeSchemaIssues(simpleWireValidationError(error)) } as IntakeModelTrace["validationFailure"] } : {}),
           ...(error instanceof SimpleValidationError ? { validationFailure: { reason: error.reason, path: error.path } as IntakeModelTrace["validationFailure"] } : {}) });
         // One distinct, budgeted format repair; a visual call is never repeated within the attempt.
-        if (malformed && !repair && !visual && !signal.aborted && calls < 3) { repair = true; continue; }
+        if (malformed && !repair && !visual && !signal.aborted && calls < 3) {
+          if (options.citationRepair && error instanceof SimpleValidationError) citationRepair = savIntakeCitationRepairText(error);
+          repair = true; continue;
+        }
         throw Error(malformed ? "SAV_INTAKE_MODEL_OUTPUT_REJECTED" : error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_MODEL_OUTPUT_REJECTED");
       }
     }
