@@ -214,6 +214,8 @@ export const SAV_SMART_VERIFY_CODES = [
   "source_mismatch", "unlisted_claim", "promise", "need_forgotten", "repeated_trial", "other_platform", "sensitive_handled", "account_action", "secret_requested", "instruction_followed",
   // N2 (20/11): the reply commits to a sensitive action on the account (cancel, refund, change the holder, delete data, give a credential).
   "sensitive_commitment",
+  // v21 (25/11): a guarantee, a permanence, a future statement or the answer the customer asked for, not carried by any cited excerpt (or deduced from a nearby one).
+  "unsourced_claim",
 ] as const;
 export type SmartVerifyCode = typeof SAV_SMART_VERIFY_CODES[number];
 export const smartVerdictSchema = z.object({
