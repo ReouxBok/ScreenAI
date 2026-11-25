@@ -544,10 +544,17 @@ describe("V2 case thread reply after closure, from V1's real record", () => {
     expect(await readCase(caseId)).toMatchObject({ owner: "agent", phase: "queued", body: { cycle: { number: 2 } } });
     expect((await listCaseEvents(caseId)).map(event => event.dedupeKey)).toContain(`inbound:gm-${reply}`);
   });
-  it("older than V1's 15-day window after the case's last activity: today's wait for V1, nothing written", async () => {
+  it("past V1's 15-day window (a race with V1's own bound): the mail goes to the team with the case, never left waiting for V1", async () => {
     const { source, caseId } = await closedAgentCase(), late = await bareMessage(source.threadId, "2026-11-12T08:00:00.000Z");
     await v1CaseThreadRecord(source.threadId, late);
-    expect(await route(late)).toMatchObject({ route: { route: "wait", reason: "v1_pending" }, written: false });
-    expect(await readCase(caseId)).toMatchObject({ phase: "resolved" });
+    expect(await route(late)).toMatchObject({ route: { route: "hand_to_team", reason: "case_thread_reply_outside_window" }, written: true });
+    expect(await readCase(caseId)).toMatchObject({ owner: "human" });
+    expect((await listCaseEvents(caseId)).map(event => event.dedupeKey)).toContain(`inbound:gm-${late}`);
+  });
+  it("V1's case fact applies the same window on the real tables: inside, the case; past it, nothing", async () => {
+    const { intakeV2CaseThreadFact } = await import("../intake/ack-ticket-store");
+    const { source, caseId } = await closedAgentCase();
+    expect(await intakeV2CaseThreadFact({ threadId: source.threadId, receivedAt: "2026-10-28T09:30:00.000Z" }, entryEnv)).toEqual({ caseId });
+    expect(await intakeV2CaseThreadFact({ threadId: source.threadId, receivedAt: "2026-11-12T08:00:00.000Z" }, entryEnv)).toBeUndefined();
   });
 });

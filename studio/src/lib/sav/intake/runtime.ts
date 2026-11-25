@@ -229,7 +229,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       { threadId: lease.input.message.threadId, threadTicketId: lease.threadTicketId }, env()).catch(() => undefined);
     // 25/11: a reply on a thread one V2 case owns goes to that case when the model leaves its scope uncertain (`SAV_V2_CASE_THREAD_REPLY=on` only).
     const v2CaseThread = savV2CaseThreadReplyEnabled(env()) ? await (deps.v2CaseThread ?? (await import("./ack-ticket-store")).intakeV2CaseThreadFact)(
-      { threadId: lease.input.message.threadId }, env()).catch(() => undefined) : undefined;
+      { threadId: lease.input.message.threadId, receivedAt: lease.input.message.receivedAt }, env()).catch(() => undefined) : undefined;
     payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, { ...otherPolicy, ...(quotedMailboxReply ? { quotedMailboxReply: true as const } : {}), ...(quotedTeamReply ? { quotedTeamReply: true as const } : {}),
       ...(acknowledgementTicket ? { acknowledgementTicket } : {}), ...(v2CaseThread ? { v2CaseThread } : {}) },
       // SAV-92: CRM reads keep 10 s each; the model gets the whole shared AI allowance, exactly like the comparison campaign.

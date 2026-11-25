@@ -5,6 +5,9 @@ import { requireDb } from "@/db";
 import { savCases } from "@/db/schema";
 import { savAckClosureEnabled } from "./ack-closure-rules";
 import { savV2CaseThreadReplyEnabled } from "./case-thread-reply";
+import { savCaseLastActivity } from "../cases/case-activity-store";
+import { caseReturnPhaseClosed, caseThreadReplyWithinWindow } from "../cases/customer-return";
+import type { CasePhase } from "../cases/case-types";
 import type { EnginePolicy } from "./engine-types";
 
 type Reader = Pick<ReturnType<typeof requireDb>, "select">;
@@ -29,15 +32,20 @@ export async function intakeAcknowledgementTicketFact(input: { threadId: string;
 /**
  * 25/11 (`SAV_V2_CASE_THREAD_REPLY=on` only): the V2 case of the mail's thread, or undefined. Set only when the thread maps to exactly one case held by the
  * agent and not sensitive (finance and cancellation stay the team's). A case held by the team or on system hold gets no fact: V1 keeps today's path, so the
- * person still gets the mail on the HubSpot ticket (`v2-entry.ts`). Off, no case, two cases, or an unreadable fact: undefined. Never throws.
+ * person still gets the mail on the HubSpot ticket (`v2-entry.ts`). A CLOSED agent case only within V1's 15-day window after its last activity (the same rule as
+ * V2's reopen, `savCaseLastActivity`); past it, or with no readable date, no fact: V1's today path. Off, no case, two cases, or an unreadable fact: undefined.
+ * Never throws.
  */
-export async function intakeV2CaseThreadFact(input: { threadId: string }, env: Record<string, string | undefined>,
+export async function intakeV2CaseThreadFact(input: { threadId: string; receivedAt: string }, env: Record<string, string | undefined>,
   db: Reader = requireDb()): Promise<EnginePolicy["v2CaseThread"]> {
   try {
     if (!savV2CaseThreadReplyEnabled(env)) return undefined;
-    const cases = await db.select({ id: savCases.id, owner: savCases.owner, sensitivity: savCases.sensitivity }).from(savCases)
+    const cases = await db.select({ id: savCases.id, owner: savCases.owner, sensitivity: savCases.sensitivity, phase: savCases.phase }).from(savCases)
       .where(sql`${input.threadId}::uuid = any(${savCases.threadIds})`).limit(2);
     const only = cases.length === 1 ? cases[0] : undefined;
-    return only && only.sensitivity === "none" && only.owner === "agent" ? { caseId: only.id } : undefined;
+    if (!only || only.sensitivity !== "none" || only.owner !== "agent") return undefined;
+    if (!caseReturnPhaseClosed(only.phase as CasePhase)) return { caseId: only.id };
+    const receivedAt = new Date(input.receivedAt);
+    return caseThreadReplyWithinWindow(receivedAt.getTime() - await savCaseLastActivity(only.id, receivedAt, db)) ? { caseId: only.id } : undefined;
   } catch { return undefined; }
 }

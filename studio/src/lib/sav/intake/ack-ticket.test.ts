@@ -251,20 +251,37 @@ describe("SAV-128 runtime fact", () => {
 });
 
 describe("25/11 V2 case thread fact", () => {
-  const db = (rows: unknown[] | Error) => ({ select: () => ({ from: () => ({ where: () => ({ limit: async () => { if (rows instanceof Error) throw rows; return rows; } }) }) }) });
+  // Cases come from `where().limit()`; each `await where()` is one last-activity read (replies/timers/commands first, then customer mails).
+  const db = (rows: unknown[] | Error, activity: (string | null)[] = []) => ({ select: () => ({ from: () => ({ where: () => ({
+    limit: async () => { if (rows instanceof Error) throw rows; return rows; },
+    then: (resolve: (value: unknown) => void) => resolve([{ at: activity.shift() ?? null }]) }) }) }) });
   const on = { SAV_V2_CASE_THREAD_REPLY: "on" };
-  const agentCase = { id: "30000000-0000-4000-8000-000000000001", owner: "agent", sensitivity: "none" };
+  const receivedAt = "2026-11-25T10:00:00.000Z";
+  const agentCase = { id: "30000000-0000-4000-8000-000000000001", owner: "agent", sensitivity: "none", phase: "awaiting_customer" };
+  const closedCase = { ...agentCase, phase: "resolved" };
   it("exactly one case held by the agent and not sensitive: its id; 0 or 2 cases, a team or held case, a sensitive one, off or an unreadable read: nothing", async () => {
     const { intakeV2CaseThreadFact } = await import("./ack-ticket-store");
-    expect(await intakeV2CaseThreadFact({ threadId }, on, db([agentCase]) as never)).toEqual({ caseId: agentCase.id });
+    const input = { threadId, receivedAt };
+    expect(await intakeV2CaseThreadFact(input, on, db([agentCase]) as never)).toEqual({ caseId: agentCase.id });
     // A case held by the team keeps today's path: V1 puts the mail on the HubSpot ticket the person works on.
-    expect(await intakeV2CaseThreadFact({ threadId }, on, db([{ ...agentCase, owner: "human" }]) as never)).toBeUndefined();
-    expect(await intakeV2CaseThreadFact({ threadId }, on, db([]) as never)).toBeUndefined();
-    expect(await intakeV2CaseThreadFact({ threadId }, on, db([agentCase, { ...agentCase, id: "30000000-0000-4000-8000-000000000002" }]) as never)).toBeUndefined();
-    expect(await intakeV2CaseThreadFact({ threadId }, on, db([{ ...agentCase, sensitivity: "finance" }]) as never)).toBeUndefined();
-    expect(await intakeV2CaseThreadFact({ threadId }, on, db([{ ...agentCase, owner: "system_hold" }]) as never)).toBeUndefined();
-    expect(await intakeV2CaseThreadFact({ threadId }, {}, db([agentCase]) as never)).toBeUndefined();
-    expect(await intakeV2CaseThreadFact({ threadId }, { SAV_V2_CASE_THREAD_REPLY: "true" }, db([agentCase]) as never)).toBeUndefined();
-    expect(await intakeV2CaseThreadFact({ threadId }, on, db(Error("down")) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact(input, on, db([{ ...agentCase, owner: "human" }]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact(input, on, db([]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact(input, on, db([agentCase, { ...agentCase, id: "30000000-0000-4000-8000-000000000002" }]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact(input, on, db([{ ...agentCase, sensitivity: "finance" }]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact(input, on, db([{ ...agentCase, owner: "system_hold" }]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact(input, {}, db([agentCase]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact(input, { SAV_V2_CASE_THREAD_REPLY: "true" }, db([agentCase]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact(input, on, db(Error("down")) as never)).toBeUndefined();
+  });
+  it("a closed agent case only within the 15-day window after its last activity; past it or with no readable date, no fact (V1's today path)", async () => {
+    const { intakeV2CaseThreadFact } = await import("./ack-ticket-store");
+    const input = { threadId, receivedAt };
+    expect(await intakeV2CaseThreadFact(input, on, db([closedCase], ["2026-11-20T10:00:00.000Z"]) as never)).toEqual({ caseId: closedCase.id });
+    expect(await intakeV2CaseThreadFact(input, on, db([closedCase], ["2026-11-10T10:00:00.000Z"]) as never)).toEqual({ caseId: closedCase.id });
+    expect(await intakeV2CaseThreadFact(input, on, db([closedCase], [null, "2026-11-18T10:00:00.000Z"]) as never)).toEqual({ caseId: closedCase.id });
+    expect(await intakeV2CaseThreadFact(input, on, db([closedCase], ["2026-11-10T09:59:59.000Z"]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact(input, on, db([{ ...closedCase, phase: "closed_no_reply" }], ["2026-10-01T00:00:00.000Z"]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact(input, on, db([closedCase], [null, null]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact(input, on, db([closedCase], ["not a date"]) as never)).toBeUndefined();
   });
 });

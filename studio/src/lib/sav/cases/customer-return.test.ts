@@ -273,11 +273,12 @@ describe("V2 case thread reply on a closed case", () => {
     expect(decideCustomerReturn(reply({ v1Target: "pending" }))).toEqual({ route: "wait", reason: "v1_pending" });
     expect(decideCustomerReturn(reply({ v1Target: "same_ticket" }))).toEqual({ route: "reopen", reason: "same_incident_v1_confirmed" });
   });
-  it("only within V1's 15-day window after the case's last activity; older or unknown, today's wait for V1", () => {
+  it("reopens only within V1's 15-day window; past it or with an unreadable date (a race with V1's bound) it goes to the team, never waits for V1", () => {
     expect(decideCustomerReturn(reply({ caseThreadReplyAgeMs: 15 * DAY }))).toEqual({ route: "reopen", reason: "case_thread_reply" });
-    expect(decideCustomerReturn(reply({ caseThreadReplyAgeMs: 15 * DAY + 1 }))).toEqual({ route: "wait", reason: "v1_pending" });
-    expect(decideCustomerReturn(reply({ caseThreadReplyAgeMs: undefined }))).toEqual({ route: "wait", reason: "v1_pending" });
-    expect(decideCustomerReturn(reply({ caseThreadReplyAgeMs: Number.NaN }))).toEqual({ route: "wait", reason: "v1_pending" });
+    for (const caseThreadReplyAgeMs of [15 * DAY + 1, undefined, Number.NaN])
+      expect(decideCustomerReturn(reply({ caseThreadReplyAgeMs }))).toEqual({ route: "hand_to_team", reason: "case_thread_reply_outside_window" });
+    // Without V1's v2_case_thread, a closed case still waits for V1 as today.
+    expect(decideCustomerReturn(closed({ caseThreadReplyAgeMs: 30 * DAY }))).toEqual({ route: "wait", reason: "v1_pending" });
   });
   it("a sensitive case goes to the team; a case on system hold or with the team is left to its owner", () => {
     expect(decideCustomerReturn(reply({ case: { owner: "agent", phase: "resolved", sensitivity: "finance" } }))).toEqual({ route: "hand_to_team", reason: "sensitive" });
