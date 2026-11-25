@@ -182,10 +182,10 @@ describe("the trigger: the real investigation's final handoff decision, once", (
     const text = messageOf();
     expect(text.split("\n")[0]).toBe("*Nouveau ticket à transmettre à l'équipe*");
     expect(text).toContain(`Camille Synthétique — <https://app.hubspot.com/contacts/${PORTAL}/record/0-1/777|fiche contact HubSpot>`);
-    expect(text).toContain("*Problème :* Le client n'arrive plus à se connecter à la plateforme.");
-    expect(text).toContain("*Motif du relais :* aucune fiche de connaissance ne couvre la demande");
+    expect(text).toContain("*Demande :* Le client n'arrive plus à se connecter à la plateforme.");
+    expect(text).toContain("*Pourquoi l'équipe :* aucune fiche de connaissance ne couvre la demande");
     expect(text).toContain(`<https://app.hubspot.com/contacts/${PORTAL}/record/0-5/${made.ticketId}|ticket ${made.ticketId}>`);
-    expect(text).toContain("*Prochaine action proposée :* Vérifier le compte du client et le rappeler.");
+    expect(text).toContain("*À faire :* Vérifier le compte du client et le rappeler.");
     expect(text).toMatch(/_Réf\. HO-[0-9a-f]{12}_$/);
     const [done] = await noticeRows().then(rows => rows.filter(r => r.id === made.execution!.id));
     expect(done).toMatchObject({ state: "confirmed" });
@@ -202,7 +202,7 @@ describe("the trigger: the real investigation's final handoff decision, once", (
     const made = await handedOver("gm-ho-reason", [handoff({ reason: "explicit_human_request" })]);
     const before = (await readCase(made.c.caseId))!;
     await pass();
-    expect(messageOf()).toContain("*Motif du relais :* le client demande à parler à une personne");
+    expect(messageOf()).toContain("*Pourquoi l'équipe :* le client demande à parler à une personne");
     const after = (await readCase(made.c.caseId))!;
     expect({ owner: after.owner, phase: after.phase, version: after.version }).toEqual({ owner: before.owner, phase: before.phase, version: before.version });
   });
@@ -285,13 +285,12 @@ describe("no notice for anything that is not a final handoff decision", () => {
     expect(row).toMatchObject({ state: "pending" });
     await pass();
     const text = messageOf();
-    expect(text).toContain("*Motif du relais :* le validateur a refusé deux fois la décision de l'agent pour ce message");
-    expect(text).toContain("*Problème :* Connexion impossible à la plateforme.");
+    expect(text).toContain("*Pourquoi l'équipe :* le validateur a refusé deux fois la décision de l'agent pour ce message");
+    expect(text).toContain("*Demande :* Connexion impossible à la plateforme.");
     expect(text).toMatch(/Motifs des refus : /);
     expect(text).toContain("Aucune réponse n'a été envoyée par l'agent.");
-    // SAV-92: the synthesis of the stored case follows the template (V1 subject here: the fixture records no customer statement).
-    expect(text).toContain("*Synthèse du dossier :*\n• Problème, d'après l'analyse V1 : « Connexion impossible à la plateforme. »");
-    expect(text).toContain("• Raison du transfert : le validateur a refusé deux fois la décision de l'agent pour ce message");
+    // Ugo (25/11): one short layout, no repeated synthesis block.
+    expect(text).not.toContain("Synthèse du dossier");
     // A notice to the team only: no customer reply was planned for this case.
     expect((await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, made.c.caseId))).map(r => r.replyKey.split(":")[0])).toEqual(["handoff-notice"]);
   });
@@ -994,7 +993,7 @@ describe("Ugo 25/11: a technical dead end goes to the team through the existing 
     expect(JSON.stringify(payload)).not.toMatch(/http_rejected|httpStatus/);
     await pass();
     const text = messageOf();
-    expect(text).toContain("*Motif du relais :* panne technique, les appels permis de l'agent sont épuisés (code technical_exhausted)");
+    expect(text).toContain("*Pourquoi l'équipe :* panne technique, les appels permis de l'agent sont épuisés (code technical_exhausted)");
     expect(text).toContain("rien ne lui a été envoyé par l'agent");
     expect(posts()).toHaveLength(1);
     // The existing hand-over stage gives the HubSpot ticket back (« Nouveau », no owner): one execution keyed on the transfer's version, queued once.

@@ -142,17 +142,17 @@ describe("the message: one template, the required sections, nothing invented", (
     const render = renderHandoffNotice(facts(), VERIFIED, PORTAL);
     expect(render.text.split("\n")[0]).toBe(`*${HANDOFF_NOTICE_TITLE}*`);
     expect(render.text).toContain(`Camille Synthétique — <https://app.hubspot.com/contacts/${PORTAL}/record/0-1/777|fiche contact HubSpot>`);
-    expect(render.text).toContain("*Problème :* Le client n'arrive plus à se connecter.");
+    expect(render.text).toContain("*Demande :* Le client n'arrive plus à se connecter.");
     expect(render.text).toContain("• Procédure syn-login : échec");
     expect(render.text).not.toContain("syn-other");
-    expect(render.text).toContain("• 2 question(s) posée(s) au client");
+    expect(render.text).toContain("• Agent : 2 question(s) posée(s) au client");
     expect(render.text).toContain("• Attendu : Accès à la plateforme");
     expect(render.text).toContain("• Constaté : Écran de connexion bloqué");
-    expect(render.text).toContain("• Hypothèse : Compte désactivé");
-    expect(render.text).toContain(`*Motif du relais :* ${HANDOFF_REASON_LABELS.knowledge_missing}`);
+    // At most three established lines: the hypothesis is the fourth, counted in the heading.
+    expect(render.text).toContain("*Ce que l'agent a établi :* (3 premiers éléments sur 4)");
+    expect(render.text).toContain(`*Pourquoi l'équipe :* ${HANDOFF_REASON_LABELS.knowledge_missing}`);
     expect(render.text).toContain(`<https://app.hubspot.com/contacts/${PORTAL}/record/0-5/${TICKET}|ticket ${TICKET}>`);
-    expect(render.text).toContain("*Prochaine action proposée :* Vérifier le compte et rappeler le client.");
-    expect(render.text).toContain("Informations manquantes : Date de la dernière connexion");
+    expect(render.text).toContain("*À faire :* Vérifier le compte et rappeler le client. Informations manquantes : Date de la dernière connexion");
     expect(render.text).toContain(`_Réf. ${render.marker}_`);
     expect(render.marker).toBe(handoffNoticeMarker(handoffNoticeKey(CASE, INPUT)));
   });
@@ -175,7 +175,8 @@ describe("the message: one template, the required sections, nothing invented", (
   it("without a trial, a question or an observation the notice says so instead of inventing an attempt", () => {
     const bare = handoffNoticeFacts(trigger({ expected: null, observed: null, hypotheses: [], missingInformation: [], trialIds: [] }), { trials: [], questions: [] } as never);
     const text = renderHandoffNotice(bare, VERIFIED, PORTAL).text;
-    expect(text).toContain("• Aucun essai enregistré avant le relais");
+    expect(text).toContain("*Ce que l'agent a établi :* rien de vérifié ni d'essayé avant le relais");
+    expect(text).toContain("*Échanges :* aucune question posée au client par l'agent");
     expect(text).not.toContain("Hypothèse");
     expect(text).not.toContain("Informations manquantes");
   });
@@ -384,8 +385,8 @@ describe("review A10: no one-time code, token, link, address or number reaches S
   it("the last look scrubs a text already sealed in the ledger: free-text lines are cleaned, foreign <...> are removed, our links and the marker are kept", () => {
     const sealed = renderHandoffNotice(facts(), VERIFIED, PORTAL);
     const historical = sealed.text
-      .replace(/(\*Problème :\* ).*/, "$1le code 718236 <!channel> https://evil.example.invalid voleur@example.invalid")
-      .replace(/(\*Prochaine action proposée :\* ).*/, "$1Appeler le 06 12 34 56 78 <@U123|boss>");
+      .replace(/(\*Demande :\* ).*/, "$1le code 718236 <!channel> https://evil.example.invalid voleur@example.invalid")
+      .replace(/(\*À faire :\* ).*/, "$1Appeler le 06 12 34 56 78 <@U123|boss>");
     expect(historical).toContain("718236");
     const scrubbed = scrubHandoffNoticeText(historical);
     expect(scrubbed).not.toMatch(/718236|evil\.example|voleur|06 12|<!channel>|<@U123/);
@@ -402,7 +403,7 @@ describe("review A10: no one-time code, token, link, address or number reaches S
   it("the Slack adapter posts the scrubbed text even for an intent sealed under the old rule; the marker still verifies", async () => {
     const slack = fakeSlack();
     const sealed = renderHandoffNotice(facts(), VERIFIED, PORTAL);
-    const intent = { ...buildHandoffNoticeIntent({ render: { ...sealed, text: sealed.text.replace(/(\*Problème :\* ).*/, "$1code 718236 voleur@example.invalid <!channel>") }, caseId: CASE, ticketId: TICKET, channel: CHANNEL }) };
+    const intent = { ...buildHandoffNoticeIntent({ render: { ...sealed, text: sealed.text.replace(/(\*Demande :\* ).*/, "$1code 718236 voleur@example.invalid <!channel>") }, caseId: CASE, ticketId: TICKET, channel: CHANNEL }) };
     await createHandoffSlackAdapters({ network: slack.network, env: () => ENV_ON }).dispatch(intent, new AbortController().signal);
     const posted = slack.state.messages[0]!.text;
     expect(posted).not.toMatch(/718236|voleur|<!channel>/);
@@ -418,11 +419,12 @@ describe("signal d'analyse du relais", () => {
   const before = [
     "*Nouveau ticket à transmettre à l'équipe*",
     `*Client :* Camille Synthétique — <https://app.hubspot.com/contacts/${PORTAL}/record/0-1/777|fiche contact HubSpot>`,
-    "*Problème :* Le client n'arrive plus à se connecter.",
-    ["*Ce que l'agent a tenté et le résultat :*", "• Procédure syn-login : échec", "• 2 question(s) posée(s) au client", "• Attendu : Accès à la plateforme", "• Constaté : Écran de connexion bloqué", "• Hypothèse : Compte désactivé"].join("\n"),
-    "*Motif du relais :* aucune fiche de connaissance ne couvre la demande",
+    "*Demande :* Le client n'arrive plus à se connecter.",
+    "*Échanges :*\n• Agent : 2 question(s) posée(s) au client",
+    ["*Ce que l'agent a établi :* (3 premiers éléments sur 4)", "• Procédure syn-login : échec", "• Constaté : Écran de connexion bloqué", "• Attendu : Accès à la plateforme"].join("\n"),
+    "*Pourquoi l'équipe :* aucune fiche de connaissance ne couvre la demande",
+    "*À faire :* Vérifier le compte et rappeler le client. Informations manquantes : Date de la dernière connexion",
     `*Ticket HubSpot :* <https://app.hubspot.com/contacts/${PORTAL}/record/0-5/${TICKET}|ticket ${TICKET}>`,
-    "*Prochaine action proposée :* Vérifier le compte et rappeler le client.. Informations manquantes : Date de la dernière connexion",
     `_Réf. ${handoffNoticeMarker(handoffNoticeKey(CASE, INPUT))}_`,
   ].join("\n\n");
 
@@ -445,10 +447,10 @@ describe("signal d'analyse du relais", () => {
   it("sections are separated by one blank line, the lists inside a section stay on consecutive lines, the reference closes after a blank line", () => {
     const text = renderHandoffNotice(facts(), VERIFIED, PORTAL).text;
     const sections = text.split("\n\n");
-    expect(sections).toHaveLength(8);
+    expect(sections).toHaveLength(9);
     expect(sections[0]).toBe("*Nouveau ticket à transmettre à l'équipe*");
-    expect(sections[3]!.split("\n")).toHaveLength(6);
-    expect(sections[3]!.split("\n")[1]).toBe("• Procédure syn-login : échec");
+    expect(sections[4]!.split("\n")).toHaveLength(4);
+    expect(sections[4]!.split("\n")[1]).toBe("• Procédure syn-login : échec");
     expect(sections.at(-1)).toMatch(/^_Réf\. HO-[0-9a-f]{12}_$/);
     expect(text).not.toMatch(/\n{3}/);
     expect(scrubHandoffNoticeText(text)).toBe(text);
@@ -458,10 +460,10 @@ describe("signal d'analyse du relais", () => {
     const rendered = renderHandoffNotice({ ...facts(), conversationId: id }, VERIFIED, PORTAL, true).text;
     const ticket = before.split("\n").find(line => line.startsWith("*Ticket HubSpot :*"))!;
     const line = `*Conversation Limova :* \`${id}\``;
-    expect(rendered).toContain(`${ticket}\n\n${line}\n\n*Prochaine action proposée :*`);
-    const scrubbed = scrubHandoffNoticeText(rendered.replace("*Problème :* ", `*Problème :* ${longCode} `));
+    expect(rendered).toContain(`${ticket}\n\n${line}\n\n_Réf. `);
+    const scrubbed = scrubHandoffNoticeText(rendered.replace("*Demande :* ", `*Demande :* ${longCode} `));
     expect(scrubbed).toContain(line);
-    expect(scrubbed).toContain("*Problème :* [code masqué]");
+    expect(scrubbed).toContain("*Demande :* [code masqué]");
     expect(scrubbed).not.toContain(longCode);
     expect(scrubHandoffNoticeText(rendered.replace(line, `${line} ${longCode}`))).not.toContain(id);
   });
