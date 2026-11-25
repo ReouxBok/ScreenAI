@@ -18,6 +18,7 @@ import { readCaseReplyDisclosure } from "../case-reply-outbound";
 import { runCaseEffectsPass } from "../case-runtime-effects";
 import { listCaseEvents, readCase } from "../case-store";
 import { isSmartSupportProvenance, SAV_SMART_ENTRY_FAMILY, SAV_SMART_NO_THREAD_WAIT, type KnowledgeRef } from "../case-types";
+import { SAV_CASE_ACCESS_SCOPE_REVISION } from "../investigation-access-scope";
 import { readCustomerReturnFacts, routeCustomerReturn } from "../customer-return-store";
 import type { CaseEmbeddingSpendPort, CaseEmbeddingTransport, CaseKnowledgeVectorSearch } from "../investigation-budgeted-retrieval";
 import type { CaseInvestigationModelRequest } from "../investigation-runner";
@@ -97,7 +98,7 @@ const provenanceDeps: PilotProvenanceDeps = {
 beforeEach(async () => { await configure(); });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
-type Ticket = Readonly<{ content?: string; subject?: string; contacts?: string[]; email?: string; app?: boolean }>;
+type Ticket = Readonly<{ content?: string; subject?: string; contacts?: string[]; email?: string; app?: boolean; categories?: string }>;
 function fixture(ticketInput: Ticket = {}) {
   const ticketId = String(++seq);
   const observedAt = new Date(Date.now() - 5_000).toISOString();
@@ -106,7 +107,8 @@ function fixture(ticketInput: Ticket = {}) {
   const ack = { id: `sent-${ticketId}`, threadId: `gmail-thread-${ticketId}` };
   const crmId = String(seq + 20_000);
   const ticket = { id: ticketId, updatedAt: observedAt,
-    properties: { subject: ticketInput.subject ?? SUBJECT, content: ticketInput.content ?? QUESTION, hubspot_owner_id: OWNER, hs_pipeline: "0", hs_pipeline_stage: "1" } };
+    properties: { subject: ticketInput.subject ?? SUBJECT, content: ticketInput.content ?? QUESTION, hubspot_owner_id: OWNER, hs_pipeline: "0", hs_pipeline_stage: "1",
+      ...(ticketInput.categories ? { hs_ticket_category: ticketInput.categories } : {}) } };
   const controls = { contacts: ticketInput.contacts ?? [CONTACT] };
   const counts = { crmPosts: 0, gmailPosts: 0, network: 0 };
   let storedCrmProperties: unknown, sentMail: { to: string; subject: string; rfcId: string; body: string; at: string } | undefined;
@@ -272,18 +274,59 @@ describe("SAV-138 : le premier mail d'un ticket créé depuis l'app, écrit par 
 
   it("réponse smart automatique non autorisée (SAV_V2_SMART_SUPPORT_MODE absent) : pas de brouillon en attente, le ticket va à l'équipe, aucun mail", async () => {
     vi.stubEnv("SAV_V2_SMART_SUPPORT_MODE", undefined);
-    const s = fixture();
-    const started = await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps()) });
+    const s = fixture(), model = decisionModel();
+    const started = await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps(model)) });
     expect(started).toMatchObject({ status: "human_wait" });
-    expect(await readCase((started as { caseId: string }).caseId)).toMatchObject({ owner: "human", threadIds: [] });
+    const caseId = (started as { caseId: string }).caseId;
+    expect(await readCase(caseId)).toMatchObject({ owner: "human", threadIds: [] });
+    // Review 25/11: the configuration is read BEFORE the model; a mail that could never leave automatically costs no call and leaves no validation.
+    expect(model.requests).toHaveLength(0);
+    expect(await validations(caseId)).toEqual([]);
     expect(s.counts).toMatchObject({ gmailPosts: 0, crmPosts: 0 });
   });
 
-  it.each(["shadow", "off"] as const)("mode %s : aucun premier mail (le case attend une personne, comme aujourd'hui)", async app => {
+  it("bloc smart-support en brouillon : aucun appel au modèle, aucune validation, le ticket va à l'équipe", async () => {
+    vi.stubEnv("SAV_V2_SMART_SUPPORT_MODE", "draft");
+    const s = fixture(), model = decisionModel();
+    const started = await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps(model)) });
+    expect(started).toMatchObject({ status: "human_wait" });
+    expect(model.requests).toHaveLength(0);
+    expect(await validations((started as { caseId: string }).caseId)).toEqual([]);
+  });
+
+  it("catégorie devenue Facturation (relue à l'entrée) : motif sensitive_request, aucun appel au modèle, aucun mail", async () => {
+    const s = fixture({ categories: "Facturation" }), model = decisionModel();
+    const started = await startV2FromThreadlessTicket(s.input, { firstMail: port(firstMailDeps(model)) });
+    expect(started).toMatchObject({ status: "human_wait", reason: "sensitive_request" });
+    expect(model.requests).toHaveLength(0);
+    expect(await readCase((started as { caseId: string }).caseId)).toMatchObject({ owner: "human" });
+    expect(s.counts).toMatchObject({ gmailPosts: 0, crmPosts: 0 });
+  });
+
+  it("cerveau smart coupé alors que le mode est live, ticket que la voie Accès admettrait : jamais la voie Accès ni le brouillon fixe, le ticket va à l'équipe", async () => {
+    const before = new Date(Date.now() - 60 * 60_000).toISOString(), after = new Date(Date.now() + 60 * 60_000).toISOString();
+    const rule = { ruleId: "access-fixture", revision: "synthetic-v1", v1Kind: "support", family: "access", at: before };
+    vi.stubEnv("SAV_V2_ENTRY_SMART", "off");
+    vi.stubEnv("SAV_V2_ADMISSION_RULES_JSON", JSON.stringify([rule]));
+    vi.stubEnv("SAV_V2_ADMISSION_POLICY_JSON", JSON.stringify({ policy: { revision: "first-mail-fixture", admittedFamilies: ["access"], approvedBy: APPROVER, approvedAt: before,
+      qualifiedRules: [{ ruleId: rule.ruleId, revision: rule.revision, families: ["access"] }] }, validFrom: before, validUntil: after }));
+    vi.stubEnv("SAV_V2_ACCESS_SCOPE_JSON", JSON.stringify({ schema: SAV_CASE_ACCESS_SCOPE_REVISION, policyRevision: "first-mail-fixture", revision: "fixture-access-scope",
+      family: "access", sources: [{ knowledgeId: card.id, contentVersionId: card.contentVersionId, use: "answer" }] }));
+    const s = fixture({ subject: "Connexion", content: "Je n’arrive pas à me connecter à mon compte." }), model = decisionModel();
+    const firstMail = vi.fn<ThreadlessFirstMailPort>(port(firstMailDeps(model)));
+    const started = await startV2FromThreadlessTicket(s.input, { firstMail });
+    expect(started).toMatchObject({ status: "human_wait", reason: "app_ticket_not_smart" });
+    expect(firstMail).not.toHaveBeenCalled();
+    expect(await validations((started as { caseId: string }).caseId)).toEqual([]);
+    expect(await readCase((started as { caseId: string }).caseId)).toMatchObject({ owner: "human" });
+    expect(s.counts).toMatchObject({ gmailPosts: 0, crmPosts: 0 });
+  });
+
+  it.each(["shadow", "off"] as const)("mode %s : aucun premier mail, le case va à l'équipe", async app => {
     await configure({ app });
     const s = fixture(), model = decisionModel(), firstMail = vi.fn<ThreadlessFirstMailPort>(port(firstMailDeps(model)));
     const started = await startV2FromThreadlessTicket(s.input, { firstMail });
-    expect(started).toMatchObject({ status: "human_wait", reason: SAV_SMART_NO_THREAD_WAIT });
+    expect(started).toMatchObject({ status: "human_wait", reason: "app_ticket_not_smart" });
     expect(firstMail).not.toHaveBeenCalled();
     expect(model.requests).toHaveLength(0);
     expect(s.counts).toMatchObject({ gmailPosts: 0, crmPosts: 0 });

@@ -61,8 +61,10 @@ export const APP_TICKET_DEFAULT_SUBJECT = "Votre demande Limova";
 export function appTicketReplySubject(subject: string | null | undefined): string {
   let line = (subject ?? "").replace(/[\p{Cc}\p{Cs}\u2028\u2029]+/gu, " ").replace(/\s+/g, " ").trim();
   while (/^(?:re|fw|fwd|tr)\s*:/i.test(line)) line = line.replace(/^(?:re|fw|fwd|tr)\s*:\s*/i, "");
-  line = line.slice(0, 200).trim();
-  return line || APP_TICKET_DEFAULT_SUBJECT;
+  // At most 200 UTF-16 units (the send check's limit), cut between characters: never half an emoji.
+  let cut = "";
+  for (const character of line) { if (cut.length + character.length > 200) break; cut += character; }
+  return cut.trim() || APP_TICKET_DEFAULT_SUBJECT;
 }
 
 /** The subject a first mail of this stored ticket must carry: an app ticket case's own (above), any other ticket's SAV-96 Access subject, unchanged. */

@@ -53,17 +53,28 @@ export async function threadlessAutoSendProblem(db: Reader, env: Env, input: Rea
  * text; the smart block switch at `rule`), plus `SAV_APP_TICKETS_MODE=live`. Read at the approval and again at the send gate, under the same locks.
  */
 export async function smartFirstMailAutoProblem(db: Reader, env: Env, input: Readonly<{ proposal: Pick<CaseReplyProposal, "text" | "purpose">; decidedBy: string | null; admissionRecord: unknown }>): Promise<string | null> {
-  const config = readAccessAutoApprovalConfig(env);
-  if (config.mode !== "on") return `auto_${config.why}`;
+  const problem = smartFirstMailConfigProblem(env, input.admissionRecord), config = readAccessAutoApprovalConfig(env);
+  if (problem || config.mode !== "on") return problem ?? "auto_disabled";
   if (input.decidedBy !== null && input.decidedBy.toLowerCase() !== config.approverId) return "approver_not_rule";
-  if (savAppTicketsMode(env) !== "live") return "app_tickets_not_live";
-  const admission = input.admissionRecord as Parameters<typeof smartSendProblem>[0]["admission"];
-  const switched = smartSwitchProblem({ env, admission, basis: ACCESS_AUTO_APPROVAL_BASIS, approvedBy: config.approverId });
-  if (switched) return switched.toLowerCase();
   let body: string;
   try { body = caseReplyEditableBody(input.proposal.text); } catch { return "reply_unreadable"; }
-  const fence = smartSendProblem({ admission, body, purpose: input.proposal.purpose });
+  const fence = smartSendProblem({ admission: input.admissionRecord as Parameters<typeof smartSendProblem>[0]["admission"], body, purpose: input.proposal.purpose });
   if (fence) return fence.toLowerCase();
+  return smartFirstMailBlockProblem(db, env);
+}
+
+/** The configuration part, no text needed: read BEFORE any model call (review 25/11), so a mail that could never leave automatically costs nothing. */
+export function smartFirstMailConfigProblem(env: Env, admissionRecord: unknown): string | null {
+  const config = readAccessAutoApprovalConfig(env);
+  if (config.mode !== "on") return `auto_${config.why}`;
+  if (savAppTicketsMode(env) !== "live") return "app_tickets_not_live";
+  const switched = smartSwitchProblem({ env, admission: admissionRecord as Parameters<typeof smartSendProblem>[0]["admission"], basis: ACCESS_AUTO_APPROVAL_BASIS,
+    approvedBy: config.approverId });
+  return switched ? switched.toLowerCase() : null;
+}
+
+/** The smart block switch, read now through `db`: only `rule` lets an automated smart mail leave. */
+export async function smartFirstMailBlockProblem(db: Reader, env: Env): Promise<string | null> {
   const gate = savBlockReplyGate(await readSavBlockSwitch(db, SAV_SMART_ENTRY_BLOCK_ID, env));
   return gate.send === "rule" ? null : gate.code;
 }

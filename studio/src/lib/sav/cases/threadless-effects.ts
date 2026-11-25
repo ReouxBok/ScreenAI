@@ -17,7 +17,7 @@ import { readThreadlessAuthority, threadlessAccessRevision, threadlessActionAllo
 import { isSmartSupportProvenance, SAV_SMART_ENTRY_POLICY_REVISION, SAV_SMART_REQUALIFIED } from "./case-types";
 import { qualifyThreadlessTicket, readThreadlessTicket, threadlessAccessQualified } from "./threadless-source";
 import { smartFirstMailAutoProblem, threadlessAutoSendProblem } from "./first-mail/first-mail-rights";
-import { appTicketSmartFirstMail } from "./app-tickets-config";
+import { appTicketSmartFirstMail, isAppTicketTransition } from "./app-tickets-config";
 import { caseReplyEditableBody } from "./case-reply-outbound";
 import { smartAdmission, smartSendProblem } from "./smart/smart-send-fence";
 import { buildNewThreadSendIntent, THREADLESS_MAILBOX, type createThreadlessTransport, type NewThreadAck, type NewThreadReceipt, type NewThreadSendIntent, type ThreadlessCrmAck } from "./threadless-transport";
@@ -240,6 +240,11 @@ async function passOne(parent: Parent, deps: PassDeps) {
   const appSmart = !gmail && appTicketSmartFirstMail(env, input.ownerTransitionKey) && smartAdmission((await readCase(parent.caseId))?.admission);
   if (smartQualified && !appSmart) {
     await waitBeforeSend(parent, SAV_SMART_REQUALIFIED, true);
+    return;
+  }
+  // An app ticket case is never sent on the Access path, whatever it qualifies as now.
+  if (!gmail && !appSmart && isAppTicketTransition(input.ownerTransitionKey)) {
+    await waitBeforeSend(parent, "app_ticket_not_smart", true);
     return;
   }
   if (appSmart && !smartQualified) {

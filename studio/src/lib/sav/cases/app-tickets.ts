@@ -5,8 +5,9 @@ import { requireDb } from "@/db";
 import { savSyncState } from "@/db/schema";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 import { requestSavHubspot } from "../hubspot-transport";
-import { APP_TICKET_TRANSITION_PREFIX, appTicketCategoryGated, appTicketSourceLabel, savAppTicketsMode, savAppTicketsSourceTypes } from "./app-tickets-config";
+import { APP_TICKET_TRANSITION_PREFIX, appTicketCategoryGated, appTicketSourceLabel, savAppTicketsMode, savAppTicketsSourceTypes, type SavAppTicketsMode } from "./app-tickets-config";
 import { hasLocalThreadForTicket, savCaseRecordingEnabled } from "./case-store";
+import { savV2EntrySmartOn } from "./smart-entry-switch";
 import { v2HubspotOwnerId } from "./intake-boundary";
 import { THREADLESS_ADMIT_PERMISSION } from "./threadless-config";
 import type { ThreadlessEntryResult } from "./threadless-entry";
@@ -23,7 +24,10 @@ import { readThreadlessAuthority, threadlessActionAllowed, threadlessSchemaInsta
  * One durable row per ticket and mode (`sav-app-ticket.v1:<mode>:<id>`) makes it idempotent; a pass lease serialises concurrent passes. A live row left
  * between assignment and entry is retried from the database (the search no longer sees an owned ticket), at most MAX_ATTEMPTS times, then handed back.
  * HubSpot tickets are never archived or deleted here.
- * Cost per pass: 1 search (2 at most), then 2 reads per new ticket (MAX_TICKETS at most); live adds 1 PATCH per taken ticket. Off: nothing.
+ * Cost per pass: 1 search (2 at most), then 2 reads per new ticket (MAX_TICKETS at most); live adds 1 PATCH and 1 entry (the model) for ONE ticket per pass,
+ * and only with APP_TICKETS_ENTRY_MARGIN_MS left before the deadline (as `sweepDueOwnerHandovers`).
+ * Leaving live (shadow or off): a live row left between assignment and entry is handed back to the team once, whatever the mode (`releaseLiveRows`).
+ * Off otherwise: one bounded database read, no HubSpot call.
  */
 
 type Env = Record<string, string | undefined>;
@@ -36,6 +40,9 @@ export const APP_TICKETS_MAX_PAGES = 2;
 export const APP_TICKETS_MAX_TICKETS = 10;
 export const APP_TICKETS_MAX_ATTEMPTS = 5;
 const RETRY_BATCH = 5;
+/** Review 25/11: at most one entry (a model call) per pass, and only with 100 s left, like `sweepDueOwnerHandovers`. */
+export const APP_TICKETS_MAX_ENTRIES = 1;
+export const APP_TICKETS_ENTRY_MARGIN_MS = 100_000;
 const OVERLAP_MS = 120_000;
 const LEASE_MS = 240_000;
 const RETENTION_MS = 30 * 86_400_000;
@@ -75,8 +82,8 @@ export type AppTicketsDeps = {
   handBack?: (input: Transition, reason: string) => Promise<ThreadlessEntryResult>;
 };
 export type AppTicketsResult =
-  | { skipped: "off" | "owner_unconfigured" | "token_missing" | "source_types_unconfigured" | "leased" | "deadline" }
-  | { mode: Mode; status: "ok" | "partial" | "search_failed"; found: number; decided: Record<string, number>; retried: number; pages: number };
+  | { skipped: "off" | "owner_unconfigured" | "token_missing" | "source_types_unconfigured" | "leased" | "deadline"; released?: number }
+  | { mode: Mode; status: "ok" | "partial" | "search_failed"; found: number; decided: Record<string, number>; retried: number; pages: number; released?: number };
 
 export function appTicketsLookbackMs(env: Env) {
   const raw = Number(env.SAV_APP_TICKETS_LOOKBACK_MINUTES);
@@ -116,6 +123,8 @@ export function appTicketsSearchBody(from: number, after?: string) {
       { propertyName: "hs_pipeline", operator: "EQ", value: SAV_HUBSPOT_SUPPORT.pipelineId },
       { propertyName: "hs_pipeline_stage", operator: "EQ", value: SAV_HUBSPOT_SUPPORT.stages.new },
       { propertyName: "hubspot_owner_id", operator: "NOT_HAS_PROPERTY" },
+      // V1's mail tickets are never this path's (the fresh read checks it again).
+      { propertyName: "source_type", operator: "NEQ", value: SAV_HUBSPOT_SUPPORT.source },
       { propertyName: "createdate", operator: "GTE", value: String(from) },
     ] }],
     sorts: [{ propertyName: "createdate", direction: "ASCENDING" }],
@@ -176,7 +185,22 @@ async function writeRow(key: string, expected: Row | null, status: string, detai
   return updated.length === 1;
 }
 
-type Context = { mode: Mode; env: Env; owner: string; sources: string[]; clock: () => Date; deps: ReturnType<typeof defaultDeps> };
+type Context = { mode: Mode; env: Env; owner: string; sources: string[]; clock: () => Date; deps: ReturnType<typeof defaultDeps>;
+  /** Whether this pass may still start an entry (a model call): under the per-pass bound, with the margin left. */
+  canEnter: () => boolean; entered: () => void };
+
+const transitionInput = (key: string, transition: NonNullable<AppTicketDetail["transition"]>): Transition =>
+  ({ ticketId: key.slice(key.lastIndexOf(":") + 1), ownerTransitionKey: transition.key, observedAt: transition.observedAt });
+
+/** A ticket in the agent's name that will not enter: back to the team, once, with no mail (`handBackOwnerHandoverTicket`). Returns the row's final state. */
+async function handBackRow(deps: Pick<Context["deps"], "handBack">, key: string, row: Row, detail: AppTicketDetail, reason: string, label: string, attempts: number, now: Date) {
+  const input = transitionInput(key, detail.transition!);
+  const back = await deps.handBack(input, reason).catch((): ThreadlessEntryResult => ({ status: "unavailable" }));
+  const handedBack = back.status === "human_wait" || back.status === "existing_case";
+  if (!handedBack) console.warn("sav_v2_app_tickets", { status: "hand_back_failed", ticketId: input.ticketId, entry: label, handBack: back.status });
+  await writeRow(key, row, handedBack ? "handed_back" : "failed", { ...detail, entry: `${label}>${back.status}`.slice(0, 80) }, attempts, now, handedBack ? null : "hand_back_failed");
+  return handedBack ? "handed_back" : "failed";
+}
 
 /** Maps the threadless entry's answer: a case (agent or team) = taken; a ticket that changed = left; anything else waits for a retry. */
 function entryOutcome(result: ThreadlessEntryResult): "taken" | "ignored_owned" | "ignored_closed" | "hand_back" | "retry" | "paused" {
@@ -192,8 +216,10 @@ function entryOutcome(result: ThreadlessEntryResult): "taken" | "ignored_owned" 
 
 /** Live, after the assignment: the existing threadless path. Returns the row's new state. */
 async function enterAssigned(context: Context, key: string, row: Row, detail: AppTicketDetail): Promise<string> {
-  const transition = detail.transition!;
-  const input = { ticketId: key.slice(key.lastIndexOf(":") + 1), ownerTransitionKey: transition.key, observedAt: transition.observedAt };
+  // No time or no slot left in this pass: the row stays `assigned`, the next pass enters it.
+  if (!context.canEnter()) return "deferred";
+  context.entered();
+  const input = transitionInput(key, detail.transition!);
   const result = await context.deps.enter(input).catch((): ThreadlessEntryResult => ({ status: "unavailable" }));
   const outcome = entryOutcome(result), now = context.clock();
   const attempts = outcome === "paused" ? row.processedCount : row.processedCount + 1;
@@ -207,14 +233,8 @@ async function enterAssigned(context: Context, key: string, row: Row, detail: Ap
     await writeRow(key, row, outcome, { ...detail, entry: result.status }, attempts, now);
     return outcome;
   }
-  // The ticket is in the agent's name and the entry cannot take it: it goes back to the team, once, with no mail (`handBackOwnerHandoverTicket`).
-  const back = await context.deps.handBack(input, outcome === "hand_back" ? `app_ticket_${result.status}` : "app_ticket_entry_unavailable")
-    .catch((): ThreadlessEntryResult => ({ status: "unavailable" }));
-  const handedBack = back.status === "human_wait" || back.status === "existing_case";
-  if (!handedBack) console.warn("sav_v2_app_tickets", { status: "hand_back_failed", ticketId: input.ticketId, entry: result.status, handBack: back.status });
-  await writeRow(key, row, handedBack ? "handed_back" : "failed", { ...detail, entry: `${result.status}>${back.status}` }, attempts, now,
-    handedBack ? null : "hand_back_failed");
-  return handedBack ? "handed_back" : "failed";
+  // The ticket is in the agent's name and the entry cannot take it: it goes back to the team, once, with no mail.
+  return handBackRow(context.deps, key, row, detail, outcome === "hand_back" ? `app_ticket_${result.status}` : "app_ticket_entry_unavailable", result.status, attempts, now);
 }
 
 /** One ticket, from its fresh read to its decision (shadow) or its entry (live). Never throws. */
@@ -249,13 +269,18 @@ async function decide(context: Context, ticketId: string, createdAt: number | un
                 : mode === "shadow" ? "would_take"
                   : !ours && !context.sources.includes(ticket.sourceType ?? "") ? "ignored_source" : "take";
   if (decision !== "take") {
+    // Our own assignment, but the ticket no longer qualifies (category, mail, stage...): it is in the agent's name, it goes back to the team once.
+    if (ours && decision !== "ignored_closed") return handBackRow(deps, key, row!, detail, `app_ticket_${decision}`, decision, row!.processedCount, context.clock());
     await writeRow(key, row, decision, detail, row?.processedCount ?? 0, context.clock());
     return decision;
   }
 
+  // Never assigned without the time and the slot to enter it in this pass (the ticket is taken at a later pass).
+  if (!context.canEnter()) return "deferred";
   if (!ours) {
     const observedAt = context.clock().toISOString();
-    if (!await deps.entryAvailable(observedAt).catch(() => false)) {
+    // The smart brain writes an app ticket's first mail: switched off, no assignment (the ticket would only be handed back).
+    if (!savV2EntrySmartOn(context.env) || !await deps.entryAvailable(observedAt).catch(() => false)) {
       const attempts = (row?.processedCount ?? 0) + 1, final = attempts >= APP_TICKETS_MAX_ATTEMPTS;
       await writeRow(key, row, final ? "left_entry_unavailable" : "waiting", detail, attempts, context.clock(), "entry_unavailable");
       return final ? "left_entry_unavailable" : "waiting";
@@ -278,10 +303,35 @@ async function decide(context: Context, ticketId: string, createdAt: number | un
   return enterAssigned(context, key, (await readRow(key))!, detail);
 }
 
+/**
+ * Review 25/11: live switched to shadow or off. A live row left between assignment and entry (`assigning`, `assigned`) is a ticket possibly in the agent's name
+ * that no pass will enter any more: it is handed back to the team ONCE (final state `handed_back` or `failed`, visible in `app_tickets_report` mode live), under
+ * the live pass lease. No such row: one bounded read, no HubSpot call, nothing written.
+ */
+async function releaseLiveRows(mode: Exclude<SavAppTicketsMode, "live">, env: Env, clock: () => Date, handBack: Context["deps"]["handBack"]): Promise<number> {
+  const stranded = await requireDb().select({ key: savSyncState.key }).from(savSyncState)
+    .where(and(sql`${savSyncState.key} like ${APP_TICKET_ROW_PREFIX + "live:%"}`, inArray(savSyncState.status, ["assigning", "assigned"])))
+    .orderBy(asc(savSyncState.updatedAt), asc(savSyncState.key)).limit(RETRY_BATCH);
+  if (!stranded.length) return 0;
+  const claimed = await claimPass("live", env, clock());
+  if (!claimed) return 0;
+  let released = 0;
+  for (const { key } of stranded) {
+    const row = await readRow(key), detail = parse(detailSchema, row?.cursor);
+    if (!row || !["assigning", "assigned"].includes(row.status) || !detail?.transition) continue;
+    await handBackRow({ handBack }, key, row, detail, `app_ticket_mode_${mode}`, `mode_${mode}`, row.processedCount, clock());
+    released++;
+  }
+  await finishPass("live", claimed.leaseAt, claimed.state, null, released, clock());
+  return released;
+}
+
 export async function reconcileSavAppTickets(options: AppTicketsDeps = {}): Promise<AppTicketsResult> {
   const env = options.env ?? process.env, clock = options.now ?? (() => new Date());
   const mode = savAppTicketsMode(env);
-  if (mode === "off") return { skipped: "off" };
+  const released = mode === "live" ? 0 : await releaseLiveRows(mode, env, clock, options.handBack ?? defaultDeps(env).handBack);
+  const withReleased = <T extends AppTicketsResult>(result: T): T => released ? { ...result, released } : result;
+  if (mode === "off") return withReleased({ skipped: "off" });
   const owner = v2HubspotOwnerId(env);
   if (!owner) return { skipped: "owner_unconfigured" };
   const sources = savAppTicketsSourceTypes(env);
@@ -290,13 +340,15 @@ export async function reconcileSavAppTickets(options: AppTicketsDeps = {}): Prom
   const deadlineMs = options.deadlineMs ?? Date.now() + 120_000;
   if (Date.now() + 30_000 > deadlineMs) return { skipped: "deadline" };
   const claimed = await claimPass(mode, env, clock());
-  if (!claimed) return { skipped: "leased" };
+  if (!claimed) return withReleased({ skipped: "leased" });
   const { state, leaseAt } = claimed;
   const defaults = defaultDeps(env);
   const deps = { search: options.search ?? defaults.search, readTicket: options.readTicket ?? defaults.readTicket,
     entryAvailable: options.entryAvailable ?? defaults.entryAvailable, assign: options.assign ?? defaults.assign,
     enter: options.enter ?? defaults.enter, handBack: options.handBack ?? defaults.handBack };
-  const context: Context = { mode, env, owner, sources, clock, deps };
+  let entries = 0;
+  const context: Context = { mode, env, owner, sources, clock, deps, entered: () => { entries++; },
+    canEnter: () => entries < APP_TICKETS_MAX_ENTRIES && Date.now() + APP_TICKETS_ENTRY_MARGIN_MS <= deadlineMs };
   const decided: Record<string, number> = {};
   const count = (status: string) => { decided[status] = (decided[status] ?? 0) + 1; };
   let budget = APP_TICKETS_MAX_TICKETS, retried = 0;
@@ -311,6 +363,7 @@ export async function reconcileSavAppTickets(options: AppTicketsDeps = {}): Prom
     if (!budget || !timeLeft()) break;
     budget--; retried++;
     count(await decide(context, row.key.slice(row.key.lastIndexOf(":") + 1), undefined));
+    if (mode === "live" && !context.canEnter()) break;
   }
 
   const from = Math.max(state.floor, state.after - OVERLAP_MS);
@@ -333,7 +386,7 @@ export async function reconcileSavAppTickets(options: AppTicketsDeps = {}): Prom
   } catch {
     await finishPass(mode, leaseAt, state, "app_tickets_search_failed", 0, clock());
     console.warn("sav_v2_app_tickets", { mode, status: "search_failed" });
-    return { mode, status: "search_failed", found: 0, decided, retried, pages };
+    return withReleased({ mode, status: "search_failed", found: 0, decided, retried, pages });
   }
   tickets.sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
 
@@ -344,8 +397,11 @@ export async function reconcileSavAppTickets(options: AppTicketsDeps = {}): Prom
     if (known) { processedThrough = ticket.createdAt; continue; }
     if (!budget || !timeLeft()) { stopped = true; break; }
     budget--;
+    const outcome = await decide(context, ticket.id, ticket.createdAt);
+    count(outcome);
+    // Deferred: nothing was written for this ticket; the cursor stays before it, the next pass takes it.
+    if (outcome === "deferred") { stopped = true; break; }
     processedThrough = ticket.createdAt;
-    count(await decide(context, ticket.id, ticket.createdAt));
   }
   await requireDb().delete(savSyncState).where(and(sql`${savSyncState.key} like ${APP_TICKET_ROW_PREFIX + "%"}`,
     notInArray(savSyncState.status, [...PENDING]), lt(savSyncState.updatedAt, new Date(clock().getTime() - RETENTION_MS))))
@@ -357,8 +413,8 @@ export async function reconcileSavAppTickets(options: AppTicketsDeps = {}): Prom
   const total = Object.values(decided).reduce((sum, value) => sum + value, 0);
   await finishPass(mode, leaseAt, next, null, total, clock());
   const status = complete ? "ok" : "partial";
-  console.info("sav_v2_app_tickets", { mode, status, found: tickets.length, retried, pages, ...decided });
-  return { mode, status, found: tickets.length, decided, retried, pages };
+  console.info("sav_v2_app_tickets", { mode, status, found: tickets.length, retried, pages, released, ...decided });
+  return withReleased({ mode, status, found: tickets.length, decided, retried, pages });
 }
 
 /** Admin report (MCP `app_tickets_report`): the recorded decisions, no ticket content (ids, states, source type, gate, dates). */

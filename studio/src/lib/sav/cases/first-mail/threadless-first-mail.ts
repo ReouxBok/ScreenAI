@@ -23,7 +23,7 @@ import { pilotProvenanceGate, readPilotReplyProvenance, type PilotProvenanceDeps
 import { savV2NewThreadAutoEnabled, threadlessReplySubject } from "../threadless-config";
 import { threadlessInputKey } from "../threadless-provenance";
 import { threadlessRequestId, threadlessTicketPlainDescription, threadlessTicketSourceRef, type ThreadlessTicketSource } from "../threadless-source";
-import { smartFirstMailAutoProblem, threadlessAutoSendProblem } from "./first-mail-rights";
+import { smartFirstMailAutoProblem, smartFirstMailBlockProblem, smartFirstMailConfigProblem, threadlessAutoSendProblem } from "./first-mail-rights";
 import { appTicketReplySubject, appTicketSmartFirstMail } from "../app-tickets-config";
 import { SAV_SMART_ENTRY_FAMILY } from "../smart-entry-switch";
 import { smartSupportStampInForce } from "../smart-support-scope";
@@ -116,6 +116,15 @@ export async function composeThreadlessFirstMail(caseId: string, deps: Threadles
       const reason = reading.status !== "ready" ? `access_skill_${reading.reason}` : reading.verdict.outcome === "team" ? `access_skill_${reading.verdict.reasons[0]}` : "access_skill_not_access";
       await handToTeam(caseId, reason);
       return { status: "team", reason };
+    }
+  }
+
+  // Review 25/11: a smart first mail that could never leave automatically (no draft mode for app tickets) costs no model call: the ticket goes to the team now.
+  if (smart) {
+    const blocked = smartFirstMailConfigProblem(env, opened.admission) ?? await smartFirstMailBlockProblem(requireDb(), env);
+    if (blocked) {
+      await handToTeam(caseId, `smart_first_mail_${blocked}`.toLowerCase().replace(/[^a-z_]+/g, "_"));
+      return { status: "team", reason: blocked };
     }
   }
 

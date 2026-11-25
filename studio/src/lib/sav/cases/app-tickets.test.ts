@@ -3,10 +3,10 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { createSavTestDb } from "../../../../test/sav-db";
 import { savSyncState } from "@/db/schema";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
-import { appTicketCategoryGated, savAppTicketsMode, savAppTicketsSourceTypes } from "./app-tickets-config";
+import { APP_TICKET_DEFAULT_SUBJECT, appTicketCategoryGated, appTicketReplySubject, savAppTicketsMode, savAppTicketsSourceTypes } from "./app-tickets-config";
 import {
-  APP_TICKET_ROW_PREFIX, APP_TICKETS_MAX_ATTEMPTS, APP_TICKETS_MAX_PAGES, APP_TICKETS_MAX_TICKETS, appTicketRowKey, appTicketsCursorKey,
-  readSavAppTicketsReport, reconcileSavAppTickets, type AppTicketRead, type AppTicketsDeps,
+  APP_TICKET_ROW_PREFIX, APP_TICKETS_ENTRY_MARGIN_MS, APP_TICKETS_MAX_ATTEMPTS, APP_TICKETS_MAX_PAGES, APP_TICKETS_MAX_TICKETS, appTicketRowKey, appTicketsCursorKey,
+  appTicketsSearchBody, readSavAppTicketsReport, reconcileSavAppTickets, type AppTicketRead, type AppTicketsDeps,
 } from "./app-tickets";
 import type { ThreadlessEntryResult } from "./threadless-entry";
 
@@ -58,7 +58,7 @@ beforeAll(async () => {
 }, 60_000);
 beforeEach(() => {
   for (const [key, value] of Object.entries({ VERCEL_ENV: "production", SAV_APP_TICKETS_MODE: "shadow", SAV_V2_HUBSPOT_OWNER_ID: OWNER,
-    SAV_APP_TICKETS_SOURCE_TYPES: APP_SOURCE, HUBSPOT_ACCESS_TOKEN: "synthetic-token" })) vi.stubEnv(key, value);
+    SAV_APP_TICKETS_SOURCE_TYPES: APP_SOURCE, HUBSPOT_ACCESS_TOKEN: "synthetic-token", SAV_V2_ENTRY_SMART: "on" })) vi.stubEnv(key, value);
   vi.stubGlobal("fetch", vi.fn(async () => { throw Error("Unexpected external call"); }));
   vi.spyOn(console, "info").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -87,6 +87,16 @@ describe("configuration", () => {
   });
   it("never accepts EMAIL (V1's tickets) as an app source type", () => {
     expect(savAppTicketsSourceTypes({ SAV_APP_TICKETS_SOURCE_TYPES: " FORM , EMAIL,CHAT,bad value,FORM" })).toEqual(["FORM", "CHAT"]);
+  });
+  it("excludes V1's EMAIL tickets in the HubSpot search itself", () => {
+    expect(appTicketsSearchBody(0).filterGroups[0]!.filters).toContainEqual({ propertyName: "source_type", operator: "NEQ", value: "EMAIL" });
+  });
+  it("cuts the first mail's subject at 200 UTF-16 units between characters, never inside an emoji", () => {
+    const subject = appTicketReplySubject(`${"a".repeat(199)}😀 suite`);
+    expect(subject).toBe("a".repeat(199));
+    expect(subject).not.toMatch(/[\uD800-\uDFFF]/u);
+    expect(appTicketReplySubject(`Re: ${"é".repeat(198)}😀`)).toBe(`${"é".repeat(198)}😀`);
+    expect(appTicketReplySubject(" \u0000 ")).toBe(APP_TICKET_DEFAULT_SUBJECT);
   });
 });
 
@@ -160,14 +170,91 @@ describe("live", () => {
     expect(crm.assign).toHaveBeenCalledTimes(1); expect(crm.enter).toHaveBeenCalledTimes(1);
   });
 
-  it("takes a ticket once when two passes run at the same time", async () => {
+  it("takes a ticket once when two passes run at the same time: the second one, started during the first one's assignment, is refused", async () => {
+    const take = ticket(), later = ticket();
+    const crm = hubspot([take, later]);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let assigning!: () => void;
+    const started = new Promise<void>(resolve => { assigning = resolve; });
+    crm.assign.mockImplementationOnce(async (id: string, owner: string) => { assigning(); await gate; take.ownerId = owner; void id; });
+    const first = reconcileSavAppTickets(crm.deps);
+    await started;
+    // The first pass holds the lease and is inside its HubSpot assignment: a concurrent pass decides nothing.
+    expect(await reconcileSavAppTickets(crm.deps)).toEqual({ skipped: "leased" });
+    release();
+    expect(await first).toMatchObject({ mode: "live", decided: { taken: 1 } });
+    expect(crm.assign).toHaveBeenCalledExactlyOnceWith(take.id, OWNER);
+    expect(crm.enter).toHaveBeenCalledTimes(1);
+  });
+
+  it("assigns nothing while the smart entry is off: the ticket waits, unassigned (the smart brain writes an app ticket's first mail)", async () => {
+    vi.stubEnv("SAV_V2_ENTRY_SMART", "off");
+    const take = ticket();
+    const crm = hubspot([take]);
+    expect(await reconcileSavAppTickets(crm.deps)).toMatchObject({ decided: { waiting: 1 } });
+    expect(crm.assign).not.toHaveBeenCalled(); expect(crm.enter).not.toHaveBeenCalled();
+    expect(take.ownerId).toBeUndefined();
+    expect(await row("live", take.id)).toMatchObject({ status: "waiting", lastError: "entry_unavailable" });
+  });
+
+  it("enters at most one ticket per pass (one model call), the others at the next passes, never skipped", async () => {
     const tickets = [ticket(), ticket(), ticket()];
     const crm = hubspot(tickets);
-    const results = await Promise.all([reconcileSavAppTickets(crm.deps), reconcileSavAppTickets(crm.deps)]);
-    expect(results.filter(result => "skipped" in result && result.skipped === "leased").length + results.filter(result => "mode" in result).length).toBe(2);
-    expect(crm.assign).toHaveBeenCalledTimes(3);
-    expect(new Set(crm.assign.mock.calls.map(call => call[0]))).toEqual(new Set(tickets.map(item => item.id)));
+    expect(await reconcileSavAppTickets(crm.deps)).toMatchObject({ status: "partial", decided: { taken: 1, deferred: 1 } });
+    expect(crm.assign).toHaveBeenCalledTimes(1); expect(crm.enter).toHaveBeenCalledTimes(1);
+    await reconcileSavAppTickets(crm.deps);
+    await reconcileSavAppTickets(crm.deps);
     expect(crm.enter).toHaveBeenCalledTimes(3);
+    expect(new Set(crm.assign.mock.calls.map(call => call[0]))).toEqual(new Set(tickets.map(item => item.id)));
+  });
+
+  it("neither assigns nor enters without 100 s left before the deadline; the ticket is taken at a later pass", async () => {
+    const take = ticket();
+    const crm = hubspot([take]);
+    expect(await reconcileSavAppTickets({ ...crm.deps, deadlineMs: Date.now() + APP_TICKETS_ENTRY_MARGIN_MS - 10_000 })).toMatchObject({ decided: { deferred: 1 } });
+    expect(crm.assign).not.toHaveBeenCalled(); expect(crm.enter).not.toHaveBeenCalled();
+    expect(await row("live", take.id)).toBeNull();
+    expect(await reconcileSavAppTickets(crm.deps)).toMatchObject({ decided: { taken: 1 } });
+    expect(crm.assign).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["shadow", "off"] as const)("switched from live to %s: a ticket left assigned is handed back to the team once, and shows in the report", async mode => {
+    const take = ticket();
+    const crm = hubspot([take]);
+    crm.enter.mockResolvedValue({ status: "unavailable" });
+    await reconcileSavAppTickets(crm.deps);
+    expect(await row("live", take.id)).toMatchObject({ status: "assigned" });
+    vi.stubEnv("SAV_APP_TICKETS_MODE", mode === "off" ? "" : mode);
+    expect(await reconcileSavAppTickets(crm.deps)).toMatchObject({ released: 1 });
+    expect(crm.handBack).toHaveBeenCalledTimes(1);
+    expect(crm.handBack.mock.calls[0]![1]).toBe(`app_ticket_mode_${mode}`);
+    expect(await row("live", take.id)).toMatchObject({ status: "handed_back" });
+    await reconcileSavAppTickets(crm.deps);
+    expect(crm.handBack).toHaveBeenCalledTimes(1);
+    expect(crm.enter).toHaveBeenCalledTimes(1);
+    const report = await readSavAppTicketsReport({ mode: "live", limit: 10 });
+    expect(report.tickets).toContainEqual(expect.objectContaining({ ticketId: take.id, decision: "handed_back", entry: `mode_${mode}>human_wait` }));
+  });
+
+  it("off with no live row left: no HubSpot call, nothing written", async () => {
+    vi.stubEnv("SAV_APP_TICKETS_MODE", "");
+    const crm = hubspot([ticket()]);
+    expect(await reconcileSavAppTickets(crm.deps)).toEqual({ skipped: "off" });
+    for (const port of [crm.search, crm.readTicket, crm.assign, crm.enter, crm.handBack]) expect(port).not.toHaveBeenCalled();
+    expect(await allRows()).toEqual([]);
+  });
+
+  it("our own assignment on a ticket that turned billing meanwhile: handed back to the team once, never entered", async () => {
+    const take = ticket();
+    const crm = hubspot([take]);
+    crm.assign.mockImplementationOnce(async (id: string, owner: string) => { take.ownerId = owner; throw Error(`synthetic timeout ${id}`); });
+    await reconcileSavAppTickets(crm.deps);
+    take.categories = billing;
+    expect(await reconcileSavAppTickets(crm.deps)).toMatchObject({ retried: 1, decided: { handed_back: 1 } });
+    expect(crm.handBack).toHaveBeenCalledTimes(1);
+    expect(crm.handBack.mock.calls[0]![1]).toBe("app_ticket_team_category");
+    expect(crm.enter).not.toHaveBeenCalled();
   });
 
   it("never touches a billing or cancellation ticket: no owner change, no entry (no model), no hand-back (no Slack, no mail)", async () => {
@@ -225,20 +312,21 @@ describe("live", () => {
     expect(crm.assign).toHaveBeenCalledTimes(1);
   });
 
-  it("reads at most two search pages and decides at most the per-pass bound, then resumes from the cursor", async () => {
+  it("shadow reads at most two search pages and decides at most the per-pass bound, then resumes from the cursor", async () => {
+    vi.stubEnv("SAV_APP_TICKETS_MODE", "shadow");
     const base = Date.now() - 30 * 60_000;
     const tickets = Array.from({ length: 250 }, (_, index) => ticket({ createdAt: base + index * 1_000 }));
     const crm = hubspot(tickets, { fullPages: true });
     const first = await reconcileSavAppTickets(crm.deps);
     expect(crm.search).toHaveBeenCalledTimes(APP_TICKETS_MAX_PAGES);
-    expect(first).toMatchObject({ status: "partial" });
+    expect(first).toMatchObject({ status: "partial", decided: { would_take: APP_TICKETS_MAX_TICKETS } });
     expect(crm.readTicket).toHaveBeenCalledTimes(APP_TICKETS_MAX_TICKETS);
-    expect(crm.assign).toHaveBeenCalledTimes(APP_TICKETS_MAX_TICKETS);
-    const [cursor] = await database.db.select().from(savSyncState).where(eq(savSyncState.key, appTicketsCursorKey("live")));
+    const [cursor] = await database.db.select().from(savSyncState).where(eq(savSyncState.key, appTicketsCursorKey("shadow")));
     expect(JSON.parse(cursor!.cursor!).after).toBe(tickets[APP_TICKETS_MAX_TICKETS - 1]!.createdAt);
     await reconcileSavAppTickets(crm.deps);
-    expect(crm.assign).toHaveBeenCalledTimes(2 * APP_TICKETS_MAX_TICKETS);
-    expect(new Set(crm.assign.mock.calls.map(call => call[0])).size).toBe(2 * APP_TICKETS_MAX_TICKETS);
+    expect(crm.readTicket).toHaveBeenCalledTimes(2 * APP_TICKETS_MAX_TICKETS);
+    expect(new Set(crm.readTicket.mock.calls.map(call => call[0])).size).toBe(2 * APP_TICKETS_MAX_TICKETS);
+    expect(crm.assign).not.toHaveBeenCalled();
   });
 
   it("never looks before its own floor: tickets older than the lookback are not searched", async () => {

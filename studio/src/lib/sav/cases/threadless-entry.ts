@@ -8,10 +8,10 @@ import { submitCaseReplyProposal } from "./case-reply-store";
 import { hasLocalThreadForTicket, openCaseFromHubspotTicket, readCase, readCaseThreadlessSource } from "./case-store";
 import { isSmartSupportProvenance, SAV_SMART_NO_THREAD_WAIT, type CaseSnapshot } from "./case-types";
 import { composeThreadlessFirstMail, handThreadlessFirstMailToTeam, type ThreadlessFirstMailResult } from "./first-mail/threadless-first-mail";
-import { appTicketSmartFirstMail } from "./app-tickets-config";
+import { appTicketCategoryGated, appTicketSmartFirstMail, isAppTicketTransition } from "./app-tickets-config";
 import { savV2NewThreadAutoEnabled, savV2NewThreadEnabled, THREADLESS_ACCESS_DRAFT, THREADLESS_ADMIT_PERMISSION, threadlessReplySubject } from "./threadless-config";
 import { readThreadlessAuthority, threadlessAccessRevision, threadlessActionAllowed, threadlessAuthorityStillGranted, threadlessSchemaInstalled } from "./threadless-guard";
-import { qualifyThreadlessTicket, readThreadlessTicket, type ThreadlessTicketSource } from "./threadless-source";
+import { qualifyThreadlessTicket, readThreadlessTicket, type ThreadlessTicketQualification, type ThreadlessTicketSource } from "./threadless-source";
 
 type Input = { ticketId: string; ownerTransitionKey: string; observedAt: string };
 export type ThreadlessEntryResult =
@@ -50,11 +50,17 @@ async function start(input: Input, env: NodeJS.ProcessEnv, options: EntryOptions
   const read = await readThreadlessTicket(input.ticketId, env);
   if (read.status !== "ready" && read.status !== "human_wait") return { status: read.status };
   // SAV-96 B: under SAV-97 `on`, the entry is the one place that may pay for the skill's reading of the ticket; every later check reads it.
-  const qualification = await qualifyThreadlessTicket(read.source, env, new Date(), { accessSkillCompute: true });
+  // SAV-138 (Ugo 25/11): an app ticket (its key's marker) is the smart brain's or the team's, never the Access path's: not live or smart entry off, or its
+  // category turned billing or cancellation since the search (read again here), it goes to the team with no qualification paid and no model.
+  const appTicket = isAppTicketTransition(input.ownerTransitionKey);
+  const appRefusal = !appTicket ? null : appTicketCategoryGated(read.source.categories) ? "sensitive_request"
+    : !appTicketSmartFirstMail(env, input.ownerTransitionKey) ? "app_ticket_not_smart" : null;
+  const qualification: ThreadlessTicketQualification = appRefusal ? { status: "human_wait", reason: appRefusal }
+    : await qualifyThreadlessTicket(read.source, env, new Date(), { accessSkillCompute: true });
   // SAV-123 (N8): a ticket the smart entry admits with no mail thread goes to the team (`smart_no_thread`): the first mail of a ticket is not the smart brain's.
   const smartTicket = qualification.status === "admitted" && qualification.admission.qualification.requests.some(request => isSmartSupportProvenance(request.provenance));
-  // SAV-138 (Ugo 25/11): an app ticket the app-tickets pass assigned (its key's marker), mode `live`: the smart brain writes its first mail (no `smart_no_thread`).
-  const appSmart = smartTicket && appTicketSmartFirstMail(env, input.ownerTransitionKey);
+  // SAV-138: an app ticket, mode `live`, smart entry on: the smart brain writes its first mail (no `smart_no_thread`). Admitted otherwise: still the team's.
+  const appSmart = appTicket && smartTicket;
   const revision = qualification.status === "admitted" && !smartTicket ? await threadlessAccessRevision(env, db) : null;
 
   // SAV-99 (Ugo 19/11): a person gave this ticket to the agent. When the agent does not take it (not an Access request by its content, no rule,
@@ -63,7 +69,7 @@ async function start(input: Input, env: NodeJS.ProcessEnv, options: EntryOptions
   const waitReason = qualification.status === "human_wait"
     ? qualification.reason === "identity_unconfirmed" && read.status === "human_wait" ? read.reason : qualification.reason
     : qualification.status === "out_of_scope" ? threadlessWaitReason(qualification.reason)
-      : smartTicket ? appSmart ? undefined : SAV_SMART_NO_THREAD_WAIT : !revision ? "access_block_closed" : undefined;
+      : smartTicket ? appSmart ? undefined : SAV_SMART_NO_THREAD_WAIT : appTicket ? "app_ticket_not_smart" : !revision ? "access_block_closed" : undefined;
   const opened = await openCaseFromHubspotTicket({
     source: read.source, ownerTransitionKey: input.ownerTransitionKey, observedAt: input.observedAt, env,
     assertFresh: tx => threadlessAuthorityStillGranted(tx, authority, THREADLESS_ADMIT_PERMISSION),
@@ -74,6 +80,7 @@ async function start(input: Input, env: NodeJS.ProcessEnv, options: EntryOptions
   const snapshot = opened.case;
   if (waitReason && opened.status === "created") return { status: "human_wait", caseId: snapshot.caseId, reason: waitReason };
   if (appSmart) return smartAppFirstMail(input, env, snapshot, read.source, options);
+  if (appTicket) return { status: "existing_case" };
   if (snapshot.owner !== "agent" || !revision || !read.source.contact) return { status: "existing_case" };
 
   // A retry after the case transaction can restore the same draft from the same immutable event.
