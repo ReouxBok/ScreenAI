@@ -111,7 +111,7 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
     // SAV-123 (N8): a smart case is decided without a pilot scope while the smart entry is on (read at each run).
     smartSupport: () => savV2EntrySmartOn(input.env()),
     // SAV-97: `SAV_V2_ACCESS_SKILL=on` requalifies a return with the Access skill, `shadow` compares it in the logs; `off`: exactly the legacy rule, or none.
-    qualify: caseInvestigationReturnAwareQualify(v1Qualify, { readPolicyRecord, now, ...((rules => rules ? { returnRules: rules } : {})(
+    qualify: caseInvestigationReturnAwareQualify(v1Qualify, { readPolicyRecord, now, smartSupport: () => savV2EntrySmartOn(input.env()), ...((rules => rules ? { returnRules: rules } : {})(
       caseReturnRulesForAccessSkill(input.env, now, input.returnRule ? caseReturnContentRule(input.returnRule, now) : undefined))) }),
     customerTexts: caseCustomerTextsReader(),
     // SAV-92: the customer's mails and V1's CRM snapshot, read only from the database (no HubSpot call), masked and bounded.

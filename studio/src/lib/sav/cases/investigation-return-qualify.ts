@@ -7,7 +7,7 @@ import { splitSavMessageText } from "../message-context";
 import { savOutsidePersonalAccessScope, savPersonalAccessIntent } from "../request-retrieval";
 import { admissionPolicyPort, type AdmissionPolicyRecord } from "./admission-runtime";
 import { readCaseThreadlessSource } from "./case-store";
-import { SAV_CASE_SENSITIVE_FAMILIES, type CaseAdmissionQualification, type CaseEvent, type CaseRequestFamily, type CaseSnapshot } from "./case-types";
+import { SAV_CASE_SENSITIVE_FAMILIES, smartSupportProvenance, type CaseAdmissionQualification, type CaseEvent, type CaseRequestFamily, type CaseSnapshot } from "./case-types";
 import { relayQualification } from "./intake-boundary";
 import { SAV_CASE_LOGIN_INFINITIVE, SAV_CASE_SENSITIVE_WORDS } from "./sensitive-words";
 import { loginCustomerStatement, reportsOngoingLoginFailure, reportsRestoredAccess } from "./restored-access";
@@ -15,6 +15,7 @@ import { caseLatestCustomerMail } from "./investigation-runner";
 import type { CaseInvestigationStoreDeps } from "./investigation-store-ports";
 import { CaseQualificationUnavailableError, type CaseQualificationCauseCode } from "./qualification-diagnostic";
 import { threadlessReplySubject } from "./threadless-config";
+import { caseSmartSupportOpen } from "./smart-support-scope";
 
 /*
  * V2 customer return (contract A-B, 4/11), LOCAL and OFF: a mail V2 consumed on an open case BEFORE V1 has, by construction, no V1 decision.
@@ -34,6 +35,8 @@ export type CaseReturnQualifyDeps = Readonly<{
   now(): Date;
   /** Approved return rules. Absent (production today): hints only, so nobody is admitted on a return and the case goes to the team. */
   returnRules?: CaseReturnRulePort;
+  /** `SAV_V2_ENTRY_SMART=on`, read at each return (the factory's `savV2EntrySmartOn`). Absent or false: the return is qualified exactly as before. */
+  smartSupport?(): boolean;
 }>;
 
 const sensitive = (family: string) => (SAV_CASE_SENSITIVE_FAMILIES as readonly string[]).includes(family);
@@ -107,6 +110,8 @@ export function caseInvestigationReturnAwareQualify(v1Qualify: CaseInvestigation
     // The return continues the case's open requests; its own words decide their families again. A model hint never admits.
     const open = snapshot.body.openRequests.filter(row => row.status === "open").map(row => ({ requestId: row.id, family: row.family as CaseRequestFamily }));
     if (!open.length) return null;
+    // Smart return (25/11): a case the smart entry admitted, switch on, read BEFORE this return changes anything.
+    const smart = deps.smartSupport?.() === true && caseSmartSupportOpen(snapshot);
     const hints: CaseAdmissionQualification = { requests: open.map(row => ({ requestId: row.requestId, family: row.family, provenance: { kind: "intake_hint", source: event.sourceRef } })),
       identity, crmContext, teamSignals: [] };
     let qualification = hints;
@@ -124,6 +129,12 @@ export function caseInvestigationReturnAwareQualify(v1Qualify: CaseInvestigation
       } catch { throw refuse("rule_invalid"); }
       // A sensitive family the rules found stays, whatever the earlier access request was.
       qualification = { ...qualification, requests: qualification.requests.filter(row => row.provenance.kind === "qualified_rule" || sensitive(row.family) || !ruled.some(r => r.requestId === row.requestId)) };
+    }
+    // Smart return: the rules above still run, and a sensitive family they name stays (the case goes to the team). Otherwise every open request keeps
+    // the smart entry's provenance, dated from this mail, so the case stays smart-admitted and the smart brain reads the return (it judges sensitivity again).
+    if (smart && !qualification.requests.some(row => sensitive(row.family))) {
+      const at = new Date(Date.parse(event.occurredAt)).toISOString();
+      qualification = { ...qualification, requests: open.map(row => ({ requestId: row.requestId, family: row.family, provenance: smartSupportProvenance(at) })) };
     }
     let policy: unknown;
     try { policy = await policyPort(); } catch { throw refuse("policy_unavailable"); }
