@@ -38,7 +38,13 @@ export type SmartSource = Readonly<{
   needIds: readonly string[];
   /** A temporary card (an ongoing bug, a time-limited message) ends this day (YYYY-MM-DD). */
   validUntil?: string | null;
+  /** Kept by the lexical recall only (`knowledge_lexical_recall`): shown to the model as low relevance, to verify before citing. */
+  lowRelevance?: boolean;
 }>;
+/** What the model reads on a card the lexical recall kept (data on the card, never a change of the prompts). */
+export const SMART_LOW_RELEVANCE_NOTE = "faible : fiche retrouvée seulement par des mots du mail, pas par le sens. Vérifie qu'elle répond vraiment au besoin avant de la citer ; sinon ne la cite pas.";
+/** The model's view of a card's relevance: the note on a low-relevance card, nothing otherwise (every other card is shown as before). */
+export const smartRelevanceView = (card: Pick<SmartSource, "lowRelevance">) => card.lowRelevance ? { pertinence: SMART_LOW_RELEVANCE_NOTE } : {};
 export type SmartCheckInput = Readonly<{
   decision: SmartDecision; reading: SmartReading;
   /** SAV-122 (PORTE 2E, P1): the instruction the reading found in the mail (`reading.instructionText` by default). */
@@ -384,7 +390,14 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   const { urls, domains } = linksOf(reply);
   // 25/11 (owner: customers MUST get links): an official Limova site named by its home page (« https://new.limova.ai », « academy.limova.ai ») is always allowed.
   // A deeper page still has to be written in a card given for the mail, a resource or an Academy result: an invented page is never sent.
-  const officialRoot = (url: string) => { const key = exactKey(url); return key !== null && SMART_OFFICIAL_LIMOVA_HOSTS.has(key); };
+  // https only, no user, port, query or fragment, the exact host (a lookalike « limova.ai.exemple.invalid » is another host), the home page only.
+  const officialRoot = (url: string) => {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === "https:" && !parsed.username && !parsed.password && !parsed.port && !parsed.search && !parsed.hash && !/[?#]/.test(url)
+        && (parsed.pathname === "/" || parsed.pathname === "") && SMART_OFFICIAL_LIMOVA_HOSTS.has(parsed.hostname.toLowerCase().replace(/^www\./, ""));
+    } catch { return false; }
+  };
   const linkAllowed = (url: string) => allowedUrls.some(allowed => url.toLowerCase() === allowed || url.toLowerCase().startsWith(`${allowed.replace(/\/$/, "")}/`))
     || academyKeys.has(exactKey(url) ?? "") || officialRoot(url);
   // The refused links are NAMED to the correction (`factProblems`), so it removes those and keeps every allowed link. Before, it got the code alone and

@@ -3,9 +3,11 @@ import type { SavRetrievalBackend, SavRetrievalCandidate } from "../../request-r
 import { caseReplyHelpLine, prepareCaseReplyText } from "../case-reply-outbound";
 import type { CaseRequestSubject, CaseSnapshot } from "../case-types";
 import { SAV_CASE_LEXICAL_RECALL, selectCaseKnowledge } from "../investigation-knowledge";
-import { smartServerChecks } from "./smart-checks";
+import { runSmartTurn } from "./smart-agent";
+import { smartCaseKnowledge } from "./smart-case-provider";
+import { smartRelevanceView, smartServerChecks, SMART_LOW_RELEVANCE_NOTE } from "./smart-checks";
 import { smartDecisionSchema, smartReadingSchema } from "./smart-contract";
-import { SMART_GOOD_REPLY, SMART_TEST_CARD, smartGoodDecision, smartReading } from "./smart-test-doubles";
+import { SMART_GOOD_REPLY, SMART_TEST_CARD, smartGoodDecision, smartReading, smartScriptedModel, smartStaticKnowledge } from "./smart-test-doubles";
 
 /*
  * The three production quality bugs of 25/11 (Agent SAV live), on fictional data only.
@@ -36,14 +38,13 @@ const backend = (cards: SavRetrievalCandidate[]): SavRetrievalBackend => ({ read
 const scope = (lexicalRecall?: boolean) => ({ locale: "fr-FR", audience: "support" as const, now: NOW, customerWords: WORDS, ...(lexicalRecall ? { lexicalRecall } : {}) });
 
 describe("1. recall: the customer's words alone, every vector score under the floor", () => {
-  it("the smart brain's case keeps the cards whose title holds the words (LinkedIn, posts), never the off-topic one", async () => {
+  it("the smart brain's case keeps the cards holding two of the words, one in the title (LinkedIn messages, programmer posts), never a one-word or off-topic card", async () => {
     const read = await selectCaseKnowledge(snap(NO_SUBJECT), backend(LINKEDIN_CARDS), scope(true));
     if (read.status !== "ready") throw Error("expected ready");
     const [coverage] = read.selection.coverage;
     expect(coverage).toMatchObject({ status: "covered" });
-    expect(coverage!.knowledge).toHaveLength(3);
-    expect(coverage!.knowledge.map(ref => ref.knowledgeId)).not.toContain("k-imap");
-    expect(coverage!.knowledge.map(ref => ref.knowledgeId)).toEqual(expect.arrayContaining(["k-prospection", "k-automatisation"]));
+    // « LinkedIn » + « messages » and « post » + « programmer »; the cards sharing only « LinkedIn » or « post » with the mail are not recalled (review of e617a17f).
+    expect(coverage!.knowledge.map(ref => ref.knowledgeId)).toEqual(["k-prospection", "k-automatisation"]);
     expect(coverage!.limitations).toEqual(expect.arrayContaining(["customer_words_searched", SAV_CASE_LEXICAL_RECALL]));
     expect(read.selection.cards.map(row => row.id)).toEqual(coverage!.knowledge.map(ref => ref.knowledgeId));
   });
@@ -66,6 +67,36 @@ describe("1. recall: the customer's words alone, every vector score under the fl
   });
 });
 
+describe("1 bis. review of e617a17f: one shared word of a long mail never recalls a card; the brain reads recalled cards as low relevance", () => {
+  it("« je n'arrive pas à connecter mon compte » (three content words) does not recall « Connecter LinkedIn pour prospecter ou publier »", async () => {
+    const mail = "Bonjour, je n'arrive pas à connecter mon compte depuis hier soir, merci de votre aide.";
+    const read = await selectCaseKnowledge(snap(NO_SUBJECT), backend(LINKEDIN_CARDS), { ...scope(true), customerWords: mail });
+    if (read.status !== "ready") throw Error("expected ready");
+    expect(read.selection.coverage[0]).toMatchObject({ status: "no_applicable_knowledge", knowledge: [] });
+  });
+  it("the recalled cards reach the model with the low-relevance note; the circuit's other cards are shown as before", async () => {
+    const read = await selectCaseKnowledge(snap(NO_SUBJECT), backend(LINKEDIN_CARDS), scope(true));
+    if (read.status !== "ready") throw Error("expected ready");
+    const other = card("k-autre", "Fiche retrouvée par le sens", 0.9);
+    const port = smartCaseKnowledge({ knowledge: [...read.selection.cards, other], coverage: read.selection.coverage });
+    const found = await port([{ id: "n1", ask: "Programmer des posts LinkedIn", alreadyDone: [], theme: null, search: "LinkedIn programmer posts" }]);
+    expect(found.codes).toEqual(["circuit_cards", "lexical_recall"]);
+    expect(found.sources.filter(source => source.lowRelevance).map(source => source.cardId)).toEqual(["k-prospection", "k-automatisation"]);
+    expect(smartRelevanceView(found.sources.find(source => source.cardId === "k-prospection")!)).toEqual({ pertinence: SMART_LOW_RELEVANCE_NOTE });
+    expect(smartRelevanceView(found.sources.find(source => source.cardId === "k-autre")!)).toEqual({});
+    expect(SMART_LOW_RELEVANCE_NOTE).toContain("avant de la citer");
+  });
+  it("the model's payload carries the note on the recalled card only (decide call of a real turn on scripted doubles)", async () => {
+    const low = { ...SMART_TEST_CARD, lowRelevance: true }, plain = { ...SMART_TEST_CARD, cardId: "fiche-autre", title: "Autre fiche" };
+    const scripted = smartScriptedModel({ understand: { output: smartReading() }, decide: { output: smartGoodDecision() }, verify: { output: { verdict: "conforme", problems: [] } } });
+    await runSmartTurn({ subject: "Connexion", body: "Je n'arrive pas à me connecter.", thread: [] },
+      { model: scripted.model, knowledge: smartStaticKnowledge([low, plain]), maxInputBytes: 200_000, today: "2026-11-25" });
+    const decide = JSON.stringify(scripted.calls.find(call => call.kind === "decide")!.payload);
+    expect(decide).toContain("fiche-autre");
+    expect(decide.split(SMART_LOW_RELEVANCE_NOTE).length - 1).toBe(1);
+  });
+});
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // 2. Links: the official Academy link of the cited card is kept; a refused link is named so the correction removes only it
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -84,6 +115,11 @@ describe("2. links: official Limova links kept, every other link refused and nam
     expect(checks(`${SMART_GOOD_REPLY} Guide : **https://bienvenue.limova.ai/guides/connexion**`, [card]).codes).toEqual([]);
     for (const link of ["https://new.limova.ai", "new.limova.ai", "https://new.limova.ai/", "https://limova.ai"])
       expect(checks(`${SMART_GOOD_REPLY} Connectez-vous sur ${link}.`, [SMART_TEST_CARD]).codes, link).toEqual([]);
+  });
+  it("the home-page allowance needs https, the exact host and no query or fragment: http, lookalikes and parameters stay refused", () => {
+    for (const link of ["http://new.limova.ai", "http://limova.ai/", "https://new.limova.ai.exemple.invalid", "https://limova.ai.exemple.invalid/", "https://exemple-limova.ai",
+      "https://new.limova.ai/?redirect=https://exemple.invalid", "https://limova.ai/#connexion", "https://new.limova.ai:8443/", "https://user@new.limova.ai/"])
+      expect(checks(`${SMART_GOOD_REPLY} Connectez-vous sur ${link} .`, [SMART_TEST_CARD]).codes, link).toEqual(["link_not_allowed"]);
   });
   it("an invented page on an official host and any other site stay refused, and each refused link is named for the correction", () => {
     const result = checks(`${SMART_GOOD_REPLY} Guide : https://academy.limova.ai/integrations/nylas puis https://new.limova.ai/page-inventee et https://hebergeur.exemple.invalid/imap`, [SMART_TEST_CARD]);
