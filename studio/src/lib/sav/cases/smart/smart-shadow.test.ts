@@ -16,6 +16,7 @@ import { accessSkillWireAnswer } from "../access-skill/access-skill-wire";
 import type { SmartKnowledgePort } from "./smart-agent";
 import { readSmartLedger } from "./smart-ledger";
 import type { SmartEmbedPort } from "./smart-model";
+import { SAV_SMART_COMMERCIAL_PROMPT_SHA256, SAV_SMART_PROMPT_SHA256 } from "./smart-prompt";
 import { aggregateSmartShadow, readSmartShadowGates, readSmartShadowRows, runSmartShadowPass, SAV_SMART_SHADOW_PREFIX, smartShadowItem, smartV1Gate, type SmartShadowStored } from "./smart-shadow";
 import { SMART_CONFORME, SMART_TEST_CARD, smartGoodDecision, smartReading } from "./smart-test-doubles";
 
@@ -196,6 +197,20 @@ describe("porte V1 (SAV-116) : seul le « support » de V1 va au modèle", () =>
     const [row] = await readSmartShadowRows();
     expect(row).toMatchObject({ v1Gate: "support" });
     expect(typeof row!.durationMs).toBe("number");
+  });
+  it("SAV_V2_SMART_COMMERCIAL_SPLIT : éteint, l'empreinte de la v21 ; « on », les prompts commerciaux et leur empreinte figée", async () => {
+    await v1Mail({ kinds: ["support"] });
+    const systems: string[] = [], off = network();
+    await pass(ENV(), { calls: off.calls, fn: async (url, init) => { systems.push(JSON.parse(String(init.body)).systemInstruction?.parts[0].text ?? ""); return off.fn(url, init); } });
+    expect((await readSmartShadowRows())[0]!.promptSha256).toBe(SAV_SMART_PROMPT_SHA256);
+    expect(systems.filter(text => text.includes("QUESTION COMMERCIALE"))).toHaveLength(0);
+    await clearShadow();
+    await v1Mail({ kinds: ["support"] });
+    const on = network();
+    systems.length = 0;
+    await pass(ENV({ SAV_V2_SMART_COMMERCIAL_SPLIT: "on" }), { calls: on.calls, fn: async (url, init) => { systems.push(JSON.parse(String(init.body)).systemInstruction?.parts[0].text ?? ""); return on.fn(url, init); } });
+    expect((await readSmartShadowRows())[0]!.promptSha256).toBe(SAV_SMART_COMMERCIAL_PROMPT_SHA256);
+    expect(systems.filter(text => text.includes("QUESTION COMMERCIALE"))).toHaveLength(1);
   });
   it("résiliation + support : team/cancellation, aucun appel, ni quota ni argent ; compté une seule fois sur deux passes", async () => {
     await v1Mail({ kinds: ["support", "cancellation"], classification: "mixed" });

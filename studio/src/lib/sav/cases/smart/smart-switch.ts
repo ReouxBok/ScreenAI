@@ -34,6 +34,17 @@ function integer(env: Env, name: string, fallback: number, min: number, max: num
 
 export const smartAgentShadowOn = (env: Env) => env[SAV_SMART_AGENT_ENV] === "shadow";
 
+/*
+ * Ugo, 25/11: « quelle offre me convient ? » and « une démo ? » are commercial (pre-sales) questions, not a sensitive subscription topic. With
+ * `SAV_V2_SMART_COMMERCIAL_SPLIT=on` (exactly), the reading may mark such a need `commercial` (the model's judgement, never a word list): it is not
+ * searched nor answered, it is handed to the team with « Demande commerciale (choix d'offre / démo) → Sacha » in the note, and the other needs are
+ * handled as usual. Paying, buying, changing, renewing or cancelling a subscription, invoices, refunds and billing stay sensitive (whole mail to the
+ * team). Absent, empty or any other value: off, the prompts, the reading and every result are the ones of today.
+ */
+export const SAV_SMART_COMMERCIAL_SPLIT_ENV = "SAV_V2_SMART_COMMERCIAL_SPLIT";
+/** The prompt set and the turn's port for the switch: `{ commercialSplit: true }` when on, `{}` when off (spread as is: off adds nothing). */
+export const smartCommercialSet = (env: Env): Readonly<{ commercialSplit?: true }> => env[SAV_SMART_COMMERCIAL_SPLIT_ENV] === "on" ? { commercialSplit: true } : {};
+
 export function readSmartShadowConfig(env: Env): SmartShadowConfig {
   if (!smartAgentShadowOn(env)) return { mode: "off" };
   const capMicroUsdPerDay = integer(env, SAV_SMART_SHADOW_CAP_ENV, SAV_SMART_SHADOW_MAX_CAP_MICRO_USD, 1, SAV_SMART_SHADOW_MAX_CAP_MICRO_USD);

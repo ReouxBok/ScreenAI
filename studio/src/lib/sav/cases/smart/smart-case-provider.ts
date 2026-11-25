@@ -11,6 +11,7 @@ import type { SmartSource } from "./smart-checks";
 import type { SmartFact, SmartTeamNote } from "./smart-contract";
 import { smartEmptyMemory, type SmartCaseMemory } from "./smart-memory";
 import type { SmartModelPort } from "./smart-model";
+import { smartCommercialSet } from "./smart-switch";
 import { buildSmartCaseTrace, traceSmartKnowledge, type SmartCaseTraceSink, type SmartTraceSearch } from "./smart-trace";
 
 /*
@@ -235,7 +236,7 @@ export function smartCaseDecisionProvider(deps: SmartCaseProviderDeps): CaseV2Mo
     const result = await runSmartTurn(input, {
       model: smartModelWithFeedback(deps.model, request.feedback), knowledge: deps.trace ? traceSmartKnowledge(smartCaseKnowledge(request), searches) : smartCaseKnowledge(request), maxInputBytes: cap,
       today: deps.now().toISOString().slice(0, 10), recordOwn: true, ...(deps.academy ? { academy: deps.academy } : {}), ...(deps.maxExchanges ? { maxExchanges: deps.maxExchanges } : {}),
-      ...(files?.turn ? { attachments: files.turn } : {}),
+      ...(files?.turn ? { attachments: files.turn } : {}), ...smartCommercialSet(deps.env()),
     });
     deps.observe?.(result);
     const usage = smartTurnUsage(result), proposal = smartProposalFromTurn(result, request);

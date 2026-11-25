@@ -57,6 +57,11 @@ export const smartNeedSchema = z.object({
   theme: clippedNullable(80).default(null),
   /** The words to search the cards with; null when nothing is searchable. */
   search: clippedNullable(300).default(null),
+  /**
+   * 25/11 (`SAV_V2_SMART_COMMERCIAL_SPLIT`): a pre-sales question (which plan suits me, a demo), asked of the reading only when the switch is on.
+   * Only a JSON `true` counts; absent unless the model writes it, and dropped by the agent when the switch is off.
+   */
+  commercial: z.boolean().optional().catch(undefined),
 });
 export type SmartNeed = z.infer<typeof smartNeedSchema>;
 

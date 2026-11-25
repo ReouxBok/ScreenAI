@@ -7,6 +7,7 @@ import { SAV_RETRIEVAL_EMBEDDING_DIMENSION } from "../../request-retrieval-db";
 import { SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
 import { runSmartTurn, type SmartKnowledgePort, type SmartTurnResult } from "./smart-agent";
 import { smartMaxExchanges } from "./smart-memory";
+import { smartCommercialSet } from "./smart-switch";
 import { getAcademyTools } from "./tools/academy";
 import { SAV_SMART_CONTRACT_REVISION } from "./smart-contract";
 import { smartDbKnowledge } from "./smart-knowledge";
@@ -146,7 +147,7 @@ async function runSmartReplayPassUnsafe(deps: SmartReplayDeps, config: Exclude<S
   const finish = async (ran: number, stoppedBy: Extract<SmartReplayPass, { ran: number }>["stoppedBy"]) => {
     const ledger = await readSmartLedger(prefix, scope);
     const pass = { ran, stoppedBy, outcomes, skippedMails, discardedByV1, runMails: ledger.items, spentRunMicroUsd: smartLedgerSpent(ledger) };
-    log("sav_smart_shadow_replay_pass", { ...pass, runId: config.runId, revision: SAV_SMART_PROMPT_REVISION, promptSha256: smartPromptSha256().slice(0, 16), model });
+    log("sav_smart_shadow_replay_pass", { ...pass, runId: config.runId, revision: SAV_SMART_PROMPT_REVISION, promptSha256: smartPromptSha256(smartCommercialSet(env)).slice(0, 16), model });
     return pass;
   };
   // A finished run (mails or money) reads no mail at all.
@@ -203,13 +204,13 @@ async function runSmartReplayPassUnsafe(deps: SmartReplayDeps, config: Exclude<S
     try {
       turn = await runSmartTurn({ subject: mail.subject, body: mail.body, thread: mail.thread },
         { model: modelPort, knowledge: (deps.knowledge ?? (embed => smartDbKnowledge({ now: deps.now, embed })))(embedPort), maxInputBytes: cap, today: day,
-          academy: deps.academy ?? getAcademyTools(), recordOwn: false, maxExchanges: smartMaxExchanges(env) });
+          academy: deps.academy ?? getAcademyTools(), recordOwn: false, maxExchanges: smartMaxExchanges(env), ...smartCommercialSet(env) });
     } catch {
       await settleSmartItem({ prefix, scope, item, costMicroUsd: Math.max(cost, worst), status: "failed", now: deps.now(), result: null });
       outcomes.crashed = (outcomes.crashed ?? 0) + 1; ran += 1; continue;
     }
     const stored: SmartReplayStored = { runId: config.runId, v1Gate: "support", messageId: candidate.messageId, receivedAt: mail.receivedAt.toISOString(),
-      startedAt: new Date(startedAt).toISOString(), durationMs: clock() - startedAt, costMicroUsd: cost, revision: SAV_SMART_PROMPT_REVISION, promptSha256: smartPromptSha256(),
+      startedAt: new Date(startedAt).toISOString(), durationMs: clock() - startedAt, costMicroUsd: cost, revision: SAV_SMART_PROMPT_REVISION, promptSha256: smartPromptSha256(smartCommercialSet(env)),
       contractRevision: SAV_SMART_CONTRACT_REVISION, model, codeSha: env.VERCEL_GIT_COMMIT_SHA?.slice(0, 40) ?? null, turn };
     await settleSmartItem({ prefix, scope, item, costMicroUsd: cost, status: "done", now: deps.now(), result: stored });
     outcomes[turn.outcome] = (outcomes[turn.outcome] ?? 0) + 1; ran += 1;

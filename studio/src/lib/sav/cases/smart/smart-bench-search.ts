@@ -3,6 +3,7 @@ import type { SavBenchJudge } from "../../bench/bench-judge";
 import { runSmartTurn, type SmartKnowledgePort, type SmartKnowledgeResult } from "./smart-agent";
 import { smartBenchInput, smartBenchTurn } from "./smart-bench-agent";
 import { smartEmptyMemory, smartMaxExchanges, type SmartCaseMemory } from "./smart-memory";
+import { smartCommercialSet } from "./smart-switch";
 import { smartGeminiModel, smartInputCap, type SmartEmbedPort } from "./smart-model";
 import { SAV_SMART_PROMPT_REVISION, smartPromptSha256 } from "./smart-prompt";
 import type { AcademyTool } from "./tools/academy";
@@ -60,14 +61,14 @@ export function createSavBenchSearchAgent(context: Readonly<{
   const name = context.name ?? "search";
   let memory: SmartCaseMemory = smartEmptyMemory();
   return {
-    name, revision: `${name}:${SAV_SMART_PROMPT_REVISION}:${smartPromptSha256().slice(0, 12)}:${context.env.SAV_V2_MODEL ?? "?"}`,
+    name, revision: `${name}:${SAV_SMART_PROMPT_REVISION}:${smartPromptSha256(smartCommercialSet(context.env)).slice(0, 12)}:${context.env.SAV_V2_MODEL ?? "?"}`,
     async respond(input) {
       const now = new Date(input.now), searches: SmartBenchSearchCall[] = [];
       const model = smartGeminiModel({ env: () => context.env, now: () => now, network: context.network, timeoutMs: 60_000 });
       if (input.turn <= 1) memory = smartEmptyMemory();
       const result = await runSmartTurn({ ...smartBenchInput(input), memory }, {
         model, knowledge: recordSmartKnowledge(context.knowledge(context.embed, now), searches), maxInputBytes: smartInputCap(context.env, now) ?? 100_000,
-        today: input.now.slice(0, 10), academy: context.academy ?? [], recordOwn: true, maxExchanges: smartMaxExchanges(context.env),
+        today: input.now.slice(0, 10), academy: context.academy ?? [], recordOwn: true, maxExchanges: smartMaxExchanges(context.env), ...smartCommercialSet(context.env),
       });
       memory = result.memory;
       const turn = smartBenchTurn(result);

@@ -70,6 +70,21 @@ export function smartFallbackNote(input: Readonly<{ reason: SmartTeamNote["raiso
   };
 }
 
+/** 25/11 (`SAV_V2_SMART_COMMERCIAL_SPLIT=on`): our fixed routing words for a pre-sales need (which plan, a demo), first in the note's need. */
+export const SAV_SMART_COMMERCIAL_ROUTE = "Demande commerciale (choix d'offre / démo) → Sacha";
+
+/**
+ * The note with the commercial routing first in its need (idempotent). `asks`: the commercial needs as the reading wrote them. No note yet (the
+ * model answered the other needs and wrote none): a note of our own for the commercial part only, nothing invented.
+ */
+export function smartCommercialNote(note: SmartTeamNote | null, asks: readonly string[]): SmartTeamNote {
+  const route = `${SAV_SMART_COMMERCIAL_ROUTE} : ${asks.map(ask => clean(ask)).join(" ; ")}`;
+  if (!note) return { raison: "other", besoin: route.slice(0, 600), compris: "", verifie: [], essaye: [], hypotheses: [],
+    prochaineVerification: "Transmettre à Sacha (équipe commerciale) la question sur le choix d'offre ou la démo.", ditAuClient: null };
+  if (note.besoin.startsWith(SAV_SMART_COMMERCIAL_ROUTE)) return note;
+  return { ...note, besoin: `${route} | ${note.besoin}`.slice(0, 600) };
+}
+
 /** A sensitive mail: no investigation, only the families and the whole mail to the team. */
 export const smartSensitiveNote = (families: readonly string[]) =>
   `Sujet sensible (${families.length ? families.join(", ") : "à qualifier"}) : tout le mail est transmis à l'équipe, sans réponse de l'assistant.`;

@@ -15,7 +15,7 @@ import { smartDbKnowledge } from "./smart-knowledge";
 import { claimSmartItem, readSmartLedger, settleSmartItem, smartContainedErrorCode, smartItemKey, smartLedgerSpent, type SmartItemRow } from "./smart-ledger";
 import { smartGeminiEmbed, smartGeminiModel, smartInputCap, smartPrices, type SmartEmbedPort, type SmartModelPort } from "./smart-model";
 import { SAV_SMART_PROMPT_REVISION, smartPromptPinned, smartPromptSha256 } from "./smart-prompt";
-import { readSmartShadowConfig, SAV_SMART_SHADOW_LOOKBACK_MS } from "./smart-switch";
+import { readSmartShadowConfig, SAV_SMART_SHADOW_LOOKBACK_MS, smartCommercialSet } from "./smart-switch";
 
 /*
  * Agent SAV intelligent, lot E (20/11): the SHADOW pass of the new agent, from the existing reconcile pass, behind `SAV_V2_SMART_AGENT=shadow`.
@@ -219,14 +219,14 @@ async function runSmartShadowPassUnsafe(deps: SmartShadowDeps, config: Exclude<R
       turn = await runSmartTurn({ subject: mail.subject, body: mail.body, thread: mail.thread },
         { model: modelPort, knowledge: (deps.knowledge ?? (embed => smartDbKnowledge({ now: deps.now, embed })))(embedPort), maxInputBytes: cap, today: day,
           // Shadow: nothing is sent, so the agent's own questions and trials are never recorded; the memory is seeded from the thread.
-          academy: deps.academy ?? getAcademyTools(), recordOwn: false, maxExchanges: smartMaxExchanges(env) });
+          academy: deps.academy ?? getAcademyTools(), recordOwn: false, maxExchanges: smartMaxExchanges(env), ...smartCommercialSet(env) });
     } catch {
       // Unexpected: the reservation is kept as spent (nothing is known of what was sent), the mail never retried.
       await settleSmartItem({ prefix: SAV_SMART_SHADOW_PREFIX, scope: day, item, costMicroUsd: Math.max(cost, worst), status: "failed", now: deps.now(), result: null });
       outcomes.crashed = (outcomes.crashed ?? 0) + 1; ran += 1; continue;
     }
     const stored: SmartShadowStored = { v1Gate: "support", messageId: candidate.messageId, receivedAt: mail.receivedAt.toISOString(), startedAt: new Date(startedAt).toISOString(),
-      durationMs: clock() - startedAt, costMicroUsd: cost, revision: SAV_SMART_PROMPT_REVISION, promptSha256: smartPromptSha256(), contractRevision: SAV_SMART_CONTRACT_REVISION,
+      durationMs: clock() - startedAt, costMicroUsd: cost, revision: SAV_SMART_PROMPT_REVISION, promptSha256: smartPromptSha256(smartCommercialSet(env)), contractRevision: SAV_SMART_CONTRACT_REVISION,
       model, codeSha: env.VERCEL_GIT_COMMIT_SHA?.slice(0, 40) ?? null, turn };
     await settleSmartItem({ prefix: SAV_SMART_SHADOW_PREFIX, scope: day, item, costMicroUsd: cost, status: "done", now: deps.now(), result: stored });
     outcomes[turn.outcome] = (outcomes[turn.outcome] ?? 0) + 1; ran += 1;
@@ -234,7 +234,7 @@ async function runSmartShadowPassUnsafe(deps: SmartShadowDeps, config: Exclude<R
   }
   const spentTodayMicroUsd = smartLedgerSpent(await readSmartLedger(SAV_SMART_SHADOW_PREFIX, day));
   const pass = { ran, stoppedBy, outcomes, skippedMails, discardedByV1, spentTodayMicroUsd };
-  log("sav_smart_shadow_pass", { ...pass, day, revision: SAV_SMART_PROMPT_REVISION, promptSha256: smartPromptSha256().slice(0, 16), model });
+  log("sav_smart_shadow_pass", { ...pass, day, revision: SAV_SMART_PROMPT_REVISION, promptSha256: smartPromptSha256(smartCommercialSet(env)).slice(0, 16), model });
   return pass;
 }
 

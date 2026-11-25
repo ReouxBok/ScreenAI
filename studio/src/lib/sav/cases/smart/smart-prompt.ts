@@ -152,16 +152,53 @@ non_conforme exige au moins un problème. Sans problème réel : conforme et pro
 /** The instruction appended to the decide call for its ONE correction. */
 export const SAV_SMART_CORRECTION_INSTRUCTION = "CORRECTION : ta décision précédente (previousDecision) est refusée (voir problems). Action \"final\", calls vide, une decision complète qui corrige chaque phrase en cause. unlisted_claim ou source_mismatch : retire le passage nommé (ni reformulé, ni atténué) et garde les étapes que les extraits portent ; si le besoin reste sans réponse, pose UNE question précise (message exact, écran) sans deviner. unsourced_claim : retire la garantie ou la déduction, dis que tu n'as pas cette information et propose de transmettre la question à l'équipe. Sinon : handoff avec ta meilleure note. narrow à true : seulement ce que les extraits portent mot pour mot, ou UNE question précise.";
 
-export const smartDecidePrompt = () => DECIDE;
-export const smartUnderstandPrompt = () => UNDERSTAND;
-export const smartVerifyPrompt = () => VERIFY;
-export const smartCorrectionPrompt = () => `${DECIDE}\n\n${SAV_SMART_CORRECTION_INSTRUCTION}`;
+/*
+ * 25/11 (`SAV_V2_SMART_COMMERCIAL_SPLIT=on`, Ugo: « quelle offre me convient ? » and « une démo ? » are commercial, not sensitive): the variants
+ * below are used ONLY with the switch on. Off, every prompt and the pinned hash above are byte for byte the ones of v21. The sensitive rule is
+ * narrowed to real money and contract actions (pay, buy, change, renew or cancel a subscription, invoice, billing, refund); a pre-sales question
+ * becomes a need marked `commercial`, handed to the team (sales), never answered. The model judges; no word list decides.
+ */
+const SENSITIVE_SPLIT = `SUJET SENSIBLE
+Une vraie demande du client sur SON compte Limova : résiliation, payer, souscrire, changer, renouveler ou arrêter un abonnement ou une offre, paiement, facture ou facturation, remboursement, droits sur ses données, identité ou titulaire du compte, piratage. Même en une ligne, même en PS : tout le mail va à l'équipe. Dans le doute sur une vraie demande de ce type, c'est sensible.
+${SENSITIVE.split("\n")[2]}`;
 
-/** What the pinned hash covers: the four prompts and the resources, exactly as sent. */
-export const smartPromptFingerprintSource = () => JSON.stringify([SAV_SMART_PROMPT_REVISION, DECIDE, UNDERSTAND, VERIFY, SAV_SMART_CORRECTION_INSTRUCTION, SAV_SMART_RESOURCES]);
-export const smartPromptSha256 = () => createHash("sha256").update(smartPromptFingerprintSource()).digest("hex");
+const COMMERCIAL = `QUESTION COMMERCIALE (AVANT ACHAT)
+Demander quelle offre lui convient, ce que contient une offre, ou une démo : c'est une question commerciale, PAS un sujet sensible. Fais-en un besoin à part avec commercial à true : l'équipe commerciale y répond. S'il n'y a rien d'autre de sensible : sensitive no, sensitiveFamilies vide, sensible « aucune » avec la phrase de cette question pour preuve. Les autres besoins du mail se lisent comme d'habitude.
+Reste sensible, tout le mail à l'équipe : payer, souscrire ou passer à une offre, changer, renouveler ou résilier son abonnement, une facture, un remboursement, un changement de facturation.
+- « Quelle offre me conseillez-vous pour mes 8 Assistants ? Et une démo, c'est possible ? » : un besoin commercial true, {"famille":"aucune","preuve":"Quelle offre me conseillez-vous pour mes 8 Assistants ?"}
+- « Je veux passer à l'offre supérieure dès ce mois-ci » : {"famille":"abonnement","preuve":"Je veux passer à l'offre supérieure dès ce mois-ci"}`;
+
+/** The decide prompt's never-rule 1 with the switch on: a sensitive mail never reaches decide (stopped at the reading), so it is short, and the commercial need fits in it (decide stays under `SAV_SMART_PROMPT_MAX_BYTES`). */
+const DECIDE_RULE_1_SPLIT = "1. Une vraie demande sur SON compte (résilier, payer, souscrire, changer ou renouveler une offre, facture, remboursement, données, identité, piratage) va à l'équipe. Besoin commercial true (choix d'offre, démo) : ni offre, ni prix, ni démo ; coverage handed avec teamNote ; dis seulement qu'il est transmis.";
+const VERIFY_COMMERCIAL_LINE = "Dire qu'une question commerciale (choix d'offre, démo) est transmise à l'équipe n'est pas sensitive_handled.";
+const NEED_FORMAT = `"search":"mots pour chercher une fiche ou null"}`;
+
+const DECIDE_SPLIT = DECIDE.replace(`1. ${SENSITIVE.split("\n")[1]}`, DECIDE_RULE_1_SPLIT);
+const UNDERSTAND_SPLIT = UNDERSTAND
+  .replace(SENSITIVE, `${SENSITIVE_SPLIT}\n\n${COMMERCIAL}`)
+  .replace(NEED_FORMAT, `"search":"mots pour chercher une fiche ou null","commercial":false}`);
+const VERIFY_SPLIT = VERIFY.replace("\n\nFORMAT DE SORTIE", `\n${VERIFY_COMMERCIAL_LINE}\n\nFORMAT DE SORTIE`);
+
+/** Which prompt set: `commercialSplit` true only with `SAV_V2_SMART_COMMERCIAL_SPLIT=on` (`smartCommercialSplitOn`). Absent: today's prompts. */
+export type SmartPromptOptions = Readonly<{ commercialSplit?: boolean }>;
+const splitOn = (options?: SmartPromptOptions) => options?.commercialSplit === true;
+
+export const smartDecidePrompt = (options?: SmartPromptOptions) => splitOn(options) ? DECIDE_SPLIT : DECIDE;
+export const smartUnderstandPrompt = (options?: SmartPromptOptions) => splitOn(options) ? UNDERSTAND_SPLIT : UNDERSTAND;
+export const smartVerifyPrompt = (options?: SmartPromptOptions) => splitOn(options) ? VERIFY_SPLIT : VERIFY;
+export const smartCorrectionPrompt = (options?: SmartPromptOptions) => `${smartDecidePrompt(options)}\n\n${SAV_SMART_CORRECTION_INSTRUCTION}`;
+
+/** sha256 of `smartPromptFingerprintSource({ commercialSplit: true })`. Pinned by `smart-prompt.test.ts`; change it only with the revision. */
+export const SAV_SMART_COMMERCIAL_PROMPT_SHA256 = "700e497dcecf1421c8c87abf304faa10091c6c8b067a99062dd16afa84d5a11d";
+
+/** What the pinned hash covers: the four prompts and the resources, exactly as sent. Off: unchanged since v21; on: the split variants and a marker. */
+export const smartPromptFingerprintSource = (options?: SmartPromptOptions) => splitOn(options)
+  ? JSON.stringify([SAV_SMART_PROMPT_REVISION, DECIDE_SPLIT, UNDERSTAND_SPLIT, VERIFY_SPLIT, SAV_SMART_CORRECTION_INSTRUCTION, SAV_SMART_RESOURCES, "commercial_split"])
+  : JSON.stringify([SAV_SMART_PROMPT_REVISION, DECIDE, UNDERSTAND, VERIFY, SAV_SMART_CORRECTION_INSTRUCTION, SAV_SMART_RESOURCES]);
+export const smartPromptSha256 = (options?: SmartPromptOptions) => createHash("sha256").update(smartPromptFingerprintSource(options)).digest("hex");
 /** Bytes of each fixed prompt (UTF-8), for the report and the size test. */
-export const smartPromptBytes = () => ({ decide: Buffer.byteLength(DECIDE, "utf8"), understand: Buffer.byteLength(UNDERSTAND, "utf8"), verify: Buffer.byteLength(VERIFY, "utf8"),
-  correct: Buffer.byteLength(smartCorrectionPrompt(), "utf8") });
-/** Runtime guard: a prompt whose hash is not the pinned one is never sent (the shadow refuses to run). */
-export const smartPromptPinned = () => smartPromptSha256() === SAV_SMART_PROMPT_SHA256;
+export const smartPromptBytes = (options?: SmartPromptOptions) => ({ decide: Buffer.byteLength(smartDecidePrompt(options), "utf8"),
+  understand: Buffer.byteLength(smartUnderstandPrompt(options), "utf8"), verify: Buffer.byteLength(smartVerifyPrompt(options), "utf8"),
+  correct: Buffer.byteLength(smartCorrectionPrompt(options), "utf8") });
+/** Runtime guard: a prompt whose hash is not the pinned one is never sent (the shadow refuses to run). Both sets are pinned, whatever the switch. */
+export const smartPromptPinned = () => smartPromptSha256() === SAV_SMART_PROMPT_SHA256 && smartPromptSha256({ commercialSplit: true }) === SAV_SMART_COMMERCIAL_PROMPT_SHA256;
