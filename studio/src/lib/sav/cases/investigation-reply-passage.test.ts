@@ -28,8 +28,9 @@ import { SAV_INTAKE_MODEL_REVISION } from "../intake/model-readers";
 import { intakeRuntimeHash } from "../intake/runtime-contract";
 import { intakeSemanticInputHash, SAV_INTAKE_SEMANTIC_RECORD_REVISION } from "../intake/semantic-records";
 import type { SavRetrievalCandidate } from "../request-retrieval";
-import { listCaseEvents, readCase, recordCustomerReturn } from "./case-store";
-import { readCaseReplyDisclosure } from "./case-reply-outbound";
+import { appendCaseEvent, listCaseEvents, readCase, recordCustomerReturn } from "./case-store";
+import { HANDOFF_REPLY } from "./case-terminal-reply";
+import { caseReplyEditableBody, readCaseReplyDisclosure } from "./case-reply-outbound";
 import { decideCaseReply } from "./case-reply-store";
 import { caseInvestigationReturnAwareQualify, type CaseReturnRulePort } from "./investigation-return-qualify";
 import { bindCaseInvestigationToReplyPlan, caseAccessAutoReplyAuthorizer, CASE_REPLY_PLAN_PORTS, passCaseInvestigationToReplyPlan, runCaseInvestigationToReplyPlan, type CaseReplyPassageDeps } from "./investigation-reply-passage";
@@ -205,9 +206,35 @@ describe("passage to the send plan (B): C's store, A's rule, nothing short of ev
     expect(again).toEqual(first);
     expect(await sideEffects(mail.caseId)).toEqual({ effects: 0, validations: 1, timers: 0 });
   });
-  it("queues the non-sensitive handoff acknowledgement through the real provenance and auto rule, once", async () => {
+  it("Ugo 25/11: a hand-over at first contact proposes no reply at all (nothing for a person to validate)", async () => {
     const mail = await v1Mail({ ownerEffect: true });
     const runtime = wiring().deps;
+    runtime.model.provider = async request => ({ status: "ok", output: { caseVersion: request.snapshot.version,
+      understanding: { requests: request.snapshot.body.openRequests.map(row => ({ id: row.id, family: "access", status: "open", summary: "Diagnostic nécessaire" })), newFacts: [] },
+      nextAction: { kind: "handoff", reason: "diagnosis_out_of_tools", requestIds: request.snapshot.body.openRequests.map(row => row.id), report: { need: "Diagnostic nécessaire", expected: null, observed: null, trialIds: [], hypotheses: [], missingInformation: [], expectedIntervention: "Vérifier le compte", knowledge: [] } } } });
+    expect(await runCaseInvestigationRuntime(mail.caseId, runtime)).toMatchObject({ status: "recorded", outcome: "accepted" });
+    const env = { ...AUTO, SAV_V2_CLOSING_HANDOFF_REPLY: "on" };
+    const terminalProvenance = { ...provenance, env: () => env };
+    const base = passage(env);
+    const deps = { ...base, provenance: terminalProvenance, store: { ...base.store, pilotProvenance: pilotProvenanceGate(terminalProvenance) } };
+    expect(await passCaseInvestigationToReplyPlan(mail.caseId, deps)).toMatchObject({ status: "no_reply", reason: "no_reply" });
+    expect(await sideEffects(mail.caseId)).toEqual({ effects: 0, validations: 0, timers: 0 });
+    expect(await readCase(mail.caseId)).toMatchObject({ owner: "human", phase: "handoff_pending" });
+  });
+
+  it("queues the non-sensitive handoff acknowledgement through the real provenance and auto rule, once, after an earlier agent reply", async () => {
+    const mail = await v1Mail({ ownerEffect: true });
+    // An earlier exchange: the agent already replied once on this case, then the customer wrote again.
+    await appendCaseEvent({ caseId: mail.caseId, kind: "outbound_observed", direction: "agent_outbound", dedupeKey: `outbound:sent-${mail.caseId}`,
+      sourceRef: { type: "email", id: `sent-${mail.caseId}` }, occurredAt: new Date().toISOString(), detail: { purpose: "answer" } });
+    // The customer's new mail, stored with its headers (the reply threads on it), then A's committed `continue`.
+    const messageId = randomUUID(), gmail = `gm-${messageId}`;
+    await f.db.insert(savMessages).values({ id: messageId, threadId: mail.threadId, mailboxId, direction: "inbound", fromEmail: SENDER, toEmails: ["support@example.invalid"], subject: "Re: Synthétique",
+      bodyCiphertext: encryptSavPayload({ text: "Toujours bloqué.", headers: { "message-id": `<${messageId}@example.invalid>` } }), receivedAt: new Date(), gmailMessageId: gmail });
+    const current = (await readCase(mail.caseId))!;
+    await recordCustomerReturn({ route: "continue", reason: "open_case_v2_owner", caseId: mail.caseId, expectedVersion: current.version, ticketId: mail.ticketId,
+      threadId: mail.threadId, messageId, gmailMessageId: gmail, receivedAt: new Date().toISOString() });
+    const runtime = returnWiring(rule("access")).deps;
     runtime.model.provider = async request => ({ status: "ok", output: { caseVersion: request.snapshot.version,
       understanding: { requests: request.snapshot.body.openRequests.map(row => ({ id: row.id, family: "access", status: "open", summary: "Diagnostic nécessaire" })), newFacts: [] },
       nextAction: { kind: "handoff", reason: "diagnosis_out_of_tools", requestIds: request.snapshot.body.openRequests.map(row => row.id), report: { need: "Diagnostic nécessaire", expected: null, observed: null, trialIds: [], hypotheses: [], missingInformation: [], expectedIntervention: "Vérifier le compte", knowledge: [] } } } });
@@ -221,7 +248,7 @@ describe("passage to the send plan (B): C's store, A's rule, nothing short of ev
     const rows = await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, mail.caseId));
     expect(rows).toHaveLength(1);
     const text = decryptSavPayload<{ text: string }>(rows[0]!.proposalCiphertext).text;
-    expect(text).toContain("Un conseiller reprend votre demande.");
+    expect(caseReplyEditableBody(text)).toBe(HANDOFF_REPLY);
     expect(readCaseReplyDisclosure(text)?.mode).toBe("automated");
   });
 

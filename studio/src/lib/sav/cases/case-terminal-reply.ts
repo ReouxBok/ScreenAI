@@ -6,7 +6,16 @@ import { readCaseInvestigationProgress } from "./investigation-record";
 export const closingHandoffReplyEnabled = (env: Readonly<Record<string, string | undefined>>) => env.SAV_V2_CLOSING_HANDOFF_REPLY === "on";
 export const isTerminalReply = (purpose: string) => purpose === "closing" || purpose === "handoff";
 export const CLOSING_REPLY = "Merci pour votre confirmation, nous sommes ravis que le problème soit résolu. Si le problème revient, vous pouvez répondre à ce message.";
-export const HANDOFF_REPLY = "Un conseiller reprend votre demande.";
+export const HANDOFF_REPLY = "Bonjour,\n\nMerci pour votre retour. Je transmets votre demande à un membre de l'équipe support Limova, qui reprend la suite et reviendra vers vous par email dès que possible. Vous n'avez rien à renvoyer : il dispose de tout l'historique de nos échanges.";
+
+/**
+ * Ugo (25/11): a hand-over BEFORE any exchange sends the customer nothing; only after at least one agent reply on the case does the hand-over reply go out.
+ * True when an agent reply (`agent_outbound`) was recorded before the input event of the decision (`in:<event>` / `back:<event>`), so the hand-over reply itself never counts.
+ */
+export function agentRepliedBefore(events: readonly Pick<CaseEvent, "id" | "direction">[], inputKey: string) {
+  const at = events.findIndex(e => e.id === inputKey.slice(inputKey.indexOf(":") + 1));
+  return at > 0 && events.slice(0, at).some(e => e.direction === "agent_outbound");
+}
 
 /** Only the agent's own durable transfer, before any person takes over. CRM ownership is still checked separately. */
 export function pendingHandoffReply(snapshot: CaseSnapshot, events: readonly CaseEvent[], triggerEventId: string) {
@@ -24,7 +33,7 @@ export function handoffReplyTrigger(snapshot: CaseSnapshot, events: readonly Cas
   if (read.record.decision.actionsPaused || read.record.decision.validation.decision.nextAction.reason === "sensitive_request") return null;
   if (events.some(e => e.caseVersion > read.caseVersion && (e.direction === "human_outbound" || e.kind === "inbound_confirmed"))) return null;
   const id = trigger.inputKey.slice(trigger.inputKey.indexOf(":") + 1), at = events.findIndex(e => e.id === id);
-  if (at < 0) return null;
+  if (at < 0 || !agentRepliedBefore(events, trigger.inputKey)) return null;
   const mail = trigger.inputKey.startsWith("back:") ? events.slice(0, at).findLast(e => e.direction === "customer_inbound" && e.sourceRef.type === "email") : events[at];
   return mail?.direction === "customer_inbound" && mail.sourceRef.type === "email" ? `inbound:${mail.sourceRef.id}` : null;
 }
