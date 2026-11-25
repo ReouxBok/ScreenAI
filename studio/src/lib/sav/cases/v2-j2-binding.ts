@@ -12,7 +12,9 @@ import { submitCaseReplyProposal, decideCaseReply, type CaseReplyStoreDeps } fro
 import { queueValidatedCaseReply } from "./case-runtime-effects";
 import { readJ2ReminderText, j2AutoGate, readJ2Origin } from "./j2-auto-reminder";
 import { accessAutoReplyAuthorizer } from "./customer-return-store";
-import { readAccessAutoApprovalConfig } from "./customer-return";
+import { ACCESS_AUTO_APPROVAL_BASIS, readAccessAutoApprovalConfig } from "./customer-return";
+import { caseSmartSupportOpen, smartSwitchProblem } from "./smart-support-scope";
+import { smartAdmission } from "./smart/smart-send-fence";
 import { judgeCurrentTicketOwner } from "./case-ticket-owner";
 import { caseAdmissionStatus } from "./admission-policy";
 import { readCase } from "./case-store";
@@ -74,7 +76,8 @@ export async function enqueueApprovedJ2(timer: Pick<J2Timer,"id"|"caseId">, case
 
 /** Authors the deterministic reminder, through the normal durable proposal, rule and queue. */
 export async function produceAutoJ2(timer: Pick<J2Timer,"id"|"caseId">, caseVersion: number, deps: CaseReplyStoreDeps) {
-  const blocked = await j2AutoGate(deps.env());
+  // SAV-123: a case the smart entry admitted is gated by the smart switches and block (`j2AutoGate`), as its reply is.
+  const blocked = await j2AutoGate(deps.env(), undefined, (await readCase(timer.caseId))?.admission);
   if (blocked) return blocked;
   const config = readAccessAutoApprovalConfig(deps.env());
   if (config.mode !== "on") return "j2_auto_off";
@@ -90,13 +93,16 @@ export async function produceAutoJ2(timer: Pick<J2Timer,"id"|"caseId">, caseVers
   const decided = await decideCaseReply({ action: "approve", validationId: proposed.id, approverId: config.approverId,
     seen: { payloadHash: caseReplyPayloadHash(proposal), caseVersion, recipient: proposal.recipient }, expectedCaseVersion: caseVersion, deps,
     authorizer: accessAutoReplyAuthorizer({ env: deps.env(), readFacts: async () => {
-      if (await j2AutoGate(deps.env())) return null;
-      if (!await readJ2Origin(timer.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), new Date(), deps.env())) return null;
       const snapshot = await readCase(timer.caseId);
-      if (!snapshot) return null;
+      if (!snapshot || await j2AutoGate(deps.env(), undefined, snapshot.admission)) return null;
+      if (!await readJ2Origin(timer.caseId, proposal.triggerEventId, await deps.currentPolicyRevision(), new Date(), deps.env())) return null;
       const owner = await judgeCurrentTicketOwner(deps.readTicketOwner, snapshot.ticketId);
+      // Smart only while admitted by the smart entry, every open request of its block, and the smart switches on for a rule's approval (same gates as its reply).
+      const smartSupport = smartAdmission(snapshot.admission) && caseSmartSupportOpen(snapshot)
+        && !smartSwitchProblem({ env: deps.env(), admission: snapshot.admission, basis: ACCESS_AUTO_APPROVAL_BASIS, approvedBy: config.approverId });
       return { case: { owner: snapshot.owner, sensitivity: snapshot.sensitivity, admitted: caseAdmissionStatus(snapshot, await deps.currentPolicyRevision()).admitted },
-        openFamilies: snapshot.body.openRequests.filter(r => r.status === "open").map(r => r.family), decision: null, ownerNow: owner.ok ? "v2" : "unknown" };
+        openFamilies: snapshot.body.openRequests.filter(r => r.status === "open").map(r => r.family), decision: null, ownerNow: owner.ok ? "v2" : "unknown",
+        ...(smartSupport ? { smartSupport: true } : {}) };
     } }) });
   return decided.ok ? "approved" : decided.code;
 }
