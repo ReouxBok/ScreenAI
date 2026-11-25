@@ -21,7 +21,9 @@ const timestamp = z.string().max(64).refine(value => Number.isFinite(Date.parse(
 const cursorSchema = z.object({ v: z.literal(3), filters: z.string(), after: z.object({ createdAt: timestamp, id: z.uuid() }), snapshotAt: timestamp, attendus: z.number().int().nonnegative() }).strict();
 const invalid = (): never => { throw Error("SAV_V2_INVENTORY_CURSOR_INVALID"); };
 const handoffCodes = new Set<string>([...SAV_CASE_ADMISSION_TEAM_REASONS, "explicit_human_request", "sensitive_request", "knowledge_missing", "knowledge_conflict",
-  "evidence_inaccessible", "diagnosis_out_of_tools", "repeated_failure", "out_of_scope", "decision_refused", "validator_refusals", "awaiting_v2_attribution"]);
+  "evidence_inaccessible", "diagnosis_out_of_tools", "repeated_failure", "out_of_scope", "decision_refused", "validator_refusals", "awaiting_v2_attribution",
+  // Ugo (25/11): technical dead ends handed to the team by the store (`SAV_CASE_TECHNICAL_HANDOFF_WAITS`).
+  "technical_exhausted", "context_invalid", "knowledge_request_invalid"]);
 const object = z.record(z.string(), z.unknown());
 
 export type V2ReadTx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];

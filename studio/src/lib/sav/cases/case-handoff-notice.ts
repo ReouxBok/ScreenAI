@@ -115,7 +115,7 @@ export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
   decision_refused: "le validateur a refusé deux fois la décision de l'agent pour ce message",
   outside_active_blocks: "cette partie du message est laissée à l'équipe : aucun bloc actif de l'agent ne la couvre, ou elle dépasse la limite de demandes d'une réponse",
   team_part_handoff_unavailable: "la partie équipe du message n'a pas pu être signalée à temps : le mail entier revient à l'équipe",
-  technical_exhausted: "panne technique, tous les appels permis de l'agent ont échoué (code technical_exhausted)",
+  technical_exhausted: "panne technique, les appels permis de l'agent sont épuisés (code technical_exhausted)",
   context_invalid: "panne technique, le dossier n'a pas pu être préparé pour l'agent (code context_invalid)",
   knowledge_request_invalid: "panne technique, la recherche de connaissances a été refusée avant tout appel (code knowledge_request_invalid)",
 };
@@ -520,8 +520,8 @@ const NOTE_REASON_SENTENCES: Record<HandoffReason, string> = {
   outside_active_blocks: "Cette partie de la demande relève de l'équipe ; je continue de traiter le reste du message.",
   team_part_handoff_unavailable: "Aucune réponse ne lui a été envoyée : tout le message est à reprendre.",
   agent_not_taken: "Je n'ai pas pris ce ticket en charge et aucun mail n'a été envoyé au client.",
-  // Ugo (25/11): fixed words and the closed code, never an error message. « 3 » is `SAV_CASE_INVESTIGATION_MAX_CALLS` (a test keeps them equal).
-  technical_exhausted: "Panne technique : l'agent n'a pas pu traiter ce message après 3 tentatives. Rien n'a été envoyé au client. Code : technical_exhausted.",
+  // Ugo (25/11): fixed words and the closed code, never an error message. Neutral: the calls may be model or embedding calls, or lost in a crash.
+  technical_exhausted: "Panne technique : l'agent n'a pas pu traiter ce message (appels permis épuisés). Rien n'a été envoyé au client. Code : technical_exhausted.",
   context_invalid: "Panne technique : l'agent n'a pas pu préparer le dossier de ce message. Rien n'a été envoyé au client. Code : context_invalid.",
   knowledge_request_invalid: "Panne technique : la recherche de connaissances de ce message a été refusée. Rien n'a été envoyé au client. Code : knowledge_request_invalid.",
 };

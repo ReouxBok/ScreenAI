@@ -20,6 +20,7 @@ import {
   createHandoffNoticeDriver, enqueueHandoffNotice, enqueueHandoffNotices, HANDOFF_NOT_POSTED_RETRIES, type HandoffNoticePayload, pendingHandoffNoticeExecutions, runHandoffNoticePass,
 } from "./case-handoff-notice-store";
 import { HANDOFF_NOTICE_KEY_PREFIX, handoffNoticeKey, type HandoffCrmReading } from "./case-handoff-notice";
+import { enqueueHandoffStage } from "./case-handoff-stage";
 import { listCaseEvents, openCaseEvent, readCase, transitionCaseOwner } from "./case-store";
 import { SAV_CASE_TEAM_PART_WAIT_BOUNDS, settleCaseTeamPartWait } from "./case-team-part-wait";
 import { caseDedupeKey, caseRequestId, type CaseAdmissionQualification, type CaseRequestSubject, type CaseSnapshot, type KnowledgeRef } from "./case-types";
@@ -988,14 +989,22 @@ describe("Ugo 25/11: a technical dead end goes to the team through the existing 
     expect((await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, made.c.caseId))).map(r => r.replyKey.split(":")[0])).toEqual(["handoff-notice"]);
     const payload = decryptSavPayload<HandoffNoticePayload>(rows[0]!.payloadCiphertext);
     expect(payload.facts.reason).toBe("technical_exhausted");
-    expect(payload.note?.text).toContain(`Panne technique : l'agent n'a pas pu traiter ce message après ${SAV_CASE_INVESTIGATION_MAX_CALLS} tentatives. Rien n'a été envoyé au client. Code : technical_exhausted.`);
+    expect(payload.note?.text).toContain("Panne technique : l'agent n'a pas pu traiter ce message (appels permis épuisés). Rien n'a été envoyé au client. Code : technical_exhausted.");
     // Never a raw error or diagnostic.
     expect(JSON.stringify(payload)).not.toMatch(/http_rejected|httpStatus/);
     await pass();
     const text = messageOf();
-    expect(text).toContain("*Motif du relais :* panne technique, tous les appels permis de l'agent ont échoué (code technical_exhausted)");
+    expect(text).toContain("*Motif du relais :* panne technique, les appels permis de l'agent sont épuisés (code technical_exhausted)");
     expect(text).toContain("rien ne lui a été envoyé par l'agent");
     expect(posts()).toHaveLength(1);
+    // The existing hand-over stage gives the HubSpot ticket back (« Nouveau », no owner): one execution keyed on the transfer's version, queued once.
+    const transfer = (await transfersOf(made.c.caseId))[0]!;
+    const stageEnv = () => ({ ...environment, SAV_V2_TICKET_STAGES: "on", SAV_V2_STAGE_WAITING_CUSTOMER: "2", SAV_V2_STAGE_CLOSED: "4", SAV_V2_HANDOFF_STAGE: "on",
+      SAV_V2_HANDOFF_STAGE_SINCE: new Date(Date.parse(transfer.occurredAt) - 60_000).toISOString() });
+    const stageKey = `case-stage:${made.c.caseId.toLowerCase()}:handoff:handoff-v${transfer.caseVersion}`;
+    expect(await enqueueHandoffStage({ caseId: made.c.caseId, policy: { id: policyId, hash: policyHash }, env: stageEnv })).toMatchObject({ ok: true, created: true, key: stageKey });
+    expect(await enqueueHandoffStage({ caseId: made.c.caseId, policy: { id: policyId, hash: policyHash }, env: stageEnv })).toMatchObject({ ok: true, created: false, key: stageKey });
+    expect((await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, made.c.caseId))).map(r => r.replyKey).filter(key => key.startsWith("case-stage:"))).toEqual([stageKey]);
 
     // A second pass (or a concurrent one after it): the case is the team's, nothing is called, transferred or noticed again.
     expect(await investigate(made.c.caseId, [failed])).toMatchObject({ status: "skipped", modelCalls: 0 });
