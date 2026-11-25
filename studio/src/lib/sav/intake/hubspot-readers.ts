@@ -31,6 +31,14 @@ const iso = (value: string | undefined | null): string | undefined => {
   return date && Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
 };
 class ReadFault extends SavCrmLocalReadError {}
+/** SAV-139: an engagement whose body HubSpot does not return (an email logged with only files, an empty note) no longer
+ * blocks the whole ticket history when `SAV_INTAKE_BODYLESS_HISTORY=on`: it is kept, dated, with this explicit marker
+ * instead of a body. Off (default), a bodyless engagement is still a partial read (`history_body_unavailable`). */
+export const SAV_INTAKE_BODYLESS_NOTE_TEXT = "[Note sans texte lisible dans le CRM]";
+export const SAV_INTAKE_BODYLESS_EMAIL_TEXT = "[Email sans texte lisible dans le CRM]";
+export function savIntakeBodylessHistoryEnabled(env: Partial<Record<string, string | undefined>> = process.env) {
+  return env.SAV_INTAKE_BODYLESS_HISTORY === "on";
+}
 export type IntakeReadTrace = { operation: string; status: "complete" | "partial" | "failed"; reason: string | null; observedAt: string; requests: number; transport?: SavCrmReadDiagnostic };
 export type SavIntakeCrmReaders = Pick<IntakeAdapters, "findContactsByEmail" | "directAssociations" | "getContact" | "ticketsForContact" | "ticketHistory">;
 
@@ -50,9 +58,10 @@ export function isSavIntakeHubspotRead(path: string, method: string): boolean {
 
 export function createSavIntakeHubspotReaders(options: {
   network: typeof fetch; now?: () => Date; onRead?: (trace: IntakeReadTrace) => void;
-  maxPages?: number; maxNetworkRequests?: number;
+  maxPages?: number; maxNetworkRequests?: number; bodylessHistory?: boolean;
 }): SavIntakeCrmReaders {
   const now = options.now ?? (() => new Date());
+  const bodylessHistory = options.bodylessHistory ?? savIntakeBodylessHistoryEnabled();
   const maxPages = options.maxPages ?? 5, maxRequests = options.maxNetworkRequests ?? 100;
   if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 5 || !Number.isSafeInteger(maxRequests) || maxRequests < 1 || maxRequests > 100) throw Error("SAV_INTAKE_READ_LIMIT_INVALID");
   let requests = 0;
@@ -178,8 +187,11 @@ export function createSavIntakeHubspotReaders(options: {
         for (const row of await batch(type, ids, engagementProperties[type], signal)) {
           const at = iso(row.properties.hs_timestamp); if (!at) throw new ReadFault("partial", "history_date_unknown");
           const props = row.properties;
-          const body = type === "notes" ? props.hs_note_body : props.hs_email_text || props.hs_email_html;
-          if (body === undefined || body === null) throw new ReadFault("partial", "history_body_unavailable");
+          const source = type === "notes" ? props.hs_note_body : props.hs_email_text || props.hs_email_html;
+          // Only an explicitly empty body is tolerated: a property HubSpot did not return at all (scope, schema) stays a partial read.
+          const returned = (type === "notes" ? ["hs_note_body"] : ["hs_email_text", "hs_email_html"]).every(key => Object.hasOwn(props, key));
+          if ((source === undefined || source === null) && !(bodylessHistory && returned)) throw new ReadFault("partial", "history_body_unavailable");
+          const body = source ?? (type === "notes" ? SAV_INTAKE_BODYLESS_NOTE_TEXT : SAV_INTAKE_BODYLESS_EMAIL_TEXT);
           const text = type === "notes" ? body : JSON.stringify({ from: props.hs_email_from_email, to: props.hs_email_to_email, direction: props.hs_email_direction, subject: props.hs_email_subject, body });
           events.push({ id: `${type}:${row.id}`, kind: type === "notes" ? "note" : "email", at, text });
         }
