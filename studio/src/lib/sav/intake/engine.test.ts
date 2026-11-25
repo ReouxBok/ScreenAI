@@ -984,20 +984,27 @@ describe("V2 case thread reply", () => {
     const plan = await f.run();
     expect(plan.decision.disposition).toMatchObject({ kind: "collect_context" }); expect(plan.progress.view).toBe("to_validate");
   });
-  it("a person's classification choice is never overridden by the case fact", async () => {
+  it("a person's classification choice or the operator's manual override is never overridden by the case fact", async () => {
     const f = fixture(["unknown"]); f.policy.v2CaseThread = { caseId };
     f.input.humanResolution = { choiceId: "choice-1", at, classification: "unknown" };
     expect((await f.run()).decision.disposition).toMatchObject({ kind: "collect_context" });
+    const manual = fixture(["unknown"]); manual.policy.v2CaseThread = { caseId }; manual.policy.manualSupportOverride = resource;
+    expect((await manual.run()).decision.disposition).toMatchObject({ kind: "collect_context" });
   });
-  it("switch off (no fact, nature never acknowledgement): the decision is identical to today's", async () => {
-    const make = () => { const f = fixture(["acknowledgement"]); f.input.message.currentText = "Merci, cela semble ok."; f.analysis.nature = "request"; return f; };
-    const today = await make().run();
+  // Golden values taken on origin/main 78160e60 (before this change) with the same fixtures: switch off, the plans are byte-identical to the old code's.
+  it("switch off (no fact, nature never acknowledgement): fingerprint and decision identical to origin/main 78160e60", async () => {
+    const digest = (p: IntakePlan) => createHash("sha256").update(JSON.stringify(p.decision)).digest("hex");
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = "Merci, cela semble ok."; f.analysis.nature = "request";
+    const today = await f.run();
     toValidate(today);
-    const again = await make().run();
-    expect(again.fingerprint).toBe(today.fingerprint); expect(again.decision).toEqual(today.decision);
-    // A support follow-up keeps its ticket path with or without a case on the thread when the scope is not uncertain.
+    expect(today.fingerprint).toBe("7_9FL-M1epJ3T_1vfng_GdqrLDH2o4mf0VgCbce79ks");
+    expect(digest(today)).toBe("a4a6545594e3bb8971a7dda554f71962c7fcbc48a2bdbc615ca86482c817d7fa");
     const support = fixture(["support"]); support.tickets.push(ticket("201"));
+    const linked = await support.run();
+    expect(linked.fingerprint).toBe("dM8iKoPrVNaEPgL8O99Hyltxlsv1KMbC44maqJLGrD0");
+    expect(digest(linked)).toBe("9dcf51a31051304dc87fceb5bccd215b43b55cc5a6102bf958cca57eba7e8de5");
+    // A support follow-up keeps its ticket path with the case fact too: the fact acts only on an uncertain scope.
     const withFact = fixture(["support"]); withFact.tickets.push(ticket("201")); withFact.policy.v2CaseThread = { caseId };
-    expect((await withFact.run()).decision).toEqual((await support.run()).decision);
+    expect((await withFact.run()).fingerprint).toBe(linked.fingerprint);
   });
 });

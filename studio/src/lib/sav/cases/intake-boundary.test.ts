@@ -494,7 +494,8 @@ describe("V2 case thread reply relay", () => {
     expect(event.detail).toMatchObject({ messageId, relay: { kind: "case_thread_reply", messageId, intakeRunVersion: runSeq, sourceHash: "source-hash-fixture" } });
     expect(await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, messageId))).toEqual([]);
   });
-  it("reaches a case held by the team, which stays the team's", async () => {
+  // V1 gives the fact only for an agent case; a team that takes the case after V1's analysis still finds the reply on it (it is never dropped).
+  it("reaches a case the team took after V1's analysis, which stays the team's", async () => {
     const human = await intake();
     await recordCaseAfterConfirmedIntake(human.messageId, confirmed(human.ticketId));
     const reply = await bareMessage(human.threadId);
@@ -510,5 +511,43 @@ describe("V2 case thread reply relay", () => {
       sourceHash: snapshot.sourceHash, payloadCiphertext: encryptSavPayload({ revision: "fixture", plan: { decision: { classification: "unknown", requests: [], disposition: { kind: "no_ticket", reason: "v2_case_thread" } } } }) }).returning();
     expect(await readIntakeAcknowledgement(messageId)).toMatchObject({ runId: run!.id, runVersion: 21, reason: "v2_case_thread" });
     expect(await recordCaseAfterConfirmedIntake(messageId, noProgress)).toMatchObject({ appended: true, relay: "case_thread_reply" });
+  });
+});
+
+// 25/11 (`SAV_V2_CASE_THREAD_REPLY=on`): production path of the V2 entry on a closed case, on the real tables. V1's own record of the mail (`v2_case_thread`,
+// sources matching) is read back by the customer return (`readCustomerReturnFacts` → `readIntakeAcknowledgement`), and the case reopens within V1's
+// 15-day window; older, the mail waits for V1 as today. Only the HubSpot owner is a simulated port.
+describe("V2 case thread reply after closure, from V1's real record", () => {
+  const V2_OWNER = "900001";
+  const entryEnv = { SAV_CASE_RECORDING: "on", SAV_V2_ENTRY: "on", SAV_V2_CASE_THREAD_REPLY: "on", SAV_V2_HUBSPOT_OWNER_ID: V2_OWNER, HUBSPOT_SAV_OWNER_ID: "900000" };
+  async function closedAgentCase() {
+    const { source, c } = await agentCase();
+    await updateCaseRecord({ caseId: c.caseId, expectedVersion: c.version, actor: { type: "agent" }, phase: "resolved",
+      body: { ...c.body, waiting: null, cycle: { number: 1, endedBy: "resolved" } } });
+    return { source, caseId: c.caseId };
+  }
+  async function v1CaseThreadRecord(threadId: string, messageId: string) {
+    const { savIntakeSourceSnapshot } = await import("../intake/runtime-store");
+    const [message] = await f.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+    const snapshot = await f.db.transaction(async tx => savIntakeSourceSnapshot(tx as never, message!, new Date()));
+    await f.db.insert(savIntakeRuns).values({ threadId, messageId, version: 31, isCurrent: true, state: "observed", configHash: "c-thread", policyHash: "fixture", sourceHash: snapshot.sourceHash,
+      payloadCiphertext: encryptSavPayload({ revision: "fixture", plan: { decision: { classification: "unknown", requests: [{ id: "r0", kind: "unknown" }], disposition: { kind: "no_ticket", reason: "v2_case_thread" } } } }) });
+  }
+  const route = async (messageId: string) => {
+    const { routeCustomerReturn } = await import("./customer-return-store");
+    return routeCustomerReturn(messageId, { env: entryEnv, readTicketOwner: vi.fn(async () => V2_OWNER), readAdmissionPolicy: async () => POLICY as never });
+  };
+  it("reopens the closed agent case on V1's v2_case_thread, read from V1's record", async () => {
+    const { source, caseId } = await closedAgentCase(), reply = await bareMessage(source.threadId, "2026-10-28T09:30:00.000Z");
+    await v1CaseThreadRecord(source.threadId, reply);
+    expect(await route(reply)).toMatchObject({ route: { route: "reopen", reason: "case_thread_reply" }, written: true });
+    expect(await readCase(caseId)).toMatchObject({ owner: "agent", phase: "queued", body: { cycle: { number: 2 } } });
+    expect((await listCaseEvents(caseId)).map(event => event.dedupeKey)).toContain(`inbound:gm-${reply}`);
+  });
+  it("older than V1's 15-day window after the case's last activity: today's wait for V1, nothing written", async () => {
+    const { source, caseId } = await closedAgentCase(), late = await bareMessage(source.threadId, "2026-11-12T08:00:00.000Z");
+    await v1CaseThreadRecord(source.threadId, late);
+    expect(await route(late)).toMatchObject({ route: { route: "wait", reason: "v1_pending" }, written: false });
+    expect(await readCase(caseId)).toMatchObject({ phase: "resolved" });
   });
 });

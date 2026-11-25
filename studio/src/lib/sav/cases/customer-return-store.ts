@@ -2,7 +2,7 @@
 // (continue, reopen, hand to the team) with `recordCustomerReturn`. Every other route writes nothing: V1's normal intake and relay keep the mail as before.
 // Called by the V2 entry (`v2-entry.ts`) behind its own flag. Reads the database, and the ticket owner through an injected port only when the route needs it (one GET, no write).
 import "server-only";
-import { and, eq, inArray, min, sql } from "drizzle-orm";
+import { and, eq, inArray, lte, max, min, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savCaseEvents, savCases, savIntakeExecutions, savMessages } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
@@ -12,7 +12,7 @@ import type { CaseAdmissionInput } from "./admission-policy";
 import { CaseVersionStaleError, listCaseEvents, readCase, recordCustomerReturn, savCaseRecordingEnabled, type CaseTx, type CustomerReturnRecord } from "./case-store";
 import { caseDedupeKey } from "./case-types";
 import {
-  customerMailOrder, customerReturnNeedsOwner, decideAccessAutoApproval, decideCustomerReturn, readAccessAutoApprovalConfig,
+  caseReturnPhaseClosed, customerMailOrder, customerReturnNeedsOwner, decideAccessAutoApproval, decideCustomerReturn, readAccessAutoApprovalConfig,
   type AccessAutoApprovalFacts, type CustomerReturnFacts, type CustomerReturnOwnerNow, type CustomerReturnRoute,
 } from "./customer-return";
 import type { CaseReplyAuthorizationRequest, CaseReplyAuthorizer } from "./case-reply-validation";
@@ -105,6 +105,15 @@ async function readAutomated(messageId: string): Promise<boolean> {
   }) !== null;
 }
 
+/** 25/11: when a closed case last moved before this mail: its latest reply, timer, command or owner change, else its latest customer mail. Bookkeeping events
+ * (admission, observations, CRM reads) can come after the closure and are not counted, so the `case_thread_reply` window never exceeds V1's 15 days after it. */
+async function lastCaseActivity(caseId: string, before: Date, db: ReturnType<typeof requireDb>) {
+  const latest = async (kinds: string[]) => (await db.select({ at: max(savCaseEvents.occurredAt) }).from(savCaseEvents)
+    .where(and(eq(savCaseEvents.caseId, caseId), inArray(savCaseEvents.kind, kinds), lte(savCaseEvents.occurredAt, before))))[0]?.at;
+  const at = await latest(["outbound_observed", "timer_fired", "human_command", "owner_changed"]) ?? await latest(["inbound_confirmed"]);
+  return at ? new Date(at).getTime() : Number.NaN;
+}
+
 /** The facts of one stored inbound mail, owner not read yet (`unknown`). */
 export async function readCustomerReturnFacts(messageId: string, deps: CustomerReturnDeps = {}) {
   const db = requireDb();
@@ -120,12 +129,15 @@ export async function readCustomerReturnFacts(messageId: string, deps: CustomerR
     .where(and(eq(savCaseEvents.caseId, current.caseId), eq(savCaseEvents.dedupeKey, caseDedupeKey.inbound(message.gmailMessageId))));
   const [first] = await db.select({ at: min(savCaseEvents.occurredAt) }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, current.caseId), eq(savCaseEvents.kind, "inbound_confirmed")));
   const v1Acknowledgement = deps.readAcknowledgement ? null : await readIntakeAcknowledgement(message.id);
+  const caseThreadReply = deps.readCaseThreadReply ? await deps.readCaseThreadReply(message.id) : v1Acknowledgement?.reason === "v2_case_thread";
   const facts: CustomerReturnFacts = {
     link: "one_case", case: { owner: current.owner, phase: current.phase, sensitivity: current.sensitivity }, alreadyRecorded: Boolean(recorded),
     beforeCase: Boolean(first?.at && message.receivedAt < new Date(first.at)),
     automated: await (deps.readAutomated ?? readAutomated)(message.id),
     acknowledgement: deps.readAcknowledgement ? await deps.readAcknowledgement(message.id) : v1Acknowledgement !== null && v1Acknowledgement.reason !== "v2_case_thread",
-    caseThreadReply: deps.readCaseThreadReply ? await deps.readCaseThreadReply(message.id) : v1Acknowledgement?.reason === "v2_case_thread",
+    caseThreadReply,
+    // Read only for V1's `v2_case_thread` on a closed case: nothing more is read on any other path.
+    ...(caseThreadReply && caseReturnPhaseClosed(current.phase) ? { caseThreadReplyAgeMs: message.receivedAt.getTime() - await lastCaseActivity(current.caseId, message.receivedAt, db) } : {}),
     v1Target: await (deps.readV1Target ?? readV1Target)(message.id, current.ticketId),
     olderThanLatest: !recorded && await olderThanRecorded(message, current.caseId),
     ownerNow: "unknown", paused: await relayPaused(db),

@@ -27,8 +27,9 @@ export async function intakeAcknowledgementTicketFact(input: { threadId: string;
 }
 
 /**
- * 25/11 (`SAV_V2_CASE_THREAD_REPLY=on` only): the V2 case of the mail's thread, or undefined. Set only when the thread maps to exactly one case, neither
- * sensitive (finance and cancellation stay the team's) nor on system hold. Off, no case, two cases, or an unreadable fact: undefined (today's path). Never throws.
+ * 25/11 (`SAV_V2_CASE_THREAD_REPLY=on` only): the V2 case of the mail's thread, or undefined. Set only when the thread maps to exactly one case held by the
+ * agent and not sensitive (finance and cancellation stay the team's). A case held by the team or on system hold gets no fact: V1 keeps today's path, so the
+ * person still gets the mail on the HubSpot ticket (`v2-entry.ts`). Off, no case, two cases, or an unreadable fact: undefined. Never throws.
  */
 export async function intakeV2CaseThreadFact(input: { threadId: string }, env: Record<string, string | undefined>,
   db: Reader = requireDb()): Promise<EnginePolicy["v2CaseThread"]> {
@@ -37,6 +38,6 @@ export async function intakeV2CaseThreadFact(input: { threadId: string }, env: R
     const cases = await db.select({ id: savCases.id, owner: savCases.owner, sensitivity: savCases.sensitivity }).from(savCases)
       .where(sql`${input.threadId}::uuid = any(${savCases.threadIds})`).limit(2);
     const only = cases.length === 1 ? cases[0] : undefined;
-    return only && only.sensitivity === "none" && only.owner !== "system_hold" ? { caseId: only.id } : undefined;
+    return only && only.sensitivity === "none" && only.owner === "agent" ? { caseId: only.id } : undefined;
   } catch { return undefined; }
 }

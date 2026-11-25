@@ -1,5 +1,6 @@
 // 25/11 (`SAV_V2_CASE_THREAD_REPLY`): nature acknowledgement and its one sentence reach V1's understanding call only with the switch; off, the request and
 // the launch fingerprint are those of before. Model stubbed. Synthetic.
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { createSavIntakeSemanticReaders, type IntakeGeminiCall } from "./model-readers";
 import type { IntakeMessage } from "./engine-types";
@@ -11,7 +12,7 @@ const FOUR = JSON.stringify(["request", "newsletter", "information", "indetermin
 const FIVE = JSON.stringify(["request", "newsletter", "information", "indeterminate", "acknowledgement"]);
 const SENTENCE = "Report nature acknowledgement (with acknowledgement requests) only when";
 
-function reader(enabled: boolean | undefined, nature: string) {
+function reader(enabled: boolean | undefined, nature: string, extra: { routing?: boolean } = {}) {
   const bodies: Parameters<IntakeGeminiCall>[0]["body"][] = [];
   const call: IntakeGeminiCall = async request => {
     bodies.push(request.body);
@@ -20,7 +21,7 @@ function reader(enabled: boolean | undefined, nature: string) {
     return { json: { messageId: MID, nature, requests: [{ id: "r1", kind: "acknowledgement", currentMessageId: MID, quoteId: quote }] },
       metadata: { inputTokens: 1, outputTokens: 1, thoughtTokens: 0, totalTokens: 2 } };
   };
-  const readers = createSavIntakeSemanticReaders({ model: "gemini-fixture", call, ...(enabled === undefined ? {} : { caseThreadReply: enabled }) });
+  const readers = createSavIntakeSemanticReaders({ model: "gemini-fixture", call, ...extra, ...(enabled === undefined ? {} : { caseThreadReply: enabled }) });
   return { bodies, analyse: () => readers.analyseMessage({ message, conversation: [message] }, new AbortController().signal) };
 }
 
@@ -32,6 +33,14 @@ describe("understanding call", () => {
     expect(JSON.stringify(bodies[0]!.generationConfig)).not.toContain(FIVE);
     expect(bodies[0]!.systemInstruction.parts[0]!.text).not.toContain(SENTENCE);
     await expect(reader(undefined, "acknowledgement").analyse()).rejects.toThrow();
+  });
+  // Golden sha256 of the request body taken on origin/main 78160e60 with this very fixture: off, the request is byte-identical to the old code's.
+  it("off: the request body is byte-identical to origin/main 78160e60 (without and with routing)", async () => {
+    const plain = reader(undefined, "request"), routed = reader(undefined, "request", { routing: true });
+    await plain.analyse(); await routed.analyse();
+    const sha = (body: unknown) => createHash("sha256").update(JSON.stringify(body)).digest("hex");
+    expect(sha(plain.bodies[0])).toBe("8d16b3e35e2aaa0bcf1208a42c3a0d1555b6a3e742fc1a75494da5d33d525141");
+    expect(sha(routed.bodies[0])).toBe("b5d74669c126dd77875be1c8058ec60097a3f2e7735a753500e065b70e0b44ac");
   });
   it("off and false send the same request", async () => {
     const a = reader(undefined, "request"), b = reader(false, "request");

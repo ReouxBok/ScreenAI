@@ -107,7 +107,7 @@ export type EnginePolicy = {
    * unreadable fact, the operator paths): today's acknowledgement_only. */
   acknowledgementTicket?: { ticketId: string | null };
   /** 25/11 (`SAV_V2_CASE_THREAD_REPLY=on` only): per-mail runtime evidence, never configuration nor model output (`ack-ticket-store.ts`). The mail's thread
-   * maps to exactly one V2 case, neither sensitive nor on system hold: a reply whose scope the model left uncertain goes to that case (`v2_case_thread`). */
+   * maps to exactly one V2 case, held by the agent and not sensitive: a reply whose scope the model left uncertain goes to that case (`v2_case_thread`). */
   v2CaseThread?: { caseId: string };
 };
 export type IntakeAdapters = {
