@@ -14,7 +14,7 @@ import { loginCustomerStatement, reportsOngoingLoginFailure, reportsRestoredAcce
 import { caseLatestCustomerMail } from "./investigation-runner";
 import type { CaseInvestigationStoreDeps } from "./investigation-store-ports";
 import { CaseQualificationUnavailableError, type CaseQualificationCauseCode } from "./qualification-diagnostic";
-import { threadlessReplySubject } from "./threadless-config";
+import { threadlessExpectedReplySubject } from "./app-tickets-config";
 import { caseSmartSupportOpen } from "./smart-support-scope";
 
 /*
@@ -62,7 +62,7 @@ async function readThreadlessReturnOrigin(snapshot: CaseSnapshot, events: readon
   const [message] = await db.select({ from: savMessages.fromEmail, recipients: savMessages.toEmails, subject: savMessages.subject, at: savMessages.receivedAt })
     .from(savMessages).where(and(eq(savMessages.direction, "outbound"), eq(savMessages.gmailMessageId, sent.sourceRef.id),
       eq(savMessages.threadId, mail.threadId), eq(savMessages.mailboxId, mail.mailboxId)));
-  if (!message || message.from !== "contact@limova.ai" || message.subject !== threadlessReplySubject(snapshot.ticketId)
+  if (!message || message.from !== "contact@limova.ai" || message.subject !== threadlessExpectedReplySubject(origin)
       || message.recipients.length !== 1 || message.recipients[0] !== contact.email || message.at > mail.receivedAt) return null;
   return { fromEmail: contact.email, subject: message.subject };
 }

@@ -11,7 +11,8 @@ import { revalidateFiredJ2, type J2CaseView, type J2CaseEventView } from "./time
 import type { CaseTimer } from "./case-types";
 import { caseEffectHash, type CaseReplyProposal } from "./case-effects";
 import { readCaseThreadlessSource } from "./case-store";
-import { threadlessReplyShape, threadlessReplySubject } from "./threadless-config";
+import { threadlessReplyShape } from "./threadless-config";
+import { threadlessExpectedReplySubject } from "./app-tickets-config";
 
 export type CaseReplyFacts = Readonly<{
   /** `caseAdmissionStatus` of the case now; a customer message recorded after the version the person saw is `input_newer` even though the case was re-admitted for it. */
@@ -62,7 +63,7 @@ export async function readCaseReplyFacts(tx: ExecutionTx, proposal: CaseReplyPro
       ? await readCaseThreadlessSource(tx, row.id, proposal.triggerEventId) : null;
     const valid = source?.source.contact && caseEffectHash(source.source) === proposal.ticketSource?.version
       && row?.sensitivity === "none" && row.version === proposal.caseVersion
-      && row.phase === "queued" && proposal.subject === threadlessReplySubject(row.ticketId);
+      && row.phase === "queued" && proposal.subject === threadlessExpectedReplySubject(source!);
     return {
       admission: valid ? admission : { admitted: false, reason: "ticket_source_changed" },
       storedSender: valid ? source!.source.contact!.email : null,

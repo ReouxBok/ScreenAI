@@ -19,6 +19,8 @@ import { assertSavOutboundRecipientAllowed } from "../policy";
 import type { CaseReplyContext } from "./case-effect-intents";
 import { caseReplyModeForBasis } from "./case-reply-mode";
 import { savV2NewThreadAutoEnabled, savV2NewThreadEnabled, threadlessReplyShape } from "./threadless-config";
+import { appTicketSmartFirstMail } from "./app-tickets-config";
+import { readCaseThreadlessSource } from "./case-store";
 import { caseReplyKey, caseReplyPayloadHash, caseReplyQuestions, readCaseEffectsMode, type CaseReplyProposal } from "./case-effects";
 import { readCaseReplyFacts } from "./case-reply-facts";
 import { caseReplyStoredTextProblem, caseReplyTextProblemForBasis } from "./case-reply-mode";
@@ -241,7 +243,9 @@ export async function decideCaseReply(input: Readonly<{
   if (!authorization.allowed) return refuse(authorization.code);
   // SAV-96 B: a first mail (ticket with no thread) is a person's unless `SAV_V2_NEW_THREAD_AUTO=on`; even then only the injected Access rule's authorizer
   // may grant the automated basis (`threadless-first-mail.ts`), and the send gate re-reads it (`threadless-effects.ts`).
-  if (action === "approve" && proposal.ticketSource && caseReplyModeForBasis(authorization.basis) !== "manual_reviewed" && !savV2NewThreadAutoEnabled(deps.env()))
+  // SAV-138 (Ugo 25/11): the smart first mail of an app ticket rests on the smart reply's rights instead (`smartFirstMailAutoProblem`), never on that switch.
+  if (action === "approve" && proposal.ticketSource && caseReplyModeForBasis(authorization.basis) !== "manual_reviewed" && !savV2NewThreadAutoEnabled(deps.env())
+    && !appTicketSmartFirstMail(deps.env(), (await readCaseThreadlessSource(requireDb(), proposal.caseId, proposal.triggerEventId))?.ownerTransitionKey))
     return refuse("proposal_invalid", "ticket_review_required");
   // The mention the text carries must be the one THIS authority allows: the automated mention only under the automatic rule's basis, the reviewed one only under a human's.
   if (action === "approve") { const wrongMode = caseReplyTextProblemForBasis(proposal.text, authorization.basis); if (wrongMode) return refuse("proposal_invalid", wrongMode); }

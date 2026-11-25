@@ -19,6 +19,7 @@ import { refreshSavDashboardProjection, savSqlDashboardEnabled } from "@/lib/sav
 import { randomUUID } from "node:crypto";
 import { recordSavWorkerPulse } from "@/lib/sav/monitor";
 import { savV2OwnerHandoverEnabled, savV2OwnerHandoverPollEnabled } from "@/lib/sav/cases/owner-handover-config";
+import { savAppTicketsMode } from "@/lib/sav/cases/app-tickets-config";
 
 export type SavReconcileTrigger = "vercel_cron" | "gmail_webhook" | "heartbeat_workflow";
 export type SavReconcilePassOptions = { trigger: SavReconcileTrigger; pulseId?: string; budgetMs?: number };
@@ -72,6 +73,9 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     (await import("@/lib/sav/cases/owner-handover-poll")).pollSavOwnerHandovers({ deadlineMs: derivedDeadline })) : undefined;
   const ownerHandovers = savV2OwnerHandoverEnabled() ? await runStep("v2_owner_handovers", async () =>
     (await import("@/lib/sav/cases/owner-handover")).sweepDueOwnerHandovers(derivedDeadline)) : undefined;
+  // SAV-138: tickets created from the Limova app (no mail), SAV_APP_TICKETS_MODE=shadow|live; off (default): absent from the payload, not one call.
+  const appTickets = savAppTicketsMode() !== "off" ? await runStep<Awaited<ReturnType<typeof import("@/lib/sav/cases/app-tickets").reconcileSavAppTickets>>>("v2_app_tickets", async () =>
+    (await import("@/lib/sav/cases/app-tickets")).reconcileSavAppTickets({ deadlineMs: derivedDeadline })) : undefined;
   const emailOpenings = await runStep("email_openings", () => dispatchPendingSavEmailOpenings(10));
   const contextRefreshes = await runStep("context_refreshes", () => processPendingSavContextRefreshes(5));
   const [trainings, evaluations] = await Promise.all([
@@ -155,7 +159,7 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     return runSmartBenchSelfTestPass({ env: () => process.env, now: () => new Date(), deadlineMs: derivedDeadline });
   }) : undefined;
   // V2 effects (replies, handoff notices, ticket stages, closures) have their own worker: /api/cron/sav-v2-effects (11/11).
-  const payload = { ...(ownerHandoverPoll ? { ownerHandoverPoll } : {}), ...(ownerHandovers ? { ownerHandovers } : {}), ...(accessSkillSelfTest ? { accessSkillSelfTest } : {}), ...(smartShadow ? { smartShadow } : {}), ...(smartShadowReplay ? { smartShadowReplay } : {}), ...(smartBenchSelfTest ? { smartBenchSelfTest } : {}), caseReminders, ticketSafetyNet, ackClosures, intakeRouting, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { ...(ownerHandoverPoll ? { ownerHandoverPoll } : {}), ...(ownerHandovers ? { ownerHandovers } : {}), ...(appTickets ? { appTickets } : {}), ...(accessSkillSelfTest ? { accessSkillSelfTest } : {}), ...(smartShadow ? { smartShadow } : {}), ...(smartShadowReplay ? { smartShadowReplay } : {}), ...(smartBenchSelfTest ? { smartBenchSelfTest } : {}), caseReminders, ticketSafetyNet, ackClosures, intakeRouting, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return { payload, hasStepFailure, pulseId };

@@ -23,6 +23,7 @@ import {
 import { trialsOnCustomerReturn } from "./case-trial-return";
 import { caseQualificationPrecheck } from "./qualification-diagnostic";
 import { savV2NewThreadEnabled } from "./threadless-config";
+import { appTicketSmartFirstMail } from "./app-tickets-config";
 import type { ThreadlessTicketEvent, ThreadlessTicketSource } from "./threadless-source";
 
 type Db = ReturnType<typeof requireDb>;
@@ -403,7 +404,9 @@ export async function openCaseFromHubspotTicket(input: ThreadlessCaseStart): Pro
   const admission = input.admission && { ...input.admission, qualification: parseQualification(input.admission.qualification) };
   // SAV-123 (N8): a ticket the smart entry admitted with no mail thread is not answered by the agent (the first mail of a ticket is the Access pilot's, not the
   // smart brain's, limit RAPPORT_N8): its case is born with the team (`smart_no_thread`), and the existing hand-over stage gives the ticket back.
-  const waitReason = input.waitReason ?? (admission?.qualification.requests.some(request => isSmartSupportProvenance(request.provenance)) ? SAV_SMART_NO_THREAD_WAIT : undefined);
+  // SAV-138 (Ugo 25/11): an app ticket this path assigned (its key's marker), mode `live`: the smart brain writes its first mail, the case is born with the agent.
+  const smartFirstMail = appTicketSmartFirstMail(env, input.ownerTransitionKey);
+  const waitReason = input.waitReason ?? (!smartFirstMail && admission?.qualification.requests.some(request => isSmartSupportProvenance(request.provenance)) ? SAV_SMART_NO_THREAD_WAIT : undefined);
   const detail = threadlessTicketEventSchema.parse({ source: input.source, ownerTransitionKey: input.ownerTransitionKey,
     observedAt: input.observedAt, ...(waitReason ? { waitReason } : {}) });
   const { source } = detail, ticketId = source.ticketId;

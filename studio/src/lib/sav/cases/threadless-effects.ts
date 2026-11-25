@@ -7,16 +7,19 @@ import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { intakeAdmissionUsage, SAV_INTAKE_OPERATIONAL_PROFILE } from "../intake/budget-profile";
 import { admissionLock, confirmExecutionEffect, deferExecutionEffect, executionJournal, recordEffectAck, type ExecutionTx } from "../intake/execution-store";
 import type { Effect } from "../intake/execution-types";
-import { lockCaseForWrite, hasLocalThreadForTicket, readCaseThreadlessSource, appendCaseEvent, updateCaseRecord, transitionCaseOwner } from "./case-store";
+import { lockCaseForWrite, hasLocalThreadForTicket, readCase, readCaseThreadlessSource, appendCaseEvent, updateCaseRecord, transitionCaseOwner } from "./case-store";
 import { caseEffectHash, caseReplyKey, checkCaseReplyApproval, type CaseReplyProposal } from "./case-effects";
 import { readCaseReplyFacts } from "./case-reply-facts";
 import { caseReplyTextProblemForBasis, caseReplyModeForBasis } from "./case-reply-mode";
 import { savCaseReplyValidations } from "./case-reply-validation-table";
 import { savV2NewThreadEnabled, THREADLESS_ADMIT_PERMISSION, THREADLESS_CRM_PERMISSION, THREADLESS_SEND_PERMISSION } from "./threadless-config";
 import { readThreadlessAuthority, threadlessAccessRevision, threadlessActionAllowed, threadlessAuthorityStillGranted, threadlessSchemaInstalled } from "./threadless-guard";
-import { isSmartSupportProvenance, SAV_SMART_REQUALIFIED } from "./case-types";
+import { isSmartSupportProvenance, SAV_SMART_ENTRY_POLICY_REVISION, SAV_SMART_REQUALIFIED } from "./case-types";
 import { qualifyThreadlessTicket, readThreadlessTicket, threadlessAccessQualified } from "./threadless-source";
-import { threadlessAutoSendProblem } from "./first-mail/first-mail-rights";
+import { smartFirstMailAutoProblem, threadlessAutoSendProblem } from "./first-mail/first-mail-rights";
+import { appTicketSmartFirstMail, isAppTicketTransition } from "./app-tickets-config";
+import { caseReplyEditableBody } from "./case-reply-outbound";
+import { smartAdmission, smartSendProblem } from "./smart/smart-send-fence";
 import { buildNewThreadSendIntent, THREADLESS_MAILBOX, type createThreadlessTransport, type NewThreadAck, type NewThreadReceipt, type NewThreadSendIntent, type ThreadlessCrmAck } from "./threadless-transport";
 import type { CaseRuntimeDeps } from "./case-runtime-effects";
 import { enqueueCaseTicketStage } from "./case-ticket-stage-queue";
@@ -231,12 +234,36 @@ async function passOne(parent: Parent, deps: PassDeps) {
   // PORTE 2B: the ticket now qualifies on the smart path (SAV_V2_ENTRY_SMART turned on after the queue): the Access first mail never leaves and the case goes back
   // to the team ONCE through the existing hand-over (owner human, `handoff_pending`: note, stage and Slack by the hand-over notice, no mail); the parent is refused,
   // so no later pass takes it again.
-  if (qualification?.status === "admitted" && qualification.admission.qualification.requests.some(row => isSmartSupportProvenance(row.provenance))) {
+  const smartQualified = qualification?.status === "admitted" && qualification.admission.qualification.requests.some(row => isSmartSupportProvenance(row.provenance));
+  // SAV-138 (Ugo 25/11): the smart first mail of an app ticket (the case's key marker, mode `live`, smart entry on) needs the smart qualification NOW; the mode
+  // or the switch changed after the queue, or the ticket no longer qualifies smart: nothing leaves, the case goes to the team once (same hand-over).
+  const appSmart = !gmail && appTicketSmartFirstMail(env, input.ownerTransitionKey) && smartAdmission((await readCase(parent.caseId))?.admission);
+  if (smartQualified && !appSmart) {
     await waitBeforeSend(parent, SAV_SMART_REQUALIFIED, true);
     return;
   }
-  const accessRevision = qualification && threadlessAccessQualified(qualification) ? await threadlessAccessRevision(env, db) : null;
+  // An app ticket case is never sent on the Access path, whatever it qualifies as now.
+  if (!gmail && !appSmart && isAppTicketTransition(input.ownerTransitionKey)) {
+    await waitBeforeSend(parent, "app_ticket_not_smart", true);
+    return;
+  }
+  if (appSmart && !smartQualified) {
+    await waitBeforeSend(parent, qualification?.status === "human_wait" && /^[a-z_]{1,80}$/.test(qualification.reason) ? qualification.reason : "app_ticket_requalified", true);
+    return;
+  }
+  const accessRevision = appSmart ? SAV_SMART_ENTRY_POLICY_REVISION
+    : qualification && threadlessAccessQualified(qualification) ? await threadlessAccessRevision(env, db) : null;
   if (!gmail && !accessRevision) return;
+  if (appSmart) {
+    // The smart reply's last look on OUR text, whoever approved it (as `case-effect-driver.ts` on a thread reply).
+    let body = proposal.text;
+    try { body = caseReplyEditableBody(proposal.text); } catch { body = proposal.text; }
+    const fence = smartSendProblem({ admission: (await readCase(parent.caseId))?.admission, body, purpose: proposal.purpose });
+    if (fence) {
+      await waitBeforeSend(parent, fence.toLowerCase(), true);
+      return;
+    }
+  }
   if (!gmail) {
     // SAV-96 B: the last look before the marker, exactly as a thread reply (`case-effect-driver.ts`): the decision, its scope and every cited card
     // re-proven now, under the PERSISTED basis. A card retired or changed since the approval: no POST, a person takes the ticket. An automated
@@ -274,7 +301,7 @@ async function passOne(parent: Parent, deps: PassDeps) {
       // SAV-96 B: an automated first mail is sent only while every right it was approved under still holds, read now under the same locks.
       const automated = caseReplyModeForBasis(approval?.authorizationBasis) === "automated";
       if (approval?.state !== "approved" || approval.executionId !== parent.id || !approval.decidedAt || !approval.decidedBy
-          || (automated ? await threadlessAutoSendProblem(tx, deps.env(), { proposal, decidedBy: approval.decidedBy, admissionRecord: facts.admissionRecord }) !== null
+          || (automated ? await (appSmart ? smartFirstMailAutoProblem : threadlessAutoSendProblem)(tx, deps.env(), { proposal, decidedBy: approval.decidedBy, admissionRecord: facts.admissionRecord }) !== null
             : caseReplyModeForBasis(approval.authorizationBasis) !== "manual_reviewed")
           || caseReplyTextProblemForBasis(proposal.text, approval.authorizationBasis)
           || checkCaseReplyApproval(proposal, { payloadHash: approval.payloadHash, caseVersion: approval.caseVersion, recipient: approval.recipient,
