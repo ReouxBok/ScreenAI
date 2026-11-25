@@ -68,16 +68,31 @@ export function savIntakeCustomerSignalAbsenceVerified(routing: Pick<SavIntakeRo
 export type SavIntakeSafeArchiveFacts = Readonly<{
   /** V1's plan saw no request at all (zero, or only « other »), and asked only for its classification. */
   noRequest: boolean;
-  /** The mail carries an attachment V1 did not read (absent: none). Never archived then. */
+  /** The mail carries an attachment V1 did not read (absent: none). Never archived then, except a delivery report below. */
   unreadAttachment?: boolean;
+  /** SAV-92's noise verdict on THIS message: strong noise for a delivery status report or a mailer-daemon non-delivery (absent: no). */
+  deliveryReport?: boolean;
+  /** « limova » appears only inside @limova.ai addresses (text, subject, sender): a bounce of our own mail. Absent: no. */
+  productMentionAddressOnly?: boolean;
   sender: SavIntakeSenderContact;
   productMention: boolean;
   customerSignalAbsenceVerified: boolean;
 }>;
 const NO_REQUEST_REASONS: readonly string[] = ["classification_incomplete", "other_rule_not_applicable"];
 const ARCHIVE_ONLY: readonly string[] = ["demarchage", "notification_auto", "phishing"];
+const DELIVERY_REASONS: readonly string[] = ["SAV_NOISE_DELIVERY_STATUS", "SAV_NOISE_MAILER_DAEMON"];
+/** True only when SAV-92's stored verdict is about this very message, is strong noise, and names a delivery report (observe or on). Never the
+ * sender's name alone: the filter's own rules require the report header or the non-delivery wording. */
+export function savIntakeDeliveryReport(noise: { messageId?: string; verdict?: string; strength?: string | null; reason?: string | null } | null | undefined, messageId: string) {
+  return Boolean(noise && noise.messageId === messageId && noise.verdict === "noise" && noise.strength === "strong" && noise.reason && DELIVERY_REASONS.includes(noise.reason));
+}
+const OWN_ADDRESS = /[\p{L}\p{N}._%+-]+@limova\.ai\b/giu;
+const addressOnly = (...values: string[]) => values.some(v => /limova/iu.test(v)) && values.every(v => !/limova/iu.test(v.replace(OWN_ADDRESS, " ")));
+
 /** The facts of one analysed mail, from its stored plan, message and routing field; null when the plan or message is missing. */
 export function savIntakeSafeArchiveFacts(input: {
+  /** Set by the runtime from `savIntakeDeliveryReport` (absent: false). */
+  deliveryReport?: boolean;
   plan: { decision: { requests: readonly { kind: string }[]; disposition: { kind: string; reasons?: readonly string[] }; evidence?: readonly { id: string; source: string }[] };
     senderContact?: SavIntakeSenderContact } | null | undefined;
   message: { currentText: string; fromEmail: string; subject?: string | null; unreadAttachments?: readonly unknown[]; attachmentInputs?: readonly { sourceId: string }[] } | null | undefined;
@@ -86,12 +101,16 @@ export function savIntakeSafeArchiveFacts(input: {
   const { plan, message } = input;
   if (!plan || !message) return null;
   const disposition = plan.decision.disposition;
-  const noRequest = disposition.kind === "collect_context" && (disposition.reasons ?? []).every(reason => NO_REQUEST_REASONS.includes(reason))
-    && plan.decision.requests.every(request => request.kind === "other");
   // An attachment counts as read only when V1 kept its analysed observation as evidence.
   const read = new Set((plan.decision.evidence ?? []).filter(e => e.source === "current_attachment").map(e => e.id));
   const unreadAttachment = Boolean(message.unreadAttachments?.length) || (message.attachmentInputs ?? []).some(input => !read.has(input.sourceId));
-  return { noRequest, ...(unreadAttachment ? { unreadAttachment } : {}), sender: plan.senderContact ?? "unknown", productMention: savIntakeMentionsProduct(message.currentText, message.fromEmail, message.subject ?? ""),
+  // A delivery report's returned copy is an unread file, which V1 reports as an incomplete history: only then is that reason admitted.
+  const admitted = input.deliveryReport && unreadAttachment ? [...NO_REQUEST_REASONS, "history_incomplete"] : NO_REQUEST_REASONS;
+  const noRequest = disposition.kind === "collect_context" && (disposition.reasons ?? []).every(reason => admitted.includes(reason))
+    && plan.decision.requests.every(request => request.kind === "other");
+  const ownAddressOnly = addressOnly(message.currentText, message.subject ?? "", message.fromEmail);
+  return { noRequest, ...(unreadAttachment ? { unreadAttachment } : {}), ...(input.deliveryReport ? { deliveryReport: true } : {}),
+    ...(ownAddressOnly ? { productMentionAddressOnly: true } : {}), sender: plan.senderContact ?? "unknown", productMention: savIntakeMentionsProduct(message.currentText, message.fromEmail, message.subject ?? ""),
     customerSignalAbsenceVerified: savIntakeCustomerSignalAbsenceVerified(input.routing, message.currentText) };
 }
 
@@ -105,9 +124,11 @@ export function savIntakeSafeArchiveRefusal(facts: { model: SavIntakeRoutingAnal
   if (!model) return "model_routing_missing";
   if (!ARCHIVE_ONLY.includes(model.class)) return "v1_collect_context";
   if (model.confidence !== "high") return `confidence_${model.confidence}`;
-  if (safe.unreadAttachment) return "safe_archive_unread_attachment";
+  // A delivery report (SAV-92) lifts two checks only, for a high-confidence automatic notification: its returned copy, and our own addresses.
+  const bounce = safe.deliveryReport === true && model.class === "notification_auto";
+  if (safe.unreadAttachment && !bounce) return "safe_archive_unread_attachment";
   if (safe.sender !== "none") return `safe_archive_sender_${safe.sender}`;
-  if (safe.productMention) return "safe_archive_product_mention";
+  if (safe.productMention && !(bounce && safe.productMentionAddressOnly)) return "safe_archive_product_mention";
   if (!safe.customerSignalAbsenceVerified) return "safe_archive_customer_signal";
   return null;
 }
@@ -135,8 +156,7 @@ export function savIntakeSafeArchiveGuideline() {
 //                                      gets ONE repair call naming the failed check, instead of the same cached answer refused on every attempt. The
 //                                      server checks the new answer exactly as before: a quote absent from the mail is never accepted. New launch hash.
 //   SAV_INTAKE_BOUNDED_CONVERSATION  : the simple reader sends the latest messages of a long thread (bounded), never the whole thread. New launch hash.
-//   SAV_INTAKE_TICKET_DECIDE         : « quel ticket ? »: exactly one open ticket judged the same is linked; every ticket judged different gives a new
-//                                      ticket. Finance and cancellation keep today's path.
+//   SAV_INTAKE_TICKET_DECIDE         : « quel ticket ? »: exactly one open ticket judged the same is linked. Finance and cancellation keep today's path.
 export const savIntakeCitationRepairEnabled = (env: Env = process.env) => on(env, "SAV_INTAKE_CITATION_REPAIR");
 export const SAV_INTAKE_CITATION_REPAIR_REVISION = "sav-intake-citation-repair-2026-11-25.v1";
 export const savIntakeBoundedConversationEnabled = (env: Env = process.env) => on(env, "SAV_INTAKE_BOUNDED_CONVERSATION");
@@ -145,7 +165,7 @@ export const SAV_INTAKE_BOUNDED_CONVERSATION_REVISION = "sav-intake-bounded-conv
 export const SAV_INTAKE_CONVERSATION_MAX = 12;
 
 const CITATION_HINTS: Readonly<Record<string, string>> = {
-  wrong_anchor_source: "Every request must cite the CURRENT message. A request that only appears in an earlier message or in the quoted part of the thread is not a request of this mail: describe what the current message asks, or return no request.",
+  wrong_anchor_source: "Every request must cite the CURRENT message. A request that only appears in an earlier message or in the quoted part of the thread is not a request of this mail: describe what the current message asks, and return no request only if the current message itself asks nothing; never drop a finance or cancellation request.",
   registration_source_invalid: "Return `registration` only for an address the sender states in the CURRENT message as their own Limova account, with a quote copied verbatim from the current message that contains it. Otherwise omit `registration` (never the address of another person).",
   excerpt_not_in_source: "Copy every quote verbatim from its source (same words, accents and punctuation), or omit the optional field.",
   unknown_anchor: "Use only the quote identifiers offered in the citation catalogue.",
@@ -160,17 +180,18 @@ export function savIntakeCitationRepairText(failure: { reason: string; path: str
   return `\nCITATION REPAIR v1: the server refused your previous answer (${failure.reason} at ${path}). ${hint} Every other rule still applies; never invent a fact or a quote.`;
 }
 
-/** The newest messages of a thread, oldest first, plus the messages that must stay citable; and how many were left out. */
-export function savIntakeBoundConversation<T extends { id: string }>(conversation: readonly T[], keepIds: readonly (string | undefined)[], max = SAV_INTAKE_CONVERSATION_MAX) {
+/** The newest messages of a thread, oldest first, plus the thread's first inbound message and the messages that must stay citable; and how many
+ * were left out. */
+export function savIntakeBoundConversation<T extends { id: string; direction?: string }>(conversation: readonly T[], keepIds: readonly (string | undefined)[], max = SAV_INTAKE_CONVERSATION_MAX) {
   if (conversation.length <= max) return { messages: [...conversation], omitted: 0 };
-  const keep = new Set(keepIds.filter((id): id is string => Boolean(id)));
+  const keep = new Set([...keepIds, conversation.find(m => m.direction === "inbound")?.id].filter((id): id is string => Boolean(id)));
   const newest = new Set(conversation.slice(-max).map(m => m.id));
   const messages = conversation.filter(m => newest.has(m.id) || keep.has(m.id));
   return { messages, omitted: conversation.length - messages.length };
 }
 
 /** « Quel ticket ? » with SAV_INTAKE_TICKET_DECIDE: decides the comparison when the model's own judgement is unambiguous. Mutates the assessment and
- * returns true when it decided: exactly one open or new ticket judged `same` (every other ticket becomes `different`), or every ticket `different`. */
+ * returns true when it decided: exactly one open or new ticket judged `same` (every other ticket becomes `different`). */
 export function savIntakeDecideTicketChoice(assessment: { investigationComplete: boolean; tickets: { ticketId: string; relation: string }[] },
   stageOf: (ticketId: string) => string | undefined): boolean {
   if (!assessment.tickets.length) return false;
@@ -180,6 +201,6 @@ export function savIntakeDecideTicketChoice(assessment: { investigationComplete:
     assessment.investigationComplete = true;
     return true;
   }
-  if (assessment.tickets.every(t => t.relation === "different")) { assessment.investigationComplete = true; return true; }
+  // Review 2: an incomplete comparison is never completed here (every ticket « different » with an unfinished reading could duplicate a ticket).
   return false;
 }

@@ -15,7 +15,7 @@ import { readSavExternalCompletion } from "../external-completion";
 import { assertSavAgentActionsAllowed } from "./agent-pause";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./execution-policy";
 import type { GmailRequest } from "./execution-adapters";
-import { savIntakeSafeArchiveEnabled, savIntakeSafeArchiveFacts } from "./to-validate-rules";
+import { savIntakeDeliveryReport, savIntakeSafeArchiveEnabled, savIntakeSafeArchiveFacts } from "./to-validate-rules";
 import { intakeRoutingModelFromSemantics, intakeRoutingPlanFacts, savIntakeRoutingMode, SAV_INTAKE_ROUTING_MAILBOX, SAV_INTAKE_ROUTING_PERMISSION,
   type SavIntakeRoutingDecision } from "./routing-rules";
 import { INTAKE_ROUTING_FINAL_STEPS, routeIntakeMessage, type IntakeRoutingDeps, type IntakeRoutingGmail, type IntakeRoutingLiveFacts, type IntakeRoutingStep,
@@ -118,7 +118,8 @@ export async function readIntakeRoutingFacts(messageId: string): Promise<IntakeR
   // SAV-139: the same server-checked safe-archive facts as the analysis, only with `SAV_INTAKE_SAFE_ARCHIVE=on`.
   const analysed = typeof input?.message?.currentText === "string" && typeof input.message.fromEmail === "string" ? { currentText: input.message.currentText,
     fromEmail: input.message.fromEmail, subject: message.subject, unreadAttachments: input.message.unreadAttachments, attachmentInputs: input.message.attachmentInputs } : null;
-  const safeArchive = savIntakeSafeArchiveEnabled(process.env) ? savIntakeSafeArchiveFacts({ plan: payload?.plan, message: analysed, routing: model }) : null;
+  const safeArchive = savIntakeSafeArchiveEnabled(process.env) ? savIntakeSafeArchiveFacts({ plan: payload?.plan, message: analysed, routing: model,
+    deliveryReport: savIntakeDeliveryReport(payload?.noise, messageId) }) : null;
   return {
     stored,
     facts: { messageId, model, plan: intakeRoutingPlanFacts(payload?.plan), ...(safeArchive ? { safeArchive } : {}),

@@ -19,7 +19,7 @@ import { intakeAutomationAdapters } from "./automated-message";
 import { SAV_INTAKE_NOISE_RESOURCE, savIntakeNoiseLogLine } from "./noise-filter";
 import { evaluateIntakeNoise } from "./noise-filter-runtime";
 import { decideIntakeRouting, intakeRoutingModelFromSemantics, intakeRoutingPlanFacts, savIntakeRoutingLogLine } from "./routing-rules";
-import { savIntakeBoundedConversationEnabled, savIntakeCitationRepairEnabled, savIntakeSafeArchiveEnabled, savIntakeSafeArchiveFacts, savIntakeToValidatePolicy } from "./to-validate-rules";
+import { savIntakeBoundedConversationEnabled, savIntakeCitationRepairEnabled, savIntakeDeliveryReport, savIntakeSafeArchiveEnabled, savIntakeSafeArchiveFacts, savIntakeToValidatePolicy } from "./to-validate-rules";
 import type { IntakeLease } from "./runtime-store";
 import { intakeCrmEvidenceFingerprint, recordIntakeCrmReads } from "./crm-evidence-fingerprint";
 import { intakeResumeHoldReason, intakeResumeProof, newIntakeResumeObservation, observeIntakeReads } from "./resume-progress";
@@ -341,7 +341,8 @@ function routeIntakeAnalysis(payload: IntakeRuntimePayload, lease: Pick<IntakeLe
     const messageId = lease.run.messageId, input = lease.input;
     const model = intakeRoutingModelFromSemantics(payload.semantics, messageId);
     // SAV-139: server-checked safe-archive facts, only with `SAV_INTAKE_SAFE_ARCHIVE=on` (absent: today's rule).
-    const safeArchive = safeArchiveOn ? savIntakeSafeArchiveFacts({ plan: payload.plan, message: { ...input.message, subject: lease.provenance.get(messageId)?.subject ?? null }, routing: model }) : null;
+    const safeArchive = safeArchiveOn ? savIntakeSafeArchiveFacts({ plan: payload.plan, message: { ...input.message, subject: lease.provenance.get(messageId)?.subject ?? null }, routing: model,
+      deliveryReport: savIntakeDeliveryReport(payload.noise, messageId) }) : null;
     const decision = decideIntakeRouting({ messageId, analysisWaiting: state !== "observed", ...(safeArchive ? { safeArchive } : {}),
       model, plan: intakeRoutingPlanFacts(payload.plan),
       thread: { conversationLength: input.conversation.status === "complete" ? input.conversation.data.length : Number.POSITIVE_INFINITY,

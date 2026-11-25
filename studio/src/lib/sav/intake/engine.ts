@@ -390,7 +390,11 @@ export async function planSavIntake(
       const accessory = (u: { sourceId: string }) => requirements.filter(r => r.sourceId === u.sourceId).length === 1
         && requirements.some(r => r.sourceId === u.sourceId && r.role === "accessory" && r.textQuote && savEvidenceContains(message.currentText, r.textQuote));
       if (requirements.some(r => !message.unreadAttachments!.some(u => u.sourceId === r.sourceId))) return context("classification_incomplete");
-      if (message.unreadAttachments.some(u => !accessory(u))) return context("history_incomplete");
+      if (message.unreadAttachments.some(u => !accessory(u))) {
+        // SAV-139 review 2: a delivery report's returned copy stops here; the safe-archive checks still need the sender's HubSpot answer.
+        if (toValidate?.senderLookup && !requests.length) await lookupSender();
+        return context("history_incomplete");
+      }
       for (const unread of message.unreadAttachments) addEvidence(unread.sourceId, "current_attachment", message.id, { ...unread, read: false });
     } else if (analysis.unreadAttachmentRequirements?.length) return context("classification_incomplete");
     if (!requests.length && analysis.nature === "newsletter" && policy.qualifiedOther?.family === "authenticated_newsletter" && !policy.manualSupportOverride) classification = "other";

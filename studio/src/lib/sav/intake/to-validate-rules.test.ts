@@ -8,8 +8,9 @@ import {
 } from "./routing-rules";
 import { savIntakeRoutingGuideline } from "./routing-guidelines";
 import { intakeRuntimeConfigurationHash } from "./runtime-contract";
+import { savIntakeNoiseVerdict, type SavIntakeNoiseInput } from "./noise-filter";
 import {
-  savIntakeCustomerSignalAbsenceVerified, savIntakeMentionsProduct, savIntakeSafeArchiveFacts, savIntakeSafeArchiveRefusal, savIntakeSenderContact,
+  savIntakeDeliveryReport, savIntakeCustomerSignalAbsenceVerified, savIntakeMentionsProduct, savIntakeSafeArchiveFacts, savIntakeSafeArchiveRefusal, savIntakeSenderContact,
   savIntakeSupportDefaultApplies, savIntakeToValidatePolicy, type SavIntakeSafeArchiveFacts,
 } from "./to-validate-rules";
 
@@ -172,9 +173,10 @@ const policyBase = (): EnginePolicy => ({ relationRevision: "fixture-239", admit
   identification: { resourceId: "id-template", revisionId: "r1", sha256: "d".repeat(64) },
   multiTicketWarning: { resourceId: "warning", revisionId: "r1", sha256: createHash("sha256").update(warning).digest("hex"), text: warning } } });
 type Fixture = { text: string; analysis: MessageAnalysis; contacts: IntakeContact[]; tickets: IntakeTicket[]; relations?: Record<string, "same" | "different" | "partial" | "unknown">;
-  conversation?: EngineInput["conversation"]["data"]; policy?: Partial<EnginePolicy> };
+  conversation?: EngineInput["conversation"]["data"]; policy?: Partial<EnginePolicy>; unreadAttachments?: { sourceId: string; reason: "unsupported_type" }[] };
 function engine(f: Fixture) {
-  const message = { id: mid, threadId: thread, receivedAt: at, fromEmail: sender, toEmails: ["contact@exemple.invalid"], direction: "inbound" as const, currentText: f.text, contentComplete: true };
+  const message = { id: mid, threadId: thread, receivedAt: at, fromEmail: sender, toEmails: ["contact@exemple.invalid"], direction: "inbound" as const, currentText: f.text, contentComplete: true,
+    ...(f.unreadAttachments ? { unreadAttachments: f.unreadAttachments } : {}) };
   const lookups = vi.fn(async () => ok(f.contacts));
   const adapters: IntakeAdapters = {
     analyseMessage: async () => structuredClone(f.analysis),
@@ -348,5 +350,62 @@ describe("SAV-139 engine: « Déjà couvert ? lequel ? » answered by the thread
   });
   it("on, an already decided comparison is not overridden", async () => {
     expect((await two({ toValidate: { threadTicketLink: true, threadTicketId: "302" } }, { "301": "same", "302": "different" })).decision.disposition).toMatchObject({ target: { ticketId: "301" } });
+  });
+});
+
+// ---------- Review 2 D: delivery reports (bounces), archived through SAV-92's verdict only ----------
+describe("SAV-139 delivery report archive", () => {
+  const bounceText = "Message non distribué. L'adresse equipe@limova.ai n'a pas pu remettre votre message : adresse introuvable.";
+  const noiseInput = (over: Partial<SavIntakeNoiseInput> = {}): SavIntakeNoiseInput => ({ messageId: mid, direction: "inbound", fromEmail: "mailer-daemon@exemple.invalid",
+    subject: "Delivery Status Notification (Failure)", bodyText: bounceText, attachmentCount: 1,
+    headers: { "x-studio-automation-headers": "singleton-v1", "content-type": "multipart/report; report-type=delivery-status; boundary=x" },
+    context: { conversationLength: 1, threadTicketId: null, humanContext: false, quotedMailboxReply: false },
+    senderHistory: { priorInbound: 0, priorInboundNotAutomatic: 0, outboundTo: 0, ticketThreads: 0 }, ...over });
+  const stored = (verdict: ReturnType<typeof savIntakeNoiseVerdict>, messageId = mid) => ({ ...verdict, mode: "observe" as const, messageId, routed: false });
+  const bouncePlan = { decision: { requests: [], disposition: { kind: "collect_context", reasons: ["history_incomplete", "classification_incomplete"] }, evidence: [{ id: "current", source: "current_message" }] },
+    senderContact: "none" as const };
+  const bounceModel = model({ class: "notification_auto", customerSignal: false, customerSignalQuote: "n'a pas pu remettre votre message" });
+  const facts = (deliveryReport: boolean) => savIntakeSafeArchiveFacts({ plan: bouncePlan, deliveryReport, routing: bounceModel,
+    message: { currentText: bounceText, fromEmail: "mailer-daemon@exemple.invalid", subject: "Delivery Status Notification (Failure)", unreadAttachments: [{ sourceId: "f1" }] } })!;
+  it("an isolated bounce is archived (returned copy unread, our own address in the text)", () => {
+    const report = savIntakeDeliveryReport(stored(savIntakeNoiseVerdict(noiseInput())), mid);
+    expect(report).toBe(true);
+    const f = facts(report);
+    expect(f).toMatchObject({ noRequest: true, unreadAttachment: true, deliveryReport: true, productMention: true, productMentionAddressOnly: true });
+    expect(decideIntakeRouting({ messageId: mid, model: bounceModel, plan: collectPlan, thread: firstMail, safeArchive: f })).toMatchObject({ action: "archive", class: "notification_auto" });
+  });
+  it("a bounce in a customer's thread stays visible", () => {
+    const inThread = savIntakeNoiseVerdict(noiseInput({ context: { conversationLength: 3, threadTicketId: null, humanContext: false, quotedMailboxReply: false } }));
+    expect(savIntakeDeliveryReport(stored(inThread), mid)).toBe(false);
+    // Even with the report fact, the routing's own first-mail check keeps it.
+    expect(decideIntakeRouting({ messageId: mid, model: bounceModel, plan: collectPlan, thread: { ...firstMail, conversationLength: 3 }, safeArchive: facts(true) }))
+      .toMatchObject({ action: "keep", reason: "thread_history" });
+  });
+  it("a mailer-daemon without a report header is kept (the sender's name alone proves nothing)", () => {
+    const noHeader = savIntakeNoiseVerdict(noiseInput({ headers: {} }));
+    expect(noHeader.verdict).toBe("keep");
+    const report = savIntakeDeliveryReport(stored(noHeader), mid);
+    expect(report).toBe(false);
+    expect(decideIntakeRouting({ messageId: mid, model: bounceModel, plan: collectPlan, thread: firstMail, safeArchive: facts(report) })).toMatchObject({ action: "keep" });
+  });
+  it("engine: a mail without request whose file stays unread still carries the sender's answer (switch on only)", async () => {
+    const base = { text: bounceText, analysis: analysis(null, { class: "notification_auto" }, "information"), contacts: [], tickets: [], unreadAttachments: [{ sourceId: "f1", reason: "unsupported_type" as const }] };
+    const on = engine({ ...base, policy: { toValidate: { senderLookup: true } } });
+    const plan = await on.run();
+    expect(plan.decision.disposition).toMatchObject({ kind: "collect_context", reasons: ["history_incomplete", "classification_incomplete"] });
+    expect(plan.senderContact).toBe("none");
+    const off = engine(base);
+    expect((await off.run()).senderContact).toBeUndefined();
+    expect(off.lookups).not.toHaveBeenCalled();
+  });
+  it("the report fact lifts nothing else: another message's verdict, another class, a Limova mention outside our addresses, a known sender", () => {
+    expect(savIntakeDeliveryReport(stored(savIntakeNoiseVerdict(noiseInput()), "10000000-0000-4000-8000-000000000999"), mid)).toBe(false);
+    expect(decideIntakeRouting({ messageId: mid, model: model({ class: "demarchage" }), plan: collectPlan, thread: firstMail, safeArchive: facts(true) })).toMatchObject({ action: "keep" });
+    const named = savIntakeSafeArchiveFacts({ plan: bouncePlan, deliveryReport: true, routing: bounceModel,
+      message: { currentText: `${bounceText} Votre compte Limova est suspendu.`, fromEmail: "mailer-daemon@exemple.invalid", unreadAttachments: [{ sourceId: "f1" }] } })!;
+    expect(decideIntakeRouting({ messageId: mid, model: bounceModel, plan: collectPlan, thread: firstMail, safeArchive: named })).toMatchObject({ action: "keep", reason: "safe_archive_product_mention" });
+    expect(decideIntakeRouting({ messageId: mid, model: bounceModel, plan: collectPlan, thread: firstMail, safeArchive: { ...facts(true), sender: "known" } })).toMatchObject({ action: "keep" });
+    // Without the report, an incomplete history is never a mail « without request ».
+    expect(facts(false).noRequest).toBe(false);
   });
 });

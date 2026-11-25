@@ -190,8 +190,10 @@ export function createSavIntakeSemanticReaders(options: {
       contextLimit: { stage: "wire" as const, bytes: wireBytes, limitBytes: SAV_INTAKE_MODEL_LIMITS.wireTextBytes, breakdown: intakeContextBreakdown(viewed, histories) } });
     return body;
   }
-  async function generate<T>(phase: "understanding" | "ticket_matching", instruction: string, data: Record<string, unknown>, schema: z.ZodType<T>, signal: AbortSignal, validate: (value: T, note: (key: keyof IntakeOutputNormalization) => void) => void, wire?: WireContract, media?: readonly SavAdmittedMedia[], repair = false, histories?: IntakeHistory[], reservedCalls = 0): Promise<T> {
+  async function generate<T>(phase: "understanding" | "ticket_matching", instruction: string, data: Record<string, unknown>, schema: z.ZodType<T>, signal: AbortSignal, validate: (value: T, note: (key: keyof IntakeOutputNormalization) => void) => void, wire?: WireContract, media?: readonly SavAdmittedMedia[], repair = false, histories?: IntakeHistory[], reservedCalls = 0, citationLine: string | null = null): Promise<T> {
     repair ||= phase === "understanding" && options.repairMalformedOutput === true;
+    // Review 2: reset on every generate; a repair line belongs only to the call that repairs the refused answer.
+    citationRepair = citationLine;
     data = contextView(phase, instruction, data, wire?.schema ?? schema, repair);
     const text = JSON.stringify(data), inputHash = hash(data), started = Date.now();
     let metadata: SavGeminiMetadata | undefined, outputHash: string | undefined, validationFailure: IntakeModelTrace["validationFailure"];
@@ -253,14 +255,13 @@ export function createSavIntakeSemanticReaders(options: {
       // Citations, identity checks, outages and exhausted budgets are not repaired
       // here. The existing three-call envelope remains unchanged.
       const repairable = options.citationRepair && error instanceof IntakeEvidenceError ? savIntakeCitationRepairText(error.diagnostic) : null;
-      if (repairable) citationRepair = repairable;
       const malformed = error instanceof z.ZodError || code === "SAV_INTAKE_MODEL_OUTPUT_REJECTED"
         || code === "SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED" || Boolean(repairable);
       // The visual budget authorizes one image call per analysis attempt. A
       // malformed visual response resumes in a fresh, fenced second attempt;
       // it must never bypass that budget by making another image call here.
       if (!media && !repair && malformed && !signal.aborted && calls + reservedCalls < 3)
-        return generate(phase, instruction, data, schema, signal, validate, wire, media, true, histories, reservedCalls);
+        return generate(phase, instruction, data, schema, signal, validate, wire, media, true, histories, reservedCalls, repairable);
       throw Error(code);
     }
   }

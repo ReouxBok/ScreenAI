@@ -17,6 +17,8 @@ const prompt = (body: Parameters<IntakeGeminiCall>[0]["body"]) => body.systemIns
 describe("citation repair: the repair line names the refused check", () => {
   it("text for citation refusals only, with a cleaned path", () => {
     expect(savIntakeCitationRepairText({ reason: "wrong_anchor_source", path: "requests.0.sourceIds" })).toMatch(/CITATION REPAIR v1: .*wrong_anchor_source at requests\.0\.sourceIds.*CURRENT message/);
+    // Review 2: never an invitation to drop a real request.
+    expect(savIntakeCitationRepairText({ reason: "wrong_anchor_source", path: "r" })).toContain("return no request only if the current message itself asks nothing; never drop a finance or cancellation request");
     expect(savIntakeCitationRepairText({ reason: "registration_source_invalid", path: "registration" })).toMatch(/omit `registration`/);
     expect(savIntakeCitationRepairText({ reason: "output_schema_invalid", path: "x" })).toBeNull();
     expect(savIntakeCitationRepairText(undefined)).toBeNull();
@@ -51,6 +53,22 @@ describe("current pipeline: a refused citation", () => {
     expect(prompt(r.bodies[0]!)).not.toContain("CITATION REPAIR");
     expect(prompt(r.bodies[1]!)).toContain("CITATION REPAIR v1: the server refused your previous answer (wrong_anchor_source at requests.0.originMessageId)");
     expect(result.requests).toEqual([{ id: "r1", kind: "support", currentMessageId: MID }]);
+  });
+  it("review 2: a repair line never leaks into a later call of the same reader", async () => {
+    const bodies: Parameters<IntakeGeminiCall>[0]["body"][] = [];
+    const call: IntakeGeminiCall = async request => {
+      bodies.push(request.body);
+      const data = JSON.parse(request.body.contents[0].parts[0].text) as { citationCatalogue: { id: string; sourceId: string }[] };
+      const quote = data.citationCatalogue.find(e => e.sourceId === "current")!.id;
+      return { json: { messageId: MID, nature: "request", requests: [{ id: "r1", kind: "support", currentMessageId: MID, quoteId: quote, ...(bodies.length === 1 ? { originMessageId: THREAD } : {}) }],
+        ticketSummary: { title: "Agenda non synchronisé", description: "Échec.", requestIds: ["r1"] } }, metadata: meta };
+    };
+    // Every understanding call already counts as a format repair here: the refused first answer is not repaired again, only remembered.
+    const readers = createSavIntakeSemanticReaders({ model: "gemini-fixture", call, citationRepair: true, repairMalformedOutput: true });
+    await expect(readers.analyseMessage({ message, conversation: [message] }, new AbortController().signal)).rejects.toThrow("SAV_INTAKE_MODEL_CITATION_REJECTED");
+    await readers.analyseMessage({ message, conversation: [message] }, new AbortController().signal);
+    expect(bodies).toHaveLength(2);
+    expect(prompt(bodies[1]!)).not.toContain("CITATION REPAIR");
   });
   it("on: the same refused answer is still refused (no second repair, nothing accepted)", async () => {
     const r = reader(true, "same");
@@ -112,14 +130,22 @@ describe("simple pipeline: repair line and bounded thread", () => {
     const sent = (o: { boundedConversation?: boolean }) => { const s = simple({ ...o, citationRepair: false }, [...history, message]); return s.run().then(() => JSON.parse(s.bodies.at(-1)!.contents[0].parts[0].text)); };
     const off = await sent({}), on = await sent({ boundedConversation: true });
     expect(off.conversation).toHaveLength(16); expect(off.conversationNotice).toBeUndefined();
-    expect(on.conversation).toHaveLength(12);
+    expect(on.conversation).toHaveLength(13);
+    expect(on.conversation[0].sourceId).toBe(`message-${history[0]!.id}`);
     expect(on.conversation.at(-1).sourceId).toBe(`message-${MID}`);
-    expect(on.conversationNotice).toBe("4 older messages of this thread are not shown; decide on the messages shown.");
+    expect(on.conversationNotice).toBe("3 older messages of this thread are not shown; decide on the messages shown.");
   });
   it("bound helper keeps a continuation's first message", () => {
     const all = [...history, message];
     expect(savIntakeBoundConversation(all, [history[0]!.id]).messages.map(m => m.id)).toEqual([history[0]!.id, ...all.slice(-12).map(m => m.id)]);
     expect(savIntakeBoundConversation(all.slice(0, 5), []).omitted).toBe(0);
+  });
+  it("review 2: the thread's first inbound message is always kept", () => {
+    const outboundFirst = [{ ...history[1]! }, ...history.slice(2), message, { ...history[3]!, id: "80000000-0000-4000-8000-000000000199" }];
+    const kept = savIntakeBoundConversation(outboundFirst, []).messages.map(m => m.id);
+    expect(kept).toContain(history[2]!.id);
+    expect(kept).not.toContain(history[1]!.id);
+    expect(kept).toHaveLength(13);
   });
 });
 
@@ -159,10 +185,10 @@ describe("« quel ticket ? » decided by the model's own judgement", () => {
     expect((await plan("support", tickets, relations, true)).decision.disposition.kind).toBe("collect_context");
     expect((await plan("support", tickets, relations, true, decide)).decision.disposition).toMatchObject({ kind: "ticket", target: { operation: "link", ticketId: "301" } });
   });
-  it("every ticket different but the comparison left incomplete: off waits, on creates a new ticket", async () => {
+  it("review 2: every ticket different but the comparison left incomplete still waits, switch on or off (no duplicate ticket)", async () => {
     const tickets = [ticket("301"), ticket("302")], relations = { "301": "different", "302": "different" };
     expect((await plan("support", tickets, relations, false)).decision.disposition.kind).toBe("collect_context");
-    expect((await plan("support", tickets, relations, false, decide)).decision.disposition).toMatchObject({ kind: "ticket", target: { operation: "create" } });
+    expect((await plan("support", tickets, relations, false, decide)).decision.disposition.kind).toBe("collect_context");
   });
   it("several plausible candidates stay for the team", async () => {
     const twoSame = await plan("support", [ticket("301"), ticket("302")], { "301": "same", "302": "same" }, true, decide);
