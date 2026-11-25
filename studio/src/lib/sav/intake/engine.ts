@@ -8,6 +8,7 @@ import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "../ticket-r
 import { SAV_ACK_TICKET_NOTE_VERSION, savAckTicketNote, type SavAckTicketOutcome, type SavAckTicketReason } from "./ack-ticket";
 import { savEvidenceContains } from "../evidence-text";
 import { savIntakeAccountConflict, savIntakeDeclaredAccount } from "./registration-declaration";
+import { savIntakeSenderContact, savIntakeSupportDefaultApplies, type SavIntakeSenderContact } from "./to-validate-rules";
 import {
   intakeMessageSchema, intakeContactSchema, intakeAssociationSchema, intakeTicketSchema, intakeHistorySchema,
   messageAnalysisSchema, issueAssessmentSchema, identityAssessmentSchema,
@@ -148,6 +149,9 @@ export async function planSavIntake(
   // SAV-128: set once an acknowledgement goes to the CRM path for the ticket of its thread; any refusal on that path keeps today's acknowledgement_only.
   let acknowledgementTicketId: string | null = null;
   let acknowledgementOutcome: SavAckTicketOutcome | undefined;
+  // SAV-139: switches and facts of `to-validate-rules.ts`; absent, none of the code below them runs.
+  const toValidate = policy.toValidate;
+  let senderContact: SavIntakeSenderContact | undefined;
   const finalize = (disposition: SavIntakeDecision["disposition"], progress: SavIntakeProgress = { kind: "processing", phase: "context", view: null }, supervisedResource?: PrivateResource): IntakePlan => {
     const decision = savIntakeDecisionSchema.parse({
       revision: SAV_INTAKE_CONTRACT_REVISION, messageId: message.id, latestInboundMessageId: input.latestInboundMessageId,
@@ -167,7 +171,7 @@ export async function planSavIntake(
       progress: savIntakeProgressSchema.parse(progress), noteText: finalNote, ...(supervisedResource ? { supervisedResource } : {}),
       ...(finalCreation ? { newTicket: finalCreation } : {}), ...((candidateContactIds ?? selectedEquivalent) ? { candidateContactIds:candidateContactIds ?? selectedEquivalent } : {}),
       originalThreadId: message.threadId, originalRecipientEmails: [message.fromEmail], referenceMode: input.mode,
-      readCalls: calls, ...(acknowledgementOutcome ? { acknowledgementTicket: acknowledgementOutcome } : {}), effects: "not_connected",
+      readCalls: calls, ...(acknowledgementOutcome ? { acknowledgementTicket: acknowledgementOutcome } : {}), ...(senderContact ? { senderContact } : {}), effects: "not_connected",
     };
   };
   /** Today's acknowledgement plan (no ticket, no step), with the reason it was not put into the thread's ticket when that was asked. */
@@ -235,6 +239,13 @@ export async function planSavIntake(
       .sort((a, b) => a.id.localeCompare(b.id));
     addEvidence(`${prefix}-search-${contactId}`, "crm_ticket", `search-${contactId}`, relevant, result.observedAt);
     return { tickets: relevant, observedAt: result.observedAt };
+  }
+  /** SAV-139: the sender's HubSpot answer (none / known / unknown), read once. Any failure is unknown, never absence. */
+  async function lookupSender(): Promise<SavIntakeSenderContact> {
+    if (senderContact) return senderContact;
+    try { senderContact = savIntakeSenderContact(await bounded(signal => adapters.findContactsByEmail(normalizeEmail(message.fromEmail), signal), "contact_lookup_failed"), message.fromEmail); }
+    catch { senderContact = "unknown"; }
+    return senderContact;
   }
   try {
     if (message.id !== input.latestInboundMessageId || message.direction !== "inbound") return context("history_incomplete");
@@ -314,6 +325,22 @@ export async function planSavIntake(
     requests = analysis.requests.map(({ id, kind, originMessageId }) => ({ id, kind,
       evidenceIds: unique([current, ...(humanProof ? [humanProof] : []), ...(originMessageId && initialProof ? [initialProof] : [])]) }));
     const kinds = unique(requests.map(r => r.kind));
+    /** SAV-139 (SAV_INTAKE_SUPPORT_DEFAULT): « Quelle demande ? » on a real customer mail becomes one support family: the routing class says support,
+     * or the sender is a known contact and the class is unknown. Finance, cancellation, commercial, partnership, investor kinds or classes, a thanks,
+     * a person's choice, an override or a continuation keep today's path. True when the requests were turned to support. */
+    const defaultToSupport = async (): Promise<boolean> => {
+      if (!toValidate?.supportDefault || input.humanResolution || policy.manualSupportOverride || continuation) return false;
+      if (requests.some(r => !["unknown", "support", "other", "acknowledgement"].includes(r.kind))) return false;
+      const routing = analysis.routing;
+      if (!routing || !savIntakeSupportDefaultApplies(routing, routing.class === "support" ? "unknown" : await lookupSender())) return false;
+      requests = requests.length ? requests.map(r => ({ ...r, kind: "support" as const })) : [{ id: "default-support", kind: "support" as const, evidenceIds: [current] }];
+      analysis.requests = requests.map(r => ({ ...(analysis.requests.find(a => a.id === r.id) ?? { currentMessageId: message.id }), id: r.id, kind: "support" as const }));
+      classification = "support";
+      const summary = analysis.ticketSummary;
+      if (!summary || summary.title.split(/\s+/).length > 6 || summary.requestIds.length !== requests.length || requests.some(r => !summary.requestIds.includes(r.id)))
+        analysis.ticketSummary = { title: "Message client à qualifier", description: message.currentText.trim().slice(0, 4000) || "Message sans texte", requestIds: requests.map(r => r.id) };
+      return true;
+    };
     classification = kinds.includes("cancellation") ? "cancellation" : kinds.includes("finance") ? "finance"
       : kinds.includes("unknown") || !kinds.length ? "unknown" : kinds.includes("support") ? "support"
       : kinds.filter(k => ["commercial", "investor", "partnership"].includes(k)).length > 1 ? "mixed"
@@ -324,8 +351,14 @@ export async function planSavIntake(
     // A person who already chose the classification is not asked again.
     if (classification === "acknowledgement" && !input.humanResolution?.classification
       && (analysis.nature === "request" || savIntakeActiveRequestSignal(message.currentText))) {
-      classification = "unknown"; requests = requests.map(r => ({ ...r, kind: "unknown" as const }));
-      return context("classification_incomplete", "request_scope_uncertain");
+      // SAV-139 (SAV_INTAKE_THREAD_ACK): in a known thread (its ticket, or a V2 case), a thanks the model only CALLED a request (no written request
+      // marker) keeps the acknowledgement path: into the thread's ticket (SAV-128), or to V2's relay.
+      const threadAck = toValidate?.threadAck === true && !savIntakeActiveRequestSignal(message.currentText)
+        && Boolean(policy.acknowledgementTicket?.ticketId || toValidate.threadV2Case);
+      if (!threadAck && !await defaultToSupport()) {
+        classification = "unknown"; requests = requests.map(r => ({ ...r, kind: "unknown" as const }));
+        return context("classification_incomplete", "request_scope_uncertain");
+      }
     }
     if (message.attachmentInputs?.length) {
       const observations = analysis.attachmentObservations;
@@ -352,7 +385,14 @@ export async function planSavIntake(
       for (const unread of message.unreadAttachments) addEvidence(unread.sourceId, "current_attachment", message.id, { ...unread, read: false });
     } else if (analysis.unreadAttachmentRequirements?.length) return context("classification_incomplete");
     if (!requests.length && analysis.nature === "newsletter" && policy.qualifiedOther?.family === "authenticated_newsletter" && !policy.manualSupportOverride) classification = "other";
-    else if (!requests.length || kinds.includes("unknown") || classification === "mixed") return context("classification_incomplete", "request_scope_uncertain");
+    else if (!requests.length || kinds.includes("unknown") || classification === "mixed") {
+      // SAV-139 (SAV_INTAKE_SUPPORT_DEFAULT): a real customer mail goes to the support path instead of « Quelle demande ? ».
+      if (classification === "mixed" || !await defaultToSupport()) {
+        // SAV-139 (SAV_INTAKE_SAFE_ARCHIVE): the sender's HubSpot answer, for the routing's server checks of a mail without any request.
+        if (toValidate?.senderLookup && !requests.length) await lookupSender();
+        return context("classification_incomplete", "request_scope_uncertain");
+      }
+    }
     if (policy.manualSupportOverride && classification === "other") {
       // Recompute from the current message. An override is not a fabricated support request.
       return context("classification_incomplete");
@@ -381,7 +421,10 @@ export async function planSavIntake(
         // non-blocking classification choice for the team, never a blocking
         // marker. Without any runtime status the technical wait is unchanged.
         if (!policy.qualifiedOther) {
-          if (policy.otherRuleStatus === "not_applicable" || policy.otherRuleStatus === "catalogue_unavailable") return context("other_rule_not_applicable", "request_scope_uncertain");
+          if (policy.otherRuleStatus === "not_applicable" || policy.otherRuleStatus === "catalogue_unavailable") {
+            if (toValidate?.senderLookup) await lookupSender();
+            return context("other_rule_not_applicable", "request_scope_uncertain");
+          }
           if (policy.otherRuleStatus === "evidence_unavailable") return context("other_evidence_unavailable");
           return context("private_resource_unavailable");
         }
@@ -598,6 +641,20 @@ export async function planSavIntake(
         || match.evidenceIds.some(id => !evidence.some(e => e.id === id))
         || match.requestIds.some(id => !requests.some(r => r.id === id))
         || match.relation === "same" && (requests.length !== unique(match.requestIds).length || requests.some(r => !match.requestIds.includes(r.id)))) return context("same_issue_unresolved");
+    }
+    // SAV-139 (SAV_INTAKE_THREAD_TICKET_LINK): when the comparison would ask the team « déjà couvert ? lequel ? », the open ticket of the mail's own
+    // Gmail thread, on the same contact, answers it. Without such a ticket (several plausible tickets, no shared thread) the choice stays.
+    const threadTicketId = toValidate?.threadTicketLink && !humanTicketId ? toValidate.threadTicketId : null;
+    const threadTicket = threadTicketId ? tickets.get(threadTicketId) : undefined;
+    const undecided = !assessment.investigationComplete || assessment.tickets.some(t => t.relation === "unknown" || t.relation === "partial")
+      || assessment.tickets.filter(t => t.relation === "same" && tickets.get(t.ticketId)?.stage !== "closed").length > 1;
+    if (threadTicket && undecided && ["open", "new"].includes(threadTicket.stage) && threadTicket.contactIds.some(id => scopeContacts.some(c => c.contactId === id))) {
+      const proof = addEvidence("thread-ticket", "crm_ticket", threadTicket.id, { threadId: message.threadId, ticketId: threadTicket.id }, ticketObservedAt.get(threadTicket.id)!);
+      for (const match of assessment.tickets) {
+        if (match.ticketId === threadTicket.id) Object.assign(match, { relation: "same", requestIds: requests.map(r => r.id), evidenceIds: unique([...match.evidenceIds, proof]) });
+        else match.relation = "different";
+      }
+      assessment.investigationComplete = true;
     }
     // A comparison can be undecided even though every source was read. Offer a
     // choice only when every destination is an open, evidenced candidate for

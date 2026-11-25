@@ -2,10 +2,13 @@
 // the model for ONE dossier-level routing class with its confidence. The request kinds V1 already returns are unchanged; this class only feeds the routing
 // decision (`routing-rules.ts`). Examples are invented and generic: never paste a real customer mail here (public repository).
 
+import { savIntakeSafeArchiveGuideline } from "./to-validate-rules";
+
 /** Bumped on every wording change: it enters the launch hash with the switch on (`runtime-contract.ts`). */
 export const SAV_INTAKE_ROUTING_REVISION = "sav-intake-routing-2026-11-23.v2";
 
-export function savIntakeRoutingGuideline() {
+/** SAV-139: `safeArchive` (`SAV_INTAKE_SAFE_ARCHIVE=on`) appends the phishing class and the customer-signal judgement; off, the text is unchanged. */
+export function savIntakeRoutingGuideline(safeArchive = false) {
   return [
     "ROUTING CLASS GUIDELINE (dossier level). Also return `routing` = {class, confidence, justification}: the ONE class that best describes what the sender of the CURRENT authored message wants from Limova. It does not replace the request kinds; keep them exactly as you would without this field.",
     "Key distinction: they want to BUY from us or USE Limova = lead_commercial; they want to SELL us something = demarchage; they want to BUILD something together with Limova = partenariat.",
@@ -23,5 +26,6 @@ export function savIntakeRoutingGuideline() {
     "- mixed: several of these classes with real weight in the same message (for example a support problem and a purchase question).",
     "- unknown: you cannot tell.",
     "Rules: a reply in an existing exchange with our team, or anything that mentions an existing subscription, invoice or account problem, is never lead_commercial, demarchage or notification_auto: use support, finance, cancellation or mixed. Any finance or cancellation element wins (class finance or cancellation). confidence = high only when the message leaves no reasonable doubt; medium or low otherwise. justification: one short factual sentence, no personal data.",
+    ...(safeArchive ? [savIntakeSafeArchiveGuideline()] : []),
   ].join("\n");
 }
