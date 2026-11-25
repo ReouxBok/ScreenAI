@@ -47,6 +47,23 @@ function logSweep(name: "handoff_notice" | "handoff_stage", result: HandoffNotic
     windowEnded: result.windowEnded, stoppedByDeadline: result.stoppedByDeadline });
 }
 
+/**
+ * One aggregate line per hand-over execution pass (counts, never a case id): how many executions ran, how many ended confirmed (posted / moved), how many stay
+ * open for a later pass (by state), and the refusals by code. A skipped pass logs its reason only.
+ */
+function logPass(name: "handoff_notice" | "handoff_stage", result: HandoffNoticePassResult | TicketStagePassResult | null | undefined) {
+  if (!result) return;
+  if (result.skipped !== null) { console.info("sav_v2_handoff_pass", { name, skipped: result.skipped }); return; }
+  const deferred: Record<string, number> = {}, refused: Record<string, number> = {};
+  let confirmed = 0;
+  for (const one of result.processed) {
+    if (one.state === "confirmed") confirmed++;
+    else if (one.state === "refused") refused[one.reason ?? "unknown"] = (refused[one.reason ?? "unknown"] ?? 0) + 1;
+    else deferred[one.state] = (deferred[one.state] ?? 0) + 1;
+  }
+  console.info("sav_v2_handoff_pass", { name, run: result.processed.length, confirmed, deferred, refused });
+}
+
 const codeOf = (error: unknown) => (error instanceof Error ? error.message : "UNKNOWN_ERROR").replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 160);
 
 export async function runCaseV2Wake(deps: CaseV2WakeDeps): Promise<CaseV2WakeResult> {
@@ -65,12 +82,14 @@ export async function runCaseV2Wake(deps: CaseV2WakeDeps): Promise<CaseV2WakeRes
   const handoffSweep = await step("handoff_sweep", () => enqueueHandoffNotices({ policy: deps.policy, env, since: handoffSince, deadlineMs }));
   logSweep("handoff_notice", handoffSweep);
   const handoff = await step("handoff", () => runHandoffNoticePass({ ...deps.handoff, env, deadlineMs }));
+  logPass("handoff_notice", handoff);
   const replies = await step("replies", () => runCaseEffectsPass(deps.replies));
   // SAV-92 (17/11): only under `SAV_V2_HANDOFF_STAGE=on` (off: the step does not exist, the wake is the same as before). After the replies (a hand-over reply sent in this
   // wake queues its stage from its receipt), before the stages pass (which moves it in this same wake).
   const handoffStages = caseHandoffStageEnabled(env()) ? await step("handoff_stages", () => enqueueHandoffStages({ policy: deps.policy, env, since: handoffSince, deadlineMs })) : undefined;
   logSweep("handoff_stage", handoffStages);
   const stages = await step("stages", () => runCaseTicketStagePass({ ...deps.stages, env, deadlineMs, readTicketOwner }));
+  logPass("handoff_stage", stages);
   const closures = await step("closures", () => applyProvenResolutions({ policy: deps.policy, env, since: deps.since, deadlineMs, currentPolicyRevision: deps.replies.currentPolicyRevision, readTicketOwner }));
   return { handoffSweep, handoff, replies, ...(handoffStages === undefined ? {} : { handoffStages }), stages, closures, failures, skippedByDeadline: skipped };
 }
