@@ -63,6 +63,17 @@ describe("SAV-55 canonical knowledge workspace", () => {
     expect(list.total).toBe(1); expect(list.rows[0]).toMatchObject({ origin: "human", kind: "candidate", state: "pending" });
     expect((await paginateSavKnowledge({ tab: "automatic" })).total).toBe(0);
   });
+  it("searches any term of the query, accents, case and plurals folded, best match first; the whole query still matches (25/11: « programmer posts LinkedIn » found nothing)", async () => {
+    const titles = ["Connecter LinkedIn pour prospecter ou publier", "Créer une automatisation de création de post (V3)", "Lancer une campagne de prospection LinkedIn : rechercher les prospects puis personnaliser la séquence", "Renommer un espace de démonstration"];
+    for (const title of titles) await submit({ ...proposal, title }, contact);
+    const search = async (q: string) => (await paginateSavKnowledge({ tab: "human", q })).rows.map(row => row.title);
+    expect(new Set(await search("programmer posts LinkedIn"))).toEqual(new Set(titles.slice(0, 3)));
+    expect((await search("prospection LinkedIn envoi messages"))[0]).toBe(titles[2]);
+    expect(await search("CRÉATION")).toEqual([titles[1]]);
+    expect(await search("sequence")).toEqual([titles[2]]);
+    expect(await search("Renommer un espace")).toEqual([titles[3]]);
+    expect(await search("tiktok")).toEqual([]);
+  });
   it("refuses incomplete sources, private text, stale draft edits and non-owner edits", async () => {
     const draft = await saveSavKnowledgeProposal({ ...proposal, sources: [] }, contact);
     const preview = await previewSavKnowledgeProposal(draft.id, contact);

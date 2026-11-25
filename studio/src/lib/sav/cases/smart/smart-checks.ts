@@ -3,6 +3,7 @@ import {
   SAV_OTHER_PLATFORM_COMPETITORS, SAV_OTHER_PLATFORM_CONNECTED, SAV_OTHER_PLATFORM_LIMOVA, SAV_OTHER_PLATFORM_THIRD_PARTIES, savOtherPlatformClauses,
   savOtherPlatformCompares, savOtherPlatformCustomerTools, savOtherPlatformEndorses, savOtherPlatformOrients, savOtherPlatformRedirect, savOtherPlatformSubstitutes,
 } from "../../other-platform";
+import { SAV_CARD_OFFICIAL_LINKS } from "@/lib/knowledge/card-safety";
 import { requestsCredential } from "../decision-validator";
 import type { SmartCheckCode, SmartDecision, SmartReading } from "./smart-contract";
 import { smartRepeatCodes, type SmartCaseMemory } from "./smart-memory";
@@ -203,8 +204,12 @@ export const smartOtherPlatformInvite = (reply: string) => sentencesOf(reply).so
 const URL_RE = /\bhttps?:\/\/[^\s<>"')\]]+/giu;
 const DOMAIN = /(?<![\p{L}\p{N}@./-])(?:www\.)?[a-z0-9][a-z0-9-]{1,62}(?:\.[a-z0-9-]{1,62})*\.(?:com|fr|io|ai|net|org|co|app|eu|be|ch|ca|me|so|dev)(?![\p{L}\p{N}-])/giu;
 
-const stripUrl = (value: string) => value.replace(/[.,;:!?]+$/, "");
+// 25/11: Markdown or French quoting glued to a link (« **https://…** », « https://… » ») is not part of it: the link is read without it.
+const stripUrl = (value: string) => value.replace(/[.,;:!?*`»”’]+$/u, "");
 const hostOf = (url: string) => { try { return new URL(url).host.toLowerCase(); } catch { return ""; } };
+
+/** The official Limova sites (card-safety's reviewed list, Limova hosts only) and the public site: their home page is always a valid link. */
+const SMART_OFFICIAL_LIMOVA_HOSTS: ReadonlySet<string> = new Set(["limova.ai", ...SAV_CARD_OFFICIAL_LINKS.map(row => row.host).filter(host => host.endsWith(".limova.ai"))]);
 
 const BARE_PATH = /^\/[^\s<>"')\]«»]*/u;
 
@@ -377,10 +382,16 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   const allowedUrls = [...SAV_SMART_RESOURCES.map(row => row.url), ...cardLinks.urls].map(url => url.toLowerCase());
   const allowedHosts = new Set([...allowedUrls.map(hostOf), ...[...academyKeys].map(key => key.split("/")[0]!), ...cardLinks.domains].filter(Boolean).map(host => host.replace(/^www\./, "")));
   const { urls, domains } = linksOf(reply);
+  // 25/11 (owner: customers MUST get links): an official Limova site named by its home page (« https://new.limova.ai », « academy.limova.ai ») is always allowed.
+  // A deeper page still has to be written in a card given for the mail, a resource or an Academy result: an invented page is never sent.
+  const officialRoot = (url: string) => { const key = exactKey(url); return key !== null && SMART_OFFICIAL_LIMOVA_HOSTS.has(key); };
   const linkAllowed = (url: string) => allowedUrls.some(allowed => url.toLowerCase() === allowed || url.toLowerCase().startsWith(`${allowed.replace(/\/$/, "")}/`))
-    || academyKeys.has(exactKey(url) ?? "");
-  if (urls.some(url => !linkAllowed(url))) codes.add("link_not_allowed");
-  if (domains.some(domain => !allowedHosts.has(domain))) codes.add("link_not_allowed");
+    || academyKeys.has(exactKey(url) ?? "") || officialRoot(url);
+  // The refused links are NAMED to the correction (`factProblems`), so it removes those and keeps every allowed link. Before, it got the code alone and
+  // could not tell which link to drop: on 25/11 the corrected reply had lost the cited card's Academy link, which this check always allowed.
+  const refusedLinks = [...new Set([...urls.filter(url => !linkAllowed(url)),
+    ...domains.filter(domain => !allowedHosts.has(domain) && !SMART_OFFICIAL_LIMOVA_HOSTS.has(domain))])].slice(0, 5);
+  for (const link of refusedLinks) flag("link_not_allowed", `Lien non autorisé, à retirer seul (garder les autres liens) : ${link}`);
 
   // Other platforms: an invitation or a praise is refused even when the customer named it; a name is allowed only from the customer or a cited card.
   const customer = fold(input.customerText);

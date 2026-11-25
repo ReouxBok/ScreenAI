@@ -211,11 +211,17 @@ describe("login blockage once the card's checks are done (A09)", () => {
       const text = textOf(validateCaseDecision(proposal(), context(relayed(), FIRST), now));
       expect(text).toContain("Voici le lien de connexion");
       expect(text).not.toMatch(/restez bloqu|dites-moi simplement|à quelle étape/);
-      const final = prepareCaseReplyText(text, "fr", "automated", "answer");
+      // Validated by a person: the standard line is the one invitation.
+      const reviewed = prepareCaseReplyText(text, "fr", "manual_reviewed", "answer");
       const help = caseReplyHelpLine("fr");
-      expect(final.split(help).length - 1).toBe(1);
-      expect(final.indexOf(help)).toBeGreaterThan(final.indexOf("ne nous communiquez pas ce code"));
-      expect(final.split(/précisez|dites-moi|pouvez-vous|\?/).length - 1).toBe(1);
+      expect(reviewed.split(help).length - 1).toBe(1);
+      expect(reviewed.indexOf(help)).toBeGreaterThan(reviewed.indexOf("ne nous communiquez pas ce code"));
+      expect(reviewed.split(/précisez|dites-moi|pouvez-vous|\?/).length - 1).toBe(1);
+      // Sent automatically (25/11): no standard line; the AI notice is the one invitation (« répondez à ce message en précisant ce qui bloque »).
+      const final = prepareCaseReplyText(text, "fr", "automated", "answer");
+      expect(final).not.toContain(help);
+      expect(final.split(/précisez|précisant|dites-moi|pouvez-vous|\?/).length - 1).toBe(1);
+      expect(final.indexOf("précisant ce qui bloque")).toBeGreaterThan(final.indexOf("ne nous communiquez pas ce code"));
     });
     it("the screen's words without any check told: the procedure, never asking what is displayed again", () => {
       const text = textOf(validateCaseDecision(proposal(), context(relayed(), "Bonjour, je n’arrive pas à me connecter. L’écran affiche l’erreur « identifiant introuvable »."), now));
