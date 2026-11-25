@@ -5,6 +5,7 @@ import { listV2Cases, v2InventoryInput } from "@/lib/sav/cases/v2-inventory";
 import { readSmartTraceSummaries, readSmartTracesForThread } from "@/lib/sav/cases/smart/smart-trace-store";
 import { readSmartShadowReport, smartShadowReportInput } from "@/lib/sav/cases/smart/smart-shadow-report";
 import { readSmartReplayReport, smartReplayReportInput } from "@/lib/sav/cases/smart/smart-shadow-replay-report";
+import { readSavAppTicketsReport } from "@/lib/sav/cases/app-tickets";
 import type { SavClerkUser } from "@/lib/sav/intake/console-auth";
 import { listIntakeConsole } from "@/lib/sav/intake/console-store";
 import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
@@ -158,6 +159,14 @@ const v2ShadowReplayReportTool = { name: "v2_shadow_replay_report", title: "Reje
     if (context.staff.role !== "admin") return refused("SAV_V2_SHADOW_REPLAY_REPORT_FORBIDDEN", "Rejeu du shadow réservé aux administrateurs.");
     return done(await readSmartReplayReport(input));
   } };
+const appTicketsReportInput = z.object({ mode: z.enum(["shadow", "live"]).default("shadow"), limit: z.number().int().min(1).max(100).default(50) }).strict();
+const appTicketsReportTool = { name: "app_tickets_report", title: "Tickets créés depuis l’app", write: false,
+  description: "Rapport administrateur des tickets HubSpot créés depuis l’app Limova sans mail (SAV-138, SAV_APP_TICKETS_MODE). mode : shadow (ce que l’agent aurait fait) ou live. pass : état de la dernière lecture régulière et de son curseur. counts : tickets par décision. tickets : les plus récents d’abord, 100 maximum : identifiant du ticket, décision (would_take, taken, team_category = facturation ou résiliation jamais touchée, ignored_*, handed_back, waiting, failed...), tentatives, source HubSpot (source_type), catégorie bloquée, réponse de l’entrée, dates. Jamais l’objet, la description, une adresse ou un nom. Lecture seule.",
+  input: appTicketsReportInput,
+  async run(context: StudioMcpContext, input: z.infer<typeof appTicketsReportInput>) {
+    if (context.staff.role !== "admin") return refused("SAV_APP_TICKETS_REPORT_FORBIDDEN", "Rapport des tickets de l’app réservé aux administrateurs.");
+    return done(await readSavAppTicketsReport(input));
+  } };
 const listV2CasesTool = {name: "list_v2_cases", title: "Inventaire des dossiers V2", write: false,
   description: "Inventaire V2 réservé aux administrateurs, sans contenu client. from/until : dates ISO inclusives de création du dossier, jusqu’à min(until, snapshotAt) ; state filtre uniquement l’affichage : processing, awaiting_customer, reply_sent, handed_to_team, failed, paused. 25 dossiers parcourus par défaut, 100 maximum. Réutiliser le curseur et les mêmes filtres : borne snapshotAt figée, insertions ultérieures exclues ; attendus reste le total du périmètre immuable. statesFilterApplied indique si le filtre d’état est appliqué ; filteredOut compte les dossiers masqués sur chaque page. Contrôlés = lignes listées + filteredOut cumulés ; continuer tant que nextCursor existe, même avec une page vide. Une suppression ou un commit tardif ajoutant un dossier antérieur à snapshotAt invalide le parcours (SAV_V2_INVENTORY_MEMBERSHIP_CHANGED) : relancer alors le parcours depuis le début, sans curseur. Valeurs relues par page. outcomes expose séparément mail, note et statut par exécution : confirmed exige une preuve du registre, uncertain impose une vérification, blocked/skipped donne un motif lisible. Un mail confirmé ne prouve ni la note ni le statut. hubspot est le résumé historique ; consulter outcomes pour les refus et incertitudes. Coûts en micro-USD ; usage inconnu conservé en réservé. Curseur keyset compact. questions compte séparément asked, answered et open, sans texte client. replyDelaySeconds mesure le délai jusqu’à la confirmation de l’envoi. Historiques limités à 1000 entrées par dossier (dépassement explicite), registres à 1000 et 1 Mio chacun (coûts inconnus au-delà).",
   input: v2InventoryInput,
@@ -180,4 +189,4 @@ const whoami = { name: "whoami", title: "Identité Studio", write: false,
   async run(context: StudioMcpContext) { return done({ email: context.staff.email, role: context.staff.role, name: context.staff.name }); } };
 
 /** Read-only tools of this lot. Write tools (SAV-27 to SAV-30) register with write: true. */
-export const studioMcpTools: StudioMcpTool[] = [whoami, listDossiers, listV2CasesTool, v2DailyReportTool, v2ShadowReportTool, v2ShadowReplayReportTool, getDossier, getDiagnostics, getBudget] as unknown as StudioMcpTool[];
+export const studioMcpTools: StudioMcpTool[] = [whoami, listDossiers, listV2CasesTool, v2DailyReportTool, v2ShadowReportTool, v2ShadowReplayReportTool, appTicketsReportTool, getDossier, getDiagnostics, getBudget] as unknown as StudioMcpTool[];

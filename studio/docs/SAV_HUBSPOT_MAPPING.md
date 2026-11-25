@@ -41,3 +41,12 @@ L'option `Churnkey` existe mais n'est pas automatiquement sélectionnée. Ne pas
 ## Vérification
 
 `hubspot-mapping.test.ts` référence les valeurs réelles et couvre configuration divergente, membership/stage fermé, catégories invalides, multi-sélection et conservation du texte. Il n'effectue aucune écriture réelle. Les tests bout en bout avec le token de service sont différés à la recette autorisée SAV-19.
+
+## Tickets créés depuis l'app (SAV-138)
+
+Lecture régulière existante (`reconcile-pass.ts`, étape `v2_app_tickets`), code dans `src/lib/sav/cases/app-tickets.ts` :
+
+- `SAV_APP_TICKETS_MODE` : `off` par défaut (aucun appel HubSpot), `shadow` (décision enregistrée, aucun effet), `live` (attribution à `SAV_V2_HUBSPOT_OWNER_ID` puis entrée sans fil existante). Production uniquement.
+- `SAV_APP_TICKETS_SOURCE_TYPES` : valeurs `source_type` des tickets de l'app, obligatoires en `live` (`EMAIL` toujours refusé).
+- `SAV_APP_TICKETS_LOOKBACK_MINUTES` : fenêtre avant la première lecture de chaque mode (60 par défaut, 1440 au plus).
+- Catégories `Facturation` et `Résiliation` : jamais touchées (ni attribution, ni modèle, ni Slack, ni mail). Rapport : outil MCP administrateur `app_tickets_report`.
