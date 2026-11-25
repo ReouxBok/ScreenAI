@@ -8,7 +8,7 @@ import { encryptSavPayload } from "../crypto";
 import { ticketHandbackSchemaInstalled } from "./case-schema-v11";
 import { executionJournal, type ExecutionTx } from "../intake/execution-store";
 import { TICKET_STAGE_CONTRACT, type TicketStagePayload } from "./case-ticket-stage";
-import { caseTeamPartRequests, SAV_CASE_AWAITING_V2_ATTRIBUTION, type CaseSnapshot } from "./case-types";
+import { caseTeamPartRequests, SAV_CASE_ADMISSION_TEAM_REASONS, SAV_CASE_AWAITING_V2_ATTRIBUTION, type CaseSnapshot } from "./case-types";
 import { caseHandoffStageEnabled, planCaseTicketStage, readCaseTicketStageConfig, type CaseTicketStageTrigger } from "./customer-return";
 
 
@@ -44,7 +44,15 @@ export async function openHandoffVersion(tx: ExecutionTx, snapshot: Pick<CaseSna
   if (snapshot.owner !== "human" || snapshot.phase !== "handoff_pending" || !handoff || handoff.humanSince || handoff.reason === SAV_CASE_AWAITING_V2_ATTRIBUTION) return undefined;
   const [row] = await tx.select({ version: savCaseEvents.caseVersion }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, snapshot.caseId), eq(savCaseEvents.kind, "owner_changed")))
     .orderBy(desc(savCaseEvents.caseVersion)).limit(1);
-  if (row || snapshot.threadIds?.length !== 0) return row?.version;
+  if (row) return row.version;
+  // Ugo (25/11): a case refused at entry (a team reason of the admission) is born with the team WITH its mail: no `owner_changed`, its hand-over is its
+  // FIRST admission decision (one version per case: a later re-admission keeps the same key).
+  if (snapshot.threadIds?.length && SAV_CASE_ADMISSION_TEAM_REASONS.some(reason => reason === handoff.reason)) {
+    const [admitted] = await tx.select({ version: savCaseEvents.caseVersion }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, snapshot.caseId), eq(savCaseEvents.kind, "admission_decided")))
+      .orderBy(asc(savCaseEvents.caseVersion)).limit(1);
+    return admitted?.version;
+  }
+  if (snapshot.threadIds?.length !== 0) return undefined;
   // SAV-99 (Ugo 19/11): a ticket a person gave the agent without any mail, that the agent did not take, is born with the team (`openCaseFromHubspotTicket`
   // with a wait reason): no `owner_changed`, its hand-over is that birth, i.e. its one `crm_observed` input.
   const [born] = await tx.select({ version: savCaseEvents.caseVersion }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, snapshot.caseId), eq(savCaseEvents.kind, "crm_observed")))

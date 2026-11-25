@@ -25,14 +25,26 @@ type Policy = Readonly<{ id: string; hash: string }>;
 const handoffStageSinceSchema = z.iso.datetime({ offset: true });
 let warnedAboutHandoffStageSince = false;
 
+/**
+ * The activation date of V2 hand-overs (`SAV_V2_HANDOFF_STAGE_SINCE`), in epoch ms: a hand-over recorded before it gets neither stage nor (Ugo 25/11) Slack
+ * notice. Case events have millisecond precision: an ISO bound between two milliseconds starts at the next one. Null: missing or invalid, or the hand-over
+ * stage off (the date belongs to that switch: off, it is not even read, and the notices and sweeps behave as before).
+ */
+export function handoffActivationSinceMs(env: Readonly<Record<string, string | undefined>>): number | null {
+  if (!caseHandoffStageEnabled(env)) return null;
+  const parsed = handoffStageSinceSchema.safeParse(env.SAV_V2_HANDOFF_STAGE_SINCE);
+  const since = parsed.success ? Date.parse(parsed.data) : NaN;
+  if (!parsed.success || !Number.isFinite(since)) return null;
+  return since + Number(/\.[0-9]{3}[0-9]*[1-9]/.test(parsed.data));
+}
+
 /** Inside the caller's transaction, the case locked by the caller: queues the stage of the hand-over in force, if any. Writes nothing when the switch is off. */
 export async function enqueueCaseHandoffStage(tx: ExecutionTx, input: Readonly<{ snapshot: CaseSnapshot; policy: Policy; env: Env; threadId?: string }>): Promise<EnqueueTicketStageResult> {
   const env = input.env();
   if (!caseHandoffStageEnabled(env)) return { ok: false, reason: "handoff_stage_off" };
   const rawSince = env.SAV_V2_HANDOFF_STAGE_SINCE;
-  const parsed = handoffStageSinceSchema.safeParse(rawSince);
-  const since = parsed.success ? Date.parse(parsed.data) : NaN;
-  if (!parsed.success || !Number.isFinite(since)) {
+  const since = handoffActivationSinceMs(env);
+  if (since === null) {
     if (!warnedAboutHandoffStageSince) {
       warnedAboutHandoffStageSince = true;
       console.warn("SAV_V2_HANDOFF_STAGE_SINCE is missing or invalid; handoff stage admission disabled");
@@ -46,9 +58,7 @@ export async function enqueueCaseHandoffStage(tx: ExecutionTx, input: Readonly<{
     eq(savCaseEvents.caseId, input.snapshot.caseId), eq(savCaseEvents.caseVersion, version),
   )).limit(1);
   if (!event) return { ok: false, reason: "handoff_owner_event_missing" };
-  // Case events have millisecond precision. An ISO bound between two milliseconds starts at the next one.
-  const subMillisecond = /\.[0-9]{3}[0-9]*[1-9]/.test(parsed.data);
-  if (event.occurredAt.getTime() < since + Number(subMillisecond)) return { ok: false, reason: "handoff_before_since" };
+  if (event.occurredAt.getTime() < since) return { ok: false, reason: "handoff_before_since" };
   return enqueueCaseTicketStage(tx, { snapshot: input.snapshot, trigger: { kind: "handoff_recorded", caseVersion: version }, policy: input.policy, env: input.env,
     ...(input.threadId ? { threadId: input.threadId } : {}) });
 }
