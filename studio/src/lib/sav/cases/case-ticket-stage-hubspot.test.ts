@@ -130,6 +130,21 @@ describe("SAV-92 (17/11): the hand-over stage, « Nouveau » and no owner", () =
     expect([closed, configuredClosed, taken, off, other].flatMap(h => h.patches())).toHaveLength(0);
   });
 
+  it("Ugo 25/11: SAV_V2_HANDOFF_PRIORITY=high adds the HIGH priority to the hand-over PATCH only; any other value keeps the PATCH byte-identical", async () => {
+    const high = hubspot({ pipeline: "0", stage: "2", owner: PILOT });
+    await adapters(high, { ...HANDOFF_ENV, SAV_V2_HANDOFF_PRIORITY: "high" }).dispatch(handoffIntent(), signal());
+    expect(high.patches().map(call => call.body)).toEqual([{ properties: { hs_pipeline_stage: "1", hubspot_owner_id: "", hs_ticket_priority: "HIGH" } }]);
+    for (const value of [undefined, "", "HIGH", "on", "medium"]) {
+      const h = hubspot({ pipeline: "0", stage: "2", owner: PILOT });
+      await adapters(h, { ...HANDOFF_ENV, SAV_V2_HANDOFF_PRIORITY: value }).dispatch(handoffIntent(), signal());
+      expect(h.patches().map(call => JSON.stringify(call.body))).toEqual([JSON.stringify({ properties: { hs_pipeline_stage: "1", hubspot_owner_id: "" } })]);
+    }
+    // The other targets never carry it, switch on or not.
+    const waiting = hubspot({ pipeline: "0", stage: "1", owner: PILOT });
+    await adapters(waiting, { ...HANDOFF_ENV, SAV_V2_HANDOFF_PRIORITY: "high" }).dispatch(intentOf(), signal());
+    expect(waiting.patches().map(call => call.body)).toEqual([{ properties: { hs_pipeline_stage: "2" } }]);
+  });
+
   it("the other targets never touch the owner", () => {
     expect(intentOf("waiting_customer").properties).toEqual({ hs_pipeline_stage: "2" });
     expect(intentOf("closed").properties).toEqual({ hs_pipeline_stage: "4" });

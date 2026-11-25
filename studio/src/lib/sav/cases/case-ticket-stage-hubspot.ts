@@ -19,6 +19,8 @@ const REJECTED = new Set([400, 401, 403, 404, 409, 422, 429]);
 
 export type CaseTicketStageDeps = Readonly<{ network: typeof fetch; env: () => Record<string, string | undefined> }>;
 const fault = (code: string): never => { throw new Error(code); };
+/** Only the exact string `high` adds the HIGH priority to the hand-over write. */
+const handoffPriorityHigh = (env: Readonly<Record<string, string | undefined>>) => env.SAV_V2_HANDOFF_PRIORITY === "high";
 
 /** The only requests this module may make. */
 export function isTicketStageRequest(path: string, method: string): boolean {
@@ -78,7 +80,9 @@ export function createCaseTicketStageAdapters(deps: CaseTicketStageDeps): Pick<E
       // SAV-92 (17/11): a closed ticket (stage 4, or the configured closed stage) is never reopened by a hand-over.
       if (stage.target === "handoff" && (current.stage === config.closed || current.stage === SAV_HUBSPOT_SUPPORT.stages.closed)) return fault(`${TICKET_STAGE_NOT_APPLIED_PREFIX}TICKET_CLOSED`);
       // The hand-over is the only write that also clears the owner (empty value = no owner in HubSpot); every other target writes the stage alone.
-      const properties = stage.target === "handoff" ? { hs_pipeline_stage: stage.stageId, hubspot_owner_id: "" } : { hs_pipeline_stage: stage.stageId };
+      // Ugo (25/11): under `SAV_V2_HANDOFF_PRIORITY=high`, the hand-over also sets the ticket's priority to HIGH (V1's value at ticket creation). Off: unchanged.
+      const properties = stage.target === "handoff"
+        ? { hs_pipeline_stage: stage.stageId, hubspot_owner_id: "", ...(handoffPriorityHigh(deps.env()) ? { hs_ticket_priority: "HIGH" } : {}) } : { hs_pipeline_stage: stage.stageId };
       let response: Response;
       try {
         response = await call("PATCH", stage.ticketId, signal, { properties });

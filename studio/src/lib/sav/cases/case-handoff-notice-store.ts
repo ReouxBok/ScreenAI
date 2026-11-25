@@ -32,7 +32,7 @@ import { createHandoffCrmReader, type HandoffCrmReader } from "./case-handoff-cr
 import { nextSweepPage } from "./case-sweep-cursor";
 import {
   buildHandoffNoticeIntent, CONVERSATION_LINE_PREFIX, HANDOFF_NOTICE_CONTRACT, handoffNoteText, HANDOFF_NOTICE_KEY_PREFIX, awaitingHandoff, staleHandoffEventKinds, handoffNoticeFacts, handoffNoticeKey, handoffNoticeTrigger,
-  agentNotTakenNoticeTrigger, judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, teamPartNoticeTriggers, type HandoffNoticeFacts, type HandoffNoticeTrigger,
+  admissionRefusalNoticeTrigger, agentNotTakenNoticeTrigger, judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, teamPartNoticeTriggers, type HandoffNoticeFacts, type HandoffNoticeTrigger,
 } from "./case-handoff-notice";
 import { createHandoffSlackAdapters, SLACK_NOT_POSTED_PREFIX, type HandoffSlackAdapters } from "./case-handoff-slack";
 import { handoffConversationId, type CaseHandoffReceived } from "./case-handoff-summary";
@@ -46,6 +46,7 @@ import { lockCaseForWrite, listCaseEvents, readCase } from "./case-store";
 import { SAV_SMART_HANDOFF_REASONS } from "./smart/smart-contract";
 import { readSmartHandoffTraceReason, SMART_HANDOFF_TRACE_TIMEOUT_MS } from "./smart/smart-trace-store";
 import { caseNotTakenWhy } from "./case-reply-summary-note";
+import { handoffActivationSinceMs } from "./case-handoff-stage";
 
 const LEASE_MS = 80_000;
 /** After this many refusals by Slack itself (nothing posted) the effect is no longer taken back: it is verified and left to a person. */
@@ -122,8 +123,22 @@ export async function enqueueHandoffNotice(input: Readonly<{ caseId: string; pol
   // SAV-99 (Ugo 19/11): a ticket a person gave the agent, that the agent did not take, is born with the team: no investigation, its own fixed notice, and
   // possibly no thread (a ticket without mail); its key is `handoff-notice:<case>:ticket:<event>` (0055 lets that one execution have no thread).
   const notTaken = !trigger.ok && !parts.length ? agentNotTakenNoticeTrigger(snapshot, events, caseNotTakenWhy) : null;
-  const all = [...(trigger.ok ? [trigger] : []), ...parts, ...(notTaken?.ok ? [notTaken] : [])].filter(one => input.inputKey === undefined || one.inputKey === input.inputKey);
-  if (!all.length) return { ok: false, code: "no_trigger", why: trigger.ok ? "input_other" : notTaken?.ok === false && notTaken.why !== "not_handoff" ? notTaken.why : trigger.why };
+  // Ugo (25/11): a case refused at entry, born with the team WITH its mail: its own notice, keyed on its first admission decision (`admission:<event>`).
+  const entry = !trigger.ok && !parts.length && !notTaken?.ok ? admissionRefusalNoticeTrigger(snapshot, events) : null;
+  // Ugo (25/11): only hand-overs recorded since the activation (`SAV_V2_HANDOFF_STAGE_SINCE`) are noticed, never the old cases of the window. Without a
+  // valid date (or with `SAV_V2_HANDOFF_STAGE` off) the existing triggers behave as before; the entry notice, new, is never admitted without it.
+  const since = handoffActivationSinceMs(input.env());
+  const recordedSince = (one: Extract<HandoffNoticeTrigger, { ok: true }>) => {
+    if (since === null) return one !== entry;
+    const at = events.find(event => event.caseVersion === one.recordedAtVersion)?.occurredAt;
+    return at !== undefined && Date.parse(at) >= since;
+  };
+  const triggered = [...(trigger.ok ? [trigger] : []), ...parts, ...(notTaken?.ok ? [notTaken] : []), ...(entry?.ok ? [entry] : [])]
+    .filter(one => input.inputKey === undefined || one.inputKey === input.inputKey);
+  const all = triggered.filter(recordedSince);
+  if (triggered.length && !all.length) return { ok: false, code: "no_trigger", why: since === null ? "handoff_since_missing" : "handoff_before_since" };
+  if (!all.length) return { ok: false, code: "no_trigger", why: trigger.ok ? "input_other" : entry?.ok === false && entry.why !== "not_handoff" ? entry.why
+    : notTaken?.ok === false && notTaken.why !== "not_handoff" ? notTaken.why : trigger.why };
   const threadId = snapshot.threadIds.at(-1) ?? null;
   if (!threadId && !(all.length === 1 && notTaken?.ok)) return { ok: false, code: "no_thread" };
   if (!threadId && !await ticketHandbackSchemaInstalled(requireDb())) return { ok: false, code: "no_thread", why: "schema_v11_missing" };
@@ -173,7 +188,8 @@ async function admitHandoffNotice(trigger: Extract<HandoffNoticeTrigger, { ok: t
   // SAV-99: a ticket the agent did not take already gets its one short note from its hand-over stage (`case-ticket-stage-store.ts`): no second note here.
   const { modelReason, conversationId } = analysis;
   const facts = { ...handoffNoticeFacts(trigger, snapshot.body, attachments), ...(modelReason ? { modelReason } : {}), ...(conversationId ? { conversationId } : {}) };
-  const note = trigger.reason === "agent_not_taken" ? undefined : handoffNoteOf(facts, new Date().toISOString());
+  // Ugo (25/11): a case refused at entry gets its Slack notice and its stage only, no note (nothing was asked beyond those two).
+  const note = trigger.reason === "agent_not_taken" || trigger.reason === "entry_sensitive" || trigger.reason === "entry_team" ? undefined : handoffNoteOf(facts, new Date().toISOString());
   const payload: HandoffNoticePayload = { contract: HANDOFF_NOTICE_CONTRACT, key, facts, teamOwnerId, ...(note ? { note } : {}) };
   return requireDb().transaction(async (tx): Promise<EnqueueHandoffNoticeResult> => {
     const [created] = await tx.insert(savCaseEffectExecutions).values({

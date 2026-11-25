@@ -10,7 +10,7 @@
 import { createHash } from "node:crypto";
 import { crmRecordUrl } from "../intake/crm-display";
 import type { EffectIntent } from "../intake/execution-types";
-import { caseRequestSearchText, caseTeamPartRequests, SAV_CASE_AGENT_REQUESTS_PER_MAIL, type CaseSnapshot, type CaseTrial } from "./case-types";
+import { caseRequestSearchText, caseTeamPartRequests, SAV_CASE_ADMISSION_TEAM_REASONS, SAV_CASE_AGENT_REQUESTS_PER_MAIL, type CaseAdmissionReason, type CaseSnapshot, type CaseTrial } from "./case-types";
 import { SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { buildCaseHandoffSummary, caseHandoffSummaryLines, type CaseHandoffSummary } from "./case-handoff-summary";
 import { caseTechnicalHandoffWait, investigationHandoffCommand, readCaseInvestigationProgress, SAV_CASE_INVESTIGATION_RECORD_KIND, type CaseInvestigationJournalEvent, type CaseTechnicalHandoffWait } from "./investigation-record";
@@ -22,7 +22,8 @@ export const HANDOFF_NOTICE_TITLE = "Nouveau ticket à transmettre à l'équipe"
 export const HANDOFF_NOTICE_KEY_PREFIX = "handoff-notice:";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const INPUT_KEY = /^(in|back|ticket):[A-Za-z0-9._@<>=+-]{1,200}$/;
+// Ugo (25/11): `admission:<event>` is the one input of a case refused at entry (born with the team): its first admission decision.
+const INPUT_KEY = /^(in|back|ticket|admission):[A-Za-z0-9._@<>=+-]{1,200}$/;
 /** One notice per final handoff decision: the case and the input the decision answers. A new customer mail is a new input, hence a new decision and a new key. */
 export function handoffNoticeKey(caseId: string, inputKey: string): string {
   if (!UUID.test(caseId) || !INPUT_KEY.test(inputKey)) throw new Error("SAV_HANDOFF_NOTICE_KEY_INVALID");
@@ -101,7 +102,10 @@ export const HANDOFF_REASONS = ["explicit_human_request", "sensitive_request", "
   "agent_not_taken",
   // Ugo (25/11): not model reasons. A technical dead end of the investigation (`SAV_CASE_TECHNICAL_HANDOFF_WAITS`, investigation-record.ts): the store gives the
   // case to the team, no mail sent. Written out, not spread: `technicalHandoffTrigger` only compiles while every dead end is one of these reasons.
-  "technical_exhausted", "context_invalid", "knowledge_request_invalid"] as const;
+  "technical_exhausted", "context_invalid", "knowledge_request_invalid",
+  // Ugo (25/11): not model reasons. A case refused at entry (`SAV_CASE_ADMISSION_TEAM_REASONS`) is born with the team, with its mail: no investigation,
+  // no reply. `entry_sensitive` for a sensitive topic, `entry_team` for the other team reasons (confirmed bug, out of capability).
+  "entry_sensitive", "entry_team"] as const;
 export type HandoffReason = typeof HANDOFF_REASONS[number];
 export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
   explicit_human_request: "le client demande à parler à une personne",
@@ -118,6 +122,8 @@ export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
   technical_exhausted: "panne technique, les appels permis de l'agent sont épuisés (code technical_exhausted)",
   context_invalid: "panne technique, le dossier n'a pas pu être préparé pour l'agent (code context_invalid)",
   knowledge_request_invalid: "panne technique, la recherche de connaissances a été refusée avant tout appel (code knowledge_request_invalid)",
+  entry_sensitive: "sujet sensible (résiliation, facturation…)",
+  entry_team: "demande réservée à l'équipe dès son arrivée (bug confirmé ou hors des capacités de l'agent)",
 };
 /** SAV-92: the fixed next human action of a team part. The agent keeps the rest of the case. */
 export const HANDOFF_TEAM_PART_INTERVENTION = "Reprendre uniquement la partie ci-dessus. L'agent V2 garde les autres demandes du même message ; sa réponse au client indique que cette partie est transmise à l'équipe.";
@@ -213,6 +219,8 @@ export function staleHandoffEventKinds(transferred: boolean, reason?: HandoffRea
   if (reason === "outside_active_blocks") return [];
   // The whole mail went to the team by the wait's own transfer: a customer follow-up belongs to that human case, as after any durable transfer.
   if (reason === "team_part_handoff_unavailable") transferred = true;
+  // A case refused at entry was born with the team: a customer follow-up belongs to that human case too.
+  if (reason === "entry_sensitive" || reason === "entry_team") transferred = true;
   const kinds = ["observation_recorded", "human_command", "owner_changed"];
   // A customer follow-up belongs to the pending human case after durable transfer.
   if (!transferred) kinds.push("inbound_confirmed");
@@ -306,6 +314,39 @@ export function agentNotTakenNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId"
   return { ok: true, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion: born.caseVersion, reason: "agent_not_taken",
     report: { need: `Ticket attribué à l'Agent SAV, non pris en charge : ${why(handoff.reason)}`, expected: null, observed: null, trialIds: [], hypotheses: [], missingInformation: [],
       expectedIntervention: HANDOFF_NOT_TAKEN_INTERVENTION } };
+}
+
+/** Ugo (25/11): the fixed next human action of a case refused at entry. */
+export const HANDOFF_ENTRY_INTERVENTION = "Reprendre le message et répondre au client : l'agent ne l'a pas pris en charge et ne lui a envoyé aucun mail.";
+const SENSITIVE_ENTRY_REASONS: readonly CaseAdmissionReason[] = ["case_sensitive", "sensitive_family", "mixed_sensitive"];
+
+/**
+ * Ugo (25/11): the notice of a case refused at entry (`SAV_CASE_ADMISSION_TEAM_REASONS`: sensitive topic, confirmed bug, out of capability). Such a case is
+ * BORN with the team with its mail (`openCaseEvent`): no `owner_changed`, no investigation record, so neither `handoffNoticeTrigger` nor the SAV-99 trigger
+ * (which needs a case without mail) fires. Its one input is its FIRST admission decision (`admission:<event>`): exactly one notice per case, whatever
+ * follows (a customer follow-up re-admits the case under the same key). A person who took it, or a person's command since, means nothing to notice.
+ */
+export function admissionRefusalNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ticketId" | "body" | "owner" | "phase" | "threadIds">,
+  events: readonly (CaseInvestigationJournalEvent & { id?: string })[]): HandoffNoticeTrigger {
+  const handoff = snapshot.body.handoff;
+  if (snapshot.owner !== "human" || snapshot.phase !== "handoff_pending" || !handoff || !snapshot.threadIds.length) return { ok: false, why: "not_handoff" };
+  const admissionReason = SAV_CASE_ADMISSION_TEAM_REASONS.find(reason => reason === handoff.reason);
+  if (!admissionReason) return { ok: false, why: "not_handoff" };
+  if (handoff.humanSince) return { ok: false, why: "taken_by_person" };
+  // An owner change or an investigation means the case went through the agent: its own triggers (or none) apply, never this one.
+  if (events.some(event => event.kind === "owner_changed" || (event.kind === "observation_recorded"
+    && (event.detail?.record as { kind?: unknown } | undefined)?.kind === SAV_CASE_INVESTIGATION_RECORD_KIND))) return { ok: false, why: "not_handoff" };
+  const decided = [...events].sort((a, b) => a.caseVersion - b.caseVersion).find(event => event.kind === "admission_decided");
+  if (!decided || typeof decided.id !== "string") return { ok: false, why: "no_record" };
+  const reason = SENSITIVE_ENTRY_REASONS.includes(admissionReason) ? "entry_sensitive" as const : "entry_team" as const;
+  const stale = staleHandoffEventKinds(true, reason);
+  if (events.some(event => event.caseVersion > decided.caseVersion && stale.includes(event.kind))) return { ok: false, why: "stale_input" };
+  const inputKey = `admission:${decided.id}`;
+  if (!INPUT_KEY.test(inputKey)) return { ok: false, why: "no_record" };
+  const requests = snapshot.body.openRequests.filter(row => row.status !== "resolved").map(row => caseRequestSearchText(row) ?? row.summary);
+  return { ok: true, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion: decided.caseVersion, reason,
+    report: { need: `Demande laissée à l'équipe dès son arrivée : ${requests.join(" ; ") || "voir le mail du client"}`, expected: null, observed: null, trialIds: [], hypotheses: [],
+      missingInformation: [], expectedIntervention: HANDOFF_ENTRY_INTERVENTION } };
 }
 
 /**
@@ -524,6 +565,8 @@ const NOTE_REASON_SENTENCES: Record<HandoffReason, string> = {
   technical_exhausted: "Panne technique : l'agent n'a pas pu traiter ce message (appels permis épuisés). Rien n'a été envoyé au client. Code : technical_exhausted.",
   context_invalid: "Panne technique : l'agent n'a pas pu préparer le dossier de ce message. Rien n'a été envoyé au client. Code : context_invalid.",
   knowledge_request_invalid: "Panne technique : la recherche de connaissances de ce message a été refusée. Rien n'a été envoyé au client. Code : knowledge_request_invalid.",
+  entry_sensitive: "La demande porte sur un sujet sensible réservé à l'équipe ; je ne l'ai pas prise en charge et aucun mail n'a été envoyé au client.",
+  entry_team: "La demande relève de l'équipe dès son arrivée ; je ne l'ai pas prise en charge et aucun mail n'a été envoyé au client.",
 };
 const NOTE_TRIAL_OUTCOMES: Record<CaseTrial["outcome"], string> = {
   failed: "le problème persiste", pending: "nous attendons son retour", succeeded: "le client indique que cela a fonctionné", unknown: "nous ne savons pas encore si cela a suffi",

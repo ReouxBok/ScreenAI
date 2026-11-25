@@ -11,7 +11,7 @@ import { applyProvenResolutions, type ProvenResolutionSweepResult } from "./case
 import { enqueueHandoffNotices, runHandoffNoticePass, type HandoffNoticePassResult, type HandoffNoticeRuntimeDeps, type HandoffNoticeSweepResult } from "./case-handoff-notice-store";
 import { runCaseEffectsPass, type CaseRuntimeDeps, type CaseRuntimePassResult } from "./case-runtime-effects";
 import { runCaseTicketStagePass, type TicketStagePassResult, type TicketStageRuntimeDeps } from "./case-ticket-stage-store";
-import { enqueueHandoffStages, type HandoffStageSweepResult } from "./case-handoff-stage";
+import { enqueueHandoffStages, handoffActivationSinceMs, type HandoffStageSweepResult } from "./case-handoff-stage";
 import { caseHandoffStageEnabled } from "./customer-return";
 
 export type CaseV2WakeDeps = Readonly<{
@@ -41,6 +41,12 @@ export type CaseV2WakeResult = Readonly<{
   skippedByDeadline: ReadonlyArray<"handoff_sweep" | "handoff" | "replies" | "handoff_stages" | "stages" | "closures">;
 }>;
 
+/** One aggregate line per hand-over sweep (counts by refusal code, never a case id), so a check of the logs proves what the sweep did. */
+function logSweep(name: "handoff_notice" | "handoff_stage", result: HandoffNoticeSweepResult | HandoffStageSweepResult | null | undefined) {
+  if (result) console.info("sav_v2_handoff_sweep", { name, examined: result.examined, created: result.created, existing: result.existing, refused: result.refused,
+    windowEnded: result.windowEnded, stoppedByDeadline: result.stoppedByDeadline });
+}
+
 const codeOf = (error: unknown) => (error instanceof Error ? error.message : "UNKNOWN_ERROR").replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 160);
 
 export async function runCaseV2Wake(deps: CaseV2WakeDeps): Promise<CaseV2WakeResult> {
@@ -51,12 +57,19 @@ export async function runCaseV2Wake(deps: CaseV2WakeDeps): Promise<CaseV2WakeRes
     try { return await run(); } catch (error) { failures.push({ step: name, code: codeOf(error) }); return null; }
   }
   const { env, deadlineMs, readTicketOwner } = deps.replies;
-  const handoffSweep = await step("handoff_sweep", () => enqueueHandoffNotices({ policy: deps.policy, env, since: deps.since, deadlineMs }));
+  // Ugo (25/11): the hand-over sweeps walk only the cases touched since the hand-over activation (`SAV_V2_HANDOFF_STAGE_SINCE`), not the whole policy window:
+  // at 50 cases a wake, a window of weeks took hours per lap (and a lap walked while a switch was off skipped its cases until the next one). Their admissions
+  // refuse anything recorded before that date anyway. Without a valid date (or with `SAV_V2_HANDOFF_STAGE` off): the policy window, as before. Closures keep it too.
+  const activation = handoffActivationSinceMs(env());
+  const handoffSince = activation === null ? deps.since : new Date(activation);
+  const handoffSweep = await step("handoff_sweep", () => enqueueHandoffNotices({ policy: deps.policy, env, since: handoffSince, deadlineMs }));
+  logSweep("handoff_notice", handoffSweep);
   const handoff = await step("handoff", () => runHandoffNoticePass({ ...deps.handoff, env, deadlineMs }));
   const replies = await step("replies", () => runCaseEffectsPass(deps.replies));
   // SAV-92 (17/11): only under `SAV_V2_HANDOFF_STAGE=on` (off: the step does not exist, the wake is the same as before). After the replies (a hand-over reply sent in this
   // wake queues its stage from its receipt), before the stages pass (which moves it in this same wake).
-  const handoffStages = caseHandoffStageEnabled(env()) ? await step("handoff_stages", () => enqueueHandoffStages({ policy: deps.policy, env, since: deps.since, deadlineMs })) : undefined;
+  const handoffStages = caseHandoffStageEnabled(env()) ? await step("handoff_stages", () => enqueueHandoffStages({ policy: deps.policy, env, since: handoffSince, deadlineMs })) : undefined;
+  logSweep("handoff_stage", handoffStages);
   const stages = await step("stages", () => runCaseTicketStagePass({ ...deps.stages, env, deadlineMs, readTicketOwner }));
   const closures = await step("closures", () => applyProvenResolutions({ policy: deps.policy, env, since: deps.since, deadlineMs, currentPolicyRevision: deps.replies.currentPolicyRevision, readTicketOwner }));
   return { handoffSweep, handoff, replies, ...(handoffStages === undefined ? {} : { handoffStages }), stages, closures, failures, skippedByDeadline: skipped };
