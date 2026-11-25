@@ -481,3 +481,34 @@ describe("v10: a searchable subject per relayed request, from V1's accepted anal
       expect(await subject(preFix)).toEqual({ status: "absent", reason: "source_invalid" });
   });
 });
+
+// 25/11 (`SAV_V2_CASE_THREAD_REPLY=on`): a reply V1 left to the thread's case (`v2_case_thread`) reaches that case, whoever holds it, with its own proof.
+describe("V2 case thread reply relay", () => {
+  const caseThread = () => vi.fn(async (messageId: string) => ({ ...await ackRun(messageId), decision: { classification: "unknown", requests: [{ id: "r0", kind: "unknown" }] } as never, reason: "v2_case_thread" as const }));
+  it("reaches a case held by the agent, as case_thread_reply, with no execution and no new admission", async () => {
+    const { source, c } = await agentCase(), messageId = await bareMessage(source.threadId);
+    const result = await recordCaseAfterConfirmedIntake(messageId, { ...noProgress, readAcknowledgement: caseThread() });
+    expect(result).toMatchObject({ caseId: c.caseId, created: false, appended: true, version: c.version + 1, owner: "agent", relay: "case_thread_reply" });
+    const event = (await listCaseEvents(c.caseId)).at(-1)!;
+    expect(event).toMatchObject({ kind: "inbound_confirmed", direction: "customer_inbound", dedupeKey: `inbound:gm-${messageId}` });
+    expect(event.detail).toMatchObject({ messageId, relay: { kind: "case_thread_reply", messageId, intakeRunVersion: runSeq, sourceHash: "source-hash-fixture" } });
+    expect(await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, messageId))).toEqual([]);
+  });
+  it("reaches a case held by the team, which stays the team's", async () => {
+    const human = await intake();
+    await recordCaseAfterConfirmedIntake(human.messageId, confirmed(human.ticketId));
+    const reply = await bareMessage(human.threadId);
+    expect(await recordCaseAfterConfirmedIntake(reply, { ...noProgress, readAcknowledgement: caseThread() })).toMatchObject({ appended: true, owner: "human", relay: "case_thread_reply" });
+    expect((await readCaseByTicket(human.ticketId))!).toMatchObject({ owner: "human", phase: "handoff_pending" });
+  });
+  it("readIntakeAcknowledgement accepts V1's v2_case_thread record and says so; the default relay then uses its proof", async () => {
+    const { savIntakeSourceSnapshot } = await import("../intake/runtime-store");
+    const { source } = await agentCase(), messageId = await bareMessage(source.threadId);
+    const [message] = await f.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+    const snapshot = await f.db.transaction(async tx => savIntakeSourceSnapshot(tx as never, message!, new Date()));
+    const [run] = await f.db.insert(savIntakeRuns).values({ threadId: source.threadId, messageId, version: 21, isCurrent: false, state: "observed", configHash: "c21", policyHash: "fixture",
+      sourceHash: snapshot.sourceHash, payloadCiphertext: encryptSavPayload({ revision: "fixture", plan: { decision: { classification: "unknown", requests: [], disposition: { kind: "no_ticket", reason: "v2_case_thread" } } } }) }).returning();
+    expect(await readIntakeAcknowledgement(messageId)).toMatchObject({ runId: run!.id, runVersion: 21, reason: "v2_case_thread" });
+    expect(await recordCaseAfterConfirmedIntake(messageId, noProgress)).toMatchObject({ appended: true, relay: "case_thread_reply" });
+  });
+});

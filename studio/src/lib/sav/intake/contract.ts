@@ -31,7 +31,9 @@ const evidenceOrigin = {
 };
 export const savIntakeEvidenceSchema = z.discriminatedUnion("source", [
   z.object({ ...evidenceOrigin,
-    source: z.enum(["current_message", "automation_headers", "current_attachment", "customer_history", "crm_contact", "contact_association", "crm_ticket", "crm_event", "private_rule", "human_override"]),
+    source: z.enum(["current_message", "automation_headers", "current_attachment", "customer_history", "crm_contact", "contact_association", "crm_ticket", "crm_event", "private_rule", "human_override",
+      // 25/11 (`SAV_V2_CASE_THREAD_REPLY=on`): the runtime fact that the mail's thread maps to exactly one V2 case (`v2_case_thread`).
+      "v2_case"]),
   }).strict(),
   z.object({ ...evidenceOrigin, source: z.literal("ticket_contact_association"),
     ticketId: crmId, contactId: crmId, direction: z.literal("ticket_to_contact"),
@@ -97,7 +99,8 @@ export type SavIntakeMutation = z.infer<typeof savIntakeMutationSchema>;
 
 const noTicket = z.object({
   kind: z.literal("no_ticket"),
-  reason: z.enum(["qualified_other", "acknowledgement_only", "outside_support"]),
+  // `v2_case_thread` (25/11, `SAV_V2_CASE_THREAD_REPLY=on`): a reply on a thread one V2 case owns, its scope left uncertain: relayed to that case.
+  reason: z.enum(["qualified_other", "acknowledgement_only", "outside_support", "v2_case_thread"]),
   qualifiedInformation: z.enum(["authenticated_newsletter", "verified_automatic_reply", "automated_noise"]).optional(),
   nextAction: z.enum(["none", "supervised_partnership", "supervised_commercial", "supervised_investor"]),
   learning: z.literal("excluded"), evidenceIds: refs,
@@ -227,6 +230,10 @@ export const savIntakeDecisionSchema = z.object({
     && ["current_message", "automation_headers"].every(source => decision.evidence.some(e => e.source === source
       && e.sourceId === decision.messageId && disposition.evidenceIds.includes(e.id))) && decision.latestInboundMessageId === decision.messageId;
   if (disposition.kind === "no_ticket" && disposition.qualifiedInformation === "automated_noise" && !qualifiedNoise) reject("SAV_INTAKE_NOISE_EVIDENCE_REQUIRED");
+  // 25/11: a reply relayed to its thread's V2 case never decides a ticket here; never for finance or cancellation, and only on the case fact.
+  const caseThreadReply = disposition.kind === "no_ticket" && disposition.reason === "v2_case_thread";
+  if (caseThreadReply && (sensitive || ["finance", "cancellation"].includes(decision.classification) || disposition.nextAction !== "none" || disposition.qualifiedInformation
+    || !decision.evidence.some(e => e.source === "v2_case" && disposition.evidenceIds.includes(e.id)))) reject("SAV_INTAKE_CASE_THREAD_REPLY_INVALID");
   const unresolved = !qualifiedReply && !qualifiedInformation && !qualifiedNoise && (!kinds.size || kinds.has("unknown"));
   let compatible: SavIntakeClassification[];
   if (qualifiedReply) compatible = ["acknowledgement"];
@@ -241,8 +248,8 @@ export const savIntakeDecisionSchema = z.object({
   // SAV-128: only an acknowledgement (every request one) may also go into the ticket of its thread (open, or reopened); nothing else changes.
   const acknowledgementOnly = decision.classification === "acknowledgement" && kinds.size === 1 && kinds.has("acknowledgement");
   if (unresolved || compatible.includes("mixed")) {
-    if (disposition.kind !== "collect_context" || !disposition.reasons.includes("classification_incomplete")) reject("SAV_INTAKE_CLASSIFICATION_CONTEXT_REQUIRED");
-  } else {
+    if (!caseThreadReply && (disposition.kind !== "collect_context" || !disposition.reasons.includes("classification_incomplete"))) reject("SAV_INTAKE_CLASSIFICATION_CONTEXT_REQUIRED");
+  } else if (!caseThreadReply) {
     const ticketFamily = sensitive || kinds.has("support");
     if (ticketFamily ? disposition.kind === "no_ticket" : !["no_ticket", "collect_context", ...(acknowledgementOnly ? ["ticket"] : [])].includes(disposition.kind)) reject("SAV_INTAKE_REQUEST_DISPOSITION_MISMATCH");
   }
@@ -341,7 +348,7 @@ export const savIntakeDecisionSchema = z.object({
     if (disposition.declaredAddressEvidenceIds.some(id => !decision.evidence.some(evidence => evidence.id === id
       && ["current_message", "customer_history"].includes(evidence.source)))) reject("SAV_INTAKE_CUSTOMER_DECLARATION_REQUIRED");
   }
-  if (disposition.kind === "no_ticket") {
+  if (disposition.kind === "no_ticket" && !caseThreadReply) {
     const permitted = {
       other: ["qualified_other", "none"], acknowledgement: ["acknowledgement_only", "none"],
       partnership: ["outside_support", "supervised_partnership"], commercial: ["outside_support", "supervised_commercial"],

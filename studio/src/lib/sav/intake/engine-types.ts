@@ -3,6 +3,7 @@ import { savAttachmentObservationSchema, savAttachmentReasonSchema } from "../at
 import { intakeOperatorInformationSchema } from "./operator-information-contract";
 import { savAckClosureAnalysisSchema } from "./ack-closure-rules";
 import { savIntakeRoutingAnalysisSchema } from "./routing-rules";
+import { SAV_INTAKE_NATURES } from "./case-thread-reply";
 import type { SavIntakeDecision, SavIntakeMutation } from "./contract";
 
 const id = z.string().regex(/^\d{1,30}$/);
@@ -43,7 +44,8 @@ export type IntakeHistory = z.infer<typeof intakeHistorySchema>;
 export type ReadResult<T> = { status: "complete" | "partial" | "failed"; data: T; observedAt: string; reconstructedAsOf?: string };
 export const messageAnalysisSchema = z.object({
   messageId: z.uuid(),
-  nature: z.enum(["request", "newsletter", "information", "indeterminate"]).optional(),
+  /** `acknowledgement` is offered to the model only with `SAV_V2_CASE_THREAD_REPLY=on` (`case-thread-reply.ts`); older records never carry it. */
+  nature: z.enum(SAV_INTAKE_NATURES).optional(),
   requests: z.array(z.object({
     id: ref, kind: z.enum(["support", "finance", "cancellation", "partnership", "commercial", "investor", "other", "acknowledgement", "unknown"]),
     // All intentions must be supported by the CURRENT authored message.
@@ -104,6 +106,9 @@ export type EnginePolicy = {
    * the ticket of its Gmail thread (`ticketId`, null when the thread has none). Absent (`SAV_ACK_CLOSE=on`, a V2 case on the thread or its ticket, an
    * unreadable fact, the operator paths): today's acknowledgement_only. */
   acknowledgementTicket?: { ticketId: string | null };
+  /** 25/11 (`SAV_V2_CASE_THREAD_REPLY=on` only): per-mail runtime evidence, never configuration nor model output (`ack-ticket-store.ts`). The mail's thread
+   * maps to exactly one V2 case, neither sensitive nor on system hold: a reply whose scope the model left uncertain goes to that case (`v2_case_thread`). */
+  v2CaseThread?: { caseId: string };
 };
 export type IntakeAdapters = {
   analyseMessage(input: { message: IntakeMessage; conversation: readonly IntakeMessage[]; identificationContinuation?: EngineInput["identificationContinuation"] }, signal: AbortSignal): Promise<MessageAnalysis>;

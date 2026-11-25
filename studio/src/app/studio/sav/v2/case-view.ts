@@ -185,6 +185,7 @@ function readSituation(snapshot: CaseSnapshot): CasePilotSituation {
 const relayLabels: Record<string, string> = {
   intake_effects_confirmed: "V1 a traité ce mail et confirmé ses effets, puis l’a transmis à V2.",
   acknowledgement_on_case_thread: "V1 l’a classé comme simple accusé de réception, sur un fil déjà suivi par V2.",
+  case_thread_reply: "Réponse sur un fil déjà suivi par V2 : V1 l’a laissée au dossier V2, sans ticket ni validation.",
   v2_customer_return: "Retour du client sur un dossier V2 ouvert : repris par V2.",
 };
 const returnRouteLabels: Record<string, string> = { continue: "le dossier continue", reopen: "le dossier est rouvert", hand_to_team: "le dossier passe à l’équipe" };

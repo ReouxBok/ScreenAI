@@ -29,6 +29,8 @@ export type CustomerReturnFacts = Readonly<{
   automated: boolean;
   /** V1 accepted an acknowledgement-only analysis of this very mail (a « merci »). */
   acknowledgement: boolean;
+  /** 25/11 (`SAV_V2_CASE_THREAD_REPLY=on`): V1 accepted a `v2_case_thread` analysis of this very mail: the reply is the case's, V1 opens no ticket for it. */
+  caseThreadReply?: boolean;
   /** V1's CONFIRMED ticket for this mail: the case's ticket (linked or reopened), another ticket (a new subject), or none yet.
    * `pending`: V1 holds an execution of this mail that is not confirmed: its ticket is not known yet, so the mail is nobody's to consume. */
   v1Target: "same_ticket" | "other_ticket" | "none" | "pending";
@@ -45,6 +47,8 @@ export type CustomerReturnRoute =
   | Readonly<{ route: "continue"; reason: "open_case_v2_owner" }>
   /** Closed case, V1 confirmed this mail on the same ticket (its 15-day same-subject reopen): the incident is still there, a new cycle starts. */
   | Readonly<{ route: "reopen"; reason: "same_incident_v1_confirmed" }>
+  /** 25/11: closed case, V1 left this reply to it (`v2_case_thread`): a new cycle starts, the agent reads it with the case's context. */
+  | Readonly<{ route: "reopen"; reason: "case_thread_reply" }>
   /** Not V2's to continue: V1's normal intake and relay decide (a new ticket opens a new case with its own admission). */
   | Readonly<{ route: "normal_admission"; reason: "no_case" | "several_cases" | "new_subject" | "before_case" }>
   /** Closed case: a thanks or an automatic reply is kept in V1's records and reopens nothing. */
@@ -84,15 +88,16 @@ export function decideCustomerReturn(facts: CustomerReturnFacts): CustomerReturn
   if (caseReturnPhaseClosed(current.phase)) {
     if (facts.automated) return { route: "keep_closed", reason: "automated" };
     if (facts.acknowledgement) return { route: "keep_closed", reason: "acknowledgement" };
-    // Same incident or new subject is V1's confirmed decision on this very mail, never guessed here.
-    if (facts.v1Target === "none" || facts.v1Target === "pending") return { route: "wait", reason: "v1_pending" };
+    // Same incident or new subject is V1's confirmed decision on this very mail, never guessed here. 25/11: V1's `v2_case_thread` is that decision.
+    if (facts.v1Target === "pending" || (facts.v1Target === "none" && !facts.caseThreadReply)) return { route: "wait", reason: "v1_pending" };
   } else if (facts.automated) return { route: "ignore_automated", reason: "automated" };
   else if (facts.v1Target === "pending") return { route: "wait", reason: "v1_pending" };
   if (facts.paused) return { route: "wait", reason: "paused" };
   if (facts.ownerNow === "unknown") return { route: "wait", reason: "owner_unread" };
   if (facts.ownerNow === "human") return { route: "hand_to_team", reason: "human_owner" };
   if (facts.ownerNow === "none") return { route: "hand_to_team", reason: "v2_owner_removed" };
-  return caseReturnPhaseClosed(current.phase) ? { route: "reopen", reason: "same_incident_v1_confirmed" } : { route: "continue", reason: "open_case_v2_owner" };
+  if (!caseReturnPhaseClosed(current.phase)) return { route: "continue", reason: "open_case_v2_owner" };
+  return facts.v1Target === "none" && facts.caseThreadReply ? { route: "reopen", reason: "case_thread_reply" } : { route: "reopen", reason: "same_incident_v1_confirmed" };
 }
 
 /** Whether the route needs the owner read now (one CRM GET), so nothing is read for a mail that another fact already routes. */

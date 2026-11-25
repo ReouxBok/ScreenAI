@@ -249,3 +249,21 @@ describe("SAV-128 runtime fact", () => {
     expect(await intakeAcknowledgementTicketFact(input, {}, db(Error("down")) as never)).toBeUndefined();
   });
 });
+
+describe("25/11 V2 case thread fact", () => {
+  const db = (rows: unknown[] | Error) => ({ select: () => ({ from: () => ({ where: () => ({ limit: async () => { if (rows instanceof Error) throw rows; return rows; } }) }) }) });
+  const on = { SAV_V2_CASE_THREAD_REPLY: "on" };
+  const agentCase = { id: "30000000-0000-4000-8000-000000000001", owner: "agent", sensitivity: "none" };
+  it("exactly one case, not sensitive, not on system hold: its id; 0 or 2 cases, a sensitive or held case, off or an unreadable read: nothing", async () => {
+    const { intakeV2CaseThreadFact } = await import("./ack-ticket-store");
+    expect(await intakeV2CaseThreadFact({ threadId }, on, db([agentCase]) as never)).toEqual({ caseId: agentCase.id });
+    expect(await intakeV2CaseThreadFact({ threadId }, on, db([{ ...agentCase, owner: "human" }]) as never)).toEqual({ caseId: agentCase.id });
+    expect(await intakeV2CaseThreadFact({ threadId }, on, db([]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact({ threadId }, on, db([agentCase, { ...agentCase, id: "30000000-0000-4000-8000-000000000002" }]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact({ threadId }, on, db([{ ...agentCase, sensitivity: "finance" }]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact({ threadId }, on, db([{ ...agentCase, owner: "system_hold" }]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact({ threadId }, {}, db([agentCase]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact({ threadId }, { SAV_V2_CASE_THREAD_REPLY: "true" }, db([agentCase]) as never)).toBeUndefined();
+    expect(await intakeV2CaseThreadFact({ threadId }, on, db(Error("down")) as never)).toBeUndefined();
+  });
+});

@@ -24,7 +24,9 @@ import {
  * intake effect to be confirmed, not merely a plan or a succeeded run. */
 type IntakeProgress = { state: string; ticketId: string | null; confirmed: boolean; effects?: unknown[] } | null;
 /** A current V1 analysis that classified the message as an acknowledgement needing no CRM effect. */
-export type IntakeAcknowledgement = { runId: string; runVersion: number; sourceHash: string; decision: Pick<SavIntakeDecision, "classification" | "requests"> };
+export type IntakeAcknowledgement = { runId: string; runVersion: number; sourceHash: string; decision: Pick<SavIntakeDecision, "classification" | "requests">;
+  /** 25/11: `v2_case_thread` when V1 left this reply to its thread's case (`SAV_V2_CASE_THREAD_REPLY=on`); absent: an acknowledgement only. */
+  reason?: "v2_case_thread" };
 export type CaseBoundaryDeps = {
   env?: Record<string, string | undefined>; readProgress?: (messageId: string) => Promise<IntakeProgress>;
   /** Current approved admission policy. None is stored yet, so the default admits nobody. */
@@ -284,7 +286,7 @@ export function relayQualification(hints: CaseAdmissionQualification, proven: Ca
 }
 
 /** The acknowledgement read from V1's own records: the latest analysis of this message is
- * accepted, says acknowledgement only, was not refused by an operator, and its sources still
+ * accepted, says acknowledgement only (or, 25/11, a reply left to its thread's V2 case), was not refused by an operator, and its sources still
  * match the thread up to this message. */
 export async function readIntakeAcknowledgement(messageId: string): Promise<IntakeAcknowledgement | null> {
   const db = requireDb();
@@ -294,13 +296,13 @@ export async function readIntakeAcknowledgement(messageId: string): Promise<Inta
   if (!run || run.state !== "observed" || !run.sourceHash) return null;
   const plan = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext).plan;
   const disposition = plan?.decision.disposition;
-  if (!plan || disposition?.kind !== "no_ticket" || disposition.reason !== "acknowledgement_only") return null;
+  if (!plan || disposition?.kind !== "no_ticket" || (disposition.reason !== "acknowledgement_only" && disposition.reason !== "v2_case_thread")) return null;
   const { intakeHumanRefused } = await import("../intake/human-binding");
   if (await intakeHumanRefused(messageId, db)) return null;
   const { savIntakeSourceSnapshot, intakeSourceMatches } = await import("../intake/runtime-store");
   const local = await db.transaction(async tx => savIntakeSourceSnapshot(tx, message, new Date()));
   if (!intakeSourceMatches(local, run.sourceHash)) return null;
-  return { runId: run.id, runVersion: run.version, sourceHash: run.sourceHash, decision: plan.decision };
+  return { runId: run.id, runVersion: run.version, sourceHash: run.sourceHash, decision: plan.decision, ...(disposition.reason === "v2_case_thread" ? { reason: "v2_case_thread" as const } : {}) };
 }
 
 export type CaseRelayResult =
@@ -413,7 +415,7 @@ async function relayAcknowledgement(messageId: string, deps: CaseBoundaryDeps): 
   const [first] = await db.select({ at: min(savCaseEvents.occurredAt) }).from(savCaseEvents)
     .where(and(eq(savCaseEvents.caseId, cases[0]!.id), eq(savCaseEvents.kind, "inbound_confirmed")));
   if (!first?.at || message.receivedAt < new Date(first.at)) return { skipped: "before_case" };
-  const relay: CaseRelayProof = { kind: "acknowledgement_on_case_thread", messageId, intakeRunId: acknowledgement.runId, intakeRunVersion: acknowledgement.runVersion, sourceHash: acknowledgement.sourceHash };
+  const relay: CaseRelayProof = { kind: acknowledgement.reason === "v2_case_thread" ? "case_thread_reply" : "acknowledgement_on_case_thread", messageId, intakeRunId: acknowledgement.runId, intakeRunVersion: acknowledgement.runVersion, sourceHash: acknowledgement.sourceHash };
   return relayToCase({ ticketId: cases[0]!.ticketId, threadId: message.threadId, gmailMessageId: message.gmailMessageId, receivedAt: message.receivedAt, decision: acknowledgement.decision, relay, deps, confirmedTicket: false, attribution: "pending",
     assertFresh: async tx => {
       const [run] = await tx.select({ state: savIntakeRuns.state, version: savIntakeRuns.version }).from(savIntakeRuns)
