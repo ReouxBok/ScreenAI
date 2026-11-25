@@ -19,6 +19,7 @@ import { intakeAutomationAdapters } from "./automated-message";
 import { SAV_INTAKE_NOISE_RESOURCE, savIntakeNoiseLogLine } from "./noise-filter";
 import { evaluateIntakeNoise } from "./noise-filter-runtime";
 import { decideIntakeRouting, intakeRoutingModelFromSemantics, intakeRoutingPlanFacts, savIntakeRoutingLogLine } from "./routing-rules";
+import { savIntakeBoundedConversationEnabled, savIntakeCitationRepairEnabled, savIntakeDeliveryReport, savIntakeSafeArchiveEnabled, savIntakeSafeArchiveFacts, savIntakeToValidatePolicy } from "./to-validate-rules";
 import type { IntakeLease } from "./runtime-store";
 import { intakeCrmEvidenceFingerprint, recordIntakeCrmReads } from "./crm-evidence-fingerprint";
 import { intakeResumeHoldReason, intakeResumeProof, newIntakeResumeObservation, observeIntakeReads } from "./resume-progress";
@@ -195,7 +196,8 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     // SAV-92: the ticket of the Gmail thread (or a person's choice) keeps the larger history share.
     const historyPriorityTicketIds = [lease.threadTicketId, lease.input.humanResolution?.ticketId];
     const semanticReader = simple ? createSavIntakeSimpleReaders({ model: config.model, call, crm: reads, policy: config.policy, provenance: lease.provenance, historyPriorityTicketIds,
-      ...(config.routing ? { routing: true } : {}),
+      ...(config.routing ? { routing: true, ...(savIntakeSafeArchiveEnabled(env()) ? { routingSafeArchive: true } : {}) } : {}),
+      ...(savIntakeCitationRepairEnabled(env()) ? { citationRepair: true } : {}), ...(savIntakeBoundedConversationEnabled(env()) ? { boundedConversation: true } : {}),
       ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
         attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
         payload.attachments = attachments.state; checkpoint();
@@ -208,7 +210,8 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
       payload.attachments = attachments.state;
       checkpoint();
-    } } } : {}), ...(savAckClosureEnabled(env()) ? { ackClosure: true } : {}), ...(config.routing ? { routing: true } : {}), model: config.model, call, provenance: lease.provenance, onValidatedEvidence: evidence => captureRequestQuotes(payload, evidence), onTrace: trace => {
+    } } } : {}), ...(savAckClosureEnabled(env()) ? { ackClosure: true } : {}), ...(config.routing ? { routing: true, ...(savIntakeSafeArchiveEnabled(env()) ? { routingSafeArchive: true } : {}) } : {}),
+      ...(savIntakeCitationRepairEnabled(env()) ? { citationRepair: true } : {}), model: config.model, call, provenance: lease.provenance, onValidatedEvidence: evidence => captureRequestQuotes(payload, evidence), onTrace: trace => {
       semanticFailureReason = trace.errorCode ?? undefined;
       if (trace.budgetLimit) readerBudgetLimit = trace.budgetLimit;
       traces.push(trace); checkpoint();
@@ -223,8 +226,12 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     // SAV-128: an acknowledgement goes into its thread's ticket unless `SAV_ACK_CLOSE=on` or V2 owns the thread/ticket; unreadable: today's path.
     const acknowledgementTicket = await (deps.acknowledgementTicket ?? (await import("./ack-ticket-store")).intakeAcknowledgementTicketFact)(
       { threadId: lease.input.message.threadId, threadTicketId: lease.threadTicketId }, env()).catch(() => undefined);
+    // SAV-139: the « À valider » switches and the thread facts they need (absent with every switch off: today's engine).
+    const toValidateSwitches = savIntakeToValidatePolicy(env());
+    const toValidate = toValidateSwitches && savIntakeToValidatePolicy(env(), { threadTicketId: lease.threadTicketId,
+      threadV2Case: toValidateSwitches.threadAck ? await (await import("./ack-ticket-store")).intakeThreadV2CaseFact({ threadId: lease.input.message.threadId, threadTicketId: lease.threadTicketId }) : false });
     payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, { ...otherPolicy, ...(quotedMailboxReply ? { quotedMailboxReply: true as const } : {}), ...(quotedTeamReply ? { quotedTeamReply: true as const } : {}),
-      ...(acknowledgementTicket ? { acknowledgementTicket } : {}) },
+      ...(acknowledgementTicket ? { acknowledgementTicket } : {}), ...(toValidate ? { toValidate } : {}) },
       // SAV-92: CRM reads keep 10 s each; the model gets the whole shared AI allowance, exactly like the comparison campaign.
       { timeoutMs: 10_000, modelTimeoutMs: SAV_INTAKE_ANALYSIS_TIMING.modelMs }, () => new Date()));
     assertSavIntakeObservation(payload.plan);
@@ -254,7 +261,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     }
     // V1 routing (23/11). Off: nothing computed. Shadow and live: the decision is stored on the run and logged; it never changes this analysis. Only the
     // live effect (`routing-store.ts`, after the projection) may forward or archive, and it re-reads every fact first.
-    if (config.routing) routeIntakeAnalysis(payload, lease, config.routing, state, Boolean(quotedMailboxReply || quotedTeamReply));
+    if (config.routing) routeIntakeAnalysis(payload, lease, config.routing, state, Boolean(quotedMailboxReply || quotedTeamReply), savIntakeSafeArchiveEnabled(env()));
     await saveSavIntakeResult(lease, config, payload, state);
     if (payload.routing) await (await import("./routing-store")).recordIntakeRoutingDecision(payload.routing).catch(() => undefined);
     // A provider outage is retried automatically at a durable due time, not left to wait.
@@ -329,11 +336,15 @@ export async function reconcileSavIntakeRuntime(options: { deadlineMs?: number }
 
 /** V1 routing (23/11): the decision of this analysed mail, stored on the run and logged (codes, class and team recipient only). Pure apart from the log
  * line; never throws (a failure only leaves the routing absent, i.e. today's path). */
-function routeIntakeAnalysis(payload: IntakeRuntimePayload, lease: Pick<IntakeLease, "run" | "input" | "threadTicketId">, mode: "shadow" | "live", state: "observed" | "waiting", quotedReply: boolean) {
+function routeIntakeAnalysis(payload: IntakeRuntimePayload, lease: Pick<IntakeLease, "run" | "input" | "threadTicketId" | "provenance">, mode: "shadow" | "live", state: "observed" | "waiting", quotedReply: boolean, safeArchiveOn = false) {
   try {
     const messageId = lease.run.messageId, input = lease.input;
-    const decision = decideIntakeRouting({ messageId, analysisWaiting: state !== "observed",
-      model: intakeRoutingModelFromSemantics(payload.semantics, messageId), plan: intakeRoutingPlanFacts(payload.plan),
+    const model = intakeRoutingModelFromSemantics(payload.semantics, messageId);
+    // SAV-139: server-checked safe-archive facts, only with `SAV_INTAKE_SAFE_ARCHIVE=on` (absent: today's rule).
+    const safeArchive = safeArchiveOn ? savIntakeSafeArchiveFacts({ plan: payload.plan, message: { ...input.message, subject: lease.provenance.get(messageId)?.subject ?? null }, routing: model,
+      deliveryReport: savIntakeDeliveryReport(payload.noise, messageId) }) : null;
+    const decision = decideIntakeRouting({ messageId, analysisWaiting: state !== "observed", ...(safeArchive ? { safeArchive } : {}),
+      model, plan: intakeRoutingPlanFacts(payload.plan),
       thread: { conversationLength: input.conversation.status === "complete" ? input.conversation.data.length : Number.POSITIVE_INFINITY,
         ticketId: lease.threadTicketId ?? null, quotedReply,
         humanContext: Boolean(input.message.operatorInformation || input.humanResolution || input.priorRequestReview || lease.run.humanChoiceCiphertext) } });

@@ -6,6 +6,7 @@
 //   support, finance, cancellation, acknowledgement, mixed, unknown, or any doubt → nothing changes (today's path).
 import { z } from "zod";
 import { SAV_INTAKE_ROUTING_REVISION } from "./routing-guidelines";
+import { savIntakeSafeArchiveRefusal } from "./to-validate-rules";
 export { SAV_INTAKE_ROUTING_REVISION };
 
 export const SAV_INTAKE_ROUTING_MODES = ["off", "shadow", "live"] as const;
@@ -18,28 +19,48 @@ export function savIntakeRoutingMode(env: Record<string, string | undefined>): S
 
 export const SAV_INTAKE_ROUTING_CLASSES = ["support", "finance", "cancellation", "acknowledgement", "mixed", "unknown",
   "lead_commercial", "candidature", "investisseur", "partenariat", "demarchage", "notification_auto"] as const;
-export type SavIntakeRoutingClass = typeof SAV_INTAKE_ROUTING_CLASSES[number];
+/** SAV-139: `phishing` is offered to the model only with `SAV_INTAKE_SAFE_ARCHIVE=on` (`to-validate-rules.ts`); every stored class is accepted. */
+export const SAV_INTAKE_ROUTING_ALL_CLASSES = [...SAV_INTAKE_ROUTING_CLASSES, "phishing"] as const;
+export type SavIntakeRoutingClass = typeof SAV_INTAKE_ROUTING_ALL_CLASSES[number];
 export const savIntakeRoutingClassLabels: Record<SavIntakeRoutingClass, string> = {
   support: "Support", finance: "Facturation", cancellation: "Résiliation", acknowledgement: "Accusé de réception", mixed: "Mixte", unknown: "Indéterminé",
   lead_commercial: "Lead commercial", candidature: "Candidature", investisseur: "Investisseur", partenariat: "Partenariat",
-  demarchage: "Démarchage / newsletter", notification_auto: "Notification automatique",
+  demarchage: "Démarchage / newsletter", notification_auto: "Notification automatique", phishing: "Hameçonnage",
 };
 
 /** The only recipients a routed mail can ever go to (team addresses, one place). A class absent from this map is never forwarded. */
 export const SAV_INTAKE_ROUTING_RECIPIENTS: Readonly<Partial<Record<SavIntakeRoutingClass, string>>> = Object.freeze({
   lead_commercial: "sacha@limova.ai", candidature: "sacha@limova.ai", investisseur: "sacha@limova.ai", partenariat: "nathan@limova.ai",
 });
-export const SAV_INTAKE_ROUTING_ARCHIVED: readonly SavIntakeRoutingClass[] = ["demarchage", "notification_auto"];
+export const SAV_INTAKE_ROUTING_ARCHIVED: readonly SavIntakeRoutingClass[] = ["demarchage", "notification_auto", "phishing"];
 /** The only mailbox whose mails may be routed. */
 export const SAV_INTAKE_ROUTING_MAILBOX = "contact@limova.ai";
 /** The V1 execution right the live effect needs; granted by no existing policy (a renewal adds it explicitly). */
 export const SAV_INTAKE_ROUTING_PERMISSION = "route_intake_mail" as const;
 
-/** The model's routing class, stored beside V1's accepted analysis (requested only with the switch on). */
-export const savIntakeRoutingAnalysisSchema = z.object({
+/** The routing field the model is asked for (wire contract) with the switch on and `SAV_INTAKE_SAFE_ARCHIVE` off: unchanged since 23/11. */
+export const savIntakeRoutingWireSchema = z.object({
   class: z.enum(SAV_INTAKE_ROUTING_CLASSES),
   confidence: z.enum(["high", "medium", "low"]),
   justification: z.string().trim().min(1).max(300),
+}).strict();
+/** SAV-139, `SAV_INTAKE_SAFE_ARCHIVE=on` only: the phishing class, and the customer-signal judgement with an exact quote of the current text that the
+ * server verifies before any archive (`to-validate-rules.ts`). */
+export const savIntakeSafeArchiveRoutingWireSchema = z.object({
+  class: z.enum(SAV_INTAKE_ROUTING_ALL_CLASSES),
+  confidence: z.enum(["high", "medium", "low"]),
+  justification: z.string().trim().min(1).max(300),
+  customerSignal: z.boolean(),
+  customerSignalQuote: z.string().trim().min(1).max(300).optional(),
+}).strict();
+export const savIntakeRoutingWireSchemaFor = (safeArchive: boolean) => safeArchive ? savIntakeSafeArchiveRoutingWireSchema : savIntakeRoutingWireSchema;
+/** The model's routing class, stored beside V1's accepted analysis (requested only with the switch on). Accepts both wire contracts. */
+export const savIntakeRoutingAnalysisSchema = z.object({
+  class: z.enum(SAV_INTAKE_ROUTING_ALL_CLASSES),
+  confidence: z.enum(["high", "medium", "low"]),
+  justification: z.string().trim().min(1).max(300),
+  customerSignal: z.boolean().optional(),
+  customerSignalQuote: z.string().trim().min(1).max(300).optional(),
 }).strict();
 export type SavIntakeRoutingAnalysis = z.infer<typeof savIntakeRoutingAnalysisSchema>;
 
@@ -61,6 +82,8 @@ export type SavIntakeRoutingFacts = Readonly<{
     /** Live only (re-read right before the effect). */
     v2Case?: boolean; newerMessage?: boolean; handledExternally?: boolean;
   }>;
+  /** SAV-139, `SAV_INTAKE_SAFE_ARCHIVE=on` only (absent otherwise): server-checked facts that let a mail V1 saw without any request be archived. */
+  safeArchive?: import("./to-validate-rules").SavIntakeSafeArchiveFacts;
 }>;
 export type SavIntakeRoutingAction = "forward" | "archive" | "keep";
 export type SavIntakeRoutingDecision = Readonly<{
@@ -93,11 +116,13 @@ export function decideIntakeRouting(facts: SavIntakeRoutingFacts): SavIntakeRout
   if (plan.classification === "mixed") return keep("mixed_request");
   if (plan.disposition === "ticket" || plan.disposition === "request_identification") return keep("v1_ticket_path");
   // Review #347: V1 still collecting context (an unqualified Other, an unresolved scope) is never routed.
-  if (plan.disposition === "collect_context") return keep("v1_collect_context");
+  // SAV-139: except a mail without any request that passes every server-checked safe-archive condition, and then only to the archive.
+  const safeArchive = plan.disposition === "collect_context" ? savIntakeSafeArchiveRefusal(facts) : undefined;
+  if (safeArchive !== undefined && safeArchive !== null) return keep(safeArchive);
   if (!model) return keep("model_routing_missing");
   if (NEVER_ROUTED.includes(model.class)) return keep(`class_${model.class}`);
   // Review #347: the routing class must agree with V1's own plan; a disagreement stays human and is recorded to be measured.
-  if (!intakeRoutingAgrees(model.class, plan)) return keep("routing_disagreement");
+  if (safeArchive === undefined && !intakeRoutingAgrees(model.class, plan)) return keep("routing_disagreement");
   if (model.confidence !== "high") return keep(`confidence_${model.confidence}`);
   if (thread.ticketId) return keep("thread_ticket");
   if (thread.conversationLength !== 1) return keep("thread_history");
@@ -122,7 +147,7 @@ export function intakeRoutingAgrees(cls: SavIntakeRoutingClass, plan: NonNullabl
   if (plan.disposition !== "no_ticket") return false;
   const kinds = plan.requestKinds, outside = kinds.filter(kind => OUTSIDE_KINDS.includes(kind));
   switch (cls) {
-    case "demarchage": case "notification_auto": return ["other", "acknowledgement"].includes(plan.classification) && !outside.length;
+    case "demarchage": case "notification_auto": case "phishing": return ["other", "acknowledgement"].includes(plan.classification) && !outside.length;
     case "lead_commercial": return plan.classification === "commercial"
       || plan.classification === "other" && !kinds.includes("partnership") && !kinds.includes("investor");
     case "partenariat": return plan.classification === "partnership";
@@ -166,7 +191,7 @@ export function intakeRoutingShadowLabel(decision: Pick<SavIntakeRoutingDecision
 export function publicIntakeRoutingDecision(raw: unknown) {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Record<string, unknown>;
-  const cls = (SAV_INTAKE_ROUTING_CLASSES as readonly string[]).includes(String(value.class)) ? String(value.class) as SavIntakeRoutingClass : null;
+  const cls = (SAV_INTAKE_ROUTING_ALL_CLASSES as readonly string[]).includes(String(value.class)) ? String(value.class) as SavIntakeRoutingClass : null;
   const action = ["forward", "archive", "keep"].includes(String(value.action)) ? String(value.action) as SavIntakeRoutingAction : null;
   const recipient = Object.values(SAV_INTAKE_ROUTING_RECIPIENTS).includes(String(value.recipient)) ? String(value.recipient) : null;
   return {

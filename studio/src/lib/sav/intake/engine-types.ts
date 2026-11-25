@@ -104,6 +104,9 @@ export type EnginePolicy = {
    * the ticket of its Gmail thread (`ticketId`, null when the thread has none). Absent (`SAV_ACK_CLOSE=on`, a V2 case on the thread or its ticket, an
    * unreadable fact, the operator paths): today's acknowledgement_only. */
   acknowledgementTicket?: { ticketId: string | null };
+  /** SAV-139: « À valider » switches and per-mail thread facts set by the runtime from the environment and stored records, never model output
+   * (`to-validate-rules.ts`). Absent: today's engine. */
+  toValidate?: import("./to-validate-rules").SavIntakeToValidatePolicy;
 };
 export type IntakeAdapters = {
   analyseMessage(input: { message: IntakeMessage; conversation: readonly IntakeMessage[]; identificationContinuation?: EngineInput["identificationContinuation"] }, signal: AbortSignal): Promise<MessageAnalysis>;
@@ -158,6 +161,8 @@ export type IntakePlan = {
   readCalls: number;
   /** SAV-128: what became of an acknowledgement given `acknowledgementTicket` (outside the fingerprint; shown by the console). */
   acknowledgementTicket?: import("./ack-ticket").SavAckTicketOutcome;
+  /** SAV-139: HubSpot answer for the sender, read only when V1 saw no classifiable request and a switch needs it (outside the fingerprint). */
+  senderContact?: import("./to-validate-rules").SavIntakeSenderContact;
   effects: "not_connected";
 };
 export type EngineLimits = { readCalls: number; timeoutMs: number; contacts: number; tickets: number;

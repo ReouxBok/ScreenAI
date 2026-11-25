@@ -15,6 +15,7 @@ import { readSavExternalCompletion } from "../external-completion";
 import { assertSavAgentActionsAllowed } from "./agent-pause";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./execution-policy";
 import type { GmailRequest } from "./execution-adapters";
+import { savIntakeDeliveryReport, savIntakeSafeArchiveEnabled, savIntakeSafeArchiveFacts } from "./to-validate-rules";
 import { intakeRoutingModelFromSemantics, intakeRoutingPlanFacts, savIntakeRoutingMode, SAV_INTAKE_ROUTING_MAILBOX, SAV_INTAKE_ROUTING_PERMISSION,
   type SavIntakeRoutingDecision } from "./routing-rules";
 import { INTAKE_ROUTING_FINAL_STEPS, routeIntakeMessage, type IntakeRoutingDeps, type IntakeRoutingGmail, type IntakeRoutingLiveFacts, type IntakeRoutingStep,
@@ -110,11 +111,18 @@ export async function readIntakeRoutingFacts(messageId: string): Promise<IntakeR
   const latestInbound = all.find(row => row.direction === "inbound");
   const [v2] = await db.select({ id: savCases.id }).from(savCases)
     .where(thread.hubspotTicketId ? sql`${savCases.ticketId} = ${thread.hubspotTicketId} or ${thread.id}::uuid = any(${savCases.threadIds})` : sql`${thread.id}::uuid = any(${savCases.threadIds})`).limit(1);
-  const input = payload?.input as { message?: { operatorInformation?: unknown }; humanResolution?: unknown; priorRequestReview?: unknown } | undefined;
+  const input = payload?.input as { message?: { operatorInformation?: unknown; currentText?: string; fromEmail?: string; unreadAttachments?: unknown[]; attachmentInputs?: { sourceId: string }[] };
+    humanResolution?: unknown; priorRequestReview?: unknown } | undefined;
   const stored = payload?.routing ?? null;
+  const model = intakeRoutingModelFromSemantics(payload?.semantics, messageId);
+  // SAV-139: the same server-checked safe-archive facts as the analysis, only with `SAV_INTAKE_SAFE_ARCHIVE=on`.
+  const analysed = typeof input?.message?.currentText === "string" && typeof input.message.fromEmail === "string" ? { currentText: input.message.currentText,
+    fromEmail: input.message.fromEmail, subject: message.subject, unreadAttachments: input.message.unreadAttachments, attachmentInputs: input.message.attachmentInputs } : null;
+  const safeArchive = savIntakeSafeArchiveEnabled(process.env) ? savIntakeSafeArchiveFacts({ plan: payload?.plan, message: analysed, routing: model,
+    deliveryReport: savIntakeDeliveryReport(payload?.noise, messageId) }) : null;
   return {
     stored,
-    facts: { messageId, model: intakeRoutingModelFromSemantics(payload?.semantics, messageId), plan: intakeRoutingPlanFacts(payload?.plan),
+    facts: { messageId, model, plan: intakeRoutingPlanFacts(payload?.plan), ...(safeArchive ? { safeArchive } : {}),
       thread: { conversationLength: all.length, ticketId: thread.hubspotTicketId ?? null,
         humanContext: Boolean(thread.aiPaused || thread.humanRequestedAt || run?.humanChoiceCiphertext || input?.message?.operatorInformation || input?.humanResolution || input?.priorRequestReview),
         // Checked on the analysed mail (its quote headers); a stored routed decision proves it passed.

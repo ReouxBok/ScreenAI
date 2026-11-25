@@ -24,3 +24,13 @@ export async function intakeAcknowledgementTicketFact(input: { threadId: string;
     return v2 ? undefined : { ticketId };
   } catch { return undefined; }
 }
+
+/** SAV-139: a V2 case owns the thread or its ticket (`SAV_INTAKE_THREAD_ACK`). Never throws: an unreadable fact is false (today's path). */
+export async function intakeThreadV2CaseFact(input: { threadId: string; threadTicketId: string | null | undefined }, db: Reader = requireDb()): Promise<boolean> {
+  try {
+    const ticketId = input.threadTicketId && /^\d{1,30}$/.test(input.threadTicketId) ? input.threadTicketId : null;
+    const [v2] = await db.select({ id: savCases.id }).from(savCases)
+      .where(ticketId ? sql`${savCases.ticketId} = ${ticketId} or ${input.threadId}::uuid = any(${savCases.threadIds})` : sql`${input.threadId}::uuid = any(${savCases.threadIds})`).limit(1);
+    return Boolean(v2);
+  } catch { return false; }
+}
