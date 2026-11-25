@@ -14,6 +14,7 @@ import { renderSavOutboundReply, savReplyFooter } from "../reply-format";
 import { getCaseReplyEffect } from "./case-reply-registry";
 import { decideCaseReply, submitCaseReplyProposal } from "./case-reply-store";
 import { savCaseReplyValidations } from "./case-reply-validation-table";
+import { HANDOFF_REPLY } from "./case-terminal-reply";
 
 // PROPOSED TO POLE C (owner of case-reply-store.ts), not applied by UX: the store refuses, before any row or hash is written, a proposal whose text breaks
 // the UX outbound contract sav-v2-reply-outbound.v1; a finalized proposal is stored, shown and approved exactly as it will be sent.
@@ -75,7 +76,7 @@ describe("C's store and the UX outbound contract: refused before creation or has
       const unsafe = finalizeCaseReplyProposal({ ...s.proposal("Voir https://evil.invalid"), purpose }, { language: "fr", validation: "human" });
       expect(await submitCaseReplyProposal(unsafe, terminalDeps)).toEqual({ ok: false, code: "proposal_invalid", detail: "terminal_text" });
       expect(await submitCaseReplyProposal(unsafe, deps)).toEqual({ ok: false, code: "effects_off" });
-      const text = purpose === "closing" ? "Merci pour votre confirmation, nous sommes ravis que le problème soit résolu. Si le problème revient, vous pouvez répondre à ce message." : "Un conseiller reprend votre demande.";
+      const text = purpose === "closing" ? "Merci pour votre confirmation, nous sommes ravis que le problème soit résolu. Si le problème revient, vous pouvez répondre à ce message." : HANDOFF_REPLY;
       const fixed = finalizeCaseReplyProposal({ ...unsafe, text }, { language: "fr", validation: "human" });
       expect(await submitCaseReplyProposal(fixed, terminalDeps)).toMatchObject({ ok: false, code: "not_admitted", detail: "terminal_proof_missing" });
     }

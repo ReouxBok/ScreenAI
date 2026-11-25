@@ -34,14 +34,14 @@ import { applyProvenResolution, applyProvenResolutions } from "./case-resolution
 import { HANDOFF_NOTICE_KEY_PREFIX, type HandoffCrmReading } from "./case-handoff-notice";
 import { accessAutoReplyAuthorizer, routeCustomerReturn } from "./customer-return-store";
 import { ACCESS_AUTO_APPROVAL_BASIS } from "./customer-return";
-import { pendingHandoffReply, provenClosingReply } from "./case-terminal-reply";
+import { HANDOFF_REPLY, pendingHandoffReply, provenClosingReply } from "./case-terminal-reply";
 import { caseDecisionDraft } from "./investigation-intent";
 import { readCaseInvestigationProgress } from "./investigation-record";
 import { selectCaseKnowledge } from "./investigation-knowledge";
 import { runCaseInvestigation, type CaseInvestigationModelRequest, type CaseInvestigationModelResult } from "./investigation-runner";
 import { caseInvestigationReturnAwareQualify, caseReturnContentRule } from "./investigation-return-qualify";
 import { caseInvestigationStorePorts } from "./investigation-store-ports";
-import { listCaseEvents, listCaseTimers, openCaseEvent, readCase, transitionCaseOwner } from "./case-store";
+import { appendCaseEvent, listCaseEvents, listCaseTimers, openCaseEvent, readCase, transitionCaseOwner } from "./case-store";
 import { caseDedupeKey, caseRequestId, type CaseAdmissionQualification, type CaseRequestSubject, type CaseSnapshot, type KnowledgeRef } from "./case-types";
 
 /*
@@ -104,6 +104,14 @@ async function laterMail(made: Made, gmail: string, text: string) {
   await storeLaterMail(made, gmail, text);
   return (await openCaseEvent({ ticketId: made.ticketId, threadId: made.threadId, admission: byRule(made.requestId), kind: "inbound_confirmed", dedupeKey: caseDedupeKey.inbound(gmail),
     sourceRef: { type: "email", id: gmail }, occurredAt: new Date().toISOString() })).case;
+}
+
+/** Ugo 25/11: a hand-over reply needs an earlier agent reply on the case. The agent's reply is recorded, then the customer writes again (the decision's input). */
+async function afterAgentReply(made: Made, gmail: string) {
+  await appendCaseEvent({ caseId: made.caseId, kind: "outbound_observed", direction: "agent_outbound", dedupeKey: `outbound:sent-${gmail}`,
+    sourceRef: { type: "email", id: `sent-${gmail}` }, occurredAt: new Date().toISOString(), detail: { purpose: "answer" } });
+  p.setGmail(gmail, made.gmailThreadId);
+  return laterMail(made, gmail, "Toujours bloqué.");
 }
 
 async function routeLaterMail(made: Made, gmail: string, text: string) {
@@ -309,6 +317,7 @@ describe("closing and handoff customer acknowledgements", () => {
     environment = { ...environment, SAV_V2_CLOSING_HANDOFF_REPLY: "on" };
     kb.cards = [];
     const made = await newCase(`gm-terminal-fence-${reason}`);
+    await afterAgentReply(made, `gm-terminal-fence-${reason}-2`);
     expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
     expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true } });
     if (reason === "off") environment.SAV_V2_CLOSING_HANDOFF_REPLY = "off";
@@ -331,19 +340,38 @@ describe("closing and handoff customer acknowledgements", () => {
     environment = { ...environment, SAV_V2_CLOSING_HANDOFF_REPLY: "on", SAV_V2_REPLY_NOTE: "on" };
     kb.cards = [];
     const made = await newCase("gm-terminal-handoff");
+    await afterAgentReply(made, "gm-terminal-handoff-2");
     expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
     expect((await readCase(made.caseId))!.owner).toBe("human");
     const snapshot = (await readCase(made.caseId))!, events = await listCaseEvents(made.caseId);
     for (const family of ["finance", "cancellation", "identity", "rights", "subscription"] as const)
-      expect(pendingHandoffReply({ ...snapshot, body: { ...snapshot.body, openRequests: snapshot.body.openRequests.map(row => ({ ...row, family })) } }, events, "inbound:gm-terminal-handoff")).toBe(false);
+      expect(pendingHandoffReply({ ...snapshot, body: { ...snapshot.body, openRequests: snapshot.body.openRequests.map(row => ({ ...row, family })) } }, events, "inbound:gm-terminal-handoff-2")).toBe(false);
+    expect(pendingHandoffReply(snapshot, events, "inbound:gm-terminal-handoff-2")).toBe(true);
     expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true, created: true } });
     await wake(); await wake();
     expect(sends).toBe(1);
-    expect(mimeText(sentBodies[0]!)).toContain("Un conseiller reprend votre demande.");
+    expect(mimeText(sentBodies[0]!)).toContain(HANDOFF_REPLY);
     expect((await stageRows(made.caseId))).toHaveLength(0);
     expect((await readCase(made.caseId))!.phase).toBe("handoff_pending");
     const effects = await f.db.select().from(savIntakeEffects).where(eq(savIntakeEffects.kind, "reply_send"));
     expect(effects.filter(row => row.businessKey.includes(made.caseId) && row.state === "confirmed" && row.permission === "send_case_reply")).toHaveLength(1);
+  });
+
+  it("Ugo 25/11: a hand-over at first contact sends the customer nothing; the Slack notice and the « Nouveau » stage still happen", async () => {
+    environment = { ...environment, SAV_V2_CLOSING_HANDOFF_REPLY: "on", SAV_V2_HANDOFF_STAGE: "on", SAV_V2_HANDOFF_STAGE_SINCE: new Date(Date.now() - 60_000).toISOString() };
+    kb.cards = [];
+    const made = await newCase("gm-terminal-first-contact");
+    expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
+    const snapshot = (await readCase(made.caseId))!, events = await listCaseEvents(made.caseId);
+    expect(pendingHandoffReply(snapshot, events, "inbound:gm-terminal-first-contact")).toBe(false);
+    expect(await draftOf(made.caseId)).toMatchObject({ reply: null, replyLimit: "no_reply" });
+    for (let n = 0; n < 3; n++) await wake();
+    expect(sends).toBe(0);
+    expect(await replyRows(made.caseId)).toHaveLength(0);
+    expect(posts()).toHaveLength(1);
+    expect((await stageRows(made.caseId)).filter(row => row.replyKey.includes(":handoff:"))).toMatchObject([{ state: "confirmed" }]);
+    expect(ticketProps(made.ticketId)).toMatchObject({ hs_pipeline_stage: "1" });
+    expect(await readCase(made.caseId)).toMatchObject({ owner: "human", phase: "handoff_pending" });
   });
 });
 
@@ -1032,6 +1060,7 @@ describe("SAV-92 (Ugo 17/11): a V2 hand-over gives the ticket back to the team, 
   it("SAV-133 confirms the handoff reply without queuing an earlier handoff from its receipt or the sweep", async () => {
     const made = await newCase("gm-ho-receipt-before-since");
     since = new Date();
+    await afterAgentReply(made, "gm-ho-receipt-before-since-2");
     expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
     const event = (await listCaseEvents(made.caseId)).filter(event => event.kind === "owner_changed").at(-1)!;
     environment.SAV_V2_HANDOFF_STAGE = "on";
@@ -1068,6 +1097,7 @@ describe("SAV-92 (Ugo 17/11): a V2 hand-over gives the ticket back to the team, 
     const readSince = vi.fn(() => "invalid");
     Object.defineProperty(environment, "SAV_V2_HANDOFF_STAGE_SINCE", { get: readSince });
     const made = await newCase("gm-ho-stage-off");
+    await afterAgentReply(made, "gm-ho-stage-off-2");
     expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
     expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true } });
     const result = await wake(); await wake();
@@ -1083,6 +1113,7 @@ describe("SAV-92 (Ugo 17/11): a V2 hand-over gives the ticket back to the team, 
     environment.SAV_V2_HANDOFF_STAGE = "on";
     const made = await newCase("gm-ho-stage-reply", "waiting");
     expect(ticketProps(made.ticketId).hs_pipeline_stage).toBe("2");
+    await afterAgentReply(made, "gm-ho-stage-reply-2");
     expect(await investigate(made.caseId, [handoff])).toMatchObject({ outcome: "accepted" });
     const event = (await listCaseEvents(made.caseId)).filter(event => event.kind === "owner_changed").at(-1)!;
     environment.SAV_V2_HANDOFF_STAGE_SINCE = new Date(Date.parse(event.occurredAt) - 1).toISOString();
@@ -1093,7 +1124,7 @@ describe("SAV-92 (Ugo 17/11): a V2 hand-over gives the ticket back to the team, 
     expect(await autoReply(made.caseId)).toMatchObject({ queued: { ok: true } });
     await wake(); await wake(); await wake();
     expect(sends).toBe(1);
-    expect(mimeText(sentBodies[0]!)).toContain("Un conseiller reprend votre demande.");
+    expect(mimeText(sentBodies[0]!)).toContain(HANDOFF_REPLY);
     expect(await handoffStages(made.caseId)).toMatchObject([{ state: "confirmed" }]);
     expect(await stageRows(made.caseId)).toHaveLength(1); // no « waiting » stage for a terminal reply
     expect(ticketPatches(made.ticketId)).toEqual([expect.objectContaining({ body: { properties: { hs_pipeline_stage: "1", hubspot_owner_id: "" } } })]);

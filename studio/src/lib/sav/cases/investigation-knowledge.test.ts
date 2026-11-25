@@ -4,6 +4,8 @@ import { SAV_CASE_SUBJECT_ABSENCES, type CaseRequestSubject, type CaseSnapshot }
 import { SAV_CASE_DECISION_CONTRACT_REVISION } from "./decision-contract";
 import { caseReplyPayloadHash, checkCaseReplyApproval } from "./case-effects";
 import { caseDecisionDraft, caseReplyTriggerOf } from "./investigation-intent";
+import { agentRepliedBefore, HANDOFF_REPLY } from "./case-terminal-reply";
+import { caseReplyEditableBody, prepareCaseReplyText, readCaseReplyDisclosure } from "./case-reply-outbound";
 import { selectCaseKnowledge } from "./investigation-knowledge";
 import { caseBodySchema, emptyCaseBody, type CaseEvent } from "./case-types";
 import { hasMultiQuestionWait, reconcileCaseQuestionAnswers } from "./case-question-followup";
@@ -118,6 +120,9 @@ describe("B → C draft: the decision in pole C's own proposal shape (SAV-10), v
   });
   /** The stored input of `stored()`: the customer mail gm-1 (case event evt-1). */
   const EVENTS = [{ id: "evt-1", direction: "customer_inbound" as const, sourceRef: { type: "email" as const, id: "gm-1" } }];
+  const AGENT_REPLY = { id: "evt-0", direction: "agent_outbound" as const, sourceRef: { type: "email" as const, id: "gm-sent-0" } };
+  // An earlier exchange: the agent replied to a first mail, then the mail the decision answers (evt-1).
+  const REPLIED = [{ id: "evt-00", direction: "customer_inbound" as const, sourceRef: { type: "email" as const, id: "gm-0" } }, AGENT_REPLY, ...EVENTS];
   const answer = { kind: "answer", requestIds: ["r1"], steps: [{ text: "Suivre la fiche.", knowledge: ref, newFactIds: [] }], expectedResult: "Ça marche." };
   const reply = (text: string) => ({ reply: { text, citations: [ref], impossibilityClaims: [], accountAdvice: "none" } });
 
@@ -139,12 +144,12 @@ describe("B → C draft: the decision in pole C's own proposal shape (SAV-10), v
     const env = { SAV_V2_CLOSING_HANDOFF_REPLY: "on" };
     const action = { kind: "handoff", reason: "diagnosis_out_of_tools", requestIds: ["r1"], report: { need: "Diagnostic", expectedIntervention: "Vérifier", trialIds: [], hypotheses: [], missingInformation: [], knowledge: [], expected: null, observed: null } };
     expect(caseDecisionDraft("case-1", stored(action), EVENTS)?.reply).toBeNull();
-    const handoff = caseDecisionDraft("case-1", stored(action, reply("Délai garanti https://evil.invalid")), EVENTS, undefined, env)!;
-    expect(handoff).toMatchObject({ reply: { purpose: "handoff", text: "Un conseiller reprend votre demande." }, shownSources: [], citations: [] });
-    expect(caseDecisionDraft("case-1", stored({ ...action, reason: "sensitive_request" }), EVENTS, undefined, env)?.reply).toBeNull();
+    const handoff = caseDecisionDraft("case-1", stored(action, reply("Délai garanti https://evil.invalid")), REPLIED, undefined, env)!;
+    expect(handoff).toMatchObject({ reply: { purpose: "handoff", text: HANDOFF_REPLY }, shownSources: [], citations: [] });
+    expect(caseDecisionDraft("case-1", stored({ ...action, reason: "sensitive_request" }), REPLIED, undefined, env)?.reply).toBeNull();
     for (const family of ["finance", "cancellation", "identity", "rights", "subscription"]) {
       const sensitive = stored(action, { understanding: { requests: [{ id: "r1", family, status: "open", summary: "Sensible" }], newFacts: [] } });
-      expect(caseDecisionDraft("case-1", sensitive, EVENTS, undefined, env)?.reply).toBeNull();
+      expect(caseDecisionDraft("case-1", sensitive, REPLIED, undefined, env)?.reply).toBeNull();
     }
     const resolved = stored({ kind: "confirm_resolution", requestIds: ["r1"], evidence: [] });
     expect(caseDecisionDraft("case-1", resolved, EVENTS, undefined, env)?.reply).toBeNull();
@@ -153,6 +158,29 @@ describe("B → C draft: the decision in pole C's own proposal shape (SAV-10), v
     expect(caseDecisionDraft("case-1", resolved, [], undefined, env)).toMatchObject({ reply: null, replyLimit: "inbound_unknown" });
     resolved.decision!.closure = { plan: "no_close_transfer_thanks", reason: "checked", verdicts: [] };
     expect(caseDecisionDraft("case-1", resolved, EVENTS, undefined, env)?.reply).toBeNull();
+  });
+
+  it("Ugo 25/11: a hand-over before any agent reply sends nothing; after an earlier agent reply it sends the hand-over text", () => {
+    const env = { SAV_V2_CLOSING_HANDOFF_REPLY: "on" };
+    const action = { kind: "handoff", reason: "diagnosis_out_of_tools", requestIds: ["r1"], report: { need: "Diagnostic", expectedIntervention: "Vérifier", trialIds: [], hypotheses: [], missingInformation: [], knowledge: [], expected: null, observed: null } };
+    expect(caseDecisionDraft("case-1", stored(action), EVENTS, undefined, env)).toMatchObject({ reply: null, replyLimit: "no_reply" });
+    // Only an agent reply recorded BEFORE the decision's input counts: one sent after it (the hand-over reply itself) does not.
+    expect(caseDecisionDraft("case-1", stored(action), [...EVENTS, AGENT_REPLY], undefined, env)).toMatchObject({ reply: null, replyLimit: "no_reply" });
+    expect(caseDecisionDraft("case-1", stored(action), REPLIED, undefined, env)?.reply).toEqual({ purpose: "handoff", text: HANDOFF_REPLY });
+    expect(caseDecisionDraft("case-1", stored({ ...action, reason: "sensitive_request" }), REPLIED, undefined, env)?.reply).toBeNull();
+    expect(agentRepliedBefore(EVENTS, "in:evt-1")).toBe(false);
+    expect(agentRepliedBefore(REPLIED, "in:evt-1")).toBe(true);
+    expect(agentRepliedBefore(REPLIED, "back:unknown")).toBe(false);
+  });
+
+  it("Ugo 25/11: the hand-over text keeps its paragraphs, carries the signature exactly once and reads back as the fixed text", () => {
+    expect(HANDOFF_REPLY).toBe("Bonjour,\n\nMerci pour votre retour. Je transmets votre demande à un membre de l'équipe support Limova, qui reprend la suite et reviendra vers vous par email dès que possible. Vous n'avez rien à renvoyer : il dispose de tout l'historique de nos échanges.");
+    const sent = prepareCaseReplyText(HANDOFF_REPLY, "fr", "automated", "handoff");
+    expect(sent.startsWith(`${HANDOFF_REPLY}\n\n`)).toBe(true);
+    expect(sent.split("Charly — Agent IA du support Limova")).toHaveLength(2);
+    expect(readCaseReplyDisclosure(sent)?.mode).toBe("automated");
+    expect(caseReplyEditableBody(sent)).toBe(HANDOFF_REPLY);
+    expect(prepareCaseReplyText(sent, "fr", "automated", "handoff")).toBe(sent);
   });
 
   it("an answer becomes C's `answer` reply; one question becomes C's `question` with its fact keys; up to five questions share one mail; six are refused", () => {

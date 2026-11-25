@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { CLOSING_REPLY, HANDOFF_REPLY, closingHandoffReplyEnabled } from "./case-terminal-reply";
+import { CLOSING_REPLY, HANDOFF_REPLY, agentRepliedBefore, closingHandoffReplyEnabled } from "./case-terminal-reply";
 import { isSensitiveCaseFamily } from "./decision-contract";
 import type { CaseEvent, KnowledgeRef } from "./case-types";
 import { inboundInteractionId, type CaseReplyProposal } from "./case-effects";
@@ -76,7 +76,11 @@ export function caseDecisionDraft(caseId: string, stored: CaseInvestigationStore
   const terminal = closingHandoffReplyEnabled(env) && !decision.actionsPaused && !proposal.understanding.requests.some(row => isSensitiveCaseFamily(row.family));
   if (terminal && action.kind === "confirm_resolution" && decision.closure?.plan === "soft_close" && decision.closure.reason === "checked")
     reply = { purpose: "closing", text: CLOSING_REPLY };
-  else if (terminal && action.kind === "handoff" && action.reason !== "sensitive_request") reply = { purpose: "handoff", text: HANDOFF_REPLY };
+  else if (terminal && action.kind === "handoff" && action.reason !== "sensitive_request") {
+    // Ugo (25/11): no hand-over reply before any agent reply on the case (first contact: the customer gets nothing).
+    if (agentRepliedBefore(events, stored.inputKey)) reply = { purpose: "handoff", text: HANDOFF_REPLY };
+    else replyLimit = "no_reply";
+  }
   else if (!proposal.reply) replyLimit = "no_reply";
   // With the terminal switch off, preserve the historical answer/question path.
   else if (action.kind === "answer") {
