@@ -19,6 +19,7 @@ import { finalizeCaseReplyProposal } from "@/lib/sav/cases/case-reply-outbound";
 import { submitCaseReplyProposal } from "@/lib/sav/cases/case-reply-store";
 import { claimCaseForDecision, listCaseEvents, openCaseEvent, readCase, recordCaseObservation, transitionCaseOwner } from "@/lib/sav/cases/case-store";
 import { caseDedupeKey, SAV_CASE_AWAITING_V2_ATTRIBUTION } from "@/lib/sav/cases/case-types";
+import { caseInvestigationObservationRecord } from "@/lib/sav/cases/investigation-record";
 import { caseInvestigationStorePorts } from "@/lib/sav/cases/investigation-store-ports";
 import { latestInvestigationInput } from "@/lib/sav/cases/investigation-runner";
 import CasePage from "./[ticketId]/page";
@@ -69,6 +70,12 @@ async function persistRaw(caseId: string, record: Record<string, unknown>) {
   if (!claim.claimed) throw Error(`CLAIM_REFUSED:${claim.reason}`);
   await recordCaseObservation({ caseId, claimToken: claim.claim.token, currentPolicyRevision: "policy-r1", observation: { record } });
 }
+/** Ugo (25/11): B's store hands a technical dead end (context_invalid) to the team. Its wait sentence is still read back by the page from a record in B's
+ * exact format (B's own builder), written through pole A's store only, on a case that stays with the agent. */
+async function persistWaitOnly(caseId: string, modelCalls: number, waiting: Record<string, unknown>) {
+  const inputKey = latestInvestigationInput(await listCaseEvents(caseId))!;
+  await persistRaw(caseId, caseInvestigationObservationRecord(inputKey, { modelCalls, attempts: [], waiting: waiting as never, proposal: null, last: null, closure: null, recordedOn: null }, null));
+}
 const render = async (ticketId: string, search: Record<string, string> = {}) => renderToStaticMarkup(await CasePage({ params: Promise.resolve({ ticketId }), searchParams: Promise.resolve(search) }));
 /** Every row of every sav table, as text: equal before and after a render means the page wrote nothing (not a row count). */
 const snapshotAll = async (f: Db) => {
@@ -102,7 +109,13 @@ describe("I1: the investigation wait written by pole B's real store and read bac
     const stored = (await listCaseEvents(s.caseId)).filter(e => e.kind === "observation_recorded").at(-1)!.detail as { record: { inputKey: string; progress: { waiting: Record<string, unknown> } } };
     expect(stored.record.inputKey).toBe(inputKey);
     expect(stored.record.progress.waiting).toEqual({ reason: "context_invalid", since: SINCE, caseVersion: 1, problem: "event_duplicate", embeddingCalls: 2 });
-    const html = await readOnlyRender(f, s.ticketId);
+    // Ugo (25/11): a technical dead end is never left with the agent: B's store handed the case to the team, the wait code as reason.
+    const handed = (await readCase(s.caseId))!;
+    expect({ owner: handed.owner, phase: handed.phase, handoff: handed.body.handoff }).toEqual({ owner: "human", phase: "handoff_pending", handoff: { reason: "context_invalid" } });
+    expect(await readOnlyRender(f, s.ticketId)).toContain("Motif context_invalid");
+    const waiting = await seed(f);
+    await persistWaitOnly(waiting.caseId, 0, { reason: "context_invalid", since: SINCE, caseVersion: 1, problem: "event_duplicate", embeddingCalls: 2 });
+    const html = await readOnlyRender(f, waiting.ticketId);
     expect(html).toContain("Contexte de décision impossible à construire depuis le dossier : aucun appel de génération (modèle) de décision.");
     expect(html).toContain("Motif : le journal contient deux fois le même événement.");
     expect(html).toContain("Appels de génération (modèle) enregistrés : 0. Embeddings envoyés pendant ce passage : 2.");
@@ -121,10 +134,10 @@ describe("I1: the investigation wait written by pole B's real store and read bac
 
   it("embeddings 0 is shown as 0; an absent count is 'non enregistré', never 0", async () => {
     const zero = await seed(f);
-    await persistWithB(zero.caseId, 0, { reason: "context_invalid", since: SINCE, caseVersion: 1, problem: "body_invalid", embeddingCalls: 0 });
+    await persistWaitOnly(zero.caseId, 0, { reason: "context_invalid", since: SINCE, caseVersion: 1, problem: "body_invalid", embeddingCalls: 0 });
     expect(await readOnlyRender(f, zero.ticketId)).toContain("Appels de génération (modèle) enregistrés : 0. Embeddings envoyés pendant ce passage : 0.");
     const absent = await seed(f);
-    await persistWithB(absent.caseId, 0, { reason: "context_invalid", since: SINCE, caseVersion: 1, problem: "body_invalid" });
+    await persistWaitOnly(absent.caseId, 0, { reason: "context_invalid", since: SINCE, caseVersion: 1, problem: "body_invalid" });
     const html = await readOnlyRender(f, absent.ticketId);
     expect(html).toContain("Embeddings envoyés pendant ce passage : non enregistré.");
     expect(html).toContain("Motif : le contenu enregistré du dossier ne respecte pas son format.");

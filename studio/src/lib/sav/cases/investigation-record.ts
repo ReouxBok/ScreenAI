@@ -69,6 +69,19 @@ export function caseInvestigationObservationRecord(inputKey: string, progress: C
 
 /** Structural view of a pole A case event: only what this reader needs. */
 export const investigationHandoffCommand = (version: number) => `investigation-handoff-v${version}`;
+
+/**
+ * The technical dead ends of an investigation (`needsPerson` in investigation-waits.ts, never retried automatically). Zero abandoned ticket (Ugo, 25/11): the store
+ * hands the case to the team when it persists one of them (the wait code is the hand-over reason), through the existing hand-over (owner transition, stage, notice,
+ * note). No decision, so no customer mail. `technical_wait`, `usage_uncertain`, the budget waits and the pause are not dead ends: they keep retrying or waiting.
+ */
+export const SAV_CASE_TECHNICAL_HANDOFF_WAITS = ["technical_exhausted", "context_invalid", "knowledge_request_invalid"] as const;
+export type CaseTechnicalHandoffWait = typeof SAV_CASE_TECHNICAL_HANDOFF_WAITS[number];
+/** The dead end this stored progress hands to the team, or null: only a wait of an input whose decision was never recorded. */
+export function caseTechnicalHandoffWait(progress: Pick<CaseInvestigationProgress, "waiting" | "recordedOn">): CaseTechnicalHandoffWait | null {
+  const reason = progress.waiting?.reason;
+  return progress.recordedOn === null && SAV_CASE_TECHNICAL_HANDOFF_WAITS.find(code => code === reason) || null;
+}
 export type CaseInvestigationJournalEvent = { dedupeKey?: string; kind: string; caseVersion: number; detail: Record<string, unknown> | null };
 
 export type CaseInvestigationProgressRead =

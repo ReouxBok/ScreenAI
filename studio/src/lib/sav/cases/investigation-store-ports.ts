@@ -6,7 +6,7 @@ import {
   releaseCaseClaim, revalidateCaseAdmissionForPolicy, transitionCaseOwner,
 } from "./case-store";
 import type { CaseEvent, CaseSnapshot, SourceRef } from "./case-types";
-import { caseInvestigationObservationRecord, investigationHandoffCommand, readCaseInvestigationProgress } from "./investigation-record";
+import { caseInvestigationObservationRecord, caseTechnicalHandoffWait, investigationHandoffCommand, readCaseInvestigationProgress } from "./investigation-record";
 import { isCaseQualificationUnavailable, serializeCaseQualificationUnavailable, type CaseQualificationUnavailable } from "./qualification-diagnostic";
 import type { CaseAdmissionSweepPorts } from "./investigation-policy-sweep";
 import type { CaseInvestigationClaimRefusal, CaseInvestigationPorts, CaseInvestigationProgress, CaseInvestigationRecord } from "./investigation-runner";
@@ -121,7 +121,9 @@ export function caseInvestigationStorePorts(deps: CaseInvestigationStoreDeps): C
       const decided = decision !== null;
       const action = decision?.validation.outcome === "accepted" ? decision.validation.decision.nextAction : null;
       // An accepted handoff, or (Ugo 14/11) a decision the validator refused twice: the same durable transfer to the team, then the same notice.
-      const handoffReason = action?.kind === "handoff" ? action.reason : decision?.validation.outcome === "needs_review" ? decision.refusalHandoff?.reason ?? null : null;
+      // Ugo (25/11): a technical dead end (no decision, no automatic retry) goes to the team the same way, the wait code as reason, never left with the agent.
+      const handoffReason = action?.kind === "handoff" ? action.reason : decision?.validation.outcome === "needs_review" ? decision.refusalHandoff?.reason ?? null
+        : decision ? null : caseTechnicalHandoffWait(kept.progress);
       const accepted = decision?.validation.outcome === "accepted" ? decision.validation.decision : null;
       decision = null;
       try {
@@ -152,7 +154,7 @@ export function caseInvestigationStorePorts(deps: CaseInvestigationStoreDeps): C
         if (error instanceof Error && error.message === "SAV_CASE_CLAIM_LOST" && (await readCase(caseId))?.owner !== "agent") return;
         throw error;
       }
-      if (decided && deps.afterDecisionRecorded) {
+      if ((decided || handoffReason) && deps.afterDecisionRecorded) {
         try { await deps.afterDecisionRecorded(caseId); } catch { /* the decision is durable; the notice sweep admits it later */ }
       }
     },
