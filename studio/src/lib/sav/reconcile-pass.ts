@@ -73,13 +73,9 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     (await import("@/lib/sav/cases/owner-handover-poll")).pollSavOwnerHandovers({ deadlineMs: derivedDeadline })) : undefined;
   const ownerHandovers = savV2OwnerHandoverEnabled() ? await runStep("v2_owner_handovers", async () =>
     (await import("@/lib/sav/cases/owner-handover")).sweepDueOwnerHandovers(derivedDeadline)) : undefined;
-  // SAV-138: tickets created from the Limova app (no mail), SAV_APP_TICKETS_MODE=shadow|live. Off (default): no HubSpot call, absent from the payload, except
-  // the once-only hand-back of live rows left mid-way when live was switched off (one bounded database read when there is none).
+  // SAV-138: tickets created from the Limova app (no mail), SAV_APP_TICKETS_MODE=shadow|live; off (default): absent from the payload, not one call.
   const appTickets = savAppTicketsMode() !== "off" ? await runStep<Awaited<ReturnType<typeof import("@/lib/sav/cases/app-tickets").reconcileSavAppTickets>>>("v2_app_tickets", async () =>
-    (await import("@/lib/sav/cases/app-tickets")).reconcileSavAppTickets({ deadlineMs: derivedDeadline }))
-    : await (await import("@/lib/sav/cases/app-tickets")).reconcileSavAppTickets({ deadlineMs: derivedDeadline })
-      .then(result => "released" in result && result.released ? { status: "ok" as const, durationMs: 0, data: result } : undefined)
-      .catch(() => { console.warn("sav_v2_app_tickets", { mode: "off", status: "release_failed" }); return undefined; });
+    (await import("@/lib/sav/cases/app-tickets")).reconcileSavAppTickets({ deadlineMs: derivedDeadline })) : undefined;
   const emailOpenings = await runStep("email_openings", () => dispatchPendingSavEmailOpenings(10));
   const contextRefreshes = await runStep("context_refreshes", () => processPendingSavContextRefreshes(5));
   const [trainings, evaluations] = await Promise.all([

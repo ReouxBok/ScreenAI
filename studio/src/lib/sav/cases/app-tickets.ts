@@ -5,7 +5,7 @@ import { requireDb } from "@/db";
 import { savSyncState } from "@/db/schema";
 import { SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 import { requestSavHubspot } from "../hubspot-transport";
-import { APP_TICKET_TRANSITION_PREFIX, appTicketCategoryGated, appTicketSourceLabel, savAppTicketsMode, savAppTicketsSourceTypes, type SavAppTicketsMode } from "./app-tickets-config";
+import { APP_TICKET_TRANSITION_PREFIX, appTicketCategoryGated, appTicketSourceLabel, savAppTicketsMode, savAppTicketsSourceTypes } from "./app-tickets-config";
 import { hasLocalThreadForTicket, savCaseRecordingEnabled } from "./case-store";
 import { savV2EntrySmartOn } from "./smart-entry-switch";
 import { v2HubspotOwnerId } from "./intake-boundary";
@@ -26,8 +26,8 @@ import { readThreadlessAuthority, threadlessActionAllowed, threadlessSchemaInsta
  * HubSpot tickets are never archived or deleted here.
  * Cost per pass: 1 search (2 at most), then 2 reads per new ticket (MAX_TICKETS at most); live adds 1 PATCH and 1 entry (the model) for ONE ticket per pass,
  * and only with APP_TICKETS_ENTRY_MARGIN_MS left before the deadline (as `sweepDueOwnerHandovers`).
- * Leaving live (shadow or off): a live row left between assignment and entry is handed back to the team once, whatever the mode (`releaseLiveRows`).
- * Off otherwise: one bounded database read, no HubSpot call.
+ * Leaving live: in shadow, a live row left between assignment and entry is handed back to the team once (`releaseLiveRows`). Off: nothing at all, not even a
+ * database read (the reconcile pass does not load this module); the exit procedure is shadow for at least one pass, then off (`docs/SAV_HUBSPOT_MAPPING.md`).
  */
 
 type Env = Record<string, string | undefined>;
@@ -193,9 +193,11 @@ const transitionInput = (key: string, transition: NonNullable<AppTicketDetail["t
   ({ ticketId: key.slice(key.lastIndexOf(":") + 1), ownerTransitionKey: transition.key, observedAt: transition.observedAt });
 
 /** A ticket in the agent's name that will not enter: back to the team, once, with no mail (`handBackOwnerHandoverTicket`). Returns the row's final state. */
-async function handBackRow(deps: Pick<Context["deps"], "handBack">, key: string, row: Row, detail: AppTicketDetail, reason: string, label: string, attempts: number, now: Date) {
+async function handBackRow(deps: Pick<Context["deps"], "handBack">, key: string, row: Row, detail: AppTicketDetail, reason: string, label: string, attempts: number, now: Date,
+  keepOn: readonly string[] = []) {
   const input = transitionInput(key, detail.transition!);
   const back = await deps.handBack(input, reason).catch((): ThreadlessEntryResult => ({ status: "unavailable" }));
+  if (keepOn.includes(back.status)) return "kept";
   const handedBack = back.status === "human_wait" || back.status === "existing_case";
   if (!handedBack) console.warn("sav_v2_app_tickets", { status: "hand_back_failed", ticketId: input.ticketId, entry: label, handBack: back.status });
   await writeRow(key, row, handedBack ? "handed_back" : "failed", { ...detail, entry: `${label}>${back.status}`.slice(0, 80) }, attempts, now, handedBack ? null : "hand_back_failed");
@@ -303,12 +305,16 @@ async function decide(context: Context, ticketId: string, createdAt: number | un
   return enterAssigned(context, key, (await readRow(key))!, detail);
 }
 
+/** A hand-back that could not run now (V2 paused, entry unavailable or switched off): nothing is written, the row is tried again at the next pass. */
+const TRANSIENT_HAND_BACK = ["paused", "unavailable", "off"];
+
 /**
- * Review 25/11: live switched to shadow or off. A live row left between assignment and entry (`assigning`, `assigned`) is a ticket possibly in the agent's name
- * that no pass will enter any more: it is handed back to the team ONCE (final state `handed_back` or `failed`, visible in `app_tickets_report` mode live), under
- * the live pass lease. No such row: one bounded read, no HubSpot call, nothing written.
+ * Review 25/11: live switched to shadow (exit procedure: shadow for at least one pass, then off; `docs/SAV_HUBSPOT_MAPPING.md`). A live row left between
+ * assignment and entry (`assigning`, `assigned`) is a ticket possibly in the agent's name that no pass will enter any more: it is handed back to the team ONCE
+ * (final state `handed_back` or `failed`, visible in `app_tickets_report` mode live), under the live pass lease; a hand-back that cannot run now leaves the row
+ * as it is for the next pass. No such row: one bounded read, no HubSpot call, nothing written. Off never runs it (off = strictly today's behaviour).
  */
-async function releaseLiveRows(mode: Exclude<SavAppTicketsMode, "live">, env: Env, clock: () => Date, handBack: Context["deps"]["handBack"]): Promise<number> {
+async function releaseLiveRows(mode: "shadow", env: Env, clock: () => Date, handBack: Context["deps"]["handBack"]): Promise<number> {
   const stranded = await requireDb().select({ key: savSyncState.key }).from(savSyncState)
     .where(and(sql`${savSyncState.key} like ${APP_TICKET_ROW_PREFIX + "live:%"}`, inArray(savSyncState.status, ["assigning", "assigned"])))
     .orderBy(asc(savSyncState.updatedAt), asc(savSyncState.key)).limit(RETRY_BATCH);
@@ -319,8 +325,8 @@ async function releaseLiveRows(mode: Exclude<SavAppTicketsMode, "live">, env: En
   for (const { key } of stranded) {
     const row = await readRow(key), detail = parse(detailSchema, row?.cursor);
     if (!row || !["assigning", "assigned"].includes(row.status) || !detail?.transition) continue;
-    await handBackRow({ handBack }, key, row, detail, `app_ticket_mode_${mode}`, `mode_${mode}`, row.processedCount, clock());
-    released++;
+    const outcome = await handBackRow({ handBack }, key, row, detail, `app_ticket_mode_${mode}`, `mode_${mode}`, row.processedCount, clock(), TRANSIENT_HAND_BACK);
+    if (outcome !== "kept") released++;
   }
   await finishPass("live", claimed.leaseAt, claimed.state, null, released, clock());
   return released;
@@ -329,9 +335,9 @@ async function releaseLiveRows(mode: Exclude<SavAppTicketsMode, "live">, env: En
 export async function reconcileSavAppTickets(options: AppTicketsDeps = {}): Promise<AppTicketsResult> {
   const env = options.env ?? process.env, clock = options.now ?? (() => new Date());
   const mode = savAppTicketsMode(env);
-  const released = mode === "live" ? 0 : await releaseLiveRows(mode, env, clock, options.handBack ?? defaultDeps(env).handBack);
+  if (mode === "off") return { skipped: "off" };
+  const released = mode === "shadow" ? await releaseLiveRows(mode, env, clock, options.handBack ?? defaultDeps(env).handBack) : 0;
   const withReleased = <T extends AppTicketsResult>(result: T): T => released ? { ...result, released } : result;
-  if (mode === "off") return withReleased({ skipped: "off" });
   const owner = v2HubspotOwnerId(env);
   if (!owner) return { skipped: "owner_unconfigured" };
   const sources = savAppTicketsSourceTypes(env);

@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { eq, like } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../../test/sav-db";
@@ -101,6 +104,24 @@ describe("configuration", () => {
 });
 
 describe("off", () => {
+  it("does not touch the database at all", async () => {
+    vi.stubEnv("SAV_APP_TICKETS_MODE", "");
+    const real = fixture.db, touched = vi.fn();
+    fixture.db = new Proxy({}, { get: (_target, property) => { touched(property); throw Error("DB_TOUCHED"); } });
+    try {
+      const crm = hubspot([ticket()]);
+      expect(await reconcileSavAppTickets(crm.deps)).toEqual({ skipped: "off" });
+      expect(touched).not.toHaveBeenCalled();
+    } finally { fixture.db = real; }
+  });
+  it("is wired in the reconcile pass behind its switch only: off loads no module and runs no step", () => {
+    const source = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../reconcile-pass.ts"), "utf8");
+    const call = source.slice(source.indexOf("const appTickets ="), source.indexOf("const emailOpenings ="));
+    expect(call).toMatch(/^const appTickets = savAppTicketsMode\(\) !== "off" \? await runStep<[^]*?>\("v2_app_tickets", async \(\) =>/);
+    expect(call.trimEnd()).toMatch(/\) : undefined;$/);
+    expect(call.match(/import\("@\/lib\/sav\/cases\/app-tickets"\)/g)).toHaveLength(2);
+    expect(source.match(/cases\/app-tickets"/g)).toHaveLength(2);
+  });
   it.each([["absent", { SAV_APP_TICKETS_MODE: "" }], ["another value", { SAV_APP_TICKETS_MODE: "on" }], ["outside production", { VERCEL_ENV: "preview" }]])(
     "with the switch %s: no HubSpot call, no row", async (_label, env) => {
       for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
@@ -219,22 +240,47 @@ describe("live", () => {
     expect(crm.assign).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["shadow", "off"] as const)("switched from live to %s: a ticket left assigned is handed back to the team once, and shows in the report", async mode => {
+  it("switched from live to shadow: a ticket left assigned is handed back to the team once, and shows in the report", async () => {
     const take = ticket();
     const crm = hubspot([take]);
     crm.enter.mockResolvedValue({ status: "unavailable" });
     await reconcileSavAppTickets(crm.deps);
     expect(await row("live", take.id)).toMatchObject({ status: "assigned" });
-    vi.stubEnv("SAV_APP_TICKETS_MODE", mode === "off" ? "" : mode);
+    vi.stubEnv("SAV_APP_TICKETS_MODE", "shadow");
     expect(await reconcileSavAppTickets(crm.deps)).toMatchObject({ released: 1 });
     expect(crm.handBack).toHaveBeenCalledTimes(1);
-    expect(crm.handBack.mock.calls[0]![1]).toBe(`app_ticket_mode_${mode}`);
+    expect(crm.handBack.mock.calls[0]![1]).toBe("app_ticket_mode_shadow");
     expect(await row("live", take.id)).toMatchObject({ status: "handed_back" });
     await reconcileSavAppTickets(crm.deps);
     expect(crm.handBack).toHaveBeenCalledTimes(1);
     expect(crm.enter).toHaveBeenCalledTimes(1);
     const report = await readSavAppTicketsReport({ mode: "live", limit: 10 });
-    expect(report.tickets).toContainEqual(expect.objectContaining({ ticketId: take.id, decision: "handed_back", entry: `mode_${mode}>human_wait` }));
+    expect(report.tickets).toContainEqual(expect.objectContaining({ ticketId: take.id, decision: "handed_back", entry: "mode_shadow>human_wait" }));
+  });
+
+  it.each(["paused", "unavailable", "off"] as const)("V2 %s while live is switched to shadow: the row is tried again at the next pass, never failed", async status => {
+    const take = ticket();
+    const crm = hubspot([take]);
+    crm.enter.mockResolvedValue({ status: "unavailable" });
+    await reconcileSavAppTickets(crm.deps);
+    vi.stubEnv("SAV_APP_TICKETS_MODE", "shadow");
+    crm.handBack.mockResolvedValueOnce({ status });
+    expect(await reconcileSavAppTickets(crm.deps)).not.toHaveProperty("released");
+    expect(await row("live", take.id)).toMatchObject({ status: "assigned" });
+    expect(await reconcileSavAppTickets(crm.deps)).toMatchObject({ released: 1 });
+    expect(crm.handBack).toHaveBeenCalledTimes(2);
+    expect(await row("live", take.id)).toMatchObject({ status: "handed_back" });
+  });
+
+  it("switched from live straight to off: strictly nothing (the exit procedure goes through shadow first)", async () => {
+    const take = ticket();
+    const crm = hubspot([take]);
+    crm.enter.mockResolvedValue({ status: "unavailable" });
+    await reconcileSavAppTickets(crm.deps);
+    vi.stubEnv("SAV_APP_TICKETS_MODE", "");
+    expect(await reconcileSavAppTickets(crm.deps)).toEqual({ skipped: "off" });
+    expect(crm.handBack).not.toHaveBeenCalled();
+    expect(await row("live", take.id)).toMatchObject({ status: "assigned" });
   });
 
   it("off with no live row left: no HubSpot call, nothing written", async () => {
