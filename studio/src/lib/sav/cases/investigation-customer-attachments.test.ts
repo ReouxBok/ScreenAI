@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { attachmentMetadata, syntheticImage, syntheticPdf } from "../../../../test/sav-attachments";
 import { attachmentSkeleton } from "../attachment-reader";
 import { SAV_ATTACHMENT_READER_REVISION, type SavAttachmentMetadata, type SavAttachmentRead } from "../attachment-contract";
-import { buildCaseHandoffSummary, caseHandoffSummaryLines } from "./case-handoff-summary";
+import { buildCaseHandoffSummary, caseHandoffExchangeLines } from "./case-handoff-summary";
 import {
   buildCaseCustomerAttachments, caseCustomerAttachmentMedia, caseCustomerEvidence, caseReceivedAttachments, fitCaseCustomerAttachmentMedia,
   SAV_CASE_ATTACHMENT_LIMITS as L, SAV_CASE_ATTACHMENTS_INSTRUCTION, withCaseCustomerAttachments,
@@ -233,13 +233,13 @@ describe("handoff synthesis lists the files received (name, type, size; never co
   it("lists masked names, types and sizes; an instruction-like name is replaced; the line is absent when nothing was read", () => {
     const received = caseReceivedAttachments([{ attachments: [meta("erreur connexion.png", "image/png", 250_000, "1"), meta(INJECTION_NAME, "image/png", 10, "2"), meta("devis.pdf", "application/pdf", 2_000_000, "3")] }]);
     const body = { facts: [{ id: "f1", kind: "customer_statement", text: "Lien https://app.limova.ai/chat/abc?token=secret123", at: "2026-11-15T09:00:00Z", source: { type: "email", id: "e1" } }] } as unknown as Parameters<typeof buildCaseHandoffSummary>[0];
-    const lines = caseHandoffSummaryLines(buildCaseHandoffSummary(body, received), "le diagnostic dépasse les outils de l'agent");
-    const line = lines.find(row => row.startsWith("• Pièces reçues"))!;
+    const summary = buildCaseHandoffSummary(body, received);
+    const line = caseHandoffExchangeLines(summary).find(row => row.startsWith("• Pièces jointes du client"))!;
     expect(line).toContain("erreur connexion.png (image/png, 245 Ko)");
     expect(line).toContain("devis.pdf (application/pdf, 1,9 Mo)");
     expect(line).not.toMatch(/IGNORE|remboursement/);
-    expect(lines.join("\n")).toContain("(app.limova.ai)");
-    expect(lines.join("\n")).not.toContain("secret123");
-    expect(caseHandoffSummaryLines(buildCaseHandoffSummary(body), "r").some(row => row.startsWith("• Pièces reçues"))).toBe(false);
+    expect(summary.transmitted.linkHosts).toEqual(["app.limova.ai"]);
+    expect(JSON.stringify(summary)).not.toContain("secret123");
+    expect(caseHandoffExchangeLines(buildCaseHandoffSummary(body)).some(row => row.startsWith("• Pièces jointes du client"))).toBe(false);
   });
 });

@@ -25,7 +25,12 @@ export type CaseHandoffReceived = Readonly<{ files: ReadonlyArray<Readonly<{ nam
 export type CaseHandoffSummary = Readonly<{
   revision: typeof CASE_HANDOFF_SUMMARY_REVISION;
   problem: Readonly<{ source: "customer_words" | "v1_subject" | "none"; text: string | null }>;
-  exchanges: ReadonlyArray<Readonly<{ question: string; answer: string | null; answered: boolean }>>;
+  /**
+   * One row per DISTINCT question (Ugo 25/11: a reminder repeating a question is not a second question). `customerWroteAfter`: a customer mail of the case
+   * (a statement or a request it opened) is dated after the last time this question was asked, whether or not a fact was matched to it. Absent from
+   * summaries sealed before it existed (read as « not known »).
+   */
+  exchanges: ReadonlyArray<Readonly<{ question: string; answer: string | null; answered: boolean; customerWroteAfter?: boolean }>>;
   exchangesOmitted: number;
   /**
    * `urls` (SAV-92, 16/11): the customer's links in full, cleaned by `customerLinkOf`; `urlsMasked`: how many distinct links were rejected (never their text).
@@ -184,14 +189,28 @@ export function buildCaseHandoffSummary(input: Partial<Pick<CaseBody, "openReque
     : subject ? { source: "v1_subject" as const, text: clean(subject, L.problemChars) } : { source: "none" as const, text: null };
 
   const asked = [...body.questions].sort((a, b) => a.askedAt.localeCompare(b.askedAt));
-  const exchanges = asked.slice(-L.questions).map(question => {
-    const answered = Boolean(question.answeredBy);
+  // When the customer last wrote: a statement from one of their mails, or a request one of their mails opened. Only dates already in the case.
+  const customerDates = [...body.facts.filter(fact => fact.kind === "customer_statement" && fact.source.type === "email").map(fact => Date.parse(fact.at)),
+    ...body.openRequests.map(row => Date.parse(row.openedAt))].filter(Number.isFinite);
+  const lastCustomerAt = customerDates.length ? Math.max(...customerDates) : null;
+  const answerOf = (question: typeof asked[number]) => {
     const batch = body.questions.filter(other => other.askedInEffect === question.askedInEffect).length > 1;
-    const said = question.answeredBy ? byTime(body.facts.filter(fact => batch
+    return question.answeredBy ? byTime(body.facts.filter(fact => batch
       ? fact.key !== null && question.factKeys.includes(fact.key) && Date.parse(fact.at) > Date.parse(question.askedAt)
       : sameSource(fact.source, question.answeredBy!))).map(fact => fact.text).join(" ; ") : "";
-    return { question: clean(question.text, L.questionChars), answered, answer: said ? clean(said, L.answerChars) : null };
-  });
+  };
+  // Ugo (25/11): the same question asked twice (an automatic reminder) is one exchange, dated at its LAST asking (a reminder means the first got no answer).
+  const distinct = new Map<string, { question: typeof asked[number]; answered: boolean; said: string }>();
+  for (const question of asked) {
+    const textKey = sameQuestionKey(question.text), said = answerOf(question), seen = distinct.get(textKey);
+    distinct.delete(textKey);
+    distinct.set(textKey, { question, answered: Boolean(question.answeredBy) || Boolean(seen?.answered), said: said || seen?.said || "" });
+  }
+  const rows = [...distinct.values()];
+  const exchanges = rows.slice(-L.questions).map(({ question, answered, said }) => ({
+    question: clean(question.text, L.questionChars), answered, answer: said ? clean(said, L.answerChars) : null,
+    customerWroteAfter: answered || (lastCustomerAt !== null && lastCustomerAt > Date.parse(question.askedAt)),
+  }));
 
   // What the customer gave: attachments cited by the case's facts (screenshots...), and links found in the customer's statements (host only).
   const attachments = new Set(body.facts.filter(fact => fact.source.type === "attachment").map(fact => fact.source.id)).size;
@@ -212,46 +231,50 @@ export function buildCaseHandoffSummary(input: Partial<Pick<CaseBody, "openReque
     knowledgeId: KNOWLEDGE_ID.test(trial.procedure.knowledgeId) ? trial.procedure.knowledgeId : "[identifiant masqué]", outcome: trial.outcome,
     result: trial.result ? clean(trial.result.text, L.trialResultChars) : null,
   }));
-  return { revision: CASE_HANDOFF_SUMMARY_REVISION, problem, exchanges, exchangesOmitted: Math.max(0, asked.length - exchanges.length),
+  return { revision: CASE_HANDOFF_SUMMARY_REVISION, problem, exchanges, exchangesOmitted: Math.max(0, rows.length - exchanges.length),
     transmitted: { attachments, links, linkHosts: hosts.slice(0, L.linkHosts), ...(urls.length ? { urls } : {}), ...(urlsMasked ? { urlsMasked } : {}) }, tried, triedOmitted: Math.max(0, body.trials.length - tried.length),
-    ...(received?.files.length ? { received: { files: received.files.slice(0, L.receivedFiles).map(file => ({ name: clean(file.name, L.receivedNameChars), type: file.type, sizeKb: file.sizeKb })),
-      omitted: received.omitted + Math.max(0, received.files.length - L.receivedFiles) } } : {}) };
+    ...(received?.files.length ? (() => {
+      // Ugo (25/11): the same file in several mails (a signature logo, a re-sent capture) is listed once: same name and same size.
+      const files = distinctFiles(received.files.map(file => ({ name: clean(file.name, L.receivedNameChars), type: file.type, sizeKb: file.sizeKb })));
+      return { received: { files: files.slice(0, L.receivedFiles), omitted: received.omitted + Math.max(0, files.length - L.receivedFiles) } };
+    })() : {}) };
 }
 
-const OUTCOME: Record<CaseTrial["outcome"], string> = { pending: "en attente de retour du client", failed: "échec", succeeded: "réussie", unknown: "résultat inconnu" };
+/** The key two askings of the same question share: case, spaces and final punctuation ignored. */
+const sameQuestionKey = (text: string) => text.replace(/\s+/g, " ").trim().replace(/[\s?.!…]+$/u, "").toLocaleLowerCase("fr");
+/** Files listed once per name and size, in order of first appearance. */
+export function distinctFiles<T extends Readonly<{ name: string; sizeKb: number }>>(files: readonly T[]): T[] {
+  const seen = new Set<string>();
+  return files.filter(file => { const key = `${file.name.toLocaleLowerCase("fr")}\u0000${file.sizeKb}`; if (seen.has(key)) return false; seen.add(key); return true; });
+}
+
 /**
- * The synthesis as plain lines (French, team-facing), the same for the Slack notice and a future HubSpot note. `clean` is the channel's own
- * last cleaning (Slack: `sanitizeNoticeText`); the whole is bounded by `totalChars`.
+ * Ugo (25/11): the « Échanges » lines of the Slack notice, from the synthesis only. One line per DISTINCT question the agent sent (an older sealed synthesis
+ * may still list a reminder twice: merged here too), with what the customer did after it; then the files they sent, once per name and size.
+ * The customer « replied » only when the case says so (an answer matched, or a customer mail dated after the question); never guessed. `clean` is the
+ * channel's own last cleaning (Slack: `sanitizeNoticeText`).
  */
-export function caseHandoffSummaryLines(summary: CaseHandoffSummary, reasonLabel: string, clean: (value: string, max: number) => string = (value, max) => cut(value, max)): string[] {
+export function caseHandoffExchangeLines(summary: CaseHandoffSummary, clean: (value: string, max: number) => string = (value, max) => cut(value, max)): string[] {
   const L = CASE_HANDOFF_SUMMARY_LIMITS;
-  const lines: string[] = [];
-  lines.push(summary.problem.text
-    ? `• ${summary.problem.source === "customer_words" ? "Problème, mots du client" : "Problème, d'après l'analyse V1"} : « ${clean(summary.problem.text, L.problemChars)} »`
-    : "• Problème : non relevé dans le dossier");
-  if (!summary.exchanges.length) lines.push("• Questions de l'agent : aucune");
+  const merged = new Map<string, { question: string; answer: string | null; answered: boolean; customerWroteAfter?: boolean }>();
   for (const row of summary.exchanges) {
-    lines.push(`• Question : ${clean(row.question, L.questionChars)}`);
-    lines.push(row.answer ? `• Réponse : ${clean(row.answer, L.answerChars)}` : row.answered ? "• Réponse : reçue, sans fait relevé" : "• Réponse : aucune pour l'instant");
+    const key = sameQuestionKey(row.question), seen = merged.get(key);
+    merged.delete(key);
+    // The later asking decides whether the customer wrote after it; an answer already matched to the earlier one is kept.
+    merged.set(key, { ...row, answer: row.answer ?? seen?.answer ?? null, answered: row.answered || Boolean(seen?.answered) });
   }
+  const lines = [...merged.values()].map(row => {
+    const after = row.answer ? `réponse du client : ${clean(row.answer, L.answerChars)}`
+      : row.answered || row.customerWroteAfter ? "le client a répondu (voir son dernier mail)"
+      : row.customerWroteAfter === false ? "pas encore de réponse du client" : "aucune réponse relevée dans le dossier";
+    return `• Agent : ${clean(row.question, L.questionChars)} → ${after}`;
+  });
   if (summary.exchangesOmitted) lines.push(`• et ${summary.exchangesOmitted} question(s) plus ancienne(s)`);
-  const { attachments, links, linkHosts } = summary.transmitted;
-  lines.push(`• Éléments transmis : ${attachments ? `${attachments} pièce(s) jointe(s) ou capture(s) d'écran` : "aucune capture d'écran ni pièce jointe"}, ${links
-    ? `${links} lien(s)${linkHosts.length ? ` (${linkHosts.join(", ")})` : ""}` : "aucun lien"}`);
-  if (summary.received?.files.length) {
+  const files = distinctFiles(summary.received?.files ?? []);
+  if (files.length) {
     const size = (kb: number) => kb >= 1024 ? `${(kb / 1024).toFixed(1).replace(".", ",")} Mo` : `${kb} Ko`;
-    lines.push(`• Pièces reçues : ${summary.received.files.map(file => `${clean(file.name, L.receivedNameChars)} (${file.type}, ${size(file.sizeKb)})`).join(" ; ")}${summary.received.omitted ? ` ; et ${summary.received.omitted} autre(s)` : ""}`);
+    const omitted = summary.received?.omitted ?? 0;
+    lines.push(`• Pièces jointes du client : ${files.map(file => `${clean(file.name, L.receivedNameChars)} (${file.type}, ${size(file.sizeKb)})`).join(" ; ")}${omitted ? ` ; et ${omitted} autre(s)` : ""}`);
   }
-  if (!summary.tried.length) lines.push("• Essais : aucun");
-  for (const trial of summary.tried) lines.push(`• Essai ${trial.knowledgeId} : ${OUTCOME[trial.outcome]}${trial.result ? ` (${clean(trial.result, L.trialResultChars)})` : ""}`);
-  if (summary.triedOmitted) lines.push(`• et ${summary.triedOmitted} essai(s) plus ancien(s)`);
-  // The reason is never cut: the middle lines give way first.
-  const reason = `• Raison du transfert : ${reasonLabel}`;
-  const kept: string[] = [];
-  let size = reason.length + 1;
-  for (const line of lines) {
-    if (size + line.length + 1 > L.totalChars) { kept.push("• (synthèse coupée)"); break; }
-    kept.push(line); size += line.length + 1;
-  }
-  return [...kept, reason];
+  return lines;
 }

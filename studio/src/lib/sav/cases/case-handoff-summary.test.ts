@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { emptyCaseBody, type CaseBody } from "./case-types";
-import { buildCaseHandoffSummary, caseHandoffSummaryLines, CASE_HANDOFF_SUMMARY_LIMITS } from "./case-handoff-summary";
+import { buildCaseHandoffSummary, caseHandoffExchangeLines, CASE_HANDOFF_SUMMARY_LIMITS } from "./case-handoff-summary";
 import { handoffNoticeFacts, renderHandoffNotice, sanitizeNoticeText, scrubHandoffNoticeText } from "./case-handoff-notice";
 
 /* SAV-92 (Ugo 14/11): the handoff synthesis, SYN data only. */
@@ -32,32 +32,29 @@ describe("handoff synthesis (stored case only, masked, bounded)", () => {
     expect(summary.problem.text).toContain("Je n'arrive plus à me connecter");
     expect(summary.problem.text).not.toMatch(/Soleil2024|06 12 34/);
     expect(summary.exchanges).toEqual([
-      { question: "Quel message s'affiche à l'écran ?", answered: true, answer: expect.stringContaining("compte verrouillé") },
-      { question: "Depuis quel navigateur ?", answered: false, answer: null },
+      { question: "Quel message s'affiche à l'écran ?", answered: true, answer: expect.stringContaining("compte verrouillé"), customerWroteAfter: true },
+      { question: "Depuis quel navigateur ?", answered: false, answer: null, customerWroteAfter: false },
     ]);
     expect(summary.exchanges[0]!.answer).not.toContain("token=xyz");
     expect(summary.transmitted).toEqual({ attachments: 1, links: 1, linkHosts: ["app.example.invalid"], urlsMasked: 1 });
     expect(summary.tried).toEqual([{ knowledgeId: "syn-login", outcome: "failed", result: "Toujours verrouillé après réinitialisation." }]);
-    const lines = caseHandoffSummaryLines(summary, "le client demande à parler à une personne");
-    expect(lines).toContain("• Réponse : aucune pour l'instant");
-    expect(lines).toContain("• Éléments transmis : 1 pièce(s) jointe(s) ou capture(s) d'écran, 1 lien(s) (app.example.invalid)");
-    expect(lines.at(-1)).toBe("• Raison du transfert : le client demande à parler à une personne");
+    const lines = caseHandoffExchangeLines(summary);
+    expect(lines).toContain("• Agent : Depuis quel navigateur ? → pas encore de réponse du client");
+    expect(lines[0]).toMatch(/^• Agent : Quel message s'affiche à l'écran \? → réponse du client : .*compte verrouillé/);
   });
 
   it("without customer words: V1's subject; without anything: says so; nothing transmitted and nothing tried are stated", () => {
     expect(buildCaseHandoffSummary(body({ facts: [] })).problem).toEqual({ source: "v1_subject", text: "Connexion impossible à la plateforme." });
     const bare = buildCaseHandoffSummary({ ...emptyCaseBody() });
     expect(bare.problem).toEqual({ source: "none", text: null });
-    expect(caseHandoffSummaryLines(bare, "x")).toEqual([
-      "• Problème : non relevé dans le dossier", "• Questions de l'agent : aucune",
-      "• Éléments transmis : aucune capture d'écran ni pièce jointe, aucun lien", "• Essais : aucun", "• Raison du transfert : x"]);
+    expect(caseHandoffExchangeLines(bare)).toEqual([]);
   });
 
-  it("bounded: long texts are cut, older questions and trials counted, the whole capped", () => {
+  it("bounded: long texts are cut, older questions and trials counted", () => {
     const long = "mot ".repeat(1000);
     const many = body({
       facts: [{ id: "f1", text: long, source: email("gm-1"), at: AT(1), key: null, kind: "customer_statement" }],
-      questions: Array.from({ length: 9 }, (_, i) => ({ id: `q${i}`, text: long, factKeys: [], askedAt: AT(10 + i), askedInEffect: `e${i}`, answeredBy: email("gm-1") })),
+      questions: Array.from({ length: 9 }, (_, i) => ({ id: `q${i}`, text: `${i} ${long}`, factKeys: [], askedAt: AT(10 + i), askedInEffect: `e${i}`, answeredBy: email("gm-1") })),
       trials: Array.from({ length: 8 }, (_, i) => ({ id: `t${i}`, requestId: "r1", procedure: { knowledgeId: `k${i}`, contentVersionId: "v" }, askedAt: AT(i), outcome: "pending" as const, resultAt: null })),
     });
     const summary = buildCaseHandoffSummary(many);
@@ -65,29 +62,26 @@ describe("handoff synthesis (stored case only, masked, bounded)", () => {
     expect(summary.exchanges).toHaveLength(CASE_HANDOFF_SUMMARY_LIMITS.questions);
     expect(summary.exchangesOmitted).toBe(4);
     expect(summary.triedOmitted).toBe(3);
-    const lines = caseHandoffSummaryLines(summary, "x");
-    expect(lines.join("\n").length).toBeLessThanOrEqual(CASE_HANDOFF_SUMMARY_LIMITS.totalChars + 30);
-    expect(lines.at(-2)).toBe("• (synthèse coupée)");
-    expect(lines.at(-1)).toBe("• Raison du transfert : x");
+    const lines = caseHandoffExchangeLines(summary);
+    expect(lines).toHaveLength(CASE_HANDOFF_SUMMARY_LIMITS.questions + 1);
+    expect(lines.at(-1)).toBe("• et 4 question(s) plus ancienne(s)");
   });
 
-  it("the Slack notice keeps its template, adds the synthesis after it (channel-cleaned), keeps the marker, and re-scrubbing changes nothing", () => {
+  it("the Slack notice reads the exchanges from the synthesis (channel-cleaned), keeps the marker, and re-scrubbing changes nothing", () => {
     const trigger = { ok: true as const, caseId: "10000000-0000-4000-8000-000000000001", ticketId: "9500001", inputKey: "in:gm-2", recordedAtVersion: 4, reason: "explicit_human_request" as const,
       report: { need: "Le client ne peut plus se connecter.", expected: null, observed: null, trialIds: ["t1"], hypotheses: [], missingInformation: [], expectedIntervention: "Rappeler le client." } };
     const facts = handoffNoticeFacts(trigger, body());
     const render = renderHandoffNotice(facts, { contact: { status: "unverified", why: "no_matching_contact" }, ticket: { status: "verified", id: "9500001" } }, "1234567");
-    const lines = render.text.split("\n");
-    expect(lines.indexOf("*Synthèse du dossier :*")).toBeGreaterThan(lines.findIndex(line => line.startsWith("*Prochaine action proposée :*")));
-    expect(render.text).toContain("• Question : Quel message s'affiche à l'écran ?");
-    expect(render.text).toContain("• Raison du transfert : le client demande à parler à une personne");
-    const synthesis = render.text.slice(render.text.indexOf("*Synthèse du dossier :*"));
-    expect(synthesis).not.toMatch(/https?:|Soleil2024|06 12 34|token=/);
-    expect(synthesis).toContain("• Éléments transmis : 1 pièce(s) jointe(s) ou capture(s) d'écran, 1 lien(s) (app.example.invalid)");
+    expect(render.text).toContain("• Agent : Quel message s'affiche à l'écran ? → réponse du client : ");
+    expect(render.text).toContain("• Agent : Depuis quel navigateur ? → pas encore de réponse du client");
+    expect(render.text).toContain("• Procédure syn-login : échec");
+    expect(render.text).toContain("*Pourquoi l'équipe :* le client demande à parler à une personne");
+    expect(render.text).not.toMatch(/https?:\/\/app\.example|Soleil2024|06 12 34|token=/);
     expect(render.text).toMatch(/_Réf\. HO-[0-9a-f]{12}_$/);
     expect(scrubHandoffNoticeText(render.text)).toBe(render.text);
-    // A notice sealed before the synthesis existed renders exactly as before.
+    // A notice sealed before the synthesis existed only knows how many questions were asked.
     const { summary: _unused, ...sealed } = facts;
-    expect(renderHandoffNotice(sealed, { contact: { status: "unverified", why: "no_matching_contact" }, ticket: { status: "verified", id: "9500001" } }, "1234567").text).not.toContain("Synthèse du dossier");
+    expect(renderHandoffNotice(sealed, { contact: { status: "unverified", why: "no_matching_contact" }, ticket: { status: "verified", id: "9500001" } }, "1234567").text).toContain("*Échanges :*\n• Agent : 2 question(s) posée(s) au client");
     expect(sanitizeNoticeText("• x")).toBe("• x");
   });
 });
@@ -103,9 +97,9 @@ it("associates each answer in a multi-question mail with its own fact keys in th
     { id: "q3", text: "Quelle version ?", factKeys: ["version"], askedAt: AT(2), askedInEffect: "batch" },
   ] });
   expect(buildCaseHandoffSummary(current).exchanges).toEqual([
-    { question: "Quel navigateur ?", answered: true, answer: "Firefox" },
-    { question: "Quel appareil ?", answered: true, answer: "Ordinateur" },
-    { question: "Quelle version ?", answered: false, answer: null },
+    { question: "Quel navigateur ?", answered: true, answer: "Firefox", customerWroteAfter: true },
+    { question: "Quel appareil ?", answered: true, answer: "Ordinateur", customerWroteAfter: true },
+    { question: "Quelle version ?", answered: false, answer: null, customerWroteAfter: true },
   ]);
 });
 
@@ -118,5 +112,5 @@ it("retains both parts of a question answered across successive customer mails",
     { id: "q1", text: "Quel navigateur et appareil ?", factKeys: ["browser", "device"], askedAt: AT(2), askedInEffect: "batch", answeredBy: email("partial-2") },
     { id: "q2", text: "Quelle version ?", factKeys: ["version"], askedAt: AT(2), askedInEffect: "batch" },
   ] });
-  expect(buildCaseHandoffSummary(current).exchanges[0]).toEqual({ question: "Quel navigateur et appareil ?", answered: true, answer: "Firefox ; Ordinateur" });
+  expect(buildCaseHandoffSummary(current).exchanges[0]).toEqual({ question: "Quel navigateur et appareil ?", answered: true, answer: "Firefox ; Ordinateur", customerWroteAfter: true });
 });

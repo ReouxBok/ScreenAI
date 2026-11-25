@@ -12,7 +12,7 @@ import { crmRecordUrl } from "../intake/crm-display";
 import type { EffectIntent } from "../intake/execution-types";
 import { caseRequestSearchText, caseTeamPartRequests, SAV_CASE_AGENT_REQUESTS_PER_MAIL, type CaseSnapshot, type CaseTrial } from "./case-types";
 import { SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
-import { buildCaseHandoffSummary, caseHandoffSummaryLines, type CaseHandoffSummary } from "./case-handoff-summary";
+import { buildCaseHandoffSummary, caseHandoffExchangeLines, type CaseHandoffSummary } from "./case-handoff-summary";
 import { caseTechnicalHandoffWait, investigationHandoffCommand, readCaseInvestigationProgress, SAV_CASE_INVESTIGATION_RECORD_KIND, type CaseInvestigationJournalEvent, type CaseTechnicalHandoffWait } from "./investigation-record";
 import type { SAV_SMART_HANDOFF_REASONS } from "./smart/smart-contract";
 
@@ -397,6 +397,13 @@ export function resanitizeNoticeFacts(facts: HandoffNoticeFacts): HandoffNoticeF
 }
 
 const OUTCOME_LABELS: Record<CaseTrial["outcome"], string> = { pending: "en attente de retour du client", failed: "échec", succeeded: "réussie", unknown: "résultat inconnu" };
+/** Ugo (25/11): at most this many lines say what the agent established; the heading counts the rest. */
+const ESTABLISHED_LINES = 3;
+/**
+ * The Smart circuit writes the team note's « Vérifié » and « Essayé » rows into the report's hypotheses with that word as prefix (`smartHandoffProposal`).
+ * They are what the agent checked and tried, not hypotheses: each line keeps its own label. Read on the stored text, so notices already sealed read right too.
+ */
+const NOTE_ROW = /^(Vérifié|Essayé)\s*:\s*(.+)$/u;
 export type HandoffNoticeFacts = Readonly<{
   contract: typeof HANDOFF_NOTICE_CONTRACT; caseId: string; ticketId: string; inputKey: string; recordedAtVersion: number; reason: HandoffReason;
   need: string; expected: string | null; observed: string | null; hypotheses: readonly string[]; missingInformation: readonly string[]; expectedIntervention: string;
@@ -490,32 +497,58 @@ export function renderHandoffNotice(sealed: HandoffNoticeFacts, crm: HandoffCrmV
   const ticket = crm.ticket.status === "verified"
     ? (ticketUrl ? `<${ticketUrl}|ticket ${crm.ticket.id}>` : `ticket ${crm.ticket.id} vérifié, lien indisponible (portail HubSpot non configuré)`)
     : `ticket non vérifié (${UNVERIFIED_LABELS.ticket_not_found}), aucun lien proposé`;
-  const tried: string[] = [];
-  facts.trials.slice(0, NOTICE_LIMITS.trials).forEach(trial => tried.push(`• Procédure ${trial.knowledgeId} : ${OUTCOME_LABELS[trial.outcome]}`));
-  if (facts.trials.length > NOTICE_LIMITS.trials) tried.push(`• et ${facts.trials.length - NOTICE_LIMITS.trials} autre(s) procédure(s)`);
-  if (facts.questionsAsked > 0) tried.push(`• ${facts.questionsAsked} question(s) posée(s) au client`);
-  if (facts.expected) tried.push(`• Attendu : ${facts.expected}`);
-  if (facts.observed) tried.push(`• Constaté : ${facts.observed}`);
-  facts.hypotheses.forEach(item => tried.push(`• Hypothèse : ${item}`));
-  if (!tried.length) tried.push("• Aucun essai enregistré avant le relais");
-  const next = [facts.expectedIntervention || "à définir par l'équipe", ...(facts.missingInformation.length
-    ? [`${facts.reason === "decision_refused" ? "Motifs des refus" : "Informations manquantes"} : ${facts.missingInformation.join(" ; ")}`] : [])];
-  const body = [
+  const sections = (exchanges: string) => [
     `*${HANDOFF_NOTICE_TITLE}*`,
     `*Client :* ${client}`,
-    `*Problème :* ${facts.need || "non précisé"}`,
-    `*Ce que l'agent a tenté et le résultat :*\n${tried.join("\n")}`,
-    `*Motif du relais :* ${HANDOFF_REASON_LABELS[facts.reason]}`,
+    `*Demande :* ${facts.need || "non précisée"}`,
+    exchanges,
+    establishedSection(facts),
+    `*Pourquoi l'équipe :* ${HANDOFF_REASON_LABELS[facts.reason]}`,
+    `*À faire :* ${nextActionOf(facts)}`,
     `*Ticket HubSpot :* ${ticket}`,
     ...(analysisSignal && UUID.test(facts.conversationId ?? "") ? [`${CONVERSATION_LINE_PREFIX}\`${facts.conversationId}\``] : []),
-    `*Prochaine action proposée :* ${next.join(". ")}`,
-    // SAV-92: after the existing template, so a cut only ever shortens the synthesis.
-    ...(facts.summary ? [`*Synthèse du dossier :*\n${caseHandoffSummaryLines(facts.summary, HANDOFF_REASON_LABELS[facts.reason], sanitizeNoticeText).join("\n")}`] : []),
   ].join("\n\n");
   // The marker always survives the cut: the verification ties the posted message to its key by it. Sections are one blank line apart (readable in Slack); the lists inside a section stay on consecutive lines.
   const reference = `_Réf. ${marker}_`;
-  const text = `${body.slice(0, NOTICE_LIMITS.text - reference.length - 2).trimEnd()}\n\n${reference}`;
+  const budget = NOTICE_LIMITS.text - reference.length - 2;
+  // Too long: the exchanges give way first, line by line, so the reason, the next action and the ticket link are kept.
+  const exchangeLines = exchangesSection(facts).split("\n");
+  let body = sections(exchangeLines.join("\n"));
+  while (body.length > budget && exchangeLines.length > 2) { exchangeLines.splice(-2, 2, "• (échanges coupés)"); body = sections(exchangeLines.join("\n")); }
+  const text = `${body.slice(0, budget).trimEnd()}\n\n${reference}`;
   return { text, marker, key };
+}
+
+/** « Échanges »: what the agent asked and what the customer did after it (the synthesis); a notice sealed without it only knows how many questions were asked. */
+function exchangesSection(facts: HandoffNoticeFacts): string {
+  const lines = facts.summary ? caseHandoffExchangeLines(facts.summary, sanitizeNoticeText)
+    : facts.questionsAsked > 0 ? [`• Agent : ${facts.questionsAsked} question(s) posée(s) au client`] : [];
+  return lines.length ? `*Échanges :*\n${lines.join("\n")}` : "*Échanges :* aucune question posée au client par l'agent";
+}
+
+/**
+ * « Ce que l'agent a établi »: what it checked, what it tried (the note's rows, then the procedures, with their result), then what it observed, expected
+ * and supposed. One label per line, the same line once, at most `ESTABLISHED_LINES`: nothing here contradicts another line, since there is one list.
+ */
+function establishedSection(facts: HandoffNoticeFacts): string {
+  const rows = facts.hypotheses.map(text => ({ text, row: NOTE_ROW.exec(text) }));
+  const noteRows = (label: string) => rows.flatMap(({ row }) => row?.[1] === label ? [`• ${label} : ${row[2]}`] : []);
+  const trials = facts.trials.length ? facts.trials.map(trial => `• Procédure ${trial.knowledgeId} : ${OUTCOME_LABELS[trial.outcome]}`)
+    : (facts.summary?.tried ?? []).map(trial => `• Essai ${trial.knowledgeId} : ${OUTCOME_LABELS[trial.outcome]}${trial.result ? ` (${sanitizeNoticeText(trial.result, 160)})` : ""}`);
+  const all = [...noteRows("Vérifié"), ...noteRows("Essayé"), ...trials,
+    ...(facts.observed ? [`• Constaté : ${facts.observed}`] : []), ...(facts.expected ? [`• Attendu : ${facts.expected}`] : []),
+    ...rows.flatMap(({ text, row }) => row ? [] : [`• Hypothèse : ${text}`])];
+  const lines = [...new Set(all)];
+  if (!lines.length) return "*Ce que l'agent a établi :* rien de vérifié ni d'essayé avant le relais";
+  const more = lines.length > ESTABLISHED_LINES ? ` (${ESTABLISHED_LINES} premiers éléments sur ${lines.length})` : "";
+  return `*Ce que l'agent a établi :*${more}\n${lines.slice(0, ESTABLISHED_LINES).join("\n")}`;
+}
+
+/** « À faire »: the next human action, then what is missing (or, for a refused decision, why it was refused). */
+function nextActionOf(facts: HandoffNoticeFacts): string {
+  const action = (facts.expectedIntervention || "à définir par l'équipe").replace(/[.\s]+$/u, "");
+  if (!facts.missingInformation.length) return `${action}.`;
+  return `${action}. ${facts.reason === "decision_refused" ? "Motifs des refus" : "Informations manquantes"} : ${facts.missingInformation.join(" ; ")}`;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -567,7 +600,7 @@ export function handoffNoteText(facts: Pick<HandoffNoticeFacts, "reason" | "need
     if (part) lines.push(endSentence(`La partie à reprendre : ${part}`));
   }
   const asked = summary.exchanges.length + summary.exchangesOmitted;
-  if (asked) lines.push(`Nous lui avons posé ${asked === 1 ? "une question" : `${asked} questions`} ; ${summary.exchanges.at(-1)?.answered ? "il nous a répondu." : "nous attendons encore sa réponse."}`);
+  if (asked) lines.push(`Nous lui avons posé ${asked === 1 ? "une question" : `${asked} questions`} ; ${summary.exchanges.at(-1)?.answered || summary.exchanges.at(-1)?.customerWroteAfter ? "il nous a répondu." : "nous attendons encore sa réponse."}`);
   const tried = summary.tried.length + summary.triedOmitted, last = summary.tried.at(-1);
   if (tried && last) {
     const what = tried === 1 ? "une première solution" : tried === 2 ? "une première solution puis une autre solution" : `une première solution puis ${tried - 1} autres solutions`;
@@ -586,7 +619,8 @@ export function handoffNoteText(facts: Pick<HandoffNoticeFacts, "reason" | "need
 }
 
 // The lines of the notice that carry free text, and the only links that may stay in it (the ones `renderHandoffNotice` builds from a CRM-verified id and the portal id).
-const FREE_TEXT_LINE = /^(\*Problème :\* |• (?:Attendu|Constaté|Hypothèse|Question|Réponse) : |• Problème, [a-zA-ZÀ-ÿ' ]{1,40} : |• Essai [A-Za-z0-9._[\] -]{1,80} : |\*Prochaine action proposée :\* )(.*)$/;
+// The lines of the layout before 25/11 stay listed: an intent sealed under it is still scrubbed before it leaves.
+const FREE_TEXT_LINE = /^(\*Problème :\* |\*Demande :\* |• (?:Attendu|Constaté|Hypothèse|Question|Réponse|Vérifié|Essayé|Agent) : |• Problème, [a-zA-ZÀ-ÿ' ]{1,40} : |• Essai [A-Za-z0-9._[\] -]{1,80} : |\*Prochaine action proposée :\* |\*À faire :\* )(.*)$/;
 const INTERNAL_LINK = /<https:\/\/app\.hubspot\.com\/contacts\/[0-9]{1,20}\/record\/0-[15]\/[0-9]{1,30}\|[^<>|\n]{1,80}>/g;
 /**
  * The last look before Slack, on the text exactly as it is about to leave (including an intent sealed in the ledger BEFORE a rule existed): the free-text lines are made
