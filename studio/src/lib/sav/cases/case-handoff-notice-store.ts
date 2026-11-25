@@ -32,7 +32,7 @@ import { createHandoffCrmReader, type HandoffCrmReader } from "./case-handoff-cr
 import { nextSweepPage } from "./case-sweep-cursor";
 import {
   buildHandoffNoticeIntent, CONVERSATION_LINE_PREFIX, HANDOFF_NOTICE_CONTRACT, handoffNoteText, HANDOFF_NOTICE_KEY_PREFIX, awaitingHandoff, staleHandoffEventKinds, handoffNoticeFacts, handoffNoticeKey, handoffNoticeTrigger,
-  admissionRefusalNoticeTrigger, agentNotTakenNoticeTrigger, judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, teamPartNoticeTriggers, type HandoffNoticeFacts, type HandoffNoticeTrigger,
+  agentNotTakenNoticeTrigger, entryRefusalNotice, judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, teamPartNoticeTriggers, type HandoffNoticeFacts, type HandoffNoticeTrigger,
 } from "./case-handoff-notice";
 import { createHandoffSlackAdapters, SLACK_NOT_POSTED_PREFIX, type HandoffSlackAdapters } from "./case-handoff-slack";
 import { handoffConversationId, type CaseHandoffReceived } from "./case-handoff-summary";
@@ -123,22 +123,19 @@ export async function enqueueHandoffNotice(input: Readonly<{ caseId: string; pol
   // SAV-99 (Ugo 19/11): a ticket a person gave the agent, that the agent did not take, is born with the team: no investigation, its own fixed notice, and
   // possibly no thread (a ticket without mail); its key is `handoff-notice:<case>:ticket:<event>` (0055 lets that one execution have no thread).
   const notTaken = !trigger.ok && !parts.length ? agentNotTakenNoticeTrigger(snapshot, events, caseNotTakenWhy) : null;
-  // Ugo (25/11): a case refused at entry, born with the team WITH its mail: its own notice, keyed on its first admission decision (`admission:<event>`).
-  const entry = !trigger.ok && !parts.length && !notTaken?.ok ? admissionRefusalNoticeTrigger(snapshot, events) : null;
   // Ugo (25/11): only hand-overs recorded since the activation (`SAV_V2_HANDOFF_STAGE_SINCE`) are noticed, never the old cases of the window. Without a
-  // valid date (or with `SAV_V2_HANDOFF_STAGE` off) the existing triggers behave as before; the entry notice, new, is never admitted without it.
+  // valid date (or with `SAV_V2_HANDOFF_STAGE` off) the triggers behave as before. A case refused at entry never gets a notice (Ugo 25/11, firm: no trigger for it).
   const since = handoffActivationSinceMs(input.env());
   const recordedSince = (one: Extract<HandoffNoticeTrigger, { ok: true }>) => {
-    if (since === null) return one !== entry;
+    if (since === null) return true;
     const at = events.find(event => event.caseVersion === one.recordedAtVersion)?.occurredAt;
     return at !== undefined && Date.parse(at) >= since;
   };
-  const triggered = [...(trigger.ok ? [trigger] : []), ...parts, ...(notTaken?.ok ? [notTaken] : []), ...(entry?.ok ? [entry] : [])]
+  const triggered = [...(trigger.ok ? [trigger] : []), ...parts, ...(notTaken?.ok ? [notTaken] : [])]
     .filter(one => input.inputKey === undefined || one.inputKey === input.inputKey);
   const all = triggered.filter(recordedSince);
   if (triggered.length && !all.length) return { ok: false, code: "no_trigger", why: since === null ? "handoff_since_missing" : "handoff_before_since" };
-  if (!all.length) return { ok: false, code: "no_trigger", why: trigger.ok ? "input_other" : entry?.ok === false && entry.why !== "not_handoff" ? entry.why
-    : notTaken?.ok === false && notTaken.why !== "not_handoff" ? notTaken.why : trigger.why };
+  if (!all.length) return { ok: false, code: "no_trigger", why: trigger.ok ? "input_other" : notTaken?.ok === false && notTaken.why !== "not_handoff" ? notTaken.why : trigger.why };
   const threadId = snapshot.threadIds.at(-1) ?? null;
   if (!threadId && !(all.length === 1 && notTaken?.ok)) return { ok: false, code: "no_thread" };
   if (!threadId && !await ticketHandbackSchemaInstalled(requireDb())) return { ok: false, code: "no_thread", why: "schema_v11_missing" };
@@ -188,8 +185,7 @@ async function admitHandoffNotice(trigger: Extract<HandoffNoticeTrigger, { ok: t
   // SAV-99: a ticket the agent did not take already gets its one short note from its hand-over stage (`case-ticket-stage-store.ts`): no second note here.
   const { modelReason, conversationId } = analysis;
   const facts = { ...handoffNoticeFacts(trigger, snapshot.body, attachments), ...(modelReason ? { modelReason } : {}), ...(conversationId ? { conversationId } : {}) };
-  // Ugo (25/11): a case refused at entry gets its Slack notice and its stage only, no note (nothing was asked beyond those two).
-  const note = trigger.reason === "agent_not_taken" || trigger.reason === "entry_sensitive" || trigger.reason === "entry_team" ? undefined : handoffNoteOf(facts, new Date().toISOString());
+  const note = trigger.reason === "agent_not_taken" ? undefined : handoffNoteOf(facts, new Date().toISOString());
   const payload: HandoffNoticePayload = { contract: HANDOFF_NOTICE_CONTRACT, key, facts, teamOwnerId, ...(note ? { note } : {}) };
   return requireDb().transaction(async (tx): Promise<EnqueueHandoffNoticeResult> => {
     const [created] = await tx.insert(savCaseEffectExecutions).values({
@@ -253,6 +249,9 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
    */
   async function fence(tx: ExecutionTx, lease: ExecutionLease) {
     if (!await ownedExecution(tx, lease)) return fault("LEASE_LOST");
+    // Ugo (25/11, firm): an entry-refusal notice (created by PR #365's sweep, before its withdrawal) is never posted. Checked first, before any hold, so it ends
+    // for good (`refused`, no retry, no alert) at its first plan or its last look before Slack, whatever the switches.
+    if (entryRefusalNotice(payloads.get(lease)!.key, payloads.get(lease)!.facts.reason)) return fault("CANCELLED_ENTRY_REFUSAL");
     if (readHandoffNoticeConfig(deps.env()).mode !== "on") return fault("HOLD_NOTICE_OFF");
     for (const agent of ["intake", "v2"] as const) {
       const pause = savAgentPauseCode(await readSavAgentPause(tx, agent));
@@ -373,6 +372,8 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
       // A ledger row that exists is what was planned: its stored intent is returned, never a rebuilt one.
       if (existing && existing.state !== "confirmed") return effectIntent(existing);
       if (existing) return nextNoteIntent(lease, effects, options);
+      // Ugo (25/11, firm): nothing planned yet for an entry-refusal notice: it ends here for good, before the CRM reading (see `fence`).
+      if (entryRefusalNotice(payload.key, payload.facts.reason)) return fault("CANCELLED_ENTRY_REFUSAL");
       const config = readHandoffNoticeConfig(deps.env());
       if (config.mode !== "on") return fault("HOLD_NOTICE_OFF");
       // SAV-99: a notice without thread (a ticket without mail the agent did not take) has no customer address to verify the contact with.

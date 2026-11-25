@@ -10,7 +10,7 @@
 import { createHash } from "node:crypto";
 import { crmRecordUrl } from "../intake/crm-display";
 import type { EffectIntent } from "../intake/execution-types";
-import { caseRequestSearchText, caseTeamPartRequests, SAV_CASE_ADMISSION_TEAM_REASONS, SAV_CASE_AGENT_REQUESTS_PER_MAIL, type CaseAdmissionReason, type CaseSnapshot, type CaseTrial } from "./case-types";
+import { caseRequestSearchText, caseTeamPartRequests, SAV_CASE_AGENT_REQUESTS_PER_MAIL, type CaseSnapshot, type CaseTrial } from "./case-types";
 import { SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { buildCaseHandoffSummary, caseHandoffSummaryLines, type CaseHandoffSummary } from "./case-handoff-summary";
 import { caseTechnicalHandoffWait, investigationHandoffCommand, readCaseInvestigationProgress, SAV_CASE_INVESTIGATION_RECORD_KIND, type CaseInvestigationJournalEvent, type CaseTechnicalHandoffWait } from "./investigation-record";
@@ -25,6 +25,13 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Ugo (25/11): `admission:<event>` is the one input of a case refused at entry (born with the team): its first admission decision.
 const INPUT_KEY = /^(in|back|ticket|admission):[A-Za-z0-9._@<>=+-]{1,200}$/;
 /** One notice per final handoff decision: the case and the input the decision answers. A new customer mail is a new input, hence a new decision and a new key. */
+/**
+ * Ugo (25/11, firm): Slack is only for cases the agent took and worked on. A case refused at entry (V1 already leaves it in « Nouveau » without owner) never gets
+ * a notice. PR #365 created some, keyed `handoff-notice:<case>:admission:<event>` with an `entry_*` reason: this tells them apart so the driver cancels them.
+ */
+export function entryRefusalNotice(key: string, reason: HandoffReason | undefined): boolean {
+  return key.includes(":admission:") || reason === "entry_sensitive" || reason === "entry_team";
+}
 export function handoffNoticeKey(caseId: string, inputKey: string): string {
   if (!UUID.test(caseId) || !INPUT_KEY.test(inputKey)) throw new Error("SAV_HANDOFF_NOTICE_KEY_INVALID");
   return `${HANDOFF_NOTICE_KEY_PREFIX}${caseId.toLowerCase()}:${inputKey}`;
@@ -103,8 +110,8 @@ export const HANDOFF_REASONS = ["explicit_human_request", "sensitive_request", "
   // Ugo (25/11): not model reasons. A technical dead end of the investigation (`SAV_CASE_TECHNICAL_HANDOFF_WAITS`, investigation-record.ts): the store gives the
   // case to the team, no mail sent. Written out, not spread: `technicalHandoffTrigger` only compiles while every dead end is one of these reasons.
   "technical_exhausted", "context_invalid", "knowledge_request_invalid",
-  // Ugo (25/11): not model reasons. A case refused at entry (`SAV_CASE_ADMISSION_TEAM_REASONS`) is born with the team, with its mail: no investigation,
-  // no reply. `entry_sensitive` for a sensitive topic, `entry_team` for the other team reasons (confirmed bug, out of capability).
+  // Ugo (25/11, PR #365, withdrawn the same day): reasons of the entry-refusal notices created before the withdrawal. No trigger produces them any more;
+  // they stay only so those stored payloads still read, and the notice driver cancels them before any Slack call (`entryRefusalNotice`).
   "entry_sensitive", "entry_team"] as const;
 export type HandoffReason = typeof HANDOFF_REASONS[number];
 export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
@@ -314,39 +321,6 @@ export function agentNotTakenNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId"
   return { ok: true, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion: born.caseVersion, reason: "agent_not_taken",
     report: { need: `Ticket attribué à l'Agent SAV, non pris en charge : ${why(handoff.reason)}`, expected: null, observed: null, trialIds: [], hypotheses: [], missingInformation: [],
       expectedIntervention: HANDOFF_NOT_TAKEN_INTERVENTION } };
-}
-
-/** Ugo (25/11): the fixed next human action of a case refused at entry. */
-export const HANDOFF_ENTRY_INTERVENTION = "Reprendre le message et répondre au client : l'agent ne l'a pas pris en charge et ne lui a envoyé aucun mail.";
-const SENSITIVE_ENTRY_REASONS: readonly CaseAdmissionReason[] = ["case_sensitive", "sensitive_family", "mixed_sensitive"];
-
-/**
- * Ugo (25/11): the notice of a case refused at entry (`SAV_CASE_ADMISSION_TEAM_REASONS`: sensitive topic, confirmed bug, out of capability). Such a case is
- * BORN with the team with its mail (`openCaseEvent`): no `owner_changed`, no investigation record, so neither `handoffNoticeTrigger` nor the SAV-99 trigger
- * (which needs a case without mail) fires. Its one input is its FIRST admission decision (`admission:<event>`): exactly one notice per case, whatever
- * follows (a customer follow-up re-admits the case under the same key). A person who took it, or a person's command since, means nothing to notice.
- */
-export function admissionRefusalNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ticketId" | "body" | "owner" | "phase" | "threadIds">,
-  events: readonly (CaseInvestigationJournalEvent & { id?: string })[]): HandoffNoticeTrigger {
-  const handoff = snapshot.body.handoff;
-  if (snapshot.owner !== "human" || snapshot.phase !== "handoff_pending" || !handoff || !snapshot.threadIds.length) return { ok: false, why: "not_handoff" };
-  const admissionReason = SAV_CASE_ADMISSION_TEAM_REASONS.find(reason => reason === handoff.reason);
-  if (!admissionReason) return { ok: false, why: "not_handoff" };
-  if (handoff.humanSince) return { ok: false, why: "taken_by_person" };
-  // An owner change or an investigation means the case went through the agent: its own triggers (or none) apply, never this one.
-  if (events.some(event => event.kind === "owner_changed" || (event.kind === "observation_recorded"
-    && (event.detail?.record as { kind?: unknown } | undefined)?.kind === SAV_CASE_INVESTIGATION_RECORD_KIND))) return { ok: false, why: "not_handoff" };
-  const decided = [...events].sort((a, b) => a.caseVersion - b.caseVersion).find(event => event.kind === "admission_decided");
-  if (!decided || typeof decided.id !== "string") return { ok: false, why: "no_record" };
-  const reason = SENSITIVE_ENTRY_REASONS.includes(admissionReason) ? "entry_sensitive" as const : "entry_team" as const;
-  const stale = staleHandoffEventKinds(true, reason);
-  if (events.some(event => event.caseVersion > decided.caseVersion && stale.includes(event.kind))) return { ok: false, why: "stale_input" };
-  const inputKey = `admission:${decided.id}`;
-  if (!INPUT_KEY.test(inputKey)) return { ok: false, why: "no_record" };
-  const requests = snapshot.body.openRequests.filter(row => row.status !== "resolved").map(row => caseRequestSearchText(row) ?? row.summary);
-  return { ok: true, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion: decided.caseVersion, reason,
-    report: { need: `Demande laissée à l'équipe dès son arrivée : ${requests.join(" ; ") || "voir le mail du client"}`, expected: null, observed: null, trialIds: [], hypotheses: [],
-      missingInformation: [], expectedIntervention: HANDOFF_ENTRY_INTERVENTION } };
 }
 
 /**
