@@ -9,6 +9,7 @@ import { runSmartTurn, type SmartKnowledgePort, type SmartThreadMessage, type Sm
 import { SAV_SMART_ATTACHMENT_TRACE_CODES, smartCaseAttachments, type SmartFilesBudget } from "./smart-attachments";
 import type { SmartSource } from "./smart-checks";
 import type { SmartFact, SmartTeamNote } from "./smart-contract";
+import { savV2SmartLiveSearchOn, smartLiveKnowledge, type SmartLiveSearch } from "./smart-live-search";
 import { smartEmptyMemory, type SmartCaseMemory } from "./smart-memory";
 import type { SmartModelPort } from "./smart-model";
 import { smartCommercialForwardOn, smartCommercialSet } from "./smart-switch";
@@ -204,6 +205,12 @@ export type SmartCaseProviderDeps = Readonly<{
    * absent: no file is sent (`input_budget`).
    */
   attachmentFit?: () => Readonly<{ model: string; mediaTokens: number; budget: SmartFilesBudget | null }>;
+  /**
+   * Live search (`SAV_V2_SMART_LIVE_SEARCH=on`, read at each call): the live search of this input for `chercher_fiches` (smart-live-search.ts), and where
+   * the cards it found are given to the runner (proven again there at their exact version). Off or absent: the circuit's cards, as before.
+   */
+  liveSearch?: (request: CaseInvestigationModelRequest) => SmartLiveSearch;
+  liveFound?: (callKey: string, refs: ReadonlyArray<{ knowledgeId: string; contentVersionId: string }>) => void;
 }>;
 
 /**
@@ -239,17 +246,22 @@ export function smartCaseDecisionProvider(deps: SmartCaseProviderDeps): CaseV2Mo
     const searches: SmartTraceSearch[] = [];
     // Smart images: null unless the reader granted this context (flag on, smart case); then the admitted files, or text only with the reasons.
     const files = smartCaseAttachments(request.customerContext, deps.attachmentFit ?? (() => ({ model: "", mediaTokens: 0, budget: null })));
+    const live = deps.liveSearch && savV2SmartLiveSearchOn(deps.env()) ? smartLiveKnowledge({ circuit: smartCaseKnowledge(request), circuitCards: request.knowledge, search: deps.liveSearch(request) }) : null;
+    const knowledge = live?.port ?? smartCaseKnowledge(request);
     const result = await runSmartTurn(input, {
-      model: smartModelWithFeedback(deps.model, request.feedback), knowledge: deps.trace ? traceSmartKnowledge(smartCaseKnowledge(request), searches) : smartCaseKnowledge(request), maxInputBytes: cap,
+      model: smartModelWithFeedback(deps.model, request.feedback), knowledge: deps.trace ? traceSmartKnowledge(knowledge, searches, { query: Boolean(live) }) : knowledge, maxInputBytes: cap,
       today: deps.now().toISOString().slice(0, 10), recordOwn: true, ...(deps.academy ? { academy: deps.academy } : {}), ...(deps.maxExchanges ? { maxExchanges: deps.maxExchanges } : {}),
       ...(files?.turn ? { attachments: files.turn } : {}), ...smartCommercialSet(deps.env()),
       ...(smartCommercialForwardOn(deps.env()) ? { commercialForward: true } : {}),
     });
     deps.observe?.(result);
-    const usage = smartTurnUsage(result), proposal = smartProposalFromTurn(result, request);
+    // Live search (26/11): the cards a live search found are known to the proposal (citable, titles) and given to the runner, which proves them before validating.
+    const found = live?.found() ?? [], seen = found.length ? { ...request, knowledge: [...request.knowledge, ...found] } : request;
+    if (found.length) deps.liveFound?.(request.callKey, found.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId })));
+    const usage = smartTurnUsage(result), proposal = smartProposalFromTurn(result, seen);
     const attachments = files ? { admitted: files.trace.admitted, sentWith: result.attachments?.sentWith ?? [],
       refused: [...files.trace.refused, ...(result.attachments?.dropped ?? [])].slice(0, SAV_SMART_ATTACHMENT_TRACE_CODES) } : null;
-    await recordSmartTrace(deps.trace, () => buildSmartCaseTrace({ request, result, proposal, searches, at: deps.now(), ...(attachments ? { attachments } : {}) }));
+    await recordSmartTrace(deps.trace, () => buildSmartCaseTrace({ request: seen, result, proposal, searches, at: deps.now(), ...(attachments ? { attachments } : {}) }));
     if (!proposal) return { result: { status: "failed", uncertain: result.calls.some(call => call.uncertain),
       diagnostic: { stage: "content", code: "empty_response", networkAttempted: result.calls.some(call => call.sent) } }, usage };
     return { result: { status: "ok", output: proposal }, usage };

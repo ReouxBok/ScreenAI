@@ -20,6 +20,7 @@ import { caseIncidentBindings, caseTemporaryKnowledgeRequestTexts, prioritizeCas
 import { arrangeCaseMultiBlockKnowledge, arrangeCaseScopedKnowledge, caseScopedRecordCoverage, trimCaseScopedKnowledge, type CaseScopedKnowledge } from "./investigation-knowledge-ranking";
 import { INCIDENT_RUNTIME_LIMIT, type IncidentContext, type IncidentRead, type IncidentReader, type TemporaryKnowledgeLookup } from "./investigation-incidents-contract";
 import { caseCustomerContextUnavailable, caseCustomerSearchText, type CaseCustomerContext } from "./investigation-customer-context";
+import { SAV_SMART_LIVE_SEARCH_LIMITATION, smartContinuationSearchText } from "./smart/smart-live-search";
 
 /*
  * SAV-7 investigation in observation (local sub-lot 1). The flow only: every read, lease, model
@@ -276,6 +277,12 @@ export type CaseInvestigationPorts = {
    * active version only; the runner keeps a card only if it is that exact version and valid now). Absent: only retrieved scope cards are sent.
    */
   readScopeCards?(refs: KnowledgeRef[]): Promise<SavRetrievalCandidate[]>;
+  /**
+   * Live search (26/11): the smart brain's live search (`SAV_V2_SMART_LIVE_SEARCH=on`, read by `on` at each run). On a smart case only: the first search also reads
+   * the exchange before the latest reply (`smartContinuationSearchText`), and the cards `chercher_fiches` found during a call (`take`, by call key)
+   * join the knowledge once read again here at their exact version (`readScopeCards`). Absent or off: unchanged.
+   */
+  smartLiveSearch?: Readonly<{ on(): boolean; take(callKey: string): KnowledgeRef[] }>;
   /** The model transport's own preflight (no network, no cost): used only to drop out-of-scope cards before a request too large to send. */
   preflight?(request: CaseInvestigationModelRequest): CaseModelTransportDiagnostic | null;
   /**
@@ -466,7 +473,8 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
     // SAV-92: read before the search, whose second query is the customer's own words. A failed read never stops the case.
     const customerContext = ports.customerContext
       ? await Promise.resolve().then(() => ports.customerContext!(snapshot, events)).catch(() => caseCustomerContextUnavailable()) : undefined;
-    const customerWords = caseCustomerSearchText(customerContext);
+    const liveSearch = smartCase && ports.smartLiveSearch?.on() === true ? ports.smartLiveSearch : null;
+    const customerWords = (liveSearch ? smartContinuationSearchText(customerContext) : null) ?? caseCustomerSearchText(customerContext);
     // 25/11: the smart brain's case (no block scope) keeps the cards its words hold when the floor would leave it none (`selectCaseKnowledge`).
     const fetched = await ports.knowledge(snapshot, { inputKey, ...(customerWords ? { customerWords } : {}), ...(smartCase ? { lexicalRecall: true } : {}) });
     if (!Array.isArray(fetched) && fetched.status === "stopped") {
@@ -622,7 +630,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       // Ids and codes only, never a card's content.
       console.info("sav_v2_knowledge_selection", { caseId, caseVersion, sent: knowledge.map(card => card.id), scope: [...scoped.scopeKeys],
         dropped: scoped.dropped, added: scoped.added, scopeUnavailable: scoped.unavailable, scopeLeftOut: scoped.scopeLeftOut });
-    const decisionContext = temporaryIncidents?.entries.some(entry => entry.priority)
+    let decisionContext = temporaryIncidents?.entries.some(entry => entry.priority)
       ? { ...built.context, usesTemporaryKnowledge: true as const }
       : built.context;
     let proposal = prior?.proposal ?? null;
@@ -640,6 +648,26 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
     let recordedOn: number | null = null;
     const save = (waiting: CaseInvestigationWait | null) => ports.progress.save(caseId, inputKey, { modelCalls, attempts, waiting, proposal, last: validation ?? null, closure, recordedOn });
 
+    /*
+     * Live search (26/11): the cards the smart brain's live search found during a call, read again at their exact version with the search's filters
+     * (`readScopeCards`, the same proof as a scope card) and valid now, join the knowledge the validator and the record read, and each open request's
+     * coverage (the brain may use a card for any need of its mail, as the circuit's cards). A coverage status never changes. A card not proven: ignored.
+     */
+    const adoptLiveCards = async (refs: readonly KnowledgeRef[]) => {
+      const same = (card: SavRetrievalCandidate, ref: KnowledgeRef) => card.id === ref.knowledgeId && card.contentVersionId === ref.contentVersionId;
+      const wanted = refs.filter(ref => !knowledge.some(card => same(card, ref))).slice(0, 6);
+      if (!wanted.length || !ports.readScopeCards) return;
+      let read: SavRetrievalCandidate[] = [];
+      try { read = await ports.readScopeCards(wanted); } catch { return; }
+      const at = ports.now();
+      const proven = [...new Map(read.filter(card => wanted.some(ref => same(card, ref)) && assessSavKnowledgeValidity(card, ports.scope.locale, ports.scope.audience, at).eligible)
+        .map(card => [`${card.id}:${card.contentVersionId}`, card])).values()];
+      if (!proven.length) return;
+      const added = proven.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId }));
+      knowledge = [...knowledge, ...proven];
+      coverage = coverage?.map(row => ({ ...row, knowledge: [...row.knowledge, ...added], limitations: [...new Set([...row.limitations, SAV_SMART_LIVE_SEARCH_LIMITATION])] })) ?? coverage;
+      decisionContext = { ...decisionContext, knowledge, coverage };
+    };
     // One call through the single model port: pause read first, a deferral consumes nothing, a failure is stored as a wait.
     const dispatch = async (purpose: CaseInvestigationCallPurpose, feedback: CaseInvestigationModelRequest["feedback"], items: CaseClosureItem[]): Promise<Dispatched> => {
       // The pause is read before every call, not only at the start: a full pause set mid-investigation stops the next
@@ -685,7 +713,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
         await save(wait("knowledge_changed", { problem: "revision_moved" }));
         return { stop: { status: "knowledge_requeue", caseId, caseVersion, searchedRevision: "incident_context_unproven", currentRevision: incidentFingerprint ?? null, modelCalls } };
       }
-      if (result.status === "ok") return { output: result.output };
+      if (result.status === "ok") { if (liveSearch) await adoptLiveCards(liveSearch.take(`${subjectKey}:call${call}`)); return { output: result.output }; }
       attempts.push({ call, result: "failed", purpose, uncertain: result.uncertain, ...(result.diagnostic ? { diagnostic: result.diagnostic } : {}) });
       // The last allowed call failed after a proposal: that proposal is the result, recorded below.
       if (!result.uncertain && call >= SAV_CASE_INVESTIGATION_MAX_CALLS && validation) { await save(null); return { lastCallFailed: true }; }
