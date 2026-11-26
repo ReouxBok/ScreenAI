@@ -174,14 +174,17 @@ Reste sensible, tout le mail à l'équipe : tout ce qui porte sur SON abonnement
 - « Je veux passer à l'offre supérieure dès ce mois-ci » : {"famille":"abonnement","preuve":"Je veux passer à l'offre supérieure dès ce mois-ci"}`;
 
 /** The decide prompt's never-rule 1 with the switch on: a sensitive mail never reaches decide (stopped at the reading), so it is short, and the commercial need fits in it (decide stays under `SAV_SMART_PROMPT_MAX_BYTES`). */
-const DECIDE_RULE_1_SPLIT = "1. Une vraie demande sur SON compte (son abonnement ou son essai, résilier, payer, changer d'offre, facture, remboursement, données, identité, piratage) va à l'équipe. Besoin commercial true : coverage handed, teamNote ; la reply n'en dit RIEN (ni offre, prix, démo, ni transmission) et répond aux autres besoins.";
+const DECIDE_RULE_1_SPLIT = "1. Une vraie demande sur SON compte (abonnement ou essai, résilier, payer, changer d'offre, facture, remboursement, données, identité, piratage) va à l'équipe. Besoin commercial true : coverage handed, teamNote, la reply n'en dit RIEN (offre, prix, démo, transmission).";
 const VERIFY_COMMERCIAL_LINE = "13. commercial_in_reply : la réponse reprend une question commerciale du client (needs commercial true : choix ou comparaison d'offres, prix, démo), donne un conseil d'offre, un prix ou une démo, ou dit que cette question est transmise à l'équipe ou aux commerciaux. Le client ne doit rien lire à ce sujet.";
 /** v21's « only buying, changing or paying is sensitive » sentence would contradict the own-subscription rule above (26/11): replaced with the switch on. */
 const ONLY_BUY_CHANGE_PAY = "Seule une demande d'acheter, de changer ou de payer une offre est sensible ;";
 const OWN_PLAN_OR_BUY_CHANGE_PAY = "Une demande d'acheter, de changer ou de payer une offre, ou une question sur SON abonnement, SON offre ou SON essai actuels, est sensible ;";
 const NEED_FORMAT = `"search":"mots pour chercher une fiche ou null"}`;
 
-const DECIDE_SPLIT = DECIDE.replace(`1. ${SENSITIVE.split("\n")[1]}`, DECIDE_RULE_1_SPLIT);
+/** v21's « reply prévient le client » (hand-over rule) gets the commercial exception with the switch on: a commercial need is never announced (26/11). */
+const HANDOFF_NOTICE = "reply prévient le client en une ou deux phrases, sans promesse.";
+const HANDOFF_NOTICE_SPLIT = "reply prévient le client en une ou deux phrases, sans promesse (besoin commercial : la reply n'en dit rien).";
+const DECIDE_SPLIT = DECIDE.replace(`1. ${SENSITIVE.split("\n")[1]}`, DECIDE_RULE_1_SPLIT).replace(HANDOFF_NOTICE, HANDOFF_NOTICE_SPLIT);
 const UNDERSTAND_SPLIT = UNDERSTAND
   .replace(SENSITIVE, `${SENSITIVE_SPLIT}\n\n${COMMERCIAL}`)
   .replace(ONLY_BUY_CHANGE_PAY, OWN_PLAN_OR_BUY_CHANGE_PAY)
@@ -198,7 +201,7 @@ export const smartVerifyPrompt = (options?: SmartPromptOptions) => splitOn(optio
 export const smartCorrectionPrompt = (options?: SmartPromptOptions) => `${smartDecidePrompt(options)}\n\n${SAV_SMART_CORRECTION_INSTRUCTION}`;
 
 /** sha256 of `smartPromptFingerprintSource({ commercialSplit: true })`. Pinned by `smart-prompt.test.ts`; change it only with the revision. */
-export const SAV_SMART_COMMERCIAL_PROMPT_SHA256 = "3a9624d7653efddd7277be0f71a5525051dfabd3fb9daf6c5e8f62ce4c0fe09b";
+export const SAV_SMART_COMMERCIAL_PROMPT_SHA256 = "0cfa2883a56b3a6e45d1efe427b17f8882edf208f07e1f9b0384e8d104e9d6a9";
 
 /** What the pinned hash covers: the four prompts and the resources, exactly as sent. Off: unchanged since v21; on: the split variants and a marker. */
 export const smartPromptFingerprintSource = (options?: SmartPromptOptions) => splitOn(options)

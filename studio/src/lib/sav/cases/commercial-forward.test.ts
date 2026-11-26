@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  buildCommercialForward, COMMERCIAL_FORWARD_MAX_ATTEMPTS, COMMERCIAL_FORWARD_MAX_ORIGINAL_BYTES, commercialForwardKey, commercialForwardRfcMessageId, forwardCommercialPart,
+  buildCommercialForward, COMMERCIAL_FORWARD_MAX_ATTEMPTS, COMMERCIAL_FORWARD_MAX_ORIGINAL_BYTES, COMMERCIAL_FORWARD_STALE_MS, commercialForwardKey, commercialForwardRfcMessageId, forwardCommercialPart,
   SAV_COMMERCIAL_FORWARD_RECIPIENT, type CommercialForwardDeps, type CommercialForwardFacts, type CommercialForwardMetadata, type CommercialForwardStep, type CommercialForwardStore,
 } from "./commercial-forward";
 
@@ -16,8 +16,9 @@ const FACTS: CommercialForwardFacts = {
     receivedAt: "2026-11-26T08:00:00.000Z", text: "Comment configurer mes Assistants ? Quelle offre me conseillez-vous ?" },
 };
 
-function memoryStore(initial: CommercialForwardStep[] = ["queued"]) {
-  const log: Array<{ step: CommercialForwardStep; metadata: CommercialForwardMetadata }> = initial.map(step => ({ step, metadata: {} }));
+const QUEUED_AT = "2026-11-26T08:00:00.000Z";
+function memoryStore(initial: CommercialForwardStep[] = ["queued"], queuedAt: string | null = null) {
+  const log: Array<{ step: CommercialForwardStep; metadata: CommercialForwardMetadata }> = initial.map(step => ({ step, metadata: step === "queued" && queuedAt ? { queuedAt } as CommercialForwardMetadata : {} }));
   let attempts = 0, leased = false;
   const store: CommercialForwardStore = {
     steps: async () => [...new Set(log.map(row => row.step))],
@@ -115,5 +116,67 @@ describe("transfert de la partie commerciale aux commerciaux (pur, idempotent)",
     const result = await forwardCommercialPart(KEY, deps(store, gmail, { readFacts: async () => ({ ...FACTS, source: { ...FACTS.source, fromEmail: "sacha@limova.ai" } }) }));
     expect(result).toEqual({ final: "not_applied", reason: "SAV_COMMERCIAL_FORWARD_INVALID" });
     expect(sent).toHaveLength(0);
+  });
+
+  it("revue M1 : un échec avant l'envoi n'use aucune tentative (panne Gmail courte) ; passé le délai, « not_applied » avec la clé dans le log et l'équipe prévenue", async () => {
+    const { store, events, attempts } = memoryStore(["queued"], QUEUED_AT);
+    const { gmail, sent } = fakeGmail(events);
+    const down: CommercialForwardDeps["gmail"] = { ...gmail, readOriginal: async () => { throw Error("GMAIL_UNAVAILABLE"); } };
+    const alerts: string[] = [];
+    const alertTeam = async (key: string, step: string, reason: string) => { alerts.push(`${key}|${step}|${reason}`); };
+    const start = Date.parse(QUEUED_AT);
+    for (let pass = 0; pass < COMMERCIAL_FORWARD_MAX_ATTEMPTS + 3; pass += 1)
+      expect(await forwardCommercialPart(KEY, deps(store, down, { alertTeam, now: () => start + pass * 60_000 }))).toEqual({ retry: "GMAIL_UNAVAILABLE" });
+    expect(attempts()).toBe(0);
+    expect(alerts).toEqual([]);
+    // Gmail is back before the bound: the forward leaves normally.
+    expect(await forwardCommercialPart(KEY, deps(store, gmail, { alertTeam, now: () => start + 60 * 60_000 }))).toEqual({ final: "confirmed" });
+    expect(sent).toHaveLength(1);
+    expect(alerts).toEqual([]);
+
+    const late = memoryStore(["queued"], QUEUED_AT);
+    const lateGmail = fakeGmail(late.events);
+    const result = await forwardCommercialPart(KEY, deps(late.store, { ...lateGmail.gmail, readOriginal: async () => { throw Error("GMAIL_UNAVAILABLE"); } },
+      { alertTeam, now: () => start + COMMERCIAL_FORWARD_STALE_MS }));
+    expect(result).toEqual({ final: "not_applied", reason: "GMAIL_UNAVAILABLE" });
+    expect(alerts).toEqual([`${KEY}|not_applied|GMAIL_UNAVAILABLE`]);
+    expect(console.error).toHaveBeenCalledWith("sav_commercial_forward_final", { key: KEY, step: "not_applied", reason: "GMAIL_UNAVAILABLE" });
+    expect(lateGmail.sent).toHaveLength(0);
+  });
+
+  it("revue M1 : « uncertain » prévient aussi l'équipe ; une alerte en échec est journalisée, jamais levée, et le reçu final reste", async () => {
+    const { store, events, log } = memoryStore();
+    const { gmail } = fakeGmail(events, { sendThrows: true, findSent: null });
+    const alertTeam = vi.fn(async () => { throw Error("SAV_CASE_VERSION_STALE"); });
+    let last;
+    for (let pass = 0; pass < COMMERCIAL_FORWARD_MAX_ATTEMPTS; pass += 1) last = await forwardCommercialPart(KEY, deps(store, gmail, { alertTeam }));
+    expect(last).toEqual({ final: "uncertain", reason: "SAV_COMMERCIAL_FORWARD_UNCONFIRMED" });
+    expect(alertTeam).toHaveBeenCalledTimes(1);
+    expect(alertTeam).toHaveBeenCalledWith(KEY, "uncertain", "SAV_COMMERCIAL_FORWARD_UNCONFIRMED");
+    expect(console.error).toHaveBeenCalledWith("sav_commercial_forward_alert_failed", { key: KEY, code: "SAV_CASE_VERSION_STALE" });
+    expect(log.some(row => row.step === "uncertain")).toBe(true);
+  });
+
+  it("revue M2 : retenu par l'autorité, il attend ; passé le délai, il devient une tâche humaine (« not_applied », ou « uncertain » s'il était parti)", async () => {
+    const lost = async () => { throw Error("SAV_COMMERCIAL_FORWARD_PERMISSION_MISSING"); };
+    const start = Date.parse(QUEUED_AT);
+    const alerts: string[] = [];
+    const alertTeam = async (key: string, step: string, reason: string) => { alerts.push(`${step}|${reason}`); };
+    const fresh = memoryStore(["queued"], QUEUED_AT);
+    const a = fakeGmail(fresh.events);
+    expect(await forwardCommercialPart(KEY, deps(fresh.store, a.gmail, { authority: lost, alertTeam, now: () => start + 60_000 })))
+      .toEqual({ skipped: "authority", detail: "SAV_COMMERCIAL_FORWARD_PERMISSION_MISSING" });
+    expect(await forwardCommercialPart(KEY, deps(fresh.store, a.gmail, { authority: lost, alertTeam, now: () => start + COMMERCIAL_FORWARD_STALE_MS })))
+      .toEqual({ final: "not_applied", reason: "authority_lost:SAV_COMMERCIAL_FORWARD_PERMISSION_MISSING" });
+    const gone = memoryStore(["queued", "dispatched"], QUEUED_AT);
+    const b = fakeGmail(gone.events);
+    expect(await forwardCommercialPart(KEY, deps(gone.store, b.gmail, { authority: lost, alertTeam, now: () => start + COMMERCIAL_FORWARD_STALE_MS })))
+      .toEqual({ final: "uncertain", reason: "authority_lost:SAV_COMMERCIAL_FORWARD_PERMISSION_MISSING" });
+    expect(alerts).toEqual(["not_applied|authority_lost:SAV_COMMERCIAL_FORWARD_PERMISSION_MISSING", "uncertain|authority_lost:SAV_COMMERCIAL_FORWARD_PERMISSION_MISSING"]);
+    expect([...a.sent, ...b.sent]).toHaveLength(0);
+    // Without a readable queued date it is never declared stale: it keeps waiting.
+    const undated = memoryStore();
+    expect(await forwardCommercialPart(KEY, deps(undated.store, a.gmail, { authority: lost, now: () => start + 10 * COMMERCIAL_FORWARD_STALE_MS })))
+      .toEqual({ skipped: "authority", detail: "SAV_COMMERCIAL_FORWARD_PERMISSION_MISSING" });
   });
 });

@@ -5,8 +5,11 @@
 //   queued (by the V2 reply passage, BEFORE the reply is proposed) → source re-read → dispatched (recorded BEFORE the send) → Gmail send → acked (the
 //   send response's Gmail id) → read-back in Sent by that id (fallback: our own Message-ID) → confirmed.
 //   Final receipts: confirmed | not_applied | uncertain. A dispatched forward is never sent again: only a read-back can confirm it; after bounded attempts
-//   it becomes `uncertain` (« vérifier la boîte d'envoi de contact@ »). The forward itself does not read the switch: the reconcile sweep that resumes it
-//   runs only while the switch is on (turned off, queued forwards wait in their receipts and resume when it is on again).
+//   it becomes `uncertain` (« vérifier la boîte d'envoi de contact@ »). Before the dispatch nothing is counted: a short Gmail or database outage is retried
+//   until the queued forward is `COMMERCIAL_FORWARD_STALE_MS` old, then it is `not_applied`; the same bound ends a forward held by a lost authority.
+//   Every final receipt other than `confirmed` is a person's task: logged with its key (`caseId:inputKey`, no personal data) and given to the team
+//   through `deps.alertTeam` (review 26/11, M1). The forward itself does not read the switch: the reconcile sweep that resumes it runs while either
+//   commercial switch is on (review M2: a forward queued before the forward switch was turned off is still drained).
 import { createHash } from "node:crypto";
 import { SAV_INTAKE_ROUTING_MAILBOX, SAV_INTAKE_ROUTING_RECIPIENTS } from "../intake/routing-rules";
 import type { IntakeRoutingGmail, IntakeRoutingSource } from "../intake/routing-effect";
@@ -17,7 +20,10 @@ export const SAV_COMMERCIAL_FORWARD_RECIPIENT = SAV_INTAKE_ROUTING_RECIPIENTS.le
 export type CommercialForwardStep = "queued" | "dispatched" | "acked" | "confirmed" | "not_applied" | "uncertain";
 export const COMMERCIAL_FORWARD_STEPS: readonly CommercialForwardStep[] = ["queued", "dispatched", "acked", "confirmed", "not_applied", "uncertain"];
 export const COMMERCIAL_FORWARD_FINAL_STEPS: readonly CommercialForwardStep[] = ["confirmed", "not_applied", "uncertain"];
+/** Failed read-backs of a dispatched forward before it is `uncertain` (only counted once the mail may have left). */
 export const COMMERCIAL_FORWARD_MAX_ATTEMPTS = 5;
+/** A forward not dispatched this long after it was queued (Gmail down, mail unreadable, authority lost) ends `not_applied` and goes to a person. */
+export const COMMERCIAL_FORWARD_STALE_MS = 6 * 60 * 60 * 1000;
 /** Largest original attached as message/rfc822 (same bound as V1 routing); a larger one is forwarded as text only, never dropped. */
 export const COMMERCIAL_FORWARD_MAX_ORIGINAL_BYTES = 3_500_000;
 export type CommercialForwardMetadata = Record<string, string | number | boolean | null>;
@@ -46,6 +52,9 @@ export type CommercialForwardDeps = Readonly<{
   store: CommercialForwardStore;
   gmail: Pick<IntakeRoutingGmail, "readOriginal" | "send" | "sentMessageId" | "findSent">;
   signal?: AbortSignal;
+  /** A final receipt other than `confirmed`: the team must take the commercial question up itself. Its failure is logged, never thrown. */
+  alertTeam?: (key: string, step: "not_applied" | "uncertain", reason: string) => Promise<void>;
+  now?: () => number;
 }>;
 export type CommercialForwardResult =
   | Readonly<{ skipped: "authority" | "already_done" | "busy" | "not_queued"; detail?: string }>
@@ -84,11 +93,39 @@ export function buildCommercialForward(key: string, facts: CommercialForwardFact
 
 /** One forward, idempotent. Never throws for a refusal (a named result instead). */
 export async function forwardCommercialPart(key: string, deps: CommercialForwardDeps): Promise<CommercialForwardResult> {
-  try { await deps.authority(); } catch (error) { return { skipped: "authority", detail: codeOf(error) }; }
+  let held: string | null = null;
+  try { await deps.authority(); } catch (error) { held = codeOf(error); }
+  // Held by the authority (switched off, paused, right removed): it waits, unless it is stale; then it is a person's task (review M2).
+  if (held && !await staleQueued(key, deps)) return { skipped: "authority", detail: held };
   const release = await deps.store.lease(key);
   if (!release) return { skipped: "busy" };
-  try { return await forwardOwned(key, deps, deps.signal ?? new AbortController().signal); }
+  try { return held ? await abandonStale(key, deps, held) : await forwardOwned(key, deps, deps.signal ?? new AbortController().signal); }
   finally { await release().catch(error => console.warn("sav_commercial_forward_release", { code: codeOf(error) })); }
+}
+
+/** Queued, with no final receipt, and older than the bound (a queued receipt without a readable date is never stale: it keeps waiting, visibly). */
+async function staleQueued(key: string, deps: CommercialForwardDeps) {
+  const queued = await deps.store.receipt(key, "queued");
+  const at = typeof queued?.queuedAt === "string" ? Date.parse(queued.queuedAt) : NaN;
+  return Number.isFinite(at) && (deps.now ?? Date.now)() - at >= COMMERCIAL_FORWARD_STALE_MS;
+}
+
+async function abandonStale(key: string, deps: CommercialForwardDeps, held: string): Promise<CommercialForwardResult> {
+  const steps = await deps.store.steps(key);
+  if (steps.some(step => COMMERCIAL_FORWARD_FINAL_STEPS.includes(step))) return { skipped: "already_done" };
+  if (!steps.includes("queued")) return { skipped: "not_queued" };
+  return finalStep(key, deps, steps.includes("dispatched") ? "uncertain" : "not_applied", { reason: `authority_lost:${held}` });
+}
+
+async function finalStep(key: string, deps: CommercialForwardDeps, step: "confirmed" | "not_applied" | "uncertain", metadata: CommercialForwardMetadata): Promise<CommercialForwardResult> {
+  if (!await deps.store.record(key, step, { revision: SAV_COMMERCIAL_FORWARD_REVISION, ...metadata })) return { skipped: "already_done" };
+  const reason = typeof metadata.reason === "string" ? metadata.reason : null;
+  if (step !== "confirmed") {
+    // Codes and the forward's key only (case id and input key: no personal data). The team is told so a person recontacts the customer.
+    console.error("sav_commercial_forward_final", { key, step, reason });
+    if (deps.alertTeam) await deps.alertTeam(key, step, reason ?? "unknown").catch(error => console.error("sav_commercial_forward_alert_failed", { key, code: codeOf(error) }));
+  }
+  return { final: step, ...(reason ? { reason } : {}) } as const;
 }
 
 type Final = (step: "confirmed" | "not_applied" | "uncertain", metadata: CommercialForwardMetadata) => Promise<CommercialForwardResult>;
@@ -98,15 +135,12 @@ async function forwardOwned(key: string, deps: CommercialForwardDeps, signal: Ab
   const steps = await deps.store.steps(key);
   if (steps.some(step => COMMERCIAL_FORWARD_FINAL_STEPS.includes(step))) return { skipped: "already_done" };
   if (!steps.includes("queued")) return { skipped: "not_queued" };
-  const final: Final = async (step, metadata) => {
-    await deps.store.record(key, step, { revision: SAV_COMMERCIAL_FORWARD_REVISION, ...metadata });
-    // Visible in the logs (codes only): a forward that did not reach sales is a person's job.
-    if (step !== "confirmed") console.error("sav_commercial_forward_final", { step, reason: typeof metadata.reason === "string" ? metadata.reason : null });
-    return { final: step, ...(typeof metadata.reason === "string" ? { reason: metadata.reason } : {}) } as const;
-  };
+  const final: Final = (step, metadata) => finalStep(key, deps, step, metadata);
   const failed: Failed = async (reason, dispatched) => {
+    // Before the dispatch nothing can have left: retried (not counted) until the queued forward is stale (review M1: a short outage loses nothing).
+    if (!dispatched) return await staleQueued(key, deps) ? final("not_applied", { reason }) : { retry: reason };
     const attempts = await deps.store.attempt(key, { reason });
-    if (attempts >= COMMERCIAL_FORWARD_MAX_ATTEMPTS) return final(dispatched ? "uncertain" : "not_applied", { reason, attempts });
+    if (attempts >= COMMERCIAL_FORWARD_MAX_ATTEMPTS) return final("uncertain", { reason, attempts });
     return { retry: reason };
   };
   // A dispatched forward is only ever read back, never sent again.

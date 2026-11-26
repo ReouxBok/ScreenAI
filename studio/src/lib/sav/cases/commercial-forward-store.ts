@@ -2,9 +2,9 @@
 // `<caseId>:<inputKey>`; the asks are stored encrypted; the lease is a `sav.sync_state` row; the Gmail calls are V1 routing's own (contact@limova.ai only);
 // the authority is V1's execution policy with its right `route_intake_mail` (the right that already lets Studio forward a mail to sales) and neither
 // agent paused. Entry points: `enqueueCommercialForward` (the V2 reply passage, before it proposes the reply), the targeted run right after it, and a
-// bounded recovery sweep in the reconcile pass.
+// bounded recovery sweep in the reconcile pass. A forward that ends without reaching sales hands the case to the team (`alertCommercialForwardTeam`).
 import "server-only";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, asc, eq, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { auditLogs, savMailboxes, savMessages, savSyncState } from "@/db/schema";
@@ -24,6 +24,8 @@ const ATTEMPT = "sav_v2_commercial_forward_attempt";
 const LEASE_SECONDS = 120;
 /** A queued forward older than this is no longer swept (it stays visible in its receipts). */
 const SWEEP_DAYS = 7;
+/** The reason of the case's transfer when the commercial question did not reach sales: the team recontacts the customer about it. */
+export const SAV_COMMERCIAL_FORWARD_HANDOFF_REASON = "commercial_forward_not_applied";
 const actionOf = (step: CommercialForwardStep) => `sav_v2_commercial_forward_${step}`;
 const where = (key: string, action: string) => and(eq(auditLogs.entityType, ENTITY), eq(auditLogs.entityId, key), eq(auditLogs.actorEmail, ACTOR), eq(auditLogs.action, action));
 
@@ -77,7 +79,8 @@ export async function enqueueCommercialForward(input: Readonly<{ caseId: string;
   const asks = input.asks.map(ask => ask.trim()).filter(Boolean).slice(0, 4);
   if (!asks.length) return { ok: false, code: "no_ask" };
   const key = commercialForwardKey(input.caseId, input.inputKey);
-  const created = await store.record(key, "queued", { revision: SAV_COMMERCIAL_FORWARD_REVISION, caseId: input.caseId, gmailMessageId, asksCiphertext: encryptSavPayload(asks) });
+  const created = await store.record(key, "queued", { revision: SAV_COMMERCIAL_FORWARD_REVISION, caseId: input.caseId, gmailMessageId, asksCiphertext: encryptSavPayload(asks),
+    queuedAt: new Date().toISOString() });
   return { ok: true, key, created };
 }
 
@@ -107,9 +110,25 @@ export async function commercialForwardAuthority(env: Record<string, string | un
   await assertSavAgentActionsAllowed(requireDb(), "v2");
 }
 
+/**
+ * Review M1 (26/11): a commercial question that did not reach sales is a person's task. The case still held by the agent is handed to the team (owner
+ * `human`, phase `handoff_pending`, reason `commercial_forward_not_applied`), once per forward (command key from the forward's key): it then shows in
+ * the team's queue and the existing handoff stage rule applies. A case a person already has is left as it is (they see the mail). Throws on failure
+ * (the caller logs it; the final receipt is already written and the error log names the key).
+ */
+export async function alertCommercialForwardTeam(key: string) {
+  const caseId = key.split(":")[0] ?? "";
+  // Loaded here: the case store is heavy and only needed on this rare path.
+  const { readCase, transitionCaseOwner } = await import("./case-store");
+  const current = await readCase(caseId);
+  if (!current || current.owner !== "agent") return;
+  const commandKey = `commercial-forward-alert.${createHash("sha256").update(key).digest("hex").slice(0, 32)}`;
+  await transitionCaseOwner({ caseId, expectedVersion: current.version, transition: "handoff", actor: { type: "agent" }, commandKey, reason: SAV_COMMERCIAL_FORWARD_HANDOFF_REASON });
+}
+
 export function commercialForwardDeps(env: () => Record<string, string | undefined> = () => process.env, signal?: AbortSignal): CommercialForwardDeps {
   return { authority: () => commercialForwardAuthority(env()), readFacts: readCommercialForwardFacts, store: commercialForwardAuditStore, gmail: createIntakeRoutingGmail(),
-    ...(signal ? { signal } : {}) };
+    alertTeam: alertCommercialForwardTeam, ...(signal ? { signal } : {}) };
 }
 
 /** Targeted run of one forward. Never throws. */

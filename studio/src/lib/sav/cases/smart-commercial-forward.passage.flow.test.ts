@@ -12,10 +12,11 @@ vi.mock("../intake/model-dispatch", async importOriginal => {
   return Object.fromEntries(Object.entries(real).map(([name, value]) => [name, typeof value === "function" ? () => { throw Error(`MODEL_DISPATCH_FORBIDDEN:${name}`); } : value]));
 });
 // The forward store is observed, not run (its protocol has its own tests): the gate order is what this file proves.
-const forward = vi.hoisted(() => ({ order: [] as string[], authority: async () => undefined as void, enqueue: null as null | ((input: unknown) => Promise<unknown>), enqueued: [] as unknown[], synced: [] as string[] }));
+const forward = vi.hoisted(() => ({ order: [] as string[], authority: async () => undefined as void, enqueue: null as null | ((input: unknown) => Promise<unknown>), enqueued: [] as unknown[], synced: [] as string[], facts: true }));
 vi.mock("./commercial-forward-store", () => ({
   commercialForwardAuthority: async () => forward.authority(),
   enqueueCommercialForward: async (input: unknown) => { forward.order.push("enqueue"); forward.enqueued.push(input); return forward.enqueue ? forward.enqueue(input) : { ok: true, key: "k", created: forward.enqueued.length === 1 }; },
+  readCommercialForwardFacts: async () => forward.facts ? { asks: ["x"], source: {} } : null,
   syncCommercialForward: async (key: string) => { forward.synced.push(key); return { final: "confirmed" }; },
   commercialForwardDeps: () => ({}),
 }));
@@ -160,7 +161,7 @@ beforeEach(() => {
   vi.stubEnv("SAV_V2_ENTRY_SMART", "on");
   vi.stubGlobal("fetch", vi.fn(() => { throw Error("NETWORK_FORBIDDEN"); }));
   vi.spyOn(console, "info").mockImplementation(() => {});
-  forward.order = []; forward.enqueued = []; forward.synced = []; forward.enqueue = null; forward.authority = async () => undefined;
+  forward.order = []; forward.enqueued = []; forward.synced = []; forward.enqueue = null; forward.authority = async () => undefined; forward.facts = true;
 });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -196,6 +197,7 @@ describe("26/11 B : la partie commerciale est mise en file pour les commerciaux 
   it.each([
     ["la mise en file échoue", () => { forward.enqueue = async () => ({ ok: false, code: "trigger_not_inbound" }); }],
     ["la base refuse l'écriture", () => { forward.enqueue = async () => { throw Error("DB_DOWN"); }; }],
+    ["le mail d'origine est introuvable dans contact@ (revue L3)", () => { forward.facts = false; }],
     ["aucune autorité pour transmettre (droit route_intake_mail absent, agent en pause)", () => { forward.authority = async () => { throw Error("SAV_COMMERCIAL_FORWARD_PERMISSION_MISSING"); }; }],
   ])("%s : AUCUNE proposition (jamais une réponse qui oublie la question commerciale) ; attente bornée de la partie équipe", async (_label, arrange) => {
     const { mail } = await decided();

@@ -28,7 +28,7 @@ import { caseSmartSupportOpen, isSmartSupportStamp, smartSupportStampInForce } f
 import { savV2EntrySmartOn } from "./smart-entry-switch";
 import { smartSendProblem } from "./smart/smart-send-fence";
 import { smartCommercialForwardOn } from "./smart/smart-switch";
-import { commercialForwardAuthority, commercialForwardDeps, enqueueCommercialForward, syncCommercialForward } from "./commercial-forward-store";
+import { commercialForwardAuthority, commercialForwardDeps, enqueueCommercialForward, readCommercialForwardFacts, syncCommercialForward } from "./commercial-forward-store";
 import { SAV_CASE_TEAM_PART_WAIT_CODE } from "./case-team-part-wait";
 
 /** The targeted forward right after it is queued is bounded; past it, the reconcile sweep finishes it. */
@@ -173,6 +173,8 @@ export async function passCaseInvestigationToReplyPlan(caseId: string, deps: Cas
     try { await commercialForwardAuthority(deps.store.env()); } catch { return refuse("commercial_forward_unavailable"); }
     const queued = await enqueueCommercialForward({ caseId, inputKey: draft.inputKey, triggerEventId: draft.triggerEventId, asks: draft.commercialPart.asks }).catch(() => null);
     if (!queued?.ok) return refuse("commercial_forward_unavailable");
+    // The original mail must be readable in contact@ (what the forward sends): otherwise no reply leaves without it.
+    if (!await readCommercialForwardFacts(queued.key).catch(() => null)) return refuse("commercial_forward_unavailable");
     if (queued.created) await syncCommercialForward(queued.key, commercialForwardDeps(deps.store.env, AbortSignal.timeout(COMMERCIAL_FORWARD_INLINE_MS)));
   }
   // SAV-92 (review of batch 2, finding 1): a reply telling the customer part of the mail went to the team is proposed only once that part's notice is durably

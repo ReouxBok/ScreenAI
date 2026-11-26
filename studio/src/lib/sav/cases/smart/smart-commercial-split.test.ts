@@ -105,7 +105,9 @@ describe("SAV_V2_SMART_COMMERCIAL_SPLIT : question commerciale ≠ sujet sensibl
     expect(understand).toContain("Reste sensible, tout le mail à l'équipe : tout ce qui porte sur SON abonnement, SON offre ou SON essai actuels (laquelle il a, ce qu'elle inclut, combien il paie, quand finit l'essai), payer, souscrire ou passer à une offre, changer, renouveler ou résilier son abonnement, une facture, un remboursement, un changement de facturation. Dans le doute entre commercial et sensible : sensible.");
     expect(understand).toContain(`"commercial":false}`);
     expect(understand).not.toContain("résiliation, abonnement ou offre, paiement");
-    expect(smartDecidePrompt(on)).toContain("Besoin commercial true : coverage handed, teamNote ; la reply n'en dit RIEN (ni offre, prix, démo, ni transmission) et répond aux autres besoins.");
+    expect(smartDecidePrompt(on)).toContain("Besoin commercial true : coverage handed, teamNote, la reply n'en dit RIEN (offre, prix, démo, transmission).");
+    expect(smartDecidePrompt(on)).toContain("reply prévient le client en une ou deux phrases, sans promesse (besoin commercial : la reply n'en dit rien).");
+    expect(smartDecidePrompt()).not.toContain("besoin commercial : la reply n'en dit rien");
     expect(smartVerifyPrompt(on)).toContain("13. commercial_in_reply : la réponse reprend une question commerciale du client");
     expect(smartPromptBytes(on).decide).toBeLessThanOrEqual(SAV_SMART_PROMPT_MAX_BYTES);
   });
@@ -331,7 +333,7 @@ describe("26/11 B : mail mixte, l'usage répondu, la seule partie commerciale tr
     expect(smartCommercialForwardOn({ SAV_V2_SMART_COMMERCIAL_SPLIT: "on", SAV_V2_SMART_COMMERCIAL_FORWARD: "on" })).toBe(true);
     for (const env of [{ SAV_V2_SMART_COMMERCIAL_FORWARD: "on" }, { SAV_V2_SMART_COMMERCIAL_SPLIT: "on" }, { SAV_V2_SMART_COMMERCIAL_SPLIT: "on", SAV_V2_SMART_COMMERCIAL_FORWARD: "ON" },
       { SAV_V2_SMART_COMMERCIAL_SPLIT: "on", SAV_V2_SMART_COMMERCIAL_FORWARD: "true" }, {}]) expect(smartCommercialForwardOn(env)).toBe(false);
-    expect(smartDecidePrompt({ commercialSplit: true })).toContain("la reply n'en dit RIEN (ni offre, prix, démo, ni transmission)");
+    expect(smartDecidePrompt({ commercialSplit: true })).toContain("la reply n'en dit RIEN (offre, prix, démo, transmission)");
     expect(smartDecidePrompt({ commercialSplit: true })).not.toContain("dis seulement qu'il est transmis");
     expect(smartVerifyPrompt({ commercialSplit: true })).toContain("ou dit que cette question est transmise à l'équipe ou aux commerciaux. Le client ne doit rien lire à ce sujet.");
     expect(smartVerifyPrompt()).not.toContain("commercial_in_reply");

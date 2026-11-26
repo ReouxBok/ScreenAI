@@ -20,6 +20,7 @@ import { randomUUID } from "node:crypto";
 import { recordSavWorkerPulse } from "@/lib/sav/monitor";
 import { savV2OwnerHandoverEnabled, savV2OwnerHandoverPollEnabled } from "@/lib/sav/cases/owner-handover-config";
 import { savAppTicketsMode } from "@/lib/sav/cases/app-tickets-config";
+import { commercialForwardSweepOn } from "@/lib/sav/cases/smart/smart-switch";
 
 export type SavReconcileTrigger = "vercel_cron" | "gmail_webhook" | "heartbeat_workflow";
 export type SavReconcilePassOptions = { trigger: SavReconcileTrigger; pulseId?: string; budgetMs?: number };
@@ -107,9 +108,9 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     if (Date.now() + 20_000 > derivedDeadline) return { skipped: "deadline" };
     return (await import("@/lib/sav/intake/routing-store")).reconcileIntakeRoutings(3, Math.min(derivedDeadline, Date.now() + 20_000));
   });
-  // Ugo 26/11: recovery of the commercial part forwarded to sales (nothing at all unless SAV_V2_SMART_COMMERCIAL_FORWARD and the split are on; the reply
-  // passage is the fast path). Turned off with forwards still queued: they wait, visible in their receipts, and resume when it is on again.
-  const commercialForwards = process.env.SAV_V2_SMART_COMMERCIAL_SPLIT === "on" && process.env.SAV_V2_SMART_COMMERCIAL_FORWARD === "on"
+  // Ugo 26/11: recovery of the commercial part forwarded to sales (the reply passage is the fast path). Review M2: runs while EITHER commercial switch is on,
+  // so a forward queued before the forward switch was turned off is still drained; both off: no step, no query.
+  const commercialForwards = commercialForwardSweepOn(process.env)
     ? await runStep<Awaited<ReturnType<typeof import("@/lib/sav/cases/commercial-forward-store").reconcileCommercialForwards>> | { skipped: string }>("v2_commercial_forward", async () => {
       if (Date.now() + 20_000 > derivedDeadline) return { skipped: "deadline" };
       return (await import("@/lib/sav/cases/commercial-forward-store")).reconcileCommercialForwards(3, Math.min(derivedDeadline, Date.now() + 20_000));

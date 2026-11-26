@@ -52,6 +52,8 @@ export const smartCommercialSet = (env: Env): Readonly<{ commercialSplit?: true 
  */
 export const SAV_SMART_COMMERCIAL_FORWARD_ENV = "SAV_V2_SMART_COMMERCIAL_FORWARD";
 export const smartCommercialForwardOn = (env: Env) => env[SAV_SMART_COMMERCIAL_SPLIT_ENV] === "on" && env[SAV_SMART_COMMERCIAL_FORWARD_ENV] === "on";
+/** The reconcile pass resumes queued forwards while EITHER switch is on (review M2: a forward queued before one was turned off is still drained). */
+export const commercialForwardSweepOn = (env: Env) => env[SAV_SMART_COMMERCIAL_SPLIT_ENV] === "on" || env[SAV_SMART_COMMERCIAL_FORWARD_ENV] === "on";
 
 export function readSmartShadowConfig(env: Env): SmartShadowConfig {
   if (!smartAgentShadowOn(env)) return { mode: "off" };
