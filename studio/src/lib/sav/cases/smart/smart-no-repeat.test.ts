@@ -1,13 +1,15 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SavRetrievalCandidate } from "../../request-retrieval";
 import { emptyCaseBody, SAV_CASE_CONTRACT_REVISION, type CaseBody, type CaseEvent, type CaseSnapshot } from "../case-types";
+import { buildCaseDecisionContext } from "../decision-context";
+import { validateCaseDecision } from "../decision-validator";
 import type { CaseInvestigationModelRequest } from "../investigation-runner";
 import { runSmartTurn, type SmartTurnInput } from "./smart-agent";
 import type { SmartSource } from "./smart-checks";
 import { smartCaseDecisionProvider } from "./smart-case-provider";
 import {
-  SAV_SMART_NO_REPEAT_PROMPT_SHA256, SAV_SMART_REPEAT_QUESTION_THRESHOLD, SAV_SMART_REPEAT_REPLY_THRESHOLD, smartCardGuidanceLines, smartNoRepeatContext, smartNoRepeatOn,
-  smartNoRepeatPromptSha256, smartRepeatedReply, smartRepeatSimilarity, smartTurnPrompts, smartWithCardGuidance,
+  SAV_SMART_NO_REPEAT_PROMPT_SHA256, SAV_SMART_REPEAT_MIN_NEW_WORDS, SAV_SMART_REPEAT_MIN_REPLY_WORDS, SAV_SMART_REPEAT_QUESTION_THRESHOLD, SAV_SMART_REPEAT_REPLY_THRESHOLD, smartCardGuidanceLines, smartNoRepeatContext, smartNoRepeatOn,
+  smartNoRepeatPromptSha256, smartRepeatedReply, smartTurnPrompts, smartWithCardGuidance,
 } from "./smart-no-repeat";
 import { smartCorrectionPrompt, smartDecidePrompt, smartPromptSha256, smartUnderstandPrompt, smartVerifyPrompt } from "./smart-prompt";
 import { SMART_CONFORME, smartScriptedModel, smartStaticKnowledge, type SmartScript } from "./smart-test-doubles";
@@ -54,13 +56,30 @@ describe("garde-fou de répétition (similarité, seuils)", () => {
 
   it("the incident: the same question reworded, or the same text, is refused; the thresholds are the documented constants", () => {
     expect(SAV_SMART_REPEAT_REPLY_THRESHOLD).toBe(0.8);
-    expect(SAV_SMART_REPEAT_QUESTION_THRESHOLD).toBe(0.55);
-    expect(smartRepeatSimilarity(TURN2_QUESTION, "Si vous cherchiez en particulier un agent de standard téléphonique ou un chatbot que vous aviez créé, indiquez-le-moi."))
-      .toBeGreaterThanOrEqual(SAV_SMART_REPEAT_QUESTION_THRESHOLD);
+    expect(SAV_SMART_REPEAT_QUESTION_THRESHOLD).toBe(0.7);
+    expect(SAV_SMART_REPEAT_MIN_NEW_WORDS).toBe(4);
+    expect(SAV_SMART_REPEAT_MIN_REPLY_WORDS).toBe(16);
     expect(smartRepeatedReply({ outcome: "ask", reply: TURN2, memory: repetitiveAsk.memory }, [TURN1])).toEqual({ code: "repeated_reply", sentence: expect.stringContaining("Dans Limova 3") });
-    // A short new mail made only of the reworded question: caught on the question.
-    expect(smartRepeatedReply({ outcome: "ask", reply: `Bonjour,\n\n${TURN2_QUESTION}`, memory: { ...repetitiveAsk.memory, question: null } }, [TURN1]))
-      .toEqual({ code: "repeated_reply", sentence: expect.stringContaining(TURN2_QUESTION) });
+    // A question already sent AS a question, asked again with nothing new around it: caught on the question.
+    const asked = "Bonjour,\n\nCherchez-vous un assistant en particulier, par exemple un agent de standard téléphonique ou un chatbot ?\n\nBelle journée.";
+    expect(smartRepeatedReply({ outcome: "ask", reply: `Bonjour,\n\n${TURN2_QUESTION}\n\nBelle journée.`, memory: { ...repetitiveAsk.memory, question: null } }, [asked]))
+      .toEqual({ code: "repeated_reply", sentence: TURN2_QUESTION });
+  });
+
+  it("review 26/11, measured false positives, all accepted", () => {
+    const none = { ...repetitiveAsk.memory, question: null };
+    // « dites-moi si cela fonctionne » after a NEW procedure.
+    const before = "Bonjour,\n\nOuvrez les Paramètres, puis l'onglet Intégrations, et cliquez sur Reconnecter Google.\n\nDites-moi si cela fonctionne.";
+    const next = "Bonjour,\n\nMerci pour votre retour. Essayez maintenant depuis le navigateur Chrome : videz le cache, déconnectez-vous puis reconnectez votre compte Outlook dans Comptes connectés.\n\nDites-moi si cela fonctionne.";
+    expect(smartRepeatedReply({ outcome: "reply", reply: next, memory: none }, [before])).toBeNull();
+    // « capture » against « message d'erreur ».
+    expect(smartRepeatedReply({ outcome: "ask", reply: "Bonjour,\n\nPouvez-vous m'envoyer une capture de l'écran qui s'affiche ?", memory: none },
+      ["Bonjour,\n\nPouvez-vous m'envoyer le message d'erreur exact qui s'affiche à l'écran ?"])).toBeNull();
+    // « email » against « entreprise ».
+    expect(smartRepeatedReply({ outcome: "ask", reply: "Bonjour,\n\nQuel est le nom de l'entreprise utilisée pour vous connecter ?", memory: none },
+      ["Bonjour,\n\nQuelle est l'adresse email utilisée pour vous connecter ?"])).toBeNull();
+    // A short courtesy reply resembles every other one.
+    expect(smartRepeatedReply({ outcome: "reply", reply: "Bonjour,\n\nAvec plaisir, belle journée à vous !", memory: none }, ["Bonjour,\n\nAvec plaisir, très belle journée à vous."])).toBeNull();
   });
 
   it("a reply that moves on, a follow-up check, a handoff or a first turn are accepted", () => {
@@ -199,5 +218,57 @@ describe("incident 26/11 par le fournisseur du circuit (fictif)", () => {
     expect(result.result).toMatchObject({ status: "ok", output: { nextAction: { kind: "ask" } } });
     expect(warn).toHaveBeenCalledWith("sav_smart_sent_replies_unavailable", { caseId: "case-1", code: "SAV_TEST_READ_FAILED" });
     warn.mockRestore();
+  });
+});
+
+describe("incident 26/11 du fournisseur au validateur, relance avant transfert allumée (fictif)", () => {
+  const card = { id: "fiche-charly", contentVersionId: "v2", title: CARD.title, source: "fixture", verifiedAt: "2026-11-20T00:00:00Z", semanticScore: null, content: CARD.content,
+    resolution: { steps: [], escalation: ESCALATION, exceptions: [] }, availability: { active: true, published: true, indexed: true, archived: false, aiEnabled: true, locale: "fr-FR", audience: "support" } } as SavRetrievalCandidate;
+  const ev = (seq: number, kind: CaseEvent["kind"], direction: CaseEvent["direction"], id: string, at: string): CaseEvent =>
+    ({ id: `e${seq}`, caseId: "case-1", kind, dedupeKey: `${kind}:${seq}`, caseVersion: seq, direction, occurredAt: at, sourceRef: { type: "email", id }, detail: null, createdAt: at });
+  const events = [ev(1, "inbound_confirmed", "customer_inbound", "m1", "2026-11-26T10:34:00Z"), ev(2, "outbound_observed", "agent_outbound", "a1", "2026-11-26T10:49:00Z"),
+    ev(3, "inbound_confirmed", "customer_inbound", "m2", "2026-11-26T10:50:00Z")];
+  const body = { ...emptyCaseBody(), openRequests: [{ id: "r1", summary: "Retrouver les agents créés avant Limova 3.", family: "other", status: "open", openedAt: "2026-11-26T10:34:00Z" }],
+    trials: [{ id: "t1", requestId: "r1", procedure: { knowledgeId: "fiche-charly", contentVersionId: "v2" }, askedAt: "2026-11-26T10:49:00Z", outcome: "pending", resultAt: null }],
+    questions: [{ id: "procedure:e1", text: "Suivi de la réponse envoyée.", factKeys: [], askedAt: "2026-11-26T10:49:00Z", askedInEffect: "e1" },
+      { id: "in:e2:q1", text: "Si vous cherchiez en particulier un agent de standard téléphonique ou un chatbot que vous aviez créé, indiquez-le-moi.", factKeys: [], askedAt: "2026-11-26T10:49:00Z", askedInEffect: "e1" }] } as unknown as CaseBody;
+  const snapshot = { contractRevision: SAV_CASE_CONTRACT_REVISION, caseId: "case-1", ticketId: "t-1", threadIds: ["th-1"], version: 3, owner: "agent", phase: "queued", sensitivity: "none",
+    createdAt: "2026-11-26T10:34:00Z", updatedAt: "2026-11-26T10:50:00Z", admissionInputVersion: 1, admission: { target: "agent", admission: "smart_support", qualification: { requests: [], identity: { status: "unknown" }, crmContext: "complete", teamSignals: [] } },
+    body } as unknown as CaseSnapshot;
+  const request = (): CaseInvestigationModelRequest => ({ purpose: "decision", caseId: "case-1", caseVersion: 3, inputKey: "in:m2", call: 1, subjectKey: "s", callKey: "s:call1",
+    caseBudgetKey: "sav-case:case-1", snapshot, events, knowledge: [card], coverage: null, feedback: [], closure: [],
+    customerContext: { latestMessage: { at: "2026-11-26T10:50:00Z", from: "customer", text: ANSWER, truncated: false, subject: "Re: Mes agents", instructionLikeText: false },
+      thread: [{ at: "2026-11-26T10:34:00Z", from: "customer", text: FIRST_MAIL, truncated: false }] } as unknown as CaseInvestigationModelRequest["customerContext"] });
+  const validate = (proposal: unknown) => {
+    const built = buildCaseDecisionContext({ snapshot, events, knowledge: [card], locale: "fr-FR", audience: "support", admission: { admitted: true },
+      customerTexts: { "email:m1": FIRST_MAIL, "email:m2": ANSWER } });
+    if (!built.ok) throw new Error(built.problem);
+    return { context: built.context, validation: validateCaseDecision(proposal, built.context, new Date("2026-11-26T10:56:00Z")) };
+  };
+  const signals = (validation: ReturnType<typeof validate>["validation"]) => validation.outcome === "accepted" ? validation.signals : [];
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("on: the repeated_reply hand-over reaches the team as a hand-over, never a re-ask of the answered question", async () => {
+    vi.stubEnv("SAV_V2_ASK_BEFORE_HANDOFF", "on");
+    vi.stubEnv("SAV_V2_SMART_NO_REPEAT", "on");
+    const brain = smartScriptedModel({ understand: { output: reading }, decide: { output: repetitiveAsk }, verify: { output: SMART_CONFORME }, correct: { output: repetitiveAsk }, reverify: { output: SMART_CONFORME } });
+    const out = await smartCaseDecisionProvider({ model: brain.model, env: () => ({ SAV_V2_ENTRY_SMART: "on", SAV_V2_SMART_NO_REPEAT: "on" }), now: () => new Date("2026-11-26T10:55:00Z"),
+      maxInputBytes: () => 200_000, sentReplies: async () => [{ at: "2026-11-26T10:49:00Z", text: TURN1 }] })(request());
+    if (out.result.status !== "ok") throw new Error(out.result.status);
+    expect(out.result.output).toMatchObject({ nextAction: { kind: "handoff", reason: "diagnosis_out_of_tools" } });
+    const { context, validation } = validate(out.result.output);
+    expect(context.smartNoRepeat).toBe(true);
+    expect(validation).toMatchObject({ outcome: "accepted", decision: { nextAction: { kind: "handoff" } } });
+    expect(signals(validation)).not.toContain("handoff_reask_composed");
+  });
+
+  it("smart switch off: the context keeps main's shape and the same hand-over is still turned into the re-ask, as before", () => {
+    vi.stubEnv("SAV_V2_ASK_BEFORE_HANDOFF", "on");
+    const proposal = { caseVersion: 3, understanding: { requests: [{ id: "r1", summary: "Retrouver les agents créés avant Limova 3.", family: "other", status: "open" }], newFacts: [] },
+      nextAction: { kind: "handoff", reason: "diagnosis_out_of_tools", requestIds: ["r1"], report: { need: "Retrouver les agents.", expected: null, observed: null, trialIds: [], hypotheses: [],
+        missingInformation: [], expectedIntervention: "Vérifier côté équipe.", knowledge: [] } } };
+    const { context, validation } = validate(proposal);
+    expect("smartNoRepeat" in context).toBe(false);
+    expect(signals(validation)).toContain("handoff_reask_composed");
   });
 });

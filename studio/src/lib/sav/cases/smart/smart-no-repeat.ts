@@ -20,9 +20,7 @@ import { SAV_SMART_CORRECTION_INSTRUCTION, smartCorrectionPrompt, smartDecidePro
  * The measure is textual and closed: it never reads what the customer wants, it only compares our draft with what we already sent.
  */
 
-type Env = Readonly<Record<string, string | undefined>>;
-export const SAV_SMART_NO_REPEAT_ENV = "SAV_V2_SMART_NO_REPEAT";
-export const smartNoRepeatOn = (env: Env) => env[SAV_SMART_NO_REPEAT_ENV] === "on";
+export { SAV_SMART_NO_REPEAT_ENV, smartNoRepeatOn } from "../smart-entry-switch";
 
 /** One reply already sent on the case: when it was confirmed (null when unknown) and its text as sent. */
 export type SmartSentReply = Readonly<{ at: string | null; text: string }>;
@@ -32,9 +30,13 @@ export type SmartNoRepeat = Readonly<{ sent: readonly SmartSentReply[] }>;
 export const SAV_SMART_NO_REPEAT_LIMITS = Object.freeze({ replies: 3, replyChars: 1_500, replyHeadChars: 400, answerChars: 600, passagesPerReply: 3, passageChars: 400, guidanceChars: 1_500 });
 /** Share of the draft's words already present in ONE reply sent before: at or above it, the draft is a copy of that reply. */
 export const SAV_SMART_REPEAT_REPLY_THRESHOLD = 0.8;
-/** Word overlap (Jaccard) between a question of the draft and one sentence already sent: at or above it, the same question asked again. */
-export const SAV_SMART_REPEAT_QUESTION_THRESHOLD = 0.55;
-const MIN_REPLY_WORDS = 8, MIN_SENTENCE_WORDS = 4, STEM = 6;
+/** Word overlap (Jaccard) between a question of the draft and one QUESTION already sent: at or above it, the same question asked again. */
+export const SAV_SMART_REPEAT_QUESTION_THRESHOLD = 0.7;
+/** A repeated question is refused only when the rest of the draft brings fewer new words than this (a new procedure, an answer...). */
+export const SAV_SMART_REPEAT_MIN_NEW_WORDS = 4;
+/** Below this many words, a draft is never compared as a whole (a short courtesy reply resembles every other one). */
+export const SAV_SMART_REPEAT_MIN_REPLY_WORDS = 16;
+const MIN_SENTENCE_WORDS = 4, STEM = 6;
 
 /** Words of more than 3 letters, case and accents folded, cut to their first 6 letters (« cherchez » and « cherchiez » are one word). */
 export function smartRepeatWords(value: string): Set<string> {
@@ -65,20 +67,26 @@ const headAndTail = (value: string) => {
 };
 
 /**
- * The guard: `repeated_reply` when the draft (a reply or an ask, never a handoff) copies a reply already sent, or asks again a question already
- * sent (one of its sentences, or `memory.question`, against each sentence of each sent reply). Null otherwise. `sentence`: the passage in cause.
+ * The guard: `repeated_reply` when the draft (a reply or an ask, never a handoff) copies a reply already sent (at least 16 words, 80 % of them in one
+ * sent reply), or asks again a question already sent (one of its questions, or `memory.question`, against each QUESTION of each sent reply) while
+ * the rest of the draft brings fewer than 4 new words. Null otherwise. `sentence`: the passage in cause.
  */
 export function smartRepeatedReply(decision: Pick<SmartDecision, "outcome" | "reply" | "memory">, sent: readonly string[]): Readonly<{ code: "repeated_reply"; sentence: string }> | null {
   const reply = decision.reply?.trim() ?? "";
   if (decision.outcome === "handoff" || !reply || !sent.length) return null;
   const draft = smartRepeatWords(reply);
-  if (draft.size >= MIN_REPLY_WORDS && sent.some(text => common(draft, smartRepeatWords(text)) / draft.size >= SAV_SMART_REPEAT_REPLY_THRESHOLD))
+  if (draft.size >= SAV_SMART_REPEAT_MIN_REPLY_WORDS && sent.some(text => common(draft, smartRepeatWords(text)) / draft.size >= SAV_SMART_REPEAT_REPLY_THRESHOLD))
     return { code: "repeated_reply", sentence: bounded(reply, 300) };
-  const questions = [decision.memory.question?.trim() ?? "", ...sentencesOf(reply).filter(sentence => sentence.endsWith("?"))]
-    .filter(question => smartRepeatWords(question).size >= MIN_SENTENCE_WORDS);
-  const before = sent.flatMap(sentencesOf).filter(sentence => smartRepeatWords(sentence).size >= MIN_SENTENCE_WORDS);
+  const ownQuestions = sentencesOf(reply).filter(sentence => sentence.endsWith("?"));
+  const questions = [decision.memory.question?.trim() ?? "", ...ownQuestions].filter(question => smartRepeatWords(question).size >= MIN_SENTENCE_WORDS);
+  const before = sent.flatMap(sentencesOf).filter(sentence => sentence.endsWith("?") && smartRepeatWords(sentence).size >= MIN_SENTENCE_WORDS);
   const asked = questions.find(question => before.some(sentence => smartRepeatSimilarity(question, sentence) >= SAV_SMART_REPEAT_QUESTION_THRESHOLD));
-  return asked ? { code: "repeated_reply", sentence: bounded(asked, 300) } : null;
+  if (!asked) return null;
+  // The rest of the draft (outside its questions) against everything already sent: a new procedure or answer around the question is progress.
+  const known = new Set(sent.flatMap(text => [...smartRepeatWords(text)]));
+  const rest = smartRepeatWords(sentencesOf(reply).filter(sentence => !sentence.endsWith("?")).join(" "));
+  const fresh = [...rest].filter(word => !known.has(word)).length;
+  return fresh < SAV_SMART_REPEAT_MIN_NEW_WORDS ? { code: "repeated_reply", sentence: bounded(asked, 300) } : null;
 }
 
 /** The server checks of a draft, plus `repeated_reply` (named with its passage, so the correction knows what to drop). */

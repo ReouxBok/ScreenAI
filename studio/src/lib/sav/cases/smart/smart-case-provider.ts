@@ -248,7 +248,9 @@ async function readSentReplies(read: SmartCaseProviderDeps["sentReplies"], caseI
   if (!read) return [];
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([read(caseId), new Promise<readonly SmartSentReply[]>(resolve => { timer = setTimeout(() => resolve([]), SAV_SMART_SENT_REPLIES_WAIT_MS); })]);
+    return await Promise.race([read(caseId), new Promise<readonly SmartSentReply[]>(resolve => { timer = setTimeout(() => {
+      console.warn("sav_smart_sent_replies_unavailable", { caseId, code: "timeout" }); resolve([]);
+    }, SAV_SMART_SENT_REPLIES_WAIT_MS); })]);
   } catch (error) {
     console.warn("sav_smart_sent_replies_unavailable", { caseId, code: error instanceof Error && /^[A-Z0-9_]{3,80}$/.test(error.message) ? error.message : "read_failed" });
     return [];

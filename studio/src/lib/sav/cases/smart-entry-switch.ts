@@ -20,6 +20,9 @@
 type Env = Readonly<Record<string, string | undefined>>;
 export const SAV_V2_ENTRY_SMART_ENV = "SAV_V2_ENTRY_SMART";
 export const savV2EntrySmartOn = (env: Env) => env[SAV_V2_ENTRY_SMART_ENV] === "on";
+/** 26/11 (`smart/smart-no-repeat.ts`): the brain never resends a reply nor re-asks an answered question. `SAV_V2_SMART_NO_REPEAT=on` is the ONLY value that turns it on. */
+export const SAV_SMART_NO_REPEAT_ENV = "SAV_V2_SMART_NO_REPEAT";
+export const smartNoRepeatOn = (env: Env) => env[SAV_SMART_NO_REPEAT_ENV] === "on";
 /** SAV-123 (N8): the smart block may be approved by the rule only with `SAV_V2_SMART_SUPPORT_MODE=auto` (exactly); read by the block switch and at the send fence. */
 export const SAV_V2_SMART_SUPPORT_MODE_ENV = "SAV_V2_SMART_SUPPORT_MODE";
 export const savV2SmartSupportAuto = (env: Env) => env[SAV_V2_SMART_SUPPORT_MODE_ENV] === "auto";

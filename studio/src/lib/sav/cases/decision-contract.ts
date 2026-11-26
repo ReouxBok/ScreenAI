@@ -146,6 +146,9 @@ export type CaseDecisionValidationContext = {
   facts: Array<{ id: string; key: string | null; kind: "observed" | "customer_statement"; source: CaseDecisionSourceRef; at: string }>;
   /** `text`: the wording we sent, carried only with `SAV_V2_ASK_BEFORE_HANDOFF` on (the single re-ask restates it verbatim); absent, main's shape. */
   questions: Array<{ id: string; factKeys: string[]; askedAt: string; answeredBy: CaseDecisionSourceRef | null; text?: string }>;
+  /** 26/11: set only with `SAV_V2_SMART_NO_REPEAT=on` on a case admitted by the smart entry (absent: main's shape). A question followed by a customer mail is then
+   * answered, and the server's re-ask before a hand-over never restates it (`ask-before-handoff.ts`). */
+  smartNoRepeat?: true;
   trials: Array<{ id: string; requestId: string; knowledge: CaseDecisionKnowledgeRef; askedAt: string; outcome: CaseTrial["outcome"]; resultAt: string | null }>;
   /** `order` null: known only by its date (body handoff), so it cannot be placed safely against a message. */
   handoffs: Array<{ at: string; order: number | null }>;

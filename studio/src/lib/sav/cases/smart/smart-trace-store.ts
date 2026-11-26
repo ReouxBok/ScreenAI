@@ -1,5 +1,5 @@
 import "server-only";
-import { and, asc, eq, isNotNull, like, lt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, like, lt, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savCaseEffectExecutions, savCases, savIntakeEffects, savSyncState } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../../crypto";
@@ -98,21 +98,21 @@ export async function readSmartCaseTraces(caseIds: readonly string[]): Promise<M
 }
 
 /** The confirmed reply mails of a case, with the text stored for the send (bounded). Read only. */
-async function readConfirmedReplies(caseId: string) {
+async function readConfirmedReplies(caseId: string, newest = false) {
   const rows = await requireDb().select({ executionId: savCaseEffectExecutions.id, payload: savCaseEffectExecutions.payloadCiphertext, confirmedAt: savIntakeEffects.confirmedAt })
     .from(savCaseEffectExecutions).innerJoin(savIntakeEffects, eq(savIntakeEffects.executionId, savCaseEffectExecutions.id))
     .where(and(eq(savCaseEffectExecutions.caseId, caseId), eq(savIntakeEffects.kind, "reply_send"), eq(savIntakeEffects.state, "confirmed"), isNotNull(savIntakeEffects.confirmedAt)))
-    .orderBy(asc(savIntakeEffects.confirmedAt)).limit(10);
-  return rows.map(row => {
+    .orderBy(newest ? desc(savIntakeEffects.confirmedAt) : asc(savIntakeEffects.confirmedAt)).limit(10);
+  return (newest ? rows.reverse() : rows).map(row => {
     let text: string | null = null;
     try { const value = decryptSavPayload<{ proposal?: { text?: unknown } }>(row.payload)?.proposal?.text; text = typeof value === "string" ? value.slice(0, 6000) : null; } catch { text = null; }
     return { executionId: row.executionId, confirmedAt: row.confirmedAt?.toISOString() ?? null, text };
   });
 }
 
-/** `SAV_V2_SMART_NO_REPEAT=on` only (`smart-no-repeat.ts`): the confirmed reply mails of a case as the brain reads them. Read only; throws on a failed read. */
+/** `SAV_V2_SMART_NO_REPEAT=on` only (`smart-no-repeat.ts`): the 10 most recent confirmed reply mails of a case, oldest first. Read only; throws on a failed read. */
 export async function readSmartSentReplies(caseId: string): Promise<Array<{ at: string | null; text: string }>> {
-  return (await readConfirmedReplies(caseId)).flatMap(row => row.text?.trim() ? [{ at: row.confirmedAt, text: row.text }] : []);
+  return (await readConfirmedReplies(caseId, true)).flatMap(row => row.text?.trim() ? [{ at: row.confirmedAt, text: row.text }] : []);
 }
 
 /**

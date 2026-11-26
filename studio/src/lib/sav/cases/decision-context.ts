@@ -1,7 +1,8 @@
 import { caseAskBeforeHandoffEnabled } from "./ask-before-handoff";
+import { smartNoRepeatOn } from "./smart-entry-switch";
 import type { SavRetrievalCandidate } from "../request-retrieval";
 import {
-  caseBodySchema, caseTeamPartRequests, currentCaseFacts, SAV_CASE_CONTRACT_REVISION, SAV_CASE_EVENT_KIND_DIRECTIONS,
+  caseBodySchema, caseTeamPartRequests, currentCaseFacts, SAV_CASE_CONTRACT_REVISION, SAV_CASE_EVENT_KIND_DIRECTIONS, SAV_SMART_ENTRY_ADMISSION,
   type CaseEvent, type CaseSnapshot, type SourceRef,
 } from "./case-types";
 import type { CaseAdmissionStatus } from "./admission-policy";
@@ -91,5 +92,6 @@ export function buildCaseDecisionContext(input: CaseDecisionContextInput): CaseD
     coverage: input.coverage ?? null,
     // SAV-92: only when part of the mail is the team's, so every other context keeps its exact shape.
     ...(teamParts.length ? { teamParts: teamParts.map(row => ({ id: row.id })) } : {}),
+    ...(smartNoRepeatOn(process.env) && snapshot.admission?.admission === SAV_SMART_ENTRY_ADMISSION ? { smartNoRepeat: true as const } : {}),
   } };
 }

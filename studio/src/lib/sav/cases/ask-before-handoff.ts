@@ -77,9 +77,13 @@ export function caseReaskBeforeHandoff(proposal: CaseDecisionProposal, context: 
   const raw = context.customerTexts[keyOf(latest.ref)];
   if (!raw || HUMAN_REQUEST.test(normalize(loginCustomerStatement(splitSavMessageText(raw))))) return null;
 
+  // 26/11 (`smartNoRepeat`: `SAV_V2_SMART_NO_REPEAT=on`, smart case): the brain's questions carry no fact key and it writes no newFacts, so a question the
+  // customer wrote back to is answered; the brain already judged that mail (`smart-no-repeat.ts`): nothing left open means no re-ask, not a screenshot one.
   const answered = (row: CaseDecisionValidationContext["questions"][number]) => row.answeredBy !== null
-    || (row.factKeys.length ? row.factKeys.some(key => facts.some(fact => fact.key === key && fact.at > at(row.askedAt))) : false);
+    || (row.factKeys.length ? row.factKeys.some(key => facts.some(fact => fact.key === key && fact.at > at(row.askedAt))) : false)
+    || (context.smartNoRepeat === true && inbound.some(mail => at(mail.at) > at(row.askedAt)));
   const stillOpen = asked.filter(({ row }) => !answered(row)).sort((a, b) => at(a.row.askedAt) - at(b.row.askedAt) || a.index - b.index).map(({ row }) => row);
+  if (context.smartNoRepeat && !stillOpen.length) return null;
   // The wording must be the one we sent: a question whose text the record does not carry cannot be restated verbatim.
   if (stillOpen.some(row => typeof row.text !== "string" || !row.text.trim())) return null;
   const screenshotAsked = context.questions.some(row => SCREEN_TEXT.test(normalize(row.text ?? "")) || row.factKeys.some(key => SCREEN_KEY.test(key)));
