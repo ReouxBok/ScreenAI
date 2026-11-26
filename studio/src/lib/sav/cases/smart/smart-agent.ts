@@ -12,6 +12,8 @@ import {
 import type { SmartCallResult, SmartModelPort } from "./smart-model";
 import { smartWireBytes } from "./smart-model";
 import { smartMask, smartSafetyNet } from "./smart-net";
+import { SAV_CASE_ATTACHMENTS_INSTRUCTION } from "../investigation-customer-attachments";
+import type { SmartTurnAttachments } from "./smart-attachments";
 import { SAV_SMART_RESOURCES, smartCorrectionPrompt, smartDecidePrompt, smartUnderstandPrompt, smartVerifyPrompt } from "./smart-prompt";
 import { createSmartToolRunner, smartSearchWithRetry, smartToolCatalogue, SAV_SMART_TOOL_LIMITS, SAV_SMART_TOOL_RESULTS_NOTE, type SmartToolOutcome } from "./smart-tools";
 import type { AcademyTool } from "./tools/academy";
@@ -66,9 +68,17 @@ export type SmartTurnPorts = Readonly<{
   recordOwn?: boolean;
   /** `smartMaxExchanges(env)`: 4 or 5. */
   maxExchanges?: number;
+  /**
+   * Smart images (`SAV_V2_SMART_ATTACHMENT_IMAGES=on`, `smart-attachments.ts`): the admitted files of the customer's mails and their view. Absent:
+   * every call is exactly the previous one. Present: `understand` and every `decide` pass carry the parts, the view (`customerContext`) and
+   * `SAV_CASE_ATTACHMENTS_INSTRUCTION`; verify, reverify and correct never do.
+   */
+  attachments?: SmartTurnAttachments;
 }>;
 export type SmartCallRecord = Readonly<{ kind: SmartCallKind; status: "ok" | "failed"; problem: string | null; inputBytes: number; uncertain: boolean; sent: boolean;
-  usage: Readonly<{ inputTokens: number; outputTokens: number }> | null }>;
+  usage: Readonly<{ inputTokens: number; outputTokens: number }> | null;
+  /** Smart images: how many files this call carried (absent when none). */
+  media?: number }>;
 /** One line per decide pass and per tool call: codes and numbers only (the text stays encrypted with the result). */
 export type SmartStepRecord = Readonly<{ pass: number; kind: "decide" | "tool"; action?: "tools" | "final" | "invalid"; tool?: string; status?: string; code?: string | null; argsHash?: string; bytes?: number }>;
 export type SmartTurnResult = Readonly<{
@@ -96,6 +106,8 @@ export type SmartTurnResult = Readonly<{
   /** v2: the case memory after this mail (to store by thread), and whether this mail brought something new. */
   memory: SmartCaseMemory;
   progressed: boolean;
+  /** Smart images (only when the turn was given files): the calls that carried them, and why a call had to go without them (closed codes). */
+  attachments?: Readonly<{ sentWith: readonly SmartCallKind[]; dropped: readonly string[] }>;
 }>;
 
 const THREAD_MAX = 3, THREAD_CHARS = 800;
@@ -154,6 +166,13 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   };
   const customerText = [customer.subject, customer.mail, ...customer.thread.map(row => row.text)].join("\n");
   const latestCustomerText = `${customer.subject}\n${customer.mail}`;
+  // Smart images: the files of this turn (absent: every call below is exactly the previous one) and why a call had to go without them.
+  const files = ports.attachments?.media.length ? ports.attachments : null;
+  const filesDropped: string[] = [];
+  const filesView = files ? { customerContext: files.context } : {};
+  /** The correction never carries the files: their view leaves its payload (no files: the same payload as before, same keys, same order). */
+  const textOnly = (payload: object): Record<string, unknown> => { const copy: Record<string, unknown> = { ...payload }; delete copy.customerContext; return copy; };
+  const withFilesInstruction = (system: string) => `${system}\n\n${SAV_CASE_ATTACHMENTS_INSTRUCTION}`;
 
   const end = (outcome: SmartTurnOutcome, reasons: readonly string[], extra: Readonly<{ sensitiveStop?: "net" | "understand"; replyWithFooter?: string | null; note?: SmartTeamNote | null; noteText?: string | null }> = {}): SmartTurnResult => {
     // The memory: merged on every ending that read the mail (a failure or an interruption leaves it unchanged: the mail will be replayed).
@@ -166,14 +185,16 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
       outcome, reasons: [...new Set(reasons)], sensitiveStop: extra.sensitiveStop ?? null, reading, decision, replyWithFooter: extra.replyWithFooter ?? null, checks, verdicts, corrected, calls,
       sources: sources.map(row => ({ cardId: row.cardId, version: row.version, needIds: row.needIds })), missing, steps,
       teamNote: note, teamNoteText: extra.noteText ?? (note ? renderSmartTeamNote(note) : null), memory: merged.memory, progressed: merged.progressed,
+      ...(files ? { attachments: { sentWith: [...new Set(calls.filter(row => row.media).map(row => row.kind))], dropped: [...filesDropped] } } : {}),
     };
   };
   const handoff = (reasons: readonly string[], reason: SmartTeamNote["raison"]) =>
     end("handoff", reasons, { note: smartFallbackNote({ reason, reading, memory: memoryBefore, modelNote: decision?.teamNote ?? null }) });
-  const call = async (kind: Exclude<SmartCallKind, "embed">, system: string, payload: unknown, temperature: number): Promise<SmartCallResult> => {
-    const result = await ports.model({ kind, system, payload, temperature });
+  const call = async (kind: Exclude<SmartCallKind, "embed">, system: string, payload: unknown, temperature: number, withFiles = false): Promise<SmartCallResult> => {
+    const media = withFiles && files ? files.media : null;
+    const result = await ports.model({ kind, system, payload, temperature, ...(media ? { media } : {}) });
     calls.push({ kind, status: result.status, problem: result.status === "failed" ? result.problem : null, inputBytes: result.inputBytes,
-      uncertain: result.status === "failed" && result.uncertain, sent: result.status === "ok" || result.sent, usage: result.usage });
+      uncertain: result.status === "failed" && result.uncertain, sent: result.status === "ok" || result.sent, usage: result.usage, ...(media ? { media: media.length } : {}) });
     return result;
   };
 
@@ -184,7 +205,12 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const hints: readonly string[] = net.hints;
 
   // 1. Understand.
-  const understood = await call("understand", smartUnderstandPrompt(), { customer }, 0);
+  // Smart images: the files go with the reading only when the view and the instruction keep the text body under the call's cap; else text only.
+  const understandFiles = Boolean(files) && smartWireBytes(withFilesInstruction(smartUnderstandPrompt()), { customer, ...filesView }) <= ports.maxInputBytes;
+  if (files && !understandFiles) filesDropped.push("understand:input_budget");
+  const understood = understandFiles
+    ? await call("understand", withFilesInstruction(smartUnderstandPrompt()), { customer, ...filesView }, 0, true)
+    : await call("understand", smartUnderstandPrompt(), { customer }, 0);
   if (understood.status === "failed") return understood.problem === "deadline" ? end("interrupted", ["understand:deadline"]) : end("failed", [`understand:${understood.problem}`]);
   const parsedReading = parseSmartOutput(smartReadingSchema, understood.output);
   if (!parsedReading.ok) return end("failed", ["understand:output_invalid"]);
@@ -230,7 +256,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   // v18: the questions already asked on this case, explicit for decide; the model chooses (no new refusal).
   const askedBefore = smartAskedBefore(memoryBefore);
   const results: Array<{ pass: number; outcomes: SmartToolOutcome[] }> = [];
-  let thread = [...customer.thread], cards = [...sources], compactOld = false;
+  let thread = [...customer.thread], cards = [...sources], compactOld = false, decideFiles = Boolean(files);
   const payloadOf = (pass: number) => {
     const allCards = mergeSources(cards, tools.cards());
     const toolResults = results.flatMap(round => compactOld && round.pass < pass - 1
@@ -238,7 +264,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
       : round.outcomes.map(row => row.result));
     const last = courtesy || pass >= SAV_SMART_MAX_DECIDE_PASSES || tools.used() >= SAV_SMART_TOOL_LIMITS.maxCallsPerMail;
     return {
-      customer: { ...customer, thread }, needs: reading!.needs, resources, memory: memoryView, ...(askedBefore.length ? { askedBefore } : {}),
+      customer: { ...customer, thread }, ...(decideFiles ? filesView : {}), needs: reading!.needs, resources, memory: memoryView, ...(askedBefore.length ? { askedBefore } : {}),
       exchange: gate.exchange, mustHandOff: gate.mustHandOff, noProgressLastTurn: gate.noProgressLastTurn,
       cards: allCards.map(cardView), needsWithoutCard: reading!.needs.filter(need => !allCards.some(card => card.needIds.includes(need.id))).map(need => need.id),
       tools: last ? [] : catalogue, lastStep: last, ...(courtesy ? { noNeed: true } : {}),
@@ -246,10 +272,13 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     };
   };
   // Byte cap, cut order: oldest thread messages, then earlier tool results reduced to one line, then the least relevant cards (last given).
-  const fits = (pass: number) => smartWireBytes(smartCorrectionPrompt(), { ...payloadOf(pass), previousDecision: null, problems: [] }) + 6_000 <= ports.maxInputBytes;
+  // Smart images: with files, the decide prompt carries the attachments instruction too, so it is measured with it; the files' view gives way
+  // after the thread and the earlier tool results, before any card (the files themselves are not in the text body).
+  const fits = (pass: number) => smartWireBytes(decideFiles ? withFilesInstruction(smartCorrectionPrompt()) : smartCorrectionPrompt(), { ...payloadOf(pass), previousDecision: null, problems: [] }) + 6_000 <= ports.maxInputBytes;
   const reduce = (pass: number) => {
     while (!fits(pass) && thread.length) { thread = thread.slice(1); reasons.push("cut:thread"); }
     if (!fits(pass) && results.length) { compactOld = true; reasons.push("cut:tool_results"); }
+    if (!fits(pass) && decideFiles) { decideFiles = false; filesDropped.push("decide:input_budget"); }
     while (!fits(pass) && cards.length) {
       // SAV_RETRIEVAL_CARD_SIZE_FIX on: the least relevant card's text is halved (with the marker) before the card is given up.
       const lastCard = cards[cards.length - 1]!;
@@ -267,7 +296,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   for (let pass = 1; pass <= SAV_SMART_MAX_DECIDE_PASSES && !decision; pass += 1) {
     if (!reduce(pass)) return handoff([...reasons, "decide:input_too_large"], "budget_epuise");
     lastPayload = payloadOf(pass);
-    const decided = await call("decide", smartDecidePrompt(), lastPayload, 0.3);
+    const decided = decideFiles ? await call("decide", withFilesInstruction(smartDecidePrompt()), lastPayload, 0.3, true) : await call("decide", smartDecidePrompt(), lastPayload, 0.3);
     let answer: unknown = decided.status === "ok" ? decided.output : undefined;
     if (decided.status === "failed") {
       if (decided.problem === "deadline") return end("interrupted", [...reasons, "decide:deadline"]);
@@ -358,7 +387,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const problems = [...first.codes.flatMap(code => named(code).length ? named(code).map(sentence => ({ code, sentence })) : [{ code, sentence: "" }]),
     ...(first.verdict?.problems ?? [])];
   corrected = true;
-  const fixed = await call("correct", smartCorrectionPrompt(), { ...lastPayload, tools: [], lastStep: true, previousDecision: decision, problems }, 0.3);
+  const fixed = await call("correct", smartCorrectionPrompt(), { ...textOnly(lastPayload), tools: [], lastStep: true, previousDecision: decision, problems }, 0.3);
   if (fixed.status === "failed") return fixed.problem === "deadline" ? end("interrupted", [...reasons, "correct:deadline"]) : handoff([...reasons, `correct:${fixed.problem}`, "refused_once"], "panne");
   const output = smartUnwrapOutput(fixed.output) as { decision?: unknown } | null;
   const parsedFix = parseSmartOutput(smartDecisionSchema, output && typeof output === "object" && "decision" in output ? output.decision : output);
@@ -378,7 +407,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     const narrowProblems = [...second.codes.flatMap(code => namedSecond(code).length ? namedSecond(code).map(sentence => ({ code, sentence })) : [{ code, sentence: "" }]),
       ...(second.verdict?.problems ?? [])];
     reasons.push("correction:narrowed");
-    const narrowed = await call("correct", smartCorrectionPrompt(), { ...lastPayload, tools: [], lastStep: true, previousDecision: decision, problems: narrowProblems, narrow: true }, 0.3);
+    const narrowed = await call("correct", smartCorrectionPrompt(), { ...textOnly(lastPayload), tools: [], lastStep: true, previousDecision: decision, problems: narrowProblems, narrow: true }, 0.3);
     if (narrowed.status === "failed") return narrowed.problem === "deadline" ? end("interrupted", [...reasons, "correct:deadline"]) : handoff([...reasons, `correct:${narrowed.problem}`, "refused_after_correction"], "panne");
     const narrowOutput = smartUnwrapOutput(narrowed.output) as { decision?: unknown } | null;
     const parsedNarrow = parseSmartOutput(smartDecisionSchema, narrowOutput && typeof narrowOutput === "object" && "decision" in narrowOutput ? narrowOutput.decision : narrowOutput);

@@ -25,7 +25,7 @@ import type { CaseEmbeddingTransport, CaseKnowledgeVectorSearch } from "./invest
 import type { CaseInvestigationModelRequest, CaseInvestigationPauseLevel } from "./investigation-runner";
 import type { CaseV2ModelTransport } from "./investigation-v2-spend";
 import { isSmartCaseRequest, smartCaseDecisionProvider } from "./smart/smart-case-provider";
-import { smartGeminiModel, smartInputCap } from "./smart/smart-model";
+import { smartAttachmentTokenRoom, smartGeminiModel, smartInputCap } from "./smart/smart-model";
 import { smartMaxExchanges } from "./smart/smart-memory";
 import type { SmartTurnPorts } from "./smart/smart-agent";
 import type { SmartCaseTraceSink } from "./smart/smart-trace";
@@ -337,6 +337,8 @@ export function caseSmartDecisionProvider(input: Readonly<{ env: () => Env; netw
   const now = input.now ?? (() => new Date());
   return smartCaseDecisionProvider({ env: input.env, now, maxInputBytes: () => smartInputCap(input.env(), now()), maxExchanges: smartMaxExchanges(input.env()), ...(input.academy ? { academy: input.academy } : {}),
     ...(input.trace ? { trace: input.trace } : {}),
+    // Smart images: read only for a context the reader granted (`SAV_V2_SMART_ATTACHMENT_IMAGES=on`, smart case).
+    attachmentFit: () => ({ model: input.env()[SAV_V2_MODEL_ENV] ?? "", mediaTokens: smartAttachmentTokenRoom(input.env(), now()) }),
     model: smartGeminiModel({ env: input.env, now, ...(input.network ? { network: input.network } : {}), ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}) }) });
 }
 

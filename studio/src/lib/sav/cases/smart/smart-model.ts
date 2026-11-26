@@ -3,6 +3,8 @@ import { prepareV2SkillCall, type AccessSkillDeps } from "../access-skill/access
 import { readAccessSkillWireResponse, SAV_ACCESS_SKILL_GEMINI_URL, type AccessSkillUsage, type AccessSkillWireResult } from "../access-skill/access-skill-wire";
 import { resolveCaseV2GeminiKey, SAV_V2_EMBEDDING_MODEL_ENV, SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
 import { readCaseV2SpendPolicy, readCaseV2TransportPolicy } from "../investigation-v2-spend";
+import { appendCaseAttachmentParts, type CaseCustomerAttachmentMedia } from "../investigation-customer-attachments";
+import { SAV_SMART_ATTACHMENT_CALLS } from "./smart-attachments";
 import type { SmartCallKind } from "./smart-contract";
 
 /*
@@ -22,7 +24,8 @@ export type SmartCallResult =
     /** v18: on `output_json_invalid`, the object a lenient repair could read (`smartLenientJson`), else absent. Still parsed by the schema and checked. */
     lenient?: unknown }>;
 /** One model call of a turn: the port a turn uses (shadow: ledger + deadline; bench: its wire; tests: a script). */
-export type SmartModelPort = (call: Readonly<{ kind: Exclude<SmartCallKind, "embed">; system: string; payload: unknown; temperature: number }>) => Promise<SmartCallResult>;
+/** `media` (smart images, `smart-attachments.ts`): admitted customer files appended after the text part; absent on every call when the flag is off. */
+export type SmartModelPort = (call: Readonly<{ kind: Exclude<SmartCallKind, "embed">; system: string; payload: unknown; temperature: number; media?: readonly CaseCustomerAttachmentMedia[] }>) => Promise<SmartCallResult>;
 export type SmartEmbedPort = (texts: readonly string[]) => Promise<Readonly<{ status: "ok"; vectors: number[][] }> | Readonly<{ status: "failed"; problem: string; sent: boolean }>>;
 
 /*
@@ -175,10 +178,13 @@ export function smartPrices(env: Env) {
 
 /** V2's transport for one call, no budget: refused before sending when the key, model, policy or byte cap says no. */
 export function smartGeminiModel(deps: AccessSkillDeps & Readonly<{ callTimeoutMs?: () => number }>): SmartModelPort {
-  return async ({ system, payload, temperature }) => {
+  return async ({ system, payload, temperature, media }) => {
     const env = deps.env(), cap = smartInputCap(env, deps.now());
     let inputBytes = 0;
-    const prepared = prepareV2SkillCall({ env: deps.env, now: deps.now, network: deps.network, timeoutMs: deps.callTimeoutMs?.() ?? deps.timeoutMs }, maxOutputTokens => {
+    // Smart images: the text body is measured and bounded exactly as before (cap and policy `maxInputBytes`); the admitted files are appended to
+    // the body on the wire only, after those checks, as V2's decision call does (`appendCaseAttachmentParts`). No media: the same network as before.
+    const network = media?.length ? smartNetworkWithMedia(deps.network, media) : deps.network;
+    const prepared = prepareV2SkillCall({ env: deps.env, now: deps.now, network, timeoutMs: deps.callTimeoutMs?.() ?? deps.timeoutMs }, maxOutputTokens => {
       const body = smartWireBody(system, payload, maxOutputTokens, temperature, env[SAV_V2_MODEL_ENV] ?? "");
       inputBytes = Buffer.byteLength(body, "utf8");
       return body;
@@ -191,6 +197,24 @@ export function smartGeminiModel(deps: AccessSkillDeps & Readonly<{ callTimeoutM
       : { status: "failed", problem: result.problem, uncertain: result.uncertain, usage: result.usage, inputBytes, sent: true,
         ...("lenient" in result && result.lenient !== undefined ? { lenient: result.lenient } : {}) };
   };
+}
+
+/** The network of one call that carries files: the same request, the files appended as `inlineData` parts after the text part. */
+function smartNetworkWithMedia(network: CaseV2Network | undefined, media: readonly CaseCustomerAttachmentMedia[]): CaseV2Network {
+  const send = network ?? ((url, init) => fetch(url, init));
+  return (url, init) => send(url, typeof init.body === "string" ? { ...init, body: appendCaseAttachmentParts(init.body, media) } : init);
+}
+
+/**
+ * Smart images: the token allowance of the files ONE call may carry. The policy leaves `maxInputTokens - maxInputBytes` tokens above the text bound
+ * of a call (≥ 16 384); the turn's single reservation is computed from `maxInputTokens`. That room is shared by every call of the turn that may carry
+ * the files (`SAV_SMART_ATTACHMENT_CALLS`), so all the image tokens of a turn fit inside it. 0 (nothing attached) when the policy cannot be read.
+ */
+export function smartAttachmentTokenRoom(env: Env, now: Date): number {
+  try {
+    const bounds = readCaseV2TransportPolicy(env, now);
+    return Math.max(0, Math.floor((bounds.maxInputTokens - bounds.maxInputBytes) / SAV_SMART_ATTACHMENT_CALLS));
+  } catch { return 0; }
 }
 
 const MODEL_ID = /^[a-z0-9][a-z0-9.-]{0,99}$/;

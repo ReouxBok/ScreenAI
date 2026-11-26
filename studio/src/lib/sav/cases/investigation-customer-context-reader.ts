@@ -14,6 +14,7 @@ import {
   caseAttachmentMediaMode, caseStoredAttachmentMetadata, readCaseCustomerAttachments,
   type CaseAttachmentDownload, type CaseStoredMail, type CaseStoredMailBody,
 } from "./investigation-customer-attachments-reader";
+import { grantSmartCaseAttachments, smartCaseWantsAttachments } from "./smart/smart-attachments";
 
 /*
  * SAV-92: the runner's `customerContext` port, READ ONLY, from what V1 already stored. No HubSpot, Gmail or model call:
@@ -104,8 +105,11 @@ export function caseCustomerContextReader(options: Readonly<{ env?: () => Readon
       const context = buildCaseCustomerContext({ latestMessageId: latest?.id ?? null, messages, crm, missing });
       // SAV-92 review P2-2 (Ugo 14/11): the whole attachments feature (file view, evidence, its instruction with the "screenshot or link" rule) rides on
       // SAV_V2_ATTACHMENT_MEDIA. Off (the default, any unknown value): the context and the prompt stay exactly the v4 ones.
-      const mode = caseAttachmentMediaMode(options.env?.() ?? {});
-      if (mode === "off") return context;
+      const env = options.env?.() ?? {}, mode = caseAttachmentMediaMode(env);
+      // Smart images (`SAV_V2_SMART_ATTACHMENT_IMAGES=on`, smart cases only): the same read, images at least, and the context granted to the brain.
+      const smart = smartCaseWantsAttachments(env, snapshot);
+      if (mode === "off" && !smart) return context;
+      const granted = (next: CaseCustomerContext, read: boolean) => smart ? grantSmartCaseAttachments(next, read) : next;
       // SAV-92 (15/11): the files of the latest customer mail and the previous one. A failure here keeps the context without them.
       try {
         const inboundRows = rows.filter(row => row.direction === "inbound" && (!latest || row.at.getTime() <= latest.at.getTime()));
@@ -118,11 +122,11 @@ export function caseCustomerContextReader(options: Readonly<{ env?: () => Readon
         });
         const earlier = ordered.slice(2).some(id => caseStoredAttachmentMetadata(bodies.get(id)).some(item => /^image\//i.test(item.mimeType)))
           || snapshot.body.facts.some(fact => fact.source.type === "attachment");
-        const built = await readCaseCustomerAttachments(mails, { mode,
+        const built = await readCaseCustomerAttachments(mails, { mode: mode === "off" ? "images" : mode,
           owner: mail => attachmentOwner(mail as CaseStoredMail & { threadId: string }), ...(options.download ? { download: options.download } : {}) });
-        return withCaseCustomerAttachments(context, built, earlier);
+        return granted(withCaseCustomerAttachments(context, built, earlier), true);
       } catch {
-        return withCaseCustomerAttachments(context, null);
+        return granted(withCaseCustomerAttachments(context, null), false);
       }
     } catch {
       return caseCustomerContextUnavailable();
