@@ -7,6 +7,7 @@ const state = vi.hoisted(() => ({ db: null as unknown, embed: vi.fn() }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
 vi.mock("@/lib/embeddings", () => ({ embedTexts: state.embed }));
 import { searchSavKnowledgeByRequest, createSavKnowledgeVectorIndex } from "./request-retrieval-db";
+import { runWithSavRetrievalCardSizeFix } from "./request-retrieval";
 const now = new Date("2026-10-15T12:00:00Z");
 let f: Awaited<ReturnType<typeof createSavTestDb>>;
 async function seed(slug: string, options: { active?: boolean; published?: boolean; locale?: string; audience?: string; verifiedAt?: Date; validUntil?: string; aiEnabled?: boolean; content?: string } = {}) {
@@ -144,6 +145,17 @@ describe("SAV72 production query against an isolated database", () => {
       const [exact] = await createSavKnowledgeVectorIndex({ now, compact: true }).readExact([{ knowledgeId: item.id, contentVersionId: version.id }]);
       expect(exact).toMatchObject({ sourceTooLarge: false }); expect(exact.resolution).not.toBeNull();
     } finally { vi.unstubAllEnvs(); }
+  });
+  it("SAV_RETRIEVAL_CARD_SIZE_FIX scoped override (shadow replay): the DB read follows it inside its run only; a concurrent search outside stays legacy", async () => {
+    const body = Array.from({ length: 37 }, (_, i) => `Étape fictive ${i} : ouvrir le panneau synthétique Exemple et vérifier le réglage numéro ${i}. `.repeat(6)).join("\n\n");
+    const { item, version } = await seed("fiche détaillée surcharge", { content: body });
+    expect(Buffer.byteLength(body)).toBeGreaterThan(20_000);
+    const search = () => searchSavKnowledgeByRequest({ requests: [{ id: "a", summary: "Fiche détaillée surcharge" }], now });
+    const [inside, outside] = await Promise.all([runWithSavRetrievalCardSizeFix(true, search), search()]);
+    expect(inside.sources.map(source => source.key)).toEqual([`${item.id}:${version.id}`]);
+    expect(Buffer.byteLength(inside.sources[0].content)).toBeGreaterThan(12_000);
+    expect(outside.sources).toEqual([]);
+    expect((await search()).sources).toEqual([]);
   });
 
 });
