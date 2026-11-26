@@ -672,7 +672,9 @@ describe("SAV-6 purity", () => {
     expect(imports("decision-contract.ts")).toEqual(["../playbook-contract", "../request-retrieval", "./admission-policy", "./case-types", "./investigation-access-scope", "zod"]);
     // Pilot ACCÈS scope (3/11): a pure datum check, nothing behind it but the schema library.
     expect(imports("investigation-access-scope.ts")).toEqual(["zod"]);
-    expect(imports("decision-context.ts")).toEqual(["../request-retrieval", "./admission-policy", "./ask-before-handoff", "./case-types", "./decision-contract"]);
+    // 26/11 `SAV_V2_SMART_NO_REPEAT`: a pure env read, nothing behind it but the case types.
+    expect(imports("decision-context.ts")).toEqual(["../request-retrieval", "./admission-policy", "./ask-before-handoff", "./case-types", "./decision-contract", "./smart-entry-switch"]);
+    expect(imports("smart-entry-switch.ts")).toEqual(["./case-types"]);
     // Pole A's admission rule is pure: no store, database or clock behind it.
     expect(imports("admission-policy.ts")).toEqual(["./case-types"]);
   });

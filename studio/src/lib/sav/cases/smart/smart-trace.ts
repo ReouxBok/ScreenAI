@@ -22,6 +22,8 @@ const cutKeep = (value: string | null | undefined, max: number) => (value ?? "")
 export type SmartTraceCard = Readonly<{ rank: number; id: string; version: string; title: string }>;
 export type SmartTraceSearch = Readonly<{
   kind: "initial" | "tool"; status: string; codes: readonly string[];
+  /** Live search (26/11, switch on): the words the model searched with (`chercher_fiches`), cut. Absent otherwise. */
+  query?: string;
   /** Per need: the cards the search returned for it, in rank order (1 = first). */
   found: readonly Readonly<{ needId: string; cards: readonly SmartTraceCard[] }>[];
 }>;
@@ -56,12 +58,13 @@ export type SmartCaseTraceSink = (trace: SmartCaseTrace) => Promise<void> | void
  * Wraps the knowledge port so each search is recorded (the first one is the initial search, the next ones are `chercher_fiches`). The port's
  * result is returned as is; the recording itself can never throw into the turn.
  */
-export function traceSmartKnowledge(port: SmartKnowledgePort, sink: SmartTraceSearch[]): SmartKnowledgePort {
+export function traceSmartKnowledge(port: SmartKnowledgePort, sink: SmartTraceSearch[], options: Readonly<{ query?: boolean }> = {}): SmartKnowledgePort {
   return async needs => {
     const result = await port(needs);
     try {
       if (sink.length < 6) sink.push({
         kind: sink.length === 0 ? "initial" : "tool", status: result.status, codes: result.codes.slice(0, 12).map(code => cut(code, 60)),
+        ...(options.query && sink.length > 0 && needs[0] ? { query: cut(needs[0].search ?? needs[0].ask, 300) } : {}),
         found: needs.slice(0, 9).map(need => ({ needId: need.id, cards: result.sources.filter(source => source.needIds.includes(need.id)).slice(0, SAV_SMART_TRACE_TOP)
           .map((source, index) => ({ rank: index + 1, id: cut(source.cardId, 80), version: cut(source.version, 80), title: cut(source.title, 160) })) })),
       });

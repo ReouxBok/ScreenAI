@@ -2,7 +2,7 @@ import { savReplyFooter } from "../../reply-format";
 import { savRetrievalCardSizeFixOn, SAV_RETRIEVAL_TRUNCATION_MARKER, truncateSavRetrievalText } from "../../request-retrieval";
 import { smartRelevanceView, smartRepairFactSources, smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
 import {
-  parseSmartOutput, SAV_SMART_VERIFY_CODES, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartCommercialVerdictSchema, smartUnwrapOutput, smartVerdictSchema,
+  parseSmartOutput, SAV_SMART_VERIFY_CODES, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchemaFor,
   type SmartCallKind, type SmartCheckCode, type SmartDecision, type SmartNeed, type SmartReading, type SmartTeamNote, type SmartTurnOutcome, type SmartVerdict,
 } from "./smart-contract";
 import { renderSmartTeamNote, smartCommercialNote, smartFallbackNote, smartSensitiveNote } from "./smart-handoff-note";
@@ -14,7 +14,8 @@ import { smartWireBytes } from "./smart-model";
 import { smartMask, smartSafetyNet } from "./smart-net";
 import { SAV_CASE_ATTACHMENTS_INSTRUCTION } from "../investigation-customer-attachments";
 import { SAV_SMART_FILES_FACTS_NOTE, SAV_SMART_FILES_VERIFY_NOTE, smartFilesFit, smartFilesTokens, type SmartTurnAttachments } from "./smart-attachments";
-import { SAV_SMART_RESOURCES, smartCorrectionPrompt, smartDecidePrompt, smartUnderstandPrompt, smartVerifyPrompt } from "./smart-prompt";
+import { smartNoRepeatContext, smartTurnPrompts, smartWithRepeatCheck, type SmartNoRepeat } from "./smart-no-repeat";
+import { SAV_SMART_RESOURCES } from "./smart-prompt";
 import { createSmartToolRunner, smartSearchWithRetry, smartToolCatalogue, SAV_SMART_TOOL_LIMITS, SAV_SMART_TOOL_RESULTS_NOTE, type SmartToolOutcome } from "./smart-tools";
 import type { AcademyTool } from "./tools/academy";
 
@@ -84,6 +85,8 @@ export type SmartTurnPorts = Readonly<{
    * ones carries `commercialForward` (their asks), for the V2 circuit to forward to sales while the reply goes out. Absent or false: no such field, ever.
    */
   commercialForward?: boolean;
+  /** `SAV_V2_SMART_NO_REPEAT=on` only (`smart-no-repeat.ts`): the replies already sent on the case. Absent: the turn is exactly the previous one. */
+  noRepeat?: SmartNoRepeat;
 }>;
 export type SmartCallRecord = Readonly<{ kind: SmartCallKind; status: "ok" | "failed"; problem: string | null; inputBytes: number; uncertain: boolean; sent: boolean;
   usage: Readonly<{ inputTokens: number; outputTokens: number }> | null;
@@ -214,6 +217,9 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   // 25/11 (`SAV_V2_SMART_COMMERCIAL_SPLIT`): off, `promptSet` is empty (today's prompts) and `commercialAsks` stays empty.
   const promptSet = ports.commercialSplit === true ? { commercialSplit: true } : {};
   let commercialAsks: string[] = [], commercialIds = new Set<string>();
+  // `SAV_V2_SMART_NO_REPEAT` (26/11): off, `noRepeat` is null and `prompts` are exactly the prompt set's (`smartTurnPrompts(false, promptSet)`).
+  const noRepeat = ports.noRepeat ? smartNoRepeatContext(ports.noRepeat, input.thread, input.body) : null, prompts = smartTurnPrompts(Boolean(noRepeat), promptSet);
+  const alreadySent = noRepeat ? { alreadySent: noRepeat.view } : {};
 
   const end = (outcome: SmartTurnOutcome, reasons: readonly string[], extra: Readonly<{ sensitiveStop?: "net" | "understand"; replyWithFooter?: string | null; note?: SmartTeamNote | null; noteText?: string | null }> = {}): SmartTurnResult => {
     // The memory: merged on every ending that read the mail (a failure or an interruption leaves it unchanged: the mail will be replayed).
@@ -256,11 +262,11 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   // Smart images: the files go with the reading only when the turn's reservation covers it and the view and the instruction keep the text body
   // under the call's cap; else text only, with the reason.
   const understandBudget = filesFitBudget();
-  const understandFiles = understandBudget && smartWireBytes(withFilesInstruction(smartUnderstandPrompt(promptSet)), { customer, ...filesView }) <= ports.maxInputBytes;
+  const understandFiles = understandBudget && smartWireBytes(withFilesInstruction(prompts.understand), { customer, ...filesView, ...alreadySent }) <= ports.maxInputBytes;
   if (files && !understandFiles) filesDropped.push(understandBudget ? "understand:input_budget" : "understand:turn_budget");
   const understood = understandFiles
-    ? await call("understand", withFilesInstruction(smartUnderstandPrompt(promptSet)), { customer, ...filesView }, 0, true)
-    : await call("understand", smartUnderstandPrompt(promptSet), { customer }, 0);
+    ? await call("understand", withFilesInstruction(prompts.understand), { customer, ...filesView, ...alreadySent }, 0, true)
+    : await call("understand", prompts.understand, { customer, ...alreadySent }, 0);
   if (understood.status === "failed") return understood.problem === "deadline" ? end("interrupted", ["understand:deadline"]) : end("failed", [`understand:${understood.problem}`]);
   const parsedReading = parseSmartOutput(smartReadingSchema, understood.output);
   if (!parsedReading.ok) return end("failed", ["understand:output_invalid"]);
@@ -302,6 +308,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   if (found.status !== "ok") reasons.push("knowledge:unavailable");
   if (courtesy) reasons.push("understand:no_need");
   if (commercialIds.size) reasons.push("understand:commercial");
+  if (noRepeat) reasons.push("no_repeat:on");
 
   // 3. The bounded decide loop.
   const rawGate = smartProgressGate(memoryBefore, ports.maxExchanges ?? SAV_SMART_DEFAULT_MAX_EXCHANGES);
@@ -323,6 +330,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     const last = courtesy || pass >= SAV_SMART_MAX_DECIDE_PASSES || tools.used() >= SAV_SMART_TOOL_LIMITS.maxCallsPerMail;
     return {
       customer: { ...customer, thread }, ...(decideFiles ? filesView : {}), needs: reading!.needs, resources, memory: memoryView, ...(askedBefore.length ? { askedBefore } : {}),
+      ...(noRepeat ? { alreadySent: noRepeat.viewWithCards(allCards) } : {}),
       exchange: gate.exchange, mustHandOff: gate.mustHandOff, noProgressLastTurn: gate.noProgressLastTurn,
       cards: allCards.map(cardView), needsWithoutCard: reading!.needs.filter(need => !allCards.some(card => card.needIds.includes(need.id))).map(need => need.id),
       tools: last ? [] : catalogue, lastStep: last, ...(courtesy ? { noNeed: true } : {}),
@@ -332,7 +340,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   // Byte cap, cut order: oldest thread messages, then earlier tool results reduced to one line, then the least relevant cards (last given).
   // Smart images: with files, the decide prompt carries the attachments instruction too, so it is measured with it; the files' view gives way
   // after the thread and the earlier tool results, before any card (the files themselves are not in the text body).
-  const fits = (pass: number) => smartWireBytes(decideFiles ? `${withFilesInstruction(smartCorrectionPrompt(promptSet))}\n\n${SAV_SMART_FILES_FACTS_NOTE}` : smartCorrectionPrompt(promptSet), { ...payloadOf(pass), previousDecision: null, problems: [] }) + 6_000 <= ports.maxInputBytes;
+  const fits = (pass: number) => smartWireBytes(decideFiles ? `${withFilesInstruction(prompts.correct)}\n\n${SAV_SMART_FILES_FACTS_NOTE}` : prompts.correct, { ...payloadOf(pass), previousDecision: null, problems: [] }) + 6_000 <= ports.maxInputBytes;
   const reduce = (pass: number) => {
     while (!fits(pass) && thread.length) { thread = thread.slice(1); reasons.push("cut:thread"); }
     if (!fits(pass) && results.length) { compactOld = true; reasons.push("cut:tool_results"); }
@@ -356,8 +364,8 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     if (decideFiles && (pass > 1 || !filesFitBudget())) { if (pass === 1) filesDropped.push("decide:turn_budget"); decideFiles = false; }
     if (!reduce(pass)) return handoff([...reasons, "decide:input_too_large"], "budget_epuise");
     lastPayload = payloadOf(pass);
-    const decided = decideFiles ? await call("decide", `${withFilesInstruction(smartDecidePrompt(promptSet))}\n\n${SAV_SMART_FILES_FACTS_NOTE}`, lastPayload, 0.3, true)
-      : await call("decide", smartDecidePrompt(promptSet), lastPayload, 0.3);
+    const decided = decideFiles ? await call("decide", `${withFilesInstruction(prompts.decide)}\n\n${SAV_SMART_FILES_FACTS_NOTE}`, lastPayload, 0.3, true)
+      : await call("decide", prompts.decide, lastPayload, 0.3);
     let answer: unknown = decided.status === "ok" ? decided.output : undefined;
     if (decided.status === "failed") {
       if (decided.problem === "deadline") return end("interrupted", [...reasons, "decide:deadline"]);
@@ -415,19 +423,20 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
 
   // 4. Verify: server and the independent counter-read (never on a handoff without customer text).
   const review = async (current: SmartDecision, kind: "verify" | "reverify"): Promise<{ codes: SmartCheckCode[]; factProblems: SmartCheckResult["factProblems"]; verdict: SmartVerdict | null; failed: string | null; unknownCodes: boolean }> => {
-    const server = smartServerChecks({ decision: current, reading: reading!, customerText, sources, academy, memory: memoryBefore, ...(filesSent() ? { files: files!.files } : {}),
+    const checked = smartServerChecks({ decision: current, reading: reading!, customerText, sources, academy, memory: memoryBefore, ...(filesSent() ? { files: files!.files } : {}),
       ...(commercialIds.size ? { commercial: reading!.needs.filter(need => commercialIds.has(need.id)).map(need => ({ id: need.id, ask: need.ask })) } : {}) });
+    const server = noRepeat ? smartWithRepeatCheck(checked, current, noRepeat.sentTexts) : checked;
     if (current.outcome === "handoff" && !current.reply?.trim()) return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: null, unknownCodes: false };
-    const read = await call(kind, filesNoted(smartVerifyPrompt(promptSet), SAV_SMART_FILES_VERIFY_NOTE), {
+    const read = await call(kind, filesNoted(prompts.verify, SAV_SMART_FILES_VERIFY_NOTE), {
       customer: { subject: customer.subject, mail: customer.mail }, ...filesSummary(),
       needs: reading!.needs.map(need => ({ id: need.id, ask: need.ask, alreadyDone: need.alreadyDone, ...(commercialIds.has(need.id) ? { commercial: true } : {}) })),
       // Each fact with its source and excerpt; its sentence is only a hint (SAV-122): the counter-read judges every claim against the excerpts.
       reply: current.reply, facts: current.facts.map(fact => ({ type: fact.type, source: fact.cardId ?? fact.toolCallId ?? fact.sourceKind, excerpt: fact.excerpt,
         ...(fact.sentence.trim() ? { sentence: fact.sentence } : {}) })),
-      ...(reading!.instructionText ? { injectedInstruction: reading!.instructionText } : {}),
+      ...(reading!.instructionText ? { injectedInstruction: reading!.instructionText } : {}), ...(noRepeat ? { alreadySent: noRepeat.view } : {}),
     }, 0);
     if (read.status === "failed") return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: read.problem === "deadline" ? "deadline" : `${kind}:${read.problem}`, unknownCodes: false };
-    const verdict = parseSmartOutput(promptSet.commercialSplit ? smartCommercialVerdictSchema : smartVerdictSchema, read.output);
+    const verdict = parseSmartOutput(smartVerdictSchemaFor({ ...promptSet, noRepeat: Boolean(noRepeat) }), read.output);
     return { codes: [...server.codes], factProblems: server.factProblems, verdict: verdict.ok ? verdict.value : null, failed: verdict.ok ? null : `${kind}:output_invalid`,
       unknownCodes: smartUnknownVerifyCodes(read.output) };
   };
@@ -452,7 +461,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const problems = [...first.codes.flatMap(code => named(code).length ? named(code).map(sentence => ({ code, sentence })) : [{ code, sentence: "" }]),
     ...(first.verdict?.problems ?? [])];
   corrected = true;
-  const fixed = await call("correct", filesNoted(smartCorrectionPrompt(promptSet), SAV_SMART_FILES_FACTS_NOTE), { ...textOnly(lastPayload), ...filesSummary(), tools: [], lastStep: true, previousDecision: decision, problems }, 0.3);
+  const fixed = await call("correct", filesNoted(prompts.correct, SAV_SMART_FILES_FACTS_NOTE), { ...textOnly(lastPayload), ...filesSummary(), tools: [], lastStep: true, previousDecision: decision, problems }, 0.3);
   if (fixed.status === "failed") return fixed.problem === "deadline" ? end("interrupted", [...reasons, "correct:deadline"]) : handoff([...reasons, `correct:${fixed.problem}`, "refused_once"], "panne");
   const output = smartUnwrapOutput(fixed.output) as { decision?: unknown } | null;
   const parsedFix = parseSmartOutput(smartDecisionSchema, output && typeof output === "object" && "decision" in output ? output.decision : output);
@@ -472,7 +481,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     const narrowProblems = [...second.codes.flatMap(code => namedSecond(code).length ? namedSecond(code).map(sentence => ({ code, sentence })) : [{ code, sentence: "" }]),
       ...(second.verdict?.problems ?? [])];
     reasons.push("correction:narrowed");
-    const narrowed = await call("correct", filesNoted(smartCorrectionPrompt(promptSet), SAV_SMART_FILES_FACTS_NOTE), { ...textOnly(lastPayload), ...filesSummary(), tools: [], lastStep: true, previousDecision: decision, problems: narrowProblems, narrow: true }, 0.3);
+    const narrowed = await call("correct", filesNoted(prompts.correct, SAV_SMART_FILES_FACTS_NOTE), { ...textOnly(lastPayload), ...filesSummary(), tools: [], lastStep: true, previousDecision: decision, problems: narrowProblems, narrow: true }, 0.3);
     if (narrowed.status === "failed") return narrowed.problem === "deadline" ? end("interrupted", [...reasons, "correct:deadline"]) : handoff([...reasons, `correct:${narrowed.problem}`, "refused_after_correction"], "panne");
     const narrowOutput = smartUnwrapOutput(narrowed.output) as { decision?: unknown } | null;
     const parsedNarrow = parseSmartOutput(smartDecisionSchema, narrowOutput && typeof narrowOutput === "object" && "decision" in narrowOutput ? narrowOutput.decision : narrowOutput);

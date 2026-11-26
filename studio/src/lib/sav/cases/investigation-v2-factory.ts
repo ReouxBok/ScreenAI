@@ -1,7 +1,10 @@
 import "server-only";
 import { readConfirmedV1Context } from "./admission-context-reader";
 import { savV2EntrySmartOn } from "./smart-entry-switch";
-import { smartCaseTraceStore } from "./smart/smart-trace-store";
+import { readSmartSentReplies, smartCaseTraceStore } from "./smart/smart-trace-store";
+import { smartCaseLiveSearch } from "./investigation-smart-live-search";
+import { createSmartLiveFoundRegistry, savV2SmartLiveSearchOn } from "./smart/smart-live-search";
+import { readCase } from "./case-store";
 import { caseInvestigationQualify, type CaseApprovedRulePort } from "./admission-investigation-ports";
 import { caseTicketOwnerPortFromTransport } from "./admission-owner-reader";
 import type { AdmissionPolicyRecord, V1AdmissionAdapterPolicy } from "./admission-runtime";
@@ -99,17 +102,28 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
   const spendDeps = { env: input.env, now }, model = caseV2ModelSpend(spendDeps);
   const provenance = caseProvenanceReaders({ readPolicyRecord, env: input.env, now, locale: scope.locale, audience: scope.audience });
   const vectors = caseKnowledgeVectorSearch({ ...scope, now, env: input.env });
+  const embeddingSpend = caseV2EmbeddingSpend(spendDeps), embed = caseGeminiEmbeddingTransport({ env: input.env, ...(input.network ? { network: input.network } : {}) });
   const readTicketOwner = input.readTicketOwner
     ?? (snapshot => caseTicketOwnerPortFromTransport({ transport: caseHubspotOwnerReadTransport({ env: input.env, ...(input.network ? { network: input.network } : {}) }), env: input.env() })(snapshot));
+  const pauseState = casePauseState(caseV2PauseState(), input.env, now, input.caseAllowed), holder = input.holder ?? "sav-v2-investigation", leaseSeconds = input.leaseSeconds ?? 90;
+  /*
+   * Live search (`SAV_V2_SMART_LIVE_SEARCH=on`, read at each call and each run): `chercher_fiches` on the circuit's own budgeted search (the same index, embedding
+   * transport, V2 embedding budget and call ledger as the first search; pause, owner and case version read before each embedding). Only the case version
+   * of `readCase` is read by that fence. The cards found go from the provider to the runner of the same run by call key.
+   */
+  const liveFound = createSmartLiveFoundRegistry();
+  const liveSearch = smartCaseLiveSearch({ holder, leaseSeconds, vectors, embed, spend: embeddingSpend, ledger: caseCallLedgerOnStore, pauseState, readTicketOwner, scope, now,
+    readCase: async caseId => { const snapshot = await readCase(caseId); return snapshot ? { snapshot, events: [] } : null; } });
   const v1Qualify = caseInvestigationQualify({ readConfirmedContext: readConfirmedV1Context, adapterPolicy: input.adapterPolicy ?? (async () => null), readPolicyRecord, now,
     ...(input.approvedRules ? { approvedRules: input.approvedRules } : {}) });
   const deps: CaseInvestigationRuntimeDeps = {
     temporaryIncidents: provenance.readTemporaryIncidents,
     ...(temporaryKnowledgeEnabled(env) ? { temporaryKnowledge: runtimeTemporaryKnowledgeLookup(input.env) } : {}),
-    mode: "observe", holder: input.holder ?? "sav-v2-investigation", scope, now, leaseSeconds: input.leaseSeconds ?? 90,
-    pauseState: casePauseState(caseV2PauseState(), input.env, now, input.caseAllowed), readTicketOwner, accessScope: provenance.accessScope, admissionPolicyRevision: provenance.currentPolicyRevision,
+    mode: "observe", holder, scope, now, leaseSeconds,
+    pauseState, readTicketOwner, accessScope: provenance.accessScope, admissionPolicyRevision: provenance.currentPolicyRevision,
     // SAV-123 (N8): a smart case is decided without a pilot scope while the smart entry is on (read at each run).
     smartSupport: () => savV2EntrySmartOn(input.env()),
+    smartLiveSearch: { on: () => savV2SmartLiveSearchOn(input.env()), take: liveFound.take },
     // SAV-97: `SAV_V2_ACCESS_SKILL=on` requalifies a return with the Access skill, `shadow` compares it in the logs; `off`: exactly the legacy rule, or none.
     qualify: caseInvestigationReturnAwareQualify(v1Qualify, { readPolicyRecord, now, smartSupport: () => savV2EntrySmartOn(input.env()), ...((rules => rules ? { returnRules: rules } : {})(
       caseReturnRulesForAccessSkill(input.env, now, input.returnRule ? caseReturnContentRule(input.returnRule, now) : undefined))) }),
@@ -120,10 +134,12 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
     revisions: async () => ({ rules: SAV_CASE_DECISION_CONTRACT_REVISION, playbookId: await vectors.readRevision(), model: input.env()[SAV_V2_MODEL_ENV] ?? "",
       prompt: caseInvestigationPromptRevision(caseAttachmentMediaMode(input.env()) !== "off", input.env()) }),
     ledger: caseCallLedgerOnStore,
-    knowledge: { vectors, embed: caseGeminiEmbeddingTransport({ env: input.env, ...(input.network ? { network: input.network } : {}) }), spend: caseV2EmbeddingSpend(spendDeps) },
+    knowledge: { vectors, embed, spend: embeddingSpend },
     model: { preflight: caseGeminiDecisionPreflight(input.env), money: model.money, releaseMoney: model.release, provider: model.provider(caseGeminiDecisionProvider({ env: input.env, ...(input.network ? { network: input.network } : {}),
       // Recording only: the trace of each real smart turn, encrypted with the case (`smart-trace-store.ts`); never changes a decision.
-      trace: smartCaseTraceStore({ env: input.env, now }) })) },
+      trace: smartCaseTraceStore({ env: input.env, now }), liveSearch, liveFound: liveFound.put,
+      // `SAV_V2_SMART_NO_REPEAT=on` only (read only, never called when off): the case's confirmed reply mails, so the brain never sends one again.
+      sentReplies: readSmartSentReplies })) },
   };
   return { ok: true, deps, provenance };
 }
