@@ -13,6 +13,7 @@ import { savV2SmartLiveSearchOn, smartLiveKnowledge, type SmartLiveSearch } from
 import { smartEmptyMemory, type SmartCaseMemory } from "./smart-memory";
 import type { SmartModelPort } from "./smart-model";
 import { smartCommercialForwardOn, smartCommercialSet } from "./smart-switch";
+import { smartNoRepeatOn, smartWithCardGuidance, type SmartNoRepeat, type SmartSentReply } from "./smart-no-repeat";
 import { buildSmartCaseTrace, traceSmartKnowledge, type SmartCaseTraceSink, type SmartTraceSearch } from "./smart-trace";
 
 /*
@@ -43,23 +44,27 @@ const openRequests = (snapshot: CaseSnapshot) => snapshot.body.openRequests.filt
  * The case memory as the brain reads it, derived from the case's own store (no smart memory is persisted): the customer mails before the latest one
  * (exchanges), the questions we asked (answered when the case recorded an answer) and the trials with their outcome.
  */
-export function smartMemoryFromCase(snapshot: CaseSnapshot, events: readonly CaseEvent[]): SmartCaseMemory {
+export function smartMemoryFromCase(snapshot: CaseSnapshot, events: readonly CaseEvent[], options: Readonly<{ answeredByLaterMail?: boolean }> = {}): SmartCaseMemory {
   const customerMails = events.filter(event => event.direction === "customer_inbound").length;
+  // `SAV_V2_SMART_NO_REPEAT=on`: a question is also answered when the customer wrote after it was sent (the case sets `answeredBy` only for a batch of
+  // questions with fact keys, never for the brain's single question nor for the follow-up of an answer).
+  const answered = (row: CaseSnapshot["body"]["questions"][number]) => Boolean(row.answeredBy)
+    || (options.answeredByLaterMail === true && events.some(event => event.direction === "customer_inbound" && Date.parse(event.occurredAt) > Date.parse(row.askedAt)));
   const body = snapshot.body, needOf = (requestId: string) => `n${Math.max(1, Math.min(9, openRequests(snapshot).findIndex(row => row.id === requestId) + 1))}`;
   return {
     ...smartEmptyMemory(Math.max(0, customerMails - 1)),
-    questions: body.questions.slice(-4).map((row, index) => ({ needId: "n1", text: row.text, turn: index + 1, answered: Boolean(row.answeredBy) })),
+    questions: body.questions.slice(-4).map((row, index) => ({ needId: "n1", text: row.text, turn: index + 1, answered: answered(row) })),
     trials: body.trials.slice(-6).map((row, index) => ({ id: row.id.slice(0, 10), needId: needOf(row.requestId), what: `Procédure ${row.procedure.knowledgeId}`, cardId: row.procedure.knowledgeId,
       turn: index + 1, result: row.outcome === "succeeded" ? "worked" as const : row.outcome === "failed" ? "failed" as const : "pending" as const })),
   };
 }
 
 /** `SmartTurnInput` from the circuit's request: the latest customer mail, the thread before it, the memory derived from the case. Null: no mail to read. */
-export function smartTurnInputFromCase(request: CaseInvestigationModelRequest): SmartTurnInput | null {
+export function smartTurnInputFromCase(request: CaseInvestigationModelRequest, options: Readonly<{ answeredByLaterMail?: boolean }> = {}): SmartTurnInput | null {
   const latest = request.customerContext?.latestMessage;
   if (!latest?.text.trim()) return null;
   const thread: SmartThreadMessage[] = (request.customerContext?.thread ?? []).map(row => ({ from: row.from, at: row.at, text: row.text }));
-  return { subject: latest.subject ?? "", body: latest.text, thread, memory: smartMemoryFromCase(request.snapshot, request.events) };
+  return { subject: latest.subject ?? "", body: latest.text, thread, memory: smartMemoryFromCase(request.snapshot, request.events, options) };
 }
 
 /**
@@ -211,6 +216,8 @@ export type SmartCaseProviderDeps = Readonly<{
    */
   liveSearch?: (request: CaseInvestigationModelRequest) => SmartLiveSearch;
   liveFound?: (callKey: string, refs: ReadonlyArray<{ knowledgeId: string; contentVersionId: string }>) => void;
+  /** `SAV_V2_SMART_NO_REPEAT=on` only (production: `readSmartSentReplies`, read only): the confirmed reply mails of the case. Never read when off. */
+  sentReplies?: (caseId: string) => Promise<readonly SmartSentReply[]>;
 }>;
 
 /**
@@ -224,6 +231,28 @@ async function recordSmartTrace(sink: SmartCaseTraceSink | undefined, build: () 
   try {
     await Promise.race([Promise.resolve().then(() => sink(build())), new Promise<void>(resolve => { timer = setTimeout(resolve, SAV_SMART_TRACE_WAIT_MS); })]);
   } catch { /* recording only: never alters the turn */ } finally { if (timer) clearTimeout(timer); }
+}
+
+/** `SAV_V2_SMART_NO_REPEAT=on`: the circuit's cards, each with the escalation and exceptions of its structured resolution when its text lacks them. */
+function smartCaseKnowledgeWithGuidance(request: Pick<CaseInvestigationModelRequest, "knowledge"> & Partial<Pick<CaseInvestigationModelRequest, "coverage">>): SmartKnowledgePort {
+  const port = smartCaseKnowledge(request);
+  return async needs => {
+    const found = await port(needs);
+    return { ...found, sources: found.sources.map(source => smartWithCardGuidance(source, request.knowledge.find(card => card.id === source.cardId && card.contentVersionId === source.version)?.resolution ?? null)) };
+  };
+}
+
+/** Upper bound of the read of the sent replies; past it, or on a failure, the turn goes on with the thread's own support messages only. */
+export const SAV_SMART_SENT_REPLIES_WAIT_MS = 1_500;
+async function readSentReplies(read: SmartCaseProviderDeps["sentReplies"], caseId: string): Promise<readonly SmartSentReply[]> {
+  if (!read) return [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([read(caseId), new Promise<readonly SmartSentReply[]>(resolve => { timer = setTimeout(() => resolve([]), SAV_SMART_SENT_REPLIES_WAIT_MS); })]);
+  } catch (error) {
+    console.warn("sav_smart_sent_replies_unavailable", { caseId, code: error instanceof Error && /^[A-Z0-9_]{3,80}$/.test(error.message) ? error.message : "read_failed" });
+    return [];
+  } finally { if (timer) clearTimeout(timer); }
 }
 
 /** Validator refusals of one input after which no brain runs again: the second refusal goes to the team (Ugo, 14/11, `SAV_CASE_REFUSALS_BEFORE_HANDOFF`). */
@@ -241,15 +270,18 @@ export function smartCaseDecisionProvider(deps: SmartCaseProviderDeps): CaseV2Mo
       await recordSmartTrace(deps.trace, () => buildSmartCaseTrace({ request, result: null, proposal: output, searches: [], at: deps.now() }));
       return { result: { status: "ok", output }, usage: none };
     }
-    const input = smartTurnInputFromCase(request), cap = deps.maxInputBytes();
+    const noRepeatOn = smartNoRepeatOn(deps.env());
+    const input = smartTurnInputFromCase(request, noRepeatOn ? { answeredByLaterMail: true } : {}), cap = deps.maxInputBytes();
     if (!input || cap === null) return { result: { status: "failed", uncertain: false, diagnostic: { stage: "preflight", code: input ? "policy_invalid" : "empty_response", networkAttempted: false } }, usage: none };
     const searches: SmartTraceSearch[] = [];
     // Smart images: null unless the reader granted this context (flag on, smart case); then the admitted files, or text only with the reasons.
     const files = smartCaseAttachments(request.customerContext, deps.attachmentFit ?? (() => ({ model: "", mediaTokens: 0, budget: null })));
-    const live = deps.liveSearch && savV2SmartLiveSearchOn(deps.env()) ? smartLiveKnowledge({ circuit: smartCaseKnowledge(request), circuitCards: request.knowledge, search: deps.liveSearch(request) }) : null;
-    const knowledge = live?.port ?? smartCaseKnowledge(request);
+    const noRepeat: SmartNoRepeat | null = noRepeatOn ? { sent: await readSentReplies(deps.sentReplies, request.caseId) } : null;
+    const circuit = noRepeat ? smartCaseKnowledgeWithGuidance(request) : smartCaseKnowledge(request);
+    const live = deps.liveSearch && savV2SmartLiveSearchOn(deps.env()) ? smartLiveKnowledge({ circuit, circuitCards: request.knowledge, search: deps.liveSearch(request) }) : null;
+    const knowledge = live?.port ?? circuit;
     const result = await runSmartTurn(input, {
-      model: smartModelWithFeedback(deps.model, request.feedback), knowledge: deps.trace ? traceSmartKnowledge(knowledge, searches, { query: Boolean(live) }) : knowledge, maxInputBytes: cap,
+      model: smartModelWithFeedback(deps.model, request.feedback), knowledge: deps.trace ? traceSmartKnowledge(knowledge, searches, { query: Boolean(live) }) : knowledge, maxInputBytes: cap, ...(noRepeat ? { noRepeat } : {}),
       today: deps.now().toISOString().slice(0, 10), recordOwn: true, ...(deps.academy ? { academy: deps.academy } : {}), ...(deps.maxExchanges ? { maxExchanges: deps.maxExchanges } : {}),
       ...(files?.turn ? { attachments: files.turn } : {}), ...smartCommercialSet(deps.env()),
       ...(smartCommercialForwardOn(deps.env()) ? { commercialForward: true } : {}),

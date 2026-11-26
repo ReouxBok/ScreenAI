@@ -110,6 +110,11 @@ async function readConfirmedReplies(caseId: string) {
   });
 }
 
+/** `SAV_V2_SMART_NO_REPEAT=on` only (`smart-no-repeat.ts`): the confirmed reply mails of a case as the brain reads them. Read only; throws on a failed read. */
+export async function readSmartSentReplies(caseId: string): Promise<Array<{ at: string | null; text: string }>> {
+  return (await readConfirmedReplies(caseId)).flatMap(row => row.text?.trim() ? [{ at: row.confirmedAt, text: row.text }] : []);
+}
+
 /**
  * The V2 cases of an intake thread with their smart traces and the confirmed reply texts, for `get_dossier`. Read only; never throws (an
  * unreadable store gives `unavailable`), so the dossier itself is always returned.

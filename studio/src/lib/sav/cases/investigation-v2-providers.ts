@@ -334,16 +334,19 @@ export function caseGeminiDecisionPreflight(env: () => Env) {
 /** Academy tools are injected by the caller (`getAcademyTools()`), never imported here: the bench reaches this module and must not reach the Academy client. */
 /** `trace` (recording only, injected by the production factory, absent on the bench): the trace of each real smart turn. */
 type SmartLivePorts = Pick<SmartCaseProviderDeps, "liveSearch" | "liveFound">;
-export function caseSmartDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; now?: () => Date; academy?: SmartTurnPorts["academy"]; trace?: SmartCaseTraceSink } & SmartLivePorts>): CaseV2ModelTransport {
+export function caseSmartDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; now?: () => Date; academy?: SmartTurnPorts["academy"]; trace?: SmartCaseTraceSink;
+  sentReplies?: SmartCaseProviderDeps["sentReplies"] } & SmartLivePorts>): CaseV2ModelTransport {
   const now = input.now ?? (() => new Date());
   return smartCaseDecisionProvider({ env: input.env, now, maxInputBytes: () => smartInputCap(input.env(), now()), maxExchanges: smartMaxExchanges(input.env()), ...(input.academy ? { academy: input.academy } : {}),
     ...(input.trace ? { trace: input.trace } : {}), ...(input.liveSearch ? { liveSearch: input.liveSearch } : {}), ...(input.liveFound ? { liveFound: input.liveFound } : {}),
+    ...(input.sentReplies ? { sentReplies: input.sentReplies } : {}),
     // Smart images: read only for a context the reader granted (`SAV_V2_SMART_ATTACHMENT_IMAGES=on`, smart case).
     attachmentFit: () => ({ model: input.env()[SAV_V2_MODEL_ENV] ?? "", mediaTokens: smartAttachmentTokenRoom(input.env(), now()), budget: smartFilesBudget(input.env(), now()) }),
     model: smartGeminiModel({ env: input.env, now, ...(input.network ? { network: input.network } : {}), ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}) }) });
 }
 
-export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; smart?: CaseV2ModelTransport; trace?: SmartCaseTraceSink } & SmartLivePorts>): CaseV2ModelTransport {
+export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; smart?: CaseV2ModelTransport; trace?: SmartCaseTraceSink;
+  sentReplies?: SmartCaseProviderDeps["sentReplies"] } & SmartLivePorts>): CaseV2ModelTransport {
   const network = input.network ?? ((url, init) => fetch(url, init));
   let smart = input.smart;
   return async request => {

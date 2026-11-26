@@ -238,7 +238,18 @@ const verdictSchemaOf = <C extends readonly [string, ...string[]]>(codes: C) => 
 });
 export const smartVerdictSchema = verdictSchemaOf(SAV_SMART_VERIFY_CODES);
 export const smartCommercialVerdictSchema = verdictSchemaOf(SAV_SMART_COMMERCIAL_VERIFY_CODES);
-export type SmartVerdict = z.infer<typeof smartCommercialVerdictSchema>;
+/**
+ * 26/11 (`SAV_V2_SMART_NO_REPEAT=on` only; the counter-read is told about it only then): the reply copies a reply already sent or asks an answered
+ * question again. Off, the two lists and schemas above stay today's exactly (the code is read as `unlisted_claim` like any unknown word).
+ */
+export const SAV_SMART_NO_REPEAT_VERIFY_CODE = "repeated_reply";
+export const smartNoRepeatVerdictSchema = verdictSchemaOf([...SAV_SMART_VERIFY_CODES, SAV_SMART_NO_REPEAT_VERIFY_CODE] as const);
+export const smartCommercialNoRepeatVerdictSchema = verdictSchemaOf([...SAV_SMART_COMMERCIAL_VERIFY_CODES, SAV_SMART_NO_REPEAT_VERIFY_CODE] as const);
+/** The counter-read's schema for a turn: today's when both switches are off. */
+export const smartVerdictSchemaFor = (options: Readonly<{ commercialSplit?: boolean; noRepeat?: boolean }>) => options.noRepeat
+  ? (options.commercialSplit ? smartCommercialNoRepeatVerdictSchema : smartNoRepeatVerdictSchema)
+  : (options.commercialSplit ? smartCommercialVerdictSchema : smartVerdictSchema);
+export type SmartVerdict = z.infer<typeof smartCommercialNoRepeatVerdictSchema>;
 
 /** The server's own checks (no model): closed codes. Any of them refuses the reply, whatever the counter-read says. */
 export const SAV_SMART_CHECK_CODES = [
@@ -254,6 +265,8 @@ export const SAV_SMART_CHECK_CODES = [
   "instruction_followed",
   // 26/11 (`SAV_V2_SMART_COMMERCIAL_SPLIT=on` only): the reply carries a fact for a commercial need or takes up its words (never emitted off).
   "commercial_in_reply",
+  // 26/11 (`SAV_V2_SMART_NO_REPEAT=on` only, `smart-no-repeat.ts`): the draft copies a reply already sent or asks an answered question again.
+  "repeated_reply",
 ] as const;
 export type SmartCheckCode = typeof SAV_SMART_CHECK_CODES[number];
 

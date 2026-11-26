@@ -1,7 +1,7 @@
 import "server-only";
 import { readConfirmedV1Context } from "./admission-context-reader";
 import { savV2EntrySmartOn } from "./smart-entry-switch";
-import { smartCaseTraceStore } from "./smart/smart-trace-store";
+import { readSmartSentReplies, smartCaseTraceStore } from "./smart/smart-trace-store";
 import { smartCaseLiveSearch } from "./investigation-smart-live-search";
 import { createSmartLiveFoundRegistry, savV2SmartLiveSearchOn } from "./smart/smart-live-search";
 import { readCase } from "./case-store";
@@ -137,7 +137,9 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
     knowledge: { vectors, embed, spend: embeddingSpend },
     model: { preflight: caseGeminiDecisionPreflight(input.env), money: model.money, releaseMoney: model.release, provider: model.provider(caseGeminiDecisionProvider({ env: input.env, ...(input.network ? { network: input.network } : {}),
       // Recording only: the trace of each real smart turn, encrypted with the case (`smart-trace-store.ts`); never changes a decision.
-      trace: smartCaseTraceStore({ env: input.env, now }), liveSearch, liveFound: liveFound.put })) },
+      trace: smartCaseTraceStore({ env: input.env, now }), liveSearch, liveFound: liveFound.put,
+      // `SAV_V2_SMART_NO_REPEAT=on` only (read only, never called when off): the case's confirmed reply mails, so the brain never sends one again.
+      sentReplies: readSmartSentReplies })) },
   };
   return { ok: true, deps, provenance };
 }
