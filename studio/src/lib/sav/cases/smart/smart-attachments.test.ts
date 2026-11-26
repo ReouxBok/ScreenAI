@@ -314,3 +314,21 @@ describe("smart images: flag on", () => {
     expect(bodies[1]!.systemInstruction).toEqual(bodies[0]!.systemInstruction);
   });
 });
+
+describe("smart images with the commercial split on too (both switches on)", () => {
+  it("each call carrying files gets the commercial prompt plus the files instruction; no prompt lost, files still only on understand and the first decide", async () => {
+    const on = { commercialSplit: true } as const;
+    const brain = brainOf(GOOD);
+    const run = smartCaseDecisionProvider({ model: brain.model, env: () => ({ SAV_V2_ENTRY_SMART: "on", SAV_V2_SMART_COMMERCIAL_SPLIT: "on" }), now: () => new Date("2026-11-26T08:00:00Z"),
+      maxInputBytes: () => 100_000, attachmentFit: () => FIT });
+    const out = await run(requestOf(contextWith([file("capture.png", ok("c"))])));
+    expect(out.result.status).toBe("ok");
+    expect(brain.media.map(row => [row.kind, row.media?.map(item => item.hash) ?? null])).toEqual([["understand", ["c"]], ["decide", ["c"]], ["verify", null]]);
+    const [understand, decide, verify] = brain.calls;
+    expect(smartUnderstandPrompt(on)).not.toBe(smartUnderstandPrompt());
+    expect(understand!.system).toBe(`${smartUnderstandPrompt(on)}\n\n${SAV_CASE_ATTACHMENTS_INSTRUCTION}`);
+    expect(decide!.system).toBe(`${smartDecidePrompt(on)}\n\n${SAV_CASE_ATTACHMENTS_INSTRUCTION}\n\n${SAV_SMART_FILES_FACTS_NOTE}`);
+    expect(verify!.system).toBe(`${smartVerifyPrompt(on)}\n\n${SAV_SMART_FILES_VERIFY_NOTE}`);
+    expect(smartPromptSha256()).toBe(SAV_SMART_PROMPT_SHA256);
+  });
+});
