@@ -195,7 +195,11 @@ export type SmartCaseProviderDeps = Readonly<{
   env: () => Env; now: () => Date;
   /** The per-call byte cap (`smartInputCap`); null refuses before any call. */
   maxInputBytes: () => number | null;
-  academy?: SmartTurnPorts["academy"];
+  /**
+   * The Academy tools: a list, or (production factory) a getter called at EACH turn, so `SAV_V2_SMART_ACADEMY` is read at run time like the other
+   * switches. Empty or absent: no Academy tool, the same turn (catalogue and prompts) as before.
+   */
+  academy?: SmartTurnPorts["academy"] | (() => SmartTurnPorts["academy"]);
   maxExchanges?: number;
   /** Measurement only (tests, bench): the turn just run. */
   observe?: (result: SmartTurnResult) => void;
@@ -295,9 +299,10 @@ export function smartCaseDecisionProvider(deps: SmartCaseProviderDeps): CaseV2Mo
     const live = deps.liveSearch && savV2SmartLiveSearchOn(deps.env())
       ? smartLiveKnowledge({ circuit, circuitCards: request.knowledge, search: noRepeat ? smartLiveSearchWithGuidance(deps.liveSearch(request)) : deps.liveSearch(request) }) : null;
     const knowledge = live?.port ?? circuit;
+    const academy = typeof deps.academy === "function" ? deps.academy() : deps.academy;
     const result = await runSmartTurn(input, {
       model: smartModelWithFeedback(deps.model, request.feedback), knowledge: deps.trace ? traceSmartKnowledge(knowledge, searches, { query: Boolean(live) }) : knowledge, maxInputBytes: cap, ...(noRepeat ? { noRepeat } : {}),
-      today: deps.now().toISOString().slice(0, 10), recordOwn: true, ...(deps.academy ? { academy: deps.academy } : {}), ...(deps.maxExchanges ? { maxExchanges: deps.maxExchanges } : {}),
+      today: deps.now().toISOString().slice(0, 10), recordOwn: true, ...(academy?.length ? { academy } : {}), ...(deps.maxExchanges ? { maxExchanges: deps.maxExchanges } : {}),
       ...(files?.turn ? { attachments: files.turn } : {}), ...smartCommercialSet(deps.env()),
       ...(smartCommercialForwardOn(deps.env()) ? { commercialForward: true } : {}),
     });
