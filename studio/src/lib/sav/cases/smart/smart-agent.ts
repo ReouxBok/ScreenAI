@@ -1,4 +1,5 @@
 import { savReplyFooter } from "../../reply-format";
+import { savRetrievalCardSizeFixOn, SAV_RETRIEVAL_TRUNCATION_MARKER, truncateSavRetrievalText } from "../../request-retrieval";
 import { smartRelevanceView, smartRepairFactSources, smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
 import {
   parseSmartOutput, SAV_SMART_VERIFY_CODES, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchema,
@@ -249,7 +250,16 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const reduce = (pass: number) => {
     while (!fits(pass) && thread.length) { thread = thread.slice(1); reasons.push("cut:thread"); }
     if (!fits(pass) && results.length) { compactOld = true; reasons.push("cut:tool_results"); }
-    while (!fits(pass) && cards.length) { cards = cards.slice(0, -1); reasons.push("cut:cards"); }
+    while (!fits(pass) && cards.length) {
+      // SAV_RETRIEVAL_CARD_SIZE_FIX on: the least relevant card's text is halved (with the marker) before the card is given up.
+      const lastCard = cards[cards.length - 1]!;
+      if (savRetrievalCardSizeFixOn() && lastCard.content.length > 2 * SAV_RETRIEVAL_TRUNCATION_MARKER.length) {
+        cards = [...cards.slice(0, -1), { ...lastCard, content: truncateSavRetrievalText(lastCard.content, Math.floor(lastCard.content.length / 2)) }];
+        if (!reasons.includes("cut:card_text")) reasons.push("cut:card_text");
+        continue;
+      }
+      cards = cards.slice(0, -1); reasons.push("cut:cards");
+    }
     return fits(pass);
   };
 

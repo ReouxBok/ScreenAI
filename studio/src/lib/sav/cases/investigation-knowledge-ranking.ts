@@ -1,4 +1,4 @@
-import { assessSavKnowledgeValidity, savRetrievalRanking, type SavRetrievalCandidate } from "../request-retrieval";
+import { assessSavKnowledgeValidity, savRetrievalCardSizeFixOn, savRetrievalRanking, SAV_RETRIEVAL_TRUNCATION_MARKER, truncateSavRetrievalText, type SavRetrievalCandidate } from "../request-retrieval";
 import { SAV_CASE_ACCESS_BLOCK_ID, type KnowledgeRef } from "./case-types";
 import type { CaseKnowledgeCoverage } from "./decision-contract";
 import type { CaseBlockScope } from "./investigation-access-scope";
@@ -209,12 +209,19 @@ export function arrangeCaseMultiBlockKnowledge(input: Readonly<{
  */
 export function trimCaseScopedKnowledge(scoped: CaseScopedKnowledge, fits: (knowledge: SavRetrievalCandidate[], coverage: CaseKnowledgeCoverage[]) => boolean): CaseScopedKnowledge {
   let knowledge = scoped.knowledge, coverage = scoped.coverage;
-  const dropped = [...scoped.dropped];
+  const dropped = [...scoped.dropped], sizeFix = savRetrievalCardSizeFixOn();
+  let shortened = false;
   while (!fits(knowledge, coverage)) {
     const reversed = [...knowledge].reverse();
     const last = reversed.find(card => !scoped.scopeKeys.has(cardKey(card))) ?? reversed.find(card => !scoped.templateKeys.has(cardKey(card)));
     if (!last) break;
     const key = cardKey(last);
+    // SAV_RETRIEVAL_CARD_SIZE_FIX on: the card's text is halved (with the marker) before the card itself is given up.
+    if (sizeFix && last.content.length > 2 * SAV_RETRIEVAL_TRUNCATION_MARKER.length) {
+      const content = truncateSavRetrievalText(last.content, Math.floor(last.content.length / 2));
+      knowledge = knowledge.map(card => cardKey(card) === key ? { ...card, content } : card); shortened = true;
+      continue;
+    }
     knowledge = knowledge.filter(card => cardKey(card) !== key);
     coverage = coverage.map(row => {
       if (!row.knowledge.some(ref => keyOf(ref) === key)) return row;
@@ -224,7 +231,7 @@ export function trimCaseScopedKnowledge(scoped: CaseScopedKnowledge, fits: (know
     });
     dropped.push({ ...refOf(last), code: "input_budget" });
   }
-  return dropped.length === scoped.dropped.length ? scoped : { ...scoped, knowledge, coverage, dropped };
+  return dropped.length === scoped.dropped.length && !shortened ? scoped : { ...scoped, knowledge, coverage, dropped };
 }
 
 /** The coverage as recorded: what the model read, plus fixed codes with the card id for every drop or scope link on that request. */

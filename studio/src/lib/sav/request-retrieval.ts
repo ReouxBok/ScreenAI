@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { diagnosticKnowledgeSchema } from "@/lib/knowledge/diagnostic-contract";
-import { savSupportDeliveryProjectionSchema } from "@/lib/knowledge/support-delivery";
+import { savDeliveryGroups, savSupportDeliveryProjectionSchema } from "@/lib/knowledge/support-delivery";
 
 export const SAV_REQUEST_RETRIEVAL_REVISION = "sav-request-retrieval-2026-10-15.v1";
 export const SAV_RETRIEVAL_LIMITS = Object.freeze({
@@ -37,21 +37,53 @@ type SavRetrievalResolution = z.output<typeof resolutionProjection>;
 /**
  * SAV_RETRIEVAL_CARD_SIZE_FIX: the compact form of a procedure card. Its delivery groups already carry every prerequisite,
  * exception and expected result the server renders, so the top-level copies of the same texts are not sent twice. The
- * body, the delivery, the escalation and every other field stay as they are (the planner checks steps against the body).
+ * body, the delivery, the steps, the escalation and every other field stay as they are (the planner and the V2 validator
+ * check steps against the body and `steps`). Works on the retrieval projection and on a raw card resolution alike.
  */
-export function compactSavRetrievalResolution(resolution: SavRetrievalResolution): SavRetrievalResolution {
-  const delivery = resolution.delivery;
-  if (delivery?.mode !== "procedure") return resolution;
-  const parts = [...delivery.groups, ...delivery.steps];
+export function compactSavRetrievalResolution<T extends SavRetrievalResolution | NonNullable<SavRetrievalCandidate["resolution"]>>(resolution: T): T {
+  const parsed = savSupportDeliveryProjectionSchema.safeParse(resolution.delivery);
+  if (!parsed.success || parsed.data.mode !== "procedure") return resolution;
+  const parts = [...parsed.data.groups, ...parsed.data.steps];
   const covered = new Set(parts.flatMap(part => [...part.prerequisites, ...part.exceptions, part.expectedResult]).filter(Boolean));
   const { prerequisites, exceptions, expectedResult, troubleshooting, ...rest } = resolution;
-  const left = (values?: string[]) => values?.filter(value => !covered.has(value));
+  const left = (values: unknown) => Array.isArray(values) ? values.filter(value => typeof value !== "string" || !covered.has(value)) : values;
   const keptPrerequisites = left(prerequisites), keptExceptions = left(exceptions);
+  const kept = (value: unknown) => value !== undefined && !(Array.isArray(value) && !value.length);
   return { ...rest,
-    ...(keptPrerequisites?.length ? { prerequisites: keptPrerequisites } : {}),
-    ...(keptExceptions?.length ? { exceptions: keptExceptions } : {}),
-    ...(expectedResult && !covered.has(expectedResult) ? { expectedResult } : {}),
-    ...(troubleshooting && troubleshooting !== resolution.escalation && !parts.some(part => part.escalation === troubleshooting) ? { troubleshooting } : {}) };
+    ...(kept(keptPrerequisites) ? { prerequisites: keptPrerequisites } : {}),
+    ...(kept(keptExceptions) ? { exceptions: keptExceptions } : {}),
+    ...(expectedResult && !(typeof expectedResult === "string" && covered.has(expectedResult)) ? { expectedResult } : {}),
+    ...(troubleshooting && troubleshooting !== resolution.escalation && !parts.some(part => part.escalation === troubleshooting) ? { troubleshooting } : {}) } as T;
+}
+/** SAV_RETRIEVAL_CARD_SIZE_FIX: absent or any value other than `on` keeps the legacy behaviour. */
+export const savRetrievalCardSizeFixOn = () => process.env.SAV_RETRIEVAL_CARD_SIZE_FIX === "on";
+/** The model-input share one card may take on its own: the retrieval's overall bound minus its envelope. */
+const SAV_RETRIEVAL_CARD_SAFETY_BYTES = SAV_RETRIEVAL_LIMITS.contextBytes - 1_500;
+/**
+ * SAV_RETRIEVAL_CARD_SIZE_FIX: the copy of a DB card a model (V2, the smart brain) receives, never the raw oversized read.
+ * When the retrieval placed it, its text is the retrieval's (compact, possibly shortened); otherwise (lexical recall, the
+ * pool, an exact scope read) its text is shortened with the marker to the same safety net. The raw `steps` stay (the V2
+ * validator reads them); only the top-level copies of delivery-group texts are left out.
+ */
+export function savRetrievalModelCard(card: SavRetrievalCandidate, sent?: Pick<SavRequestRetrievalSource, "content" | "resolution">): SavRetrievalCandidate {
+  const resolution = card.resolution ? compactSavRetrievalResolution(card.resolution) : card.resolution;
+  // The retrieval reduced this card's procedure to fit its bound: keep that reduced form.
+  if (sent) return { ...card, content: sent.content, resolution: card.resolution?.delivery !== undefined && sent.resolution?.delivery === undefined ? sent.resolution : resolution };
+  const over = bytes({ content: card.content, resolution }) - SAV_RETRIEVAL_CARD_SAFETY_BYTES;
+  return { ...card, content: over > 0 ? truncateSavRetrievalText(card.content, over) : card.content, resolution };
+}
+/**
+ * SAV_RETRIEVAL_CARD_SIZE_FIX: the customer steps of a procedure card, as the V1 planner reads them (`sourceSteps`): the
+ * steps of the delivery groups that do not require a human, never an internal step, with their label and location.
+ * `null` when the card has no procedure delivery (the caller keeps its legacy `steps`).
+ */
+export function savCustomerProcedureSteps(resolution: unknown): string[] | null {
+  const raw = resolution && typeof resolution === "object" && "delivery" in resolution ? resolution.delivery : undefined;
+  const parsed = savSupportDeliveryProjectionSchema.safeParse(raw);
+  if (!parsed.success || parsed.data.mode !== "procedure") return null;
+  const steps = savDeliveryGroups(parsed.data).filter(group => !group.requiresHuman).flatMap(group => group.steps);
+  return [...new Map(steps.map(step => [step.id, step])).values()]
+    .map(step => [step.userLabel, step.location ? `Emplacement : ${step.location}` : "", step.instruction].filter(Boolean).join(" — "));
 }
 export const SAV_RETRIEVAL_TRUNCATION_MARKER = "\n\n[… suite de la fiche omise : budget de contexte atteint]";
 /** Removes at least `overBytes` serialized bytes from the end of a card's text (whole code points), with a visible marker. */
@@ -218,10 +250,10 @@ export async function retrieveSavKnowledgeByRequest(input: {
   if (input.primaryRequestId && !requests.some(request => request.id === input.primaryRequestId)) throw new Error("SAV_RETRIEVAL_PRIMARY_REQUEST_INVALID");
   const now = input.now ?? new Date(), locale = input.locale ?? "fr-FR", audience = input.audience ?? "support";
   if (!Number.isFinite(now.getTime()) || !/^[a-z]{2}-[A-Z]{2}$/.test(locale)) throw new Error("SAV_RETRIEVAL_CONTEXT_INVALID");
-  // Read once per call. On: a card is measured like the SQL read (body and resolution each within sourceBytes), a card
-  // skipped for budget gives its slot to the next ranked candidate and is named in the alerts. Off: unchanged.
-  const cardSizeFix = process.env.SAV_RETRIEVAL_CARD_SIZE_FIX === "on";
-  const ordered =[...requests].sort((a, b) => Number(b.id === input.primaryRequestId) - Number(a.id === input.primaryRequestId));
+  // Read once per call. On: a card's size never drops it; cards are sent in compact form and, over the overall bound, the
+  // lowest-ranked one is shortened with a marker and named in the alerts (`source_truncated`). Off: unchanged.
+  const cardSizeFix = savRetrievalCardSizeFixOn();
+  const ordered = [...requests].sort((a, b) => Number(b.id === input.primaryRequestId) - Number(a.id === input.primaryRequestId));
   const chosen = ordered.slice(0, SAV_RETRIEVAL_LIMITS.requests);
   const planned = chosen.map(request => ({ request, query: [request.product, request.feature, request.summary].filter(Boolean).join(" — ") }));
   const queryable = planned.filter(plan => plan.query.length <= SAV_RETRIEVAL_LIMITS.queryCharacters);
@@ -313,7 +345,9 @@ export async function retrieveSavKnowledgeByRequest(input: {
         sources.set(key, source); row.candidateKeys.push(key); row.status = "candidates";
       }
       const shown = () => {
-        const uniqueAlerts = [...new Map(alerts.map(alert => [`${alert.code}:${alert.sourceKey ?? ""}`, alert])).values()];
+        const deduplicated = [...new Map(alerts.map(alert => [`${alert.code}:${alert.sourceKey ?? ""}`, alert])).values()];
+        // A shortened card is always named: those alerts go first, so the 60-alert cap never hides them (none when off).
+        const uniqueAlerts = [...deduplicated.filter(alert => alert.code === "source_truncated"), ...deduplicated.filter(alert => alert.code !== "source_truncated")];
         const shownAlerts = uniqueAlerts.slice(0, 60);
         if (uniqueAlerts.length > 60) shownAlerts.push({ code: "additional_validity_alerts_omitted" });
         return shownAlerts;

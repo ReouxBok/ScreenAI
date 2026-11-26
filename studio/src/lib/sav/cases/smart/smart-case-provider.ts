@@ -1,3 +1,4 @@
+import { savCustomerProcedureSteps, savRetrievalCardSizeFixOn } from "../../request-retrieval";
 import { caseRequestSearchText, type CaseEvent, type CaseSnapshot } from "../case-types";
 import type { CaseDecisionProposal } from "../decision-contract";
 import { SAV_CASE_LEXICAL_RECALL } from "../investigation-knowledge";
@@ -71,7 +72,9 @@ export function smartCaseKnowledge(request: Pick<CaseInvestigationModelRequest, 
     const sources: SmartSource[] = request.knowledge.map(card => ({
       ...(recalled.has(`${card.id}:${card.contentVersionId}`) ? { lowRelevance: true } : {}),
       cardId: card.id, version: card.contentVersionId, title: card.title, content: card.content,
-      steps: Array.isArray(card.resolution?.steps) ? (card.resolution!.steps as unknown[]).filter((step): step is string => typeof step === "string") : [],
+      // SAV_RETRIEVAL_CARD_SIZE_FIX on: a procedure card's customer steps, as the V1 planner reads them (never an internal step).
+      steps: (savRetrievalCardSizeFixOn() ? savCustomerProcedureSteps(card.resolution) : null)
+        ?? (Array.isArray(card.resolution?.steps) ? (card.resolution!.steps as unknown[]).filter((step): step is string => typeof step === "string") : []),
       needIds, validUntil: typeof card.resolution?.validUntil === "string" && card.resolution.validUntil ? card.resolution.validUntil : null,
     }));
     return { status: "ok", sources, codes: [...(sources.length ? ["circuit_cards"] : ["no_circuit_card"]), ...(sources.some(card => card.lowRelevance) ? ["lexical_recall"] : [])] };

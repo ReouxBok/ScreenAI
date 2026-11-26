@@ -1,5 +1,5 @@
 import { createSavKnowledgeVectorIndex, SAV_RETRIEVAL_EMBEDDING_DIMENSION } from "../../request-retrieval-db";
-import { retrieveSavKnowledgeByRequest, type SavRetrievalBackend, type SavRequestRetrievalResult } from "../../request-retrieval";
+import { retrieveSavKnowledgeByRequest, savCustomerProcedureSteps, savRetrievalCardSizeFixOn, type SavRetrievalBackend, type SavRequestRetrievalResult } from "../../request-retrieval";
 import type { SmartKnowledgePort, SmartKnowledgeResult } from "./smart-agent";
 import type { SmartSource } from "./smart-checks";
 import type { SmartEmbedPort } from "./smart-model";
@@ -20,7 +20,9 @@ export function smartRetrievalRequests(needs: Parameters<SmartKnowledgePort>[0])
 export function smartSourcesOf(result: SavRequestRetrievalResult): SmartSource[] {
   return result.sources.map(source => ({
     cardId: source.id, version: source.contentVersionId, title: source.title, content: source.content,
-    steps: Array.isArray(source.resolution?.steps) ? (source.resolution!.steps as unknown[]).filter((step): step is string => typeof step === "string") : [],
+    // SAV_RETRIEVAL_CARD_SIZE_FIX on: a procedure card's customer steps, as the V1 planner reads them (never an internal step).
+    steps: (savRetrievalCardSizeFixOn() ? savCustomerProcedureSteps(source.resolution) : null)
+      ?? (Array.isArray(source.resolution?.steps) ? (source.resolution!.steps as unknown[]).filter((step): step is string => typeof step === "string") : []),
     needIds: [...source.requestIds],
     validUntil: typeof source.resolution?.validUntil === "string" && source.resolution.validUntil ? source.resolution.validUntil : null,
   }));
