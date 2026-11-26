@@ -646,7 +646,8 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       try { read = await ports.readScopeCards(wanted); } catch { return; }
       const at = ports.now();
       const proven = [...new Map(read.filter(card => wanted.some(ref => same(card, ref)) && assessSavKnowledgeValidity(card, ports.scope.locale, ports.scope.audience, at).eligible)
-        .map(card => [`${card.id}:${card.contentVersionId}`, card])).values()];
+        // SAV_RETRIEVAL_CARD_SIZE_FIX on: a card found live is bounded like a retrieved or scope card, never sent raw.
+        .map(card => [`${card.id}:${card.contentVersionId}`, savRetrievalCardSizeFixOn() ? savRetrievalModelCard(card) : card])).values()];
       if (!proven.length) return;
       const added = proven.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId }));
       knowledge = [...knowledge, ...proven];

@@ -242,6 +242,18 @@ function smartCaseKnowledgeWithGuidance(request: Pick<CaseInvestigationModelRequ
   };
 }
 
+/**
+ * `SAV_V2_SMART_NO_REPEAT=on` with `SAV_V2_SMART_LIVE_SEARCH=on`: a card found live carries its structured escalation and exceptions too (its own
+ * `resolution`, from the search's cards), like a circuit card (`smartCaseKnowledgeWithGuidance`). Either switch off: never used.
+ */
+export function smartLiveSearchWithGuidance(search: SmartLiveSearch): SmartLiveSearch {
+  return async needs => {
+    const found = await search(needs);
+    return { ...found, sources: found.sources.map(source => smartWithCardGuidance(source,
+      found.cards.find(card => card.id === source.cardId && card.contentVersionId === source.version)?.resolution ?? null)) };
+  };
+}
+
 /** Upper bound of the read of the sent replies; past it, or on a failure, the turn goes on with the thread's own support messages only. */
 export const SAV_SMART_SENT_REPLIES_WAIT_MS = 1_500;
 async function readSentReplies(read: SmartCaseProviderDeps["sentReplies"], caseId: string): Promise<readonly SmartSentReply[]> {
@@ -280,7 +292,8 @@ export function smartCaseDecisionProvider(deps: SmartCaseProviderDeps): CaseV2Mo
     const files = smartCaseAttachments(request.customerContext, deps.attachmentFit ?? (() => ({ model: "", mediaTokens: 0, budget: null })));
     const noRepeat: SmartNoRepeat | null = noRepeatOn ? { sent: await readSentReplies(deps.sentReplies, request.caseId) } : null;
     const circuit = noRepeat ? smartCaseKnowledgeWithGuidance(request) : smartCaseKnowledge(request);
-    const live = deps.liveSearch && savV2SmartLiveSearchOn(deps.env()) ? smartLiveKnowledge({ circuit, circuitCards: request.knowledge, search: deps.liveSearch(request) }) : null;
+    const live = deps.liveSearch && savV2SmartLiveSearchOn(deps.env())
+      ? smartLiveKnowledge({ circuit, circuitCards: request.knowledge, search: noRepeat ? smartLiveSearchWithGuidance(deps.liveSearch(request)) : deps.liveSearch(request) }) : null;
     const knowledge = live?.port ?? circuit;
     const result = await runSmartTurn(input, {
       model: smartModelWithFeedback(deps.model, request.feedback), knowledge: deps.trace ? traceSmartKnowledge(knowledge, searches, { query: Boolean(live) }) : knowledge, maxInputBytes: cap, ...(noRepeat ? { noRepeat } : {}),

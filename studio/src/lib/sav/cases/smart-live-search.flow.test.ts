@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import type { SavRetrievalCandidate } from "../request-retrieval";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { SAV_RETRIEVAL_TRUNCATION_MARKER, savRetrievalModelCard, type SavRetrievalCandidate } from "../request-retrieval";
 import {
   emptyCaseBody, SAV_CASE_ADMISSION_REVISION, SAV_CASE_CONTRACT_REVISION, smartSupportProvenance, SAV_SMART_ENTRY_POLICY_REVISION,
   type CaseAdmissionRecord, type CaseBody, type CaseEvent, type CaseSnapshot,
@@ -13,6 +13,12 @@ import { smartCaseDecisionProvider } from "./smart/smart-case-provider";
 import { createSmartLiveFoundRegistry, savV2SmartLiveSearchOn, type SmartLiveSearch } from "./smart/smart-live-search";
 import { SMART_CONFORME, smartGoodDecision, smartReading, smartScriptedModel, type SmartScript } from "./smart/smart-test-doubles";
 import type { SmartCaseTrace } from "./smart/smart-trace";
+
+// Wave 2 (a): the real `savRetrievalModelCard`, observed (a pass-through: every other test of this file runs the unchanged function).
+vi.mock("../request-retrieval", async importOriginal => {
+  const actual = await importOriginal<typeof import("../request-retrieval")>();
+  return { ...actual, savRetrievalModelCard: vi.fn(actual.savRetrievalModelCard) };
+});
 
 /*
  * Live search (26/11), the real case of 26/11 rewritten with FICTIONAL cards and words: « on ne retrouve plus nos agents créés depuis Limova 3 », we asked
@@ -221,5 +227,31 @@ describe("Recherche réelle — chercher_fiches cherche vraiment en production (
     const off = await runCase({ live: false, progress });
     expect(off.exactReads).toEqual([]);
     for (const record of off.records) expect(accepted(record)?.reply?.citations ?? []).not.toContainEqual({ knowledgeId: AGENT.id, contentVersionId: "v2" });
+  });
+});
+
+describe("vague 2 (a) — une carte trouvée en direct passe par la même mise en forme bornée que les cartes initiales (SAV_RETRIEVAL_CARD_SIZE_FIX)", () => {
+  // Fictional oversized card: the passage the reply cites comes first, then a long filler past the model-input safety bound.
+  const BIG = { ...AGENT, content: `${AGENT.content}\n\n${"Paragraphe fictif de remplissage sur les réglages des agents. ".repeat(700)}` };
+  afterEach(() => { vi.unstubAllEnvs(); vi.mocked(savRetrievalModelCard).mockClear(); });
+
+  it("interrupteur de taille allumé : la carte prouvée est bornée (marqueur de coupe) avant que le validateur et l'enregistrement la lisent ; la décision reste acceptée", async () => {
+    vi.stubEnv("SAV_RETRIEVAL_CARD_SIZE_FIX", "on");
+    const run = await runCase({ live: true, proven: [BIG] });
+    expect(run.report).toMatchObject({ status: "recorded", outcome: "accepted", refusal: null });
+    const calls = vi.mocked(savRetrievalModelCard).mock;
+    expect(calls.calls.map(([card]) => card.id)).toEqual([AGENT.id]);
+    const bounded = calls.results[0]!.value as SavRetrievalCandidate;
+    expect(bounded.content.length).toBeLessThan(BIG.content.length);
+    expect(bounded.content.endsWith(SAV_RETRIEVAL_TRUNCATION_MARKER)).toBe(true);
+    expect(bounded.content.startsWith(AGENT.content)).toBe(true);
+    expect(run.records[0]!.knowledge).toContainEqual({ knowledgeId: AGENT.id, contentVersionId: "v2" });
+  });
+
+  it("interrupteur de taille éteint : la carte prouvée entre telle quelle, comme avant (aucune mise en forme)", async () => {
+    vi.stubEnv("SAV_RETRIEVAL_CARD_SIZE_FIX", "");
+    const run = await runCase({ live: true, proven: [BIG] });
+    expect(run.report).toMatchObject({ status: "recorded", outcome: "accepted", refusal: null });
+    expect(vi.mocked(savRetrievalModelCard)).not.toHaveBeenCalled();
   });
 });
