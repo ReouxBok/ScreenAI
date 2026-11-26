@@ -3,7 +3,7 @@ import "server-only";
 import { sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { embedTexts } from "@/lib/embeddings";
-import { retrieveSavKnowledgeByRequest, savRetrievalTokens, SAV_RETRIEVAL_LIMITS, type SavRetrievalBackend, type SavRetrievalCandidate } from "./request-retrieval";
+import { retrieveSavKnowledgeByRequest, savRetrievalCardSizeFixOn, savRetrievalTokens, SAV_RETRIEVAL_LIMITS, type SavRetrievalBackend, type SavRetrievalCandidate } from "./request-retrieval";
 
 function rowsOf(result: unknown): Record<string, unknown>[] {
   return Array.isArray(result) ? result : (result as { rows: Record<string, unknown>[] }).rows;
@@ -41,7 +41,7 @@ export function createSavKnowledgeVectorIndex(options: { locale?: string; audien
   const db = requireDb();
   // SAV_RETRIEVAL_CARD_SIZE_FIX=on: a fiche's size is never a reason to leave it out; body and resolution are read up to
   // the compact read envelope and the retrieval meets the model-input bound by shortening text. Off: the legacy bound.
-  const readBytes = process.env.SAV_RETRIEVAL_CARD_SIZE_FIX === "on" ? SAV_RETRIEVAL_CARD_READ_BYTES : SAV_RETRIEVAL_LIMITS.sourceBytes;
+  const readBytes = savRetrievalCardSizeFixOn() ? SAV_RETRIEVAL_CARD_READ_BYTES : SAV_RETRIEVAL_LIMITS.sourceBytes;
   // V2 opt-in only. V1 retains the exact legacy SQL and mapping. Oversized raw
   // sources remain refused above this local read envelope; never cut mid-passage.
   const contentSql = options.compact

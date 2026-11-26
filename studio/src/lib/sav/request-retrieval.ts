@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { diagnosticKnowledgeSchema } from "@/lib/knowledge/diagnostic-contract";
 import { savDeliveryGroups, savSupportDeliveryProjectionSchema } from "@/lib/knowledge/support-delivery";
@@ -55,8 +56,16 @@ export function compactSavRetrievalResolution<T extends SavRetrievalResolution |
     ...(expectedResult && !(typeof expectedResult === "string" && covered.has(expectedResult)) ? { expectedResult } : {}),
     ...(troubleshooting && troubleshooting !== resolution.escalation && !parts.some(part => part.escalation === troubleshooting) ? { troubleshooting } : {}) } as T;
 }
-/** SAV_RETRIEVAL_CARD_SIZE_FIX: absent or any value other than `on` keeps the legacy behaviour. */
-export const savRetrievalCardSizeFixOn = () => process.env.SAV_RETRIEVAL_CARD_SIZE_FIX === "on";
+/**
+ * A per-call override of SAV_RETRIEVAL_CARD_SIZE_FIX, for the shadow replay only (`SAV_V2_SMART_SHADOW_REPLAY_FLAGS=card_size_fix`). Scoped to
+ * the async work started inside `runWithSavRetrievalCardSizeFix`: a concurrent request in the same process (Fluid) never inherits it, and
+ * `process.env` is never written.
+ */
+const savRetrievalCardSizeFixScope = new AsyncLocalStorage<boolean>();
+/** SAV_RETRIEVAL_CARD_SIZE_FIX: absent or any value other than `on` keeps the legacy behaviour (outside a replay override). */
+export const savRetrievalCardSizeFixOn = () => savRetrievalCardSizeFixScope.getStore() ?? process.env.SAV_RETRIEVAL_CARD_SIZE_FIX === "on";
+/** Runs `work` with SAV_RETRIEVAL_CARD_SIZE_FIX forced to `on` (true) or off (false) for that work only. Used by the shadow replay alone. */
+export const runWithSavRetrievalCardSizeFix = <T>(on: boolean, work: () => T): T => savRetrievalCardSizeFixScope.run(on, work);
 /** The model-input share one card may take on its own: the retrieval's overall bound minus its envelope. */
 const SAV_RETRIEVAL_CARD_SAFETY_BYTES = SAV_RETRIEVAL_LIMITS.contextBytes - 1_500;
 /**

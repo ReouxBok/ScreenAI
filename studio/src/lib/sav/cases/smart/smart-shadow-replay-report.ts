@@ -87,14 +87,14 @@ export async function readSmartReplayReport(raw: SmartReplayReportInput) {
     replayId: input.replayId,
     run: { mailsClaimed: ledger.items, spentMicroUsd: smartLedgerSpent(ledger), openReservations: Object.keys(ledger.open).length },
     summary: { mails: replayed.length, costMicroUsd, outcomesV20: v20, outcomesV19: v19, transitions, discardedByV1, itemsWithoutResult: withoutResult, unreadableRows: unreadable,
-      revisions: [...new Set(replayed.map(row => `${row.revision}:${row.promptSha256.slice(0, 16)}:${row.model}`))] },
+      revisions: [...new Set(replayed.map(row => `${row.revision}:${row.promptSha256.slice(0, 16)}:${row.model}${row.flags?.length ? `:flags=${row.flags.join("+")}` : ""}`))] },
     cases: page.map(row => {
       const before = shadow.get(row.messageId), threadId = threads.get(row.messageId) ?? null;
       return {
         messageId: row.messageId, threadId, receivedAt: row.receivedAt,
         v19: before?.row ? { status: "done", ...smartShadowCaseLine(before.row, day(before.row.startedAt), threadId), texts: smartReplayTexts(before.row) }
           : { status: before ? `shadow_${before.status}` : "absent", v1GateReason: before?.gate ?? null },
-        v20: { ...smartShadowCaseLine(row, day(row.startedAt), threadId), texts: smartReplayTexts(row) },
+        v20: { ...smartShadowCaseLine(row, day(row.startedAt), threadId), texts: smartReplayTexts(row), ...(row.flags?.length ? { flags: row.flags, sentRepliesBefore: row.sentRepliesBefore ?? null } : {}) },
       };
     }),
     casesTotal: listed.length, offset: input.offset, nextOffset: input.offset + page.length < listed.length ? input.offset + page.length : null,
