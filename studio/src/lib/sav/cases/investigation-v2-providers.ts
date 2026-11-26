@@ -18,7 +18,7 @@ import { createSavKnowledgeVectorIndex, SAV_RETRIEVAL_EMBEDDING_DIMENSION } from
 import type { CaseOwnerReadTransport } from "./admission-owner-reader";
 import { caseRequestSearchText, type SourceRef } from "./case-types";
 import { caseResolutionCheckSchema } from "./investigation-closure";
-import { caseDecisionProposalSchema } from "./decision-contract";
+import { caseDecisionModelProposalSchema } from "./decision-contract";
 import { reduceCaseCustomerContext, SAV_CASE_CUSTOMER_CONTEXT_LEVELS } from "./investigation-customer-context";
 import { appendCaseAttachmentParts, caseAttachmentPartsOf, fitCaseCustomerAttachmentMedia, SAV_CASE_ATTACHMENTS_INSTRUCTION } from "./investigation-customer-attachments";
 import type { CaseEmbeddingTransport, CaseKnowledgeVectorSearch } from "./investigation-budgeted-retrieval";
@@ -130,7 +130,7 @@ export const SAV_CASE_INVESTIGATION_PROMPT_REVISION = "sav-v2-investigation-prom
  * SAV-94: both gained the reply layout instruction (v5 -> v7 with attachments, v4 -> v6 without). */
 export const SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS = "sav-v2-investigation-prompt-2026-11-18.v6";
 const CLOSURE_JSON_SCHEMA = JSON.stringify(z.toJSONSchema(caseResolutionCheckSchema));
-const DECISION_JSON_SCHEMA = JSON.stringify(z.toJSONSchema(caseDecisionProposalSchema, { io: "input", unrepresentable: "any" }));
+const DECISION_JSON_SCHEMA = JSON.stringify(z.toJSONSchema(caseDecisionModelProposalSchema, { io: "input", unrepresentable: "any" }));
 /** SAV-92 idée 3: the provider copies of the SAME schemas (`caseProviderJsonSchema`), built on first use; the text schemas above are unchanged. */
 const providerSchemas = new Map<"decision" | "resolution_check", Record<string, unknown>>();
 export function caseDecisionProviderSchema(purpose: "decision" | "resolution_check") {

@@ -67,7 +67,8 @@ const nextActionSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("observe_only") }).strict(),
 ]);
 
-export const caseDecisionProposalSchema = z.object({
+/** What the Gemini decision model is asked for (its JSON schema is part of the pinned prompt): unchanged since before 26/11. */
+export const caseDecisionModelProposalSchema = z.object({
   caseVersion: z.number().int().nonnegative(),
   understanding: z.object({
     requests: z.array(z.object({
@@ -85,6 +86,14 @@ export const caseDecisionProposalSchema = z.object({
     impossibilityClaims: z.array(z.object({ requestId: id, statement: text(600), knowledge: caseDecisionKnowledgeRefSchema }).strict()).max(5),
     accountAdvice: z.enum(["none", "existing_account_access", "new_subscription", "new_account"]),
   }).strict().optional(),
+}).strict();
+/** The proposal the validator accepts: the model's, plus, from the smart brain only, its commercial part. */
+export const caseDecisionProposalSchema = caseDecisionModelProposalSchema.extend({
+  /**
+   * 26/11 (smart brain, `SAV_V2_SMART_COMMERCIAL_FORWARD=on` only; absent otherwise): the commercial questions of this mail (which plan, a demo) that the
+   * reply deliberately leaves out. The reply passage forwards them to sales before proposing the reply, never to the customer. Grants no effect by itself.
+   */
+  commercialPart: z.object({ asks: z.array(text(600)).min(1).max(4) }).strict().optional(),
 }).strict();
 export type CaseDecisionProposal = z.infer<typeof caseDecisionProposalSchema>;
 export type CaseDecisionAction = CaseDecisionProposal["nextAction"]["kind"];

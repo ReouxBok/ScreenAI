@@ -46,6 +46,8 @@ export type CaseDecisionDraft = {
   accessScope?: CaseAccessScopeStamp;
   /** SAV-92 (multi-block): every block scope the decision was validated under; each must still be the one in force. */
   blockScopes?: CaseAccessScopeStamp[];
+  /** 26/11 (smart brain, `SAV_V2_SMART_COMMERCIAL_FORWARD`): the commercial asks an answer or a question leaves out, to forward to sales before it is proposed. */
+  commercialPart?: Readonly<{ asks: readonly string[] }>;
 };
 
 /** The stored customer mail an input answers, as C's canonical trigger; null when the input names no stored mail. */
@@ -130,7 +132,8 @@ export function caseDecisionDraft(caseId: string, stored: CaseInvestigationStore
   return { caseId, inputKey: stored.inputKey, triggerEventId, decidedOn: decision.caseVersion,
     decisionContract: decision.validation.contractRevision, reply, replyLimit, noteText: caseDecisionNoteText(proposal.nextAction, decision.knowledge),
     citations: reply && (reply.purpose === "closing" || reply.purpose === "handoff") ? [] : proposal.reply ? [...proposal.reply.citations] : [], shownSources: reply && (reply.purpose === "closing" || reply.purpose === "handoff") ? [] : caseShownSources(proposal), decidedWhileActionsPaused: decision.actionsPaused, ...(stamp ? { accessScope: stamp } : {}),
-    ...(blockStamps ? { blockScopes: blockStamps } : {}) };
+    ...(blockStamps ? { blockScopes: blockStamps } : {}),
+    ...(proposal.commercialPart && reply && (reply.purpose === "answer" || reply.purpose === "question") ? { commercialPart: { asks: [...proposal.commercialPart.asks] } } : {}) };
 }
 
 /**

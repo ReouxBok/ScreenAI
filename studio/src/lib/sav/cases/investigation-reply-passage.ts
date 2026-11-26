@@ -27,6 +27,12 @@ import { readPilotReplyProvenance, type PilotProvenanceDeps } from "./pilot-pass
 import { caseSmartSupportOpen, isSmartSupportStamp, smartSupportStampInForce } from "./smart-support-scope";
 import { savV2EntrySmartOn } from "./smart-entry-switch";
 import { smartSendProblem } from "./smart/smart-send-fence";
+import { smartCommercialForwardOn } from "./smart/smart-switch";
+import { commercialForwardAuthority, commercialForwardDeps, enqueueCommercialForward, syncCommercialForward } from "./commercial-forward-store";
+import { SAV_CASE_TEAM_PART_WAIT_CODE } from "./case-team-part-wait";
+
+/** The targeted forward right after it is queued is bounded; past it, the reconcile sweep finishes it. */
+const COMMERCIAL_FORWARD_INLINE_MS = 15_000;
 
 /*
  * B (4/11, LOCAL and OFF): from the investigation of an admitted case to the NORMAL send plan, and nothing else. B proposes the recorded
@@ -158,6 +164,17 @@ export async function passCaseInvestigationToReplyPlan(caseId: string, deps: Cas
   if (draft.replyLimit === "access_scope_changed" || draft.replyLimit === "access_scope_unknown")
     return { status: "human_task_required", caseId, reason: draft.replyLimit };
   if (!draft.reply) return { status: "no_reply", caseId, reason: latest.reason ?? "no_reply" };
+  // Ugo 26/11 (`SAV_V2_SMART_COMMERCIAL_FORWARD`): a reply that leaves out the mail's commercial question is proposed only once that question's forward to
+  // sales is durably queued. Switch off since the decision, no authority to forward, or no stored mail: nothing is proposed and the case waits with the
+  // team-part code, so after its bound the WHOLE mail goes to the team (never a reply that silently drops the commercial question).
+  if (draft.commercialPart) {
+    const refuse = (detail: string): CaseReplyPassageReport => ({ status: "proposal_refused", caseId, code: SAV_CASE_TEAM_PART_WAIT_CODE, detail });
+    if (!smartCommercialForwardOn(deps.store.env())) return refuse("commercial_forward_unavailable");
+    try { await commercialForwardAuthority(deps.store.env()); } catch { return refuse("commercial_forward_unavailable"); }
+    const queued = await enqueueCommercialForward({ caseId, inputKey: draft.inputKey, triggerEventId: draft.triggerEventId, asks: draft.commercialPart.asks }).catch(() => null);
+    if (!queued?.ok) return refuse("commercial_forward_unavailable");
+    if (queued.created) await syncCommercialForward(queued.key, commercialForwardDeps(deps.store.env, AbortSignal.timeout(COMMERCIAL_FORWARD_INLINE_MS)));
+  }
   // SAV-92 (review of batch 2, finding 1): a reply telling the customer part of the mail went to the team is proposed only once that part's notice is durably
   // queued (same execution ledger, never cancelled by a later mail). Otherwise nothing is proposed: the case waits visibly, no promise without the handoff.
   if (draft.reply.text.trimEnd().endsWith(SAV_CASE_TEAM_PART_MENTION)) {

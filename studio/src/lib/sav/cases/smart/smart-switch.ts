@@ -44,6 +44,14 @@ export const smartAgentShadowOn = (env: Env) => env[SAV_SMART_AGENT_ENV] === "sh
 export const SAV_SMART_COMMERCIAL_SPLIT_ENV = "SAV_V2_SMART_COMMERCIAL_SPLIT";
 /** The prompt set and the turn's port for the switch: `{ commercialSplit: true }` when on, `{}` when off (spread as is: off adds nothing). */
 export const smartCommercialSet = (env: Env): Readonly<{ commercialSplit?: true }> => env[SAV_SMART_COMMERCIAL_SPLIT_ENV] === "on" ? { commercialSplit: true } : {};
+/*
+ * Ugo, 26/11 (sub-switch of the split, OFF by default): a mail with usage questions AND a commercial question. With BOTH
+ * `SAV_V2_SMART_COMMERCIAL_SPLIT=on` and `SAV_V2_SMART_COMMERCIAL_FORWARD=on` (exactly), the agent answers the usage needs (its reply says nothing of the
+ * commercial one) and the commercial part alone is forwarded to sales (sacha@) by the V2 reply passage, silently. Anything else: today's split (the
+ * whole mail to the team as soon as one need is commercial). Only the V2 circuit's provider reads it: the shadow, replay and benches never forward.
+ */
+export const SAV_SMART_COMMERCIAL_FORWARD_ENV = "SAV_V2_SMART_COMMERCIAL_FORWARD";
+export const smartCommercialForwardOn = (env: Env) => env[SAV_SMART_COMMERCIAL_SPLIT_ENV] === "on" && env[SAV_SMART_COMMERCIAL_FORWARD_ENV] === "on";
 
 export function readSmartShadowConfig(env: Env): SmartShadowConfig {
   if (!smartAgentShadowOn(env)) return { mode: "off" };

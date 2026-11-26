@@ -11,7 +11,7 @@ import type { SmartSource } from "./smart-checks";
 import type { SmartFact, SmartTeamNote } from "./smart-contract";
 import { smartEmptyMemory, type SmartCaseMemory } from "./smart-memory";
 import type { SmartModelPort } from "./smart-model";
-import { smartCommercialSet } from "./smart-switch";
+import { smartCommercialForwardOn, smartCommercialSet } from "./smart-switch";
 import { buildSmartCaseTrace, traceSmartKnowledge, type SmartCaseTraceSink, type SmartTraceSearch } from "./smart-trace";
 
 /*
@@ -145,7 +145,13 @@ export function smartProposalFromTurn(result: SmartTurnResult, request: Pick<Cas
   // circuit has no closing outcome, Ugo decides later between closing silently, a polite reply or the team), but its note says what it is, never « aucune
   // fiche retrouvée ». The proposed courtesy text is given to the team, not sent.
   if (result.reasons.includes("understand:no_need") && !result.reading?.needs.length) return handoff("diagnosis_out_of_tools", smartCourtesyNote(text ?? null));
-  if (!decision || !text || !open.length || decision.coverage.some(row => row.status === "handed")) return handoff(noteReason);
+  // 26/11 (`SAV_V2_SMART_COMMERCIAL_FORWARD`): the turn says every other need is answered or asked; its commercial needs are the only ones handed and
+  // leave with the proposal (`commercialPart`), forwarded to sales by the reply passage. Without it, one handed need still hands the whole mail over.
+  const commercial = result.commercialForward ? new Set((result.reading?.needs ?? []).filter(need => need.commercial === true).map(need => need.id)) : null;
+  const asks = commercial?.size ? (result.commercialForward?.asks ?? []).map(ask => cut(ask, 600)).filter(Boolean).slice(0, 4) : [];
+  const commercialPart = asks.length ? { commercialPart: { asks } } : {};
+  if (commercial && !asks.length) return handoff(noteReason);
+  if (!decision || !text || !open.length || decision.coverage.some(row => row.status === "handed" && !commercial?.has(row.needId))) return handoff(noteReason);
   const understanding = { requests: open.map(row => ({ id: row.id, summary: cut(caseRequestSearchText(row) || "Demande du client", 600) || "Demande du client", family: row.family, status: "open" as const })), newFacts: [] };
   /*
    * SAV-122 (contract v5: a fact's sentence is optional): the step's text, required non-empty by the decision contract. It is INTERNAL only (the
@@ -160,12 +166,12 @@ export function smartProposalFromTurn(result: SmartTurnResult, request: Pick<Cas
   const reply = { text: cut(text, 6000), citations: cited.slice(0, 10).map(({ knowledgeId, contentVersionId }) => ({ knowledgeId, contentVersionId })), impossibilityClaims: [], accountAdvice: "none" as const };
   if (result.outcome === "ask") {
     const question = cut(decision.memory.question || text, 600);
-    return { caseVersion: request.snapshot.version, understanding, reply,
+    return { caseVersion: request.snapshot.version, understanding, reply, ...commercialPart,
       nextAction: { kind: "ask", questions: open.slice(0, 5).map(row => ({ text: question, requestId: row.id, reducesUncertainty: "Préciser la situation du client avant de répondre.", seeks: [{ kind: "other" as const }] })) } };
   }
   if (!cited.length) return handoff("knowledge_missing", result.teamNote ?? { raison: "no_source", besoin: cut(text, 600) || "Réponse sans fiche retrouvée", compris: "", verifie: [], essaye: [], hypotheses: [],
     prochaineVerification: "La réponse proposée ne s'appuie sur aucune fiche retrouvée par le circuit : vérifier et répondre.", ditAuClient: null });
-  return { caseVersion: request.snapshot.version, understanding, reply,
+  return { caseVersion: request.snapshot.version, understanding, reply, ...commercialPart,
     nextAction: { kind: "answer", requestIds: open.map(row => row.id).slice(0, 6), steps: cited.slice(0, 8).map(row => ({ text: row.sentence, knowledge: { knowledgeId: row.knowledgeId, contentVersionId: row.contentVersionId }, newFactIds: [] })),
       expectedResult: "Le client peut reprendre son usage avec les étapes indiquées." } };
 }
@@ -237,6 +243,7 @@ export function smartCaseDecisionProvider(deps: SmartCaseProviderDeps): CaseV2Mo
       model: smartModelWithFeedback(deps.model, request.feedback), knowledge: deps.trace ? traceSmartKnowledge(smartCaseKnowledge(request), searches) : smartCaseKnowledge(request), maxInputBytes: cap,
       today: deps.now().toISOString().slice(0, 10), recordOwn: true, ...(deps.academy ? { academy: deps.academy } : {}), ...(deps.maxExchanges ? { maxExchanges: deps.maxExchanges } : {}),
       ...(files?.turn ? { attachments: files.turn } : {}), ...smartCommercialSet(deps.env()),
+      ...(smartCommercialForwardOn(deps.env()) ? { commercialForward: true } : {}),
     });
     deps.observe?.(result);
     const usage = smartTurnUsage(result), proposal = smartProposalFromTurn(result, request);

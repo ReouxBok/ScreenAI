@@ -2,7 +2,7 @@ import { savReplyFooter } from "../../reply-format";
 import { savRetrievalCardSizeFixOn, SAV_RETRIEVAL_TRUNCATION_MARKER, truncateSavRetrievalText } from "../../request-retrieval";
 import { smartRelevanceView, smartRepairFactSources, smartServerChecks, type SmartCheckResult, type SmartSource } from "./smart-checks";
 import {
-  parseSmartOutput, SAV_SMART_VERIFY_CODES, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartUnwrapOutput, smartVerdictSchema,
+  parseSmartOutput, SAV_SMART_VERIFY_CODES, smartDecisionSchema, smartReadingSchema, smartStepSchema, smartCommercialVerdictSchema, smartUnwrapOutput, smartVerdictSchema,
   type SmartCallKind, type SmartCheckCode, type SmartDecision, type SmartNeed, type SmartReading, type SmartTeamNote, type SmartTurnOutcome, type SmartVerdict,
 } from "./smart-contract";
 import { renderSmartTeamNote, smartCommercialNote, smartFallbackNote, smartSensitiveNote } from "./smart-handoff-note";
@@ -79,6 +79,11 @@ export type SmartTurnPorts = Readonly<{
    * a demo) is neither searched nor answered: handed to the team with the commercial routing in the note. Absent or false: today's turn exactly.
    */
   commercialSplit?: boolean;
+  /**
+   * `smartCommercialForwardOn(env)` (26/11, needs `commercialSplit` too): a reply or a question that answers every other need and hands ONLY the commercial
+   * ones carries `commercialForward` (their asks), for the V2 circuit to forward to sales while the reply goes out. Absent or false: no such field, ever.
+   */
+  commercialForward?: boolean;
 }>;
 export type SmartCallRecord = Readonly<{ kind: SmartCallKind; status: "ok" | "failed"; problem: string | null; inputBytes: number; uncertain: boolean; sent: boolean;
   usage: Readonly<{ inputTokens: number; outputTokens: number }> | null;
@@ -113,6 +118,8 @@ export type SmartTurnResult = Readonly<{
   progressed: boolean;
   /** Smart images (only when the turn was given files): the calls that carried them, and why a call had to go without them (closed codes). */
   attachments?: Readonly<{ sentWith: readonly SmartCallKind[]; dropped: readonly string[] }>;
+  /** 26/11 (`commercialForward` only): the commercial asks to forward to sales while this reply or question goes out. Absent otherwise. */
+  commercialForward?: Readonly<{ asks: readonly string[] }>;
 }>;
 
 const THREAD_MAX = 3, THREAD_CHARS = 800;
@@ -206,7 +213,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   const filesSummary = () => filesSent() ? { customerFiles: { count: files!.files.length, ids: files!.files.map(row => row.id) } } : {};
   // 25/11 (`SAV_V2_SMART_COMMERCIAL_SPLIT`): off, `promptSet` is empty (today's prompts) and `commercialAsks` stays empty.
   const promptSet = ports.commercialSplit === true ? { commercialSplit: true } : {};
-  let commercialAsks: string[] = [];
+  let commercialAsks: string[] = [], commercialIds = new Set<string>();
 
   const end = (outcome: SmartTurnOutcome, reasons: readonly string[], extra: Readonly<{ sensitiveStop?: "net" | "understand"; replyWithFooter?: string | null; note?: SmartTeamNote | null; noteText?: string | null }> = {}): SmartTurnResult => {
     // The memory: merged on every ending that read the mail (a failure or an interruption leaves it unchanged: the mail will be replayed).
@@ -217,11 +224,16 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
     const given = extra.note ?? (outcome === "handoff" ? decision?.teamNote ?? smartFallbackNote({ reason: "other", reading, memory: merged.memory }) : null);
     // A commercial need is the team's (sales) on every ending that carries a note: the routing comes first in the need.
     const note = given && commercialAsks.length ? smartCommercialNote(given, commercialAsks) : given;
+    // 26/11: the commercial part alone leaves with sales only when every other need got its answer or its question in this very reply.
+    const forward = ports.commercialForward === true && promptSet.commercialSplit === true && commercialIds.size > 0 && (outcome === "reply" || outcome === "ask") && decision
+      && reading!.needs.some(need => !commercialIds.has(need.id))
+      && reading!.needs.every(need => commercialIds.has(need.id) || decision!.coverage.some(row => row.needId === need.id && row.status !== "handed"));
     return {
       outcome, reasons: [...new Set(reasons)], sensitiveStop: extra.sensitiveStop ?? null, reading, decision, replyWithFooter: extra.replyWithFooter ?? null, checks, verdicts, corrected, calls,
       sources: sources.map(row => ({ cardId: row.cardId, version: row.version, needIds: row.needIds })), missing, steps,
       teamNote: note, teamNoteText: extra.noteText ?? (note ? renderSmartTeamNote(note) : null), memory: merged.memory, progressed: merged.progressed,
       ...(files ? { attachments: { sentWith: [...new Set(calls.filter(row => row.media).map(row => row.kind))], dropped: [...filesDropped] } } : {}),
+      ...(forward ? { commercialForward: { asks: [...commercialAsks] } } : {}),
     };
   };
   const handoff = (reasons: readonly string[], reason: SmartTeamNote["raison"]) =>
@@ -266,7 +278,7 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
   }
   // 25/11 (switch on, after the sensitive barrier only): the needs the reading marks commercial (which plan, a demo) are the team's (sales). They are
   // not searched; the server hands them over whatever the decision says (`bind`), with the routing in the note of every later ending (`end`).
-  const commercialIds = new Set(reading.needs.filter(need => need.commercial === true).map(need => need.id));
+  commercialIds = new Set(reading.needs.filter(need => need.commercial === true).map(need => need.id));
   commercialAsks = reading.needs.filter(need => commercialIds.has(need.id)).map(need => need.ask);
   // Product decision (Ugo, 21/11): a mail carrying an instruction addressed to the assistant (prompt injection, even reworded) NEVER gets an
   // automatic reply: the team, whether the reading quoted the instruction or not, before any decision. The server net (`smartSafetyNet`)
@@ -403,18 +415,19 @@ export async function runSmartTurn(input: SmartTurnInput, ports: SmartTurnPorts)
 
   // 4. Verify: server and the independent counter-read (never on a handoff without customer text).
   const review = async (current: SmartDecision, kind: "verify" | "reverify"): Promise<{ codes: SmartCheckCode[]; factProblems: SmartCheckResult["factProblems"]; verdict: SmartVerdict | null; failed: string | null; unknownCodes: boolean }> => {
-    const server = smartServerChecks({ decision: current, reading: reading!, customerText, sources, academy, memory: memoryBefore, ...(filesSent() ? { files: files!.files } : {}) });
+    const server = smartServerChecks({ decision: current, reading: reading!, customerText, sources, academy, memory: memoryBefore, ...(filesSent() ? { files: files!.files } : {}),
+      ...(commercialIds.size ? { commercial: reading!.needs.filter(need => commercialIds.has(need.id)).map(need => ({ id: need.id, ask: need.ask })) } : {}) });
     if (current.outcome === "handoff" && !current.reply?.trim()) return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: null, unknownCodes: false };
     const read = await call(kind, filesNoted(smartVerifyPrompt(promptSet), SAV_SMART_FILES_VERIFY_NOTE), {
       customer: { subject: customer.subject, mail: customer.mail }, ...filesSummary(),
-      needs: reading!.needs.map(need => ({ id: need.id, ask: need.ask, alreadyDone: need.alreadyDone })),
+      needs: reading!.needs.map(need => ({ id: need.id, ask: need.ask, alreadyDone: need.alreadyDone, ...(commercialIds.has(need.id) ? { commercial: true } : {}) })),
       // Each fact with its source and excerpt; its sentence is only a hint (SAV-122): the counter-read judges every claim against the excerpts.
       reply: current.reply, facts: current.facts.map(fact => ({ type: fact.type, source: fact.cardId ?? fact.toolCallId ?? fact.sourceKind, excerpt: fact.excerpt,
         ...(fact.sentence.trim() ? { sentence: fact.sentence } : {}) })),
       ...(reading!.instructionText ? { injectedInstruction: reading!.instructionText } : {}),
     }, 0);
     if (read.status === "failed") return { codes: [...server.codes], factProblems: server.factProblems, verdict: null, failed: read.problem === "deadline" ? "deadline" : `${kind}:${read.problem}`, unknownCodes: false };
-    const verdict = parseSmartOutput(smartVerdictSchema, read.output);
+    const verdict = parseSmartOutput(promptSet.commercialSplit ? smartCommercialVerdictSchema : smartVerdictSchema, read.output);
     return { codes: [...server.codes], factProblems: server.factProblems, verdict: verdict.ok ? verdict.value : null, failed: verdict.ok ? null : `${kind}:output_invalid`,
       unknownCodes: smartUnknownVerifyCodes(read.output) };
   };

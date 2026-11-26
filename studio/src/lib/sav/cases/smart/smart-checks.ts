@@ -62,6 +62,11 @@ export type SmartCheckInput = Readonly<{
    * the stored reading when there is one; without a reading the marker of an admitted file is accepted. Absent: the exact previous checks.
    */
   files?: readonly Readonly<{ id: string; reading: string | null }>[];
+  /**
+   * 26/11 (`SAV_V2_SMART_COMMERCIAL_SPLIT=on` only, absent otherwise): the needs the reading marked commercial. The reply must say nothing of them: a fact
+   * written for one, or a sentence taking up its own words (same comparison as the injected instruction, no word list), refuses (`commercial_in_reply`).
+   */
+  commercial?: ReadonlyArray<Readonly<{ id: string; ask: string }>>;
 }>;
 /**
  * `factProblems` (SAV-122, bench v8: `fact_source_invalid` again at the second pass on expiree-01 / autreoutil-06): the fact-level codes WITH
@@ -443,6 +448,10 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   // SAV-122 (PORTE 2E, P1): a sentence of OUR reply that takes up the instruction found in the mail (never a word list on the mail).
   for (const sentence of smartInstructionEchoes(reply, input.instruction ?? reading.instructionText ?? null)) {
     codes.add("instruction_followed"); factProblems.push({ code: "instruction_followed", sentence: sentence.slice(0, 300) });
+  }
+  for (const need of input.commercial ?? []) {
+    for (const fact of decision.facts.filter(row => row.needId === need.id)) flag("commercial_in_reply", factLabel(fact));
+    for (const sentence of smartInstructionEchoes(reply, need.ask)) flag("commercial_in_reply", sentence);
   }
   return { ok: codes.size === 0, codes: [...codes], factProblems };
 }

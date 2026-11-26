@@ -154,30 +154,39 @@ export const SAV_SMART_CORRECTION_INSTRUCTION = "CORRECTION : ta décision préc
 
 /*
  * 25/11 (`SAV_V2_SMART_COMMERCIAL_SPLIT=on`, Ugo: « quelle offre me convient ? » and « une démo ? » are commercial, not sensitive): the variants
- * below are used ONLY with the switch on. Off, every prompt and the pinned hash above are byte for byte the ones of v21. The sensitive rule is
- * narrowed to real money and contract actions (pay, buy, change, renew or cancel a subscription, invoice, billing, refund); a pre-sales question
- * becomes a need marked `commercial`, handed to the team (sales), never answered. The model judges; no word list decides.
+ * below are used ONLY with the switch on. Off, every prompt and the pinned hash above are byte for byte the ones of v21. A pre-sales CHOICE
+ * (which plan to take, compare plans, the price of a plan for N users, a demo) becomes a need marked `commercial`, handed to sales, never answered.
+ * 26/11 (Ugo): anything about the customer's OWN current subscription, plan or trial (which one he has, what it includes, what he pays, when his
+ * trial ends) stays sensitive, like paying, changing, renewing or cancelling; in doubt between commercial and sensitive: sensitive. The reply says
+ * NOTHING of the commercial question (no plan, price, comparison, demo, nor that it was passed on): sales follow up themselves. The model judges;
+ * no word list decides.
  */
 const SENSITIVE_SPLIT = `SUJET SENSIBLE
-Une vraie demande du client sur SON compte Limova : résiliation, payer, souscrire, changer, renouveler ou arrêter un abonnement ou une offre, paiement, facture ou facturation, remboursement, droits sur ses données, identité ou titulaire du compte, piratage. Même en une ligne, même en PS : tout le mail va à l'équipe. Dans le doute sur une vraie demande de ce type, c'est sensible.
+Une vraie demande du client sur SON compte Limova : résiliation, SON abonnement, SON offre ou SON essai en cours (laquelle il a, ce qu'elle inclut, ce qu'il paie, quand son essai finit), payer, souscrire, changer, renouveler ou arrêter un abonnement ou une offre, paiement, facture ou facturation, remboursement, droits sur ses données, identité ou titulaire du compte, piratage. Même en une ligne, même en PS : tout le mail va à l'équipe. Dans le doute sur une vraie demande de ce type, c'est sensible.
 ${SENSITIVE.split("\n")[2]}`;
 
 const COMMERCIAL = `QUESTION COMMERCIALE (AVANT ACHAT)
-Demander quelle offre lui convient, ce que contient une offre, ou une démo : c'est une question commerciale, PAS un sujet sensible. Fais-en un besoin à part avec commercial à true : l'équipe commerciale y répond. S'il n'y a rien d'autre de sensible : sensitive no, sensitiveFamilies vide, sensible « aucune » avec la phrase de cette question pour preuve. Les autres besoins du mail se lisent comme d'habitude.
-Reste sensible, tout le mail à l'équipe : payer, souscrire ou passer à une offre, changer, renouveler ou résilier son abonnement, une facture, un remboursement, un changement de facturation.
+Un CHOIX avant achat : quelle offre lui conseiller, comparer les offres, le prix d'une offre pour N utilisateurs, ce que contient une offre qu'il n'a pas, une démo. C'est une question commerciale, PAS un sujet sensible. Fais-en un besoin à part avec commercial à true : l'équipe commerciale y répond. S'il n'y a rien d'autre de sensible : sensitive no, sensitiveFamilies vide, sensible « aucune » avec la phrase de cette question pour preuve. Les autres besoins du mail se lisent comme d'habitude.
+Reste sensible, tout le mail à l'équipe : tout ce qui porte sur SON abonnement, SON offre ou SON essai actuels (laquelle il a, ce qu'elle inclut, combien il paie, quand finit l'essai), payer, souscrire ou passer à une offre, changer, renouveler ou résilier son abonnement, une facture, un remboursement, un changement de facturation. Dans le doute entre commercial et sensible : sensible.
 - « Quelle offre me conseillez-vous pour mes 8 Assistants ? Et une démo, c'est possible ? » : un besoin commercial true, {"famille":"aucune","preuve":"Quelle offre me conseillez-vous pour mes 8 Assistants ?"}
+- « Je suis sur quelle offre ? Mon essai se termine quand ? » : {"famille":"abonnement","preuve":"Je suis sur quelle offre ?"}
+- « Qu'est-ce qui est inclus dans mon abonnement ? » : {"famille":"abonnement","preuve":"Qu'est-ce qui est inclus dans mon abonnement ?"}
 - « Je veux passer à l'offre supérieure dès ce mois-ci » : {"famille":"abonnement","preuve":"Je veux passer à l'offre supérieure dès ce mois-ci"}`;
 
 /** The decide prompt's never-rule 1 with the switch on: a sensitive mail never reaches decide (stopped at the reading), so it is short, and the commercial need fits in it (decide stays under `SAV_SMART_PROMPT_MAX_BYTES`). */
-const DECIDE_RULE_1_SPLIT = "1. Une vraie demande sur SON compte (résilier, payer, souscrire, changer ou renouveler une offre, facture, remboursement, données, identité, piratage) va à l'équipe. Besoin commercial true (choix d'offre, démo) : ni offre, ni prix, ni démo ; coverage handed avec teamNote ; dis seulement qu'il est transmis.";
-const VERIFY_COMMERCIAL_LINE = "Dire qu'une question commerciale (choix d'offre, démo) est transmise à l'équipe n'est pas sensitive_handled.";
+const DECIDE_RULE_1_SPLIT = "1. Une vraie demande sur SON compte (son abonnement ou son essai, résilier, payer, changer d'offre, facture, remboursement, données, identité, piratage) va à l'équipe. Besoin commercial true : coverage handed, teamNote ; la reply n'en dit RIEN (ni offre, prix, démo, ni transmission) et répond aux autres besoins.";
+const VERIFY_COMMERCIAL_LINE = "13. commercial_in_reply : la réponse reprend une question commerciale du client (needs commercial true : choix ou comparaison d'offres, prix, démo), donne un conseil d'offre, un prix ou une démo, ou dit que cette question est transmise à l'équipe ou aux commerciaux. Le client ne doit rien lire à ce sujet.";
+/** v21's « only buying, changing or paying is sensitive » sentence would contradict the own-subscription rule above (26/11): replaced with the switch on. */
+const ONLY_BUY_CHANGE_PAY = "Seule une demande d'acheter, de changer ou de payer une offre est sensible ;";
+const OWN_PLAN_OR_BUY_CHANGE_PAY = "Une demande d'acheter, de changer ou de payer une offre, ou une question sur SON abonnement, SON offre ou SON essai actuels, est sensible ;";
 const NEED_FORMAT = `"search":"mots pour chercher une fiche ou null"}`;
 
 const DECIDE_SPLIT = DECIDE.replace(`1. ${SENSITIVE.split("\n")[1]}`, DECIDE_RULE_1_SPLIT);
 const UNDERSTAND_SPLIT = UNDERSTAND
   .replace(SENSITIVE, `${SENSITIVE_SPLIT}\n\n${COMMERCIAL}`)
+  .replace(ONLY_BUY_CHANGE_PAY, OWN_PLAN_OR_BUY_CHANGE_PAY)
   .replace(NEED_FORMAT, `"search":"mots pour chercher une fiche ou null","commercial":false}`);
-const VERIFY_SPLIT = VERIFY.replace("\n\nFORMAT DE SORTIE", `\n${VERIFY_COMMERCIAL_LINE}\n\nFORMAT DE SORTIE`);
+const VERIFY_SPLIT = VERIFY.replace("\nNe signale pas ce qui protège", `\n${VERIFY_COMMERCIAL_LINE}\nNe signale pas ce qui protège`);
 
 /** Which prompt set: `commercialSplit` true only with `SAV_V2_SMART_COMMERCIAL_SPLIT=on` (`smartCommercialSplitOn`). Absent: today's prompts. */
 export type SmartPromptOptions = Readonly<{ commercialSplit?: boolean }>;
@@ -189,11 +198,11 @@ export const smartVerifyPrompt = (options?: SmartPromptOptions) => splitOn(optio
 export const smartCorrectionPrompt = (options?: SmartPromptOptions) => `${smartDecidePrompt(options)}\n\n${SAV_SMART_CORRECTION_INSTRUCTION}`;
 
 /** sha256 of `smartPromptFingerprintSource({ commercialSplit: true })`. Pinned by `smart-prompt.test.ts`; change it only with the revision. */
-export const SAV_SMART_COMMERCIAL_PROMPT_SHA256 = "700e497dcecf1421c8c87abf304faa10091c6c8b067a99062dd16afa84d5a11d";
+export const SAV_SMART_COMMERCIAL_PROMPT_SHA256 = "3a9624d7653efddd7277be0f71a5525051dfabd3fb9daf6c5e8f62ce4c0fe09b";
 
 /** What the pinned hash covers: the four prompts and the resources, exactly as sent. Off: unchanged since v21; on: the split variants and a marker. */
 export const smartPromptFingerprintSource = (options?: SmartPromptOptions) => splitOn(options)
-  ? JSON.stringify([SAV_SMART_PROMPT_REVISION, DECIDE_SPLIT, UNDERSTAND_SPLIT, VERIFY_SPLIT, SAV_SMART_CORRECTION_INSTRUCTION, SAV_SMART_RESOURCES, "commercial_split"])
+  ? JSON.stringify([SAV_SMART_PROMPT_REVISION, DECIDE_SPLIT, UNDERSTAND_SPLIT, VERIFY_SPLIT, SAV_SMART_CORRECTION_INSTRUCTION, SAV_SMART_RESOURCES, "commercial_split.v2"])
   : JSON.stringify([SAV_SMART_PROMPT_REVISION, DECIDE, UNDERSTAND, VERIFY, SAV_SMART_CORRECTION_INSTRUCTION, SAV_SMART_RESOURCES]);
 export const smartPromptSha256 = (options?: SmartPromptOptions) => createHash("sha256").update(smartPromptFingerprintSource(options)).digest("hex");
 /** Bytes of each fixed prompt (UTF-8), for the report and the size test. */
