@@ -33,6 +33,32 @@ const resolutionProjection = z.object({
   escalation: z.string().optional(), productVersion: z.string().optional(), audience: z.string().optional(),
   validUntil: z.string().optional(), conflictsWith: strings.optional(), supersedes: strings.optional(),
 }).transform(value => value.delivery?.mode === "procedure" ? { ...value, steps: [] } : value);
+type SavRetrievalResolution = z.output<typeof resolutionProjection>;
+/**
+ * SAV_RETRIEVAL_CARD_SIZE_FIX: the compact form of a procedure card. Its delivery groups already carry every prerequisite,
+ * exception and expected result the server renders, so the top-level copies of the same texts are not sent twice. The
+ * body, the delivery, the escalation and every other field stay as they are (the planner checks steps against the body).
+ */
+export function compactSavRetrievalResolution(resolution: SavRetrievalResolution): SavRetrievalResolution {
+  const delivery = resolution.delivery;
+  if (delivery?.mode !== "procedure") return resolution;
+  const parts = [...delivery.groups, ...delivery.steps];
+  const covered = new Set(parts.flatMap(part => [...part.prerequisites, ...part.exceptions, part.expectedResult]).filter(Boolean));
+  const { prerequisites, exceptions, expectedResult, troubleshooting, ...rest } = resolution;
+  const left = (values?: string[]) => values?.filter(value => !covered.has(value));
+  const keptPrerequisites = left(prerequisites), keptExceptions = left(exceptions);
+  return { ...rest,
+    ...(keptPrerequisites?.length ? { prerequisites: keptPrerequisites } : {}),
+    ...(keptExceptions?.length ? { exceptions: keptExceptions } : {}),
+    ...(expectedResult && !covered.has(expectedResult) ? { expectedResult } : {}),
+    ...(troubleshooting && troubleshooting !== resolution.escalation && !parts.some(part => part.escalation === troubleshooting) ? { troubleshooting } : {}) };
+}
+export const SAV_RETRIEVAL_TRUNCATION_MARKER = "\n\n[… suite de la fiche omise : budget de contexte atteint]";
+/** Removes at least `overBytes` serialized bytes from the end of a card's text (whole code points), with a visible marker. */
+export function truncateSavRetrievalText(text: string, overBytes: number) {
+  const points = Array.from(text), cut = overBytes + bytes(SAV_RETRIEVAL_TRUNCATION_MARKER);
+  return cut >= points.length ? SAV_RETRIEVAL_TRUNCATION_MARKER.trimStart() : points.slice(0, points.length - cut).join("").trimEnd() + SAV_RETRIEVAL_TRUNCATION_MARKER;
+}
 
 /** Ranking and a valid publication are not proof that a card supports a claim. */
 export function assessSavKnowledgeValidity(candidate: SavRetrievalCandidate, locale: string, audience: string, now: Date) {
@@ -192,7 +218,10 @@ export async function retrieveSavKnowledgeByRequest(input: {
   if (input.primaryRequestId && !requests.some(request => request.id === input.primaryRequestId)) throw new Error("SAV_RETRIEVAL_PRIMARY_REQUEST_INVALID");
   const now = input.now ?? new Date(), locale = input.locale ?? "fr-FR", audience = input.audience ?? "support";
   if (!Number.isFinite(now.getTime()) || !/^[a-z]{2}-[A-Z]{2}$/.test(locale)) throw new Error("SAV_RETRIEVAL_CONTEXT_INVALID");
-  const ordered = [...requests].sort((a, b) => Number(b.id === input.primaryRequestId) - Number(a.id === input.primaryRequestId));
+  // Read once per call. On: a card is measured like the SQL read (body and resolution each within sourceBytes), a card
+  // skipped for budget gives its slot to the next ranked candidate and is named in the alerts. Off: unchanged.
+  const cardSizeFix = process.env.SAV_RETRIEVAL_CARD_SIZE_FIX === "on";
+  const ordered =[...requests].sort((a, b) => Number(b.id === input.primaryRequestId) - Number(a.id === input.primaryRequestId));
   const chosen = ordered.slice(0, SAV_RETRIEVAL_LIMITS.requests);
   const planned = chosen.map(request => ({ request, query: [request.product, request.feature, request.summary].filter(Boolean).join(" — ") }));
   const queryable = planned.filter(plan => plan.query.length <= SAV_RETRIEVAL_LIMITS.queryCharacters);
@@ -270,21 +299,39 @@ export async function retrieveSavKnowledgeByRequest(input: {
           if (!existing.requestIds.includes(row.requestId)) { existing.requestIds.push(row.requestId); existing.signals.push({ requestId: row.requestId, ...signals }); }
           row.candidateKeys.push(key); row.status = "candidates"; continue;
         }
+        const resolution = resolutionProjection.parse(candidate.resolution);
         const source: SavRequestRetrievalSource = { id: candidate.id, contentVersionId: candidate.contentVersionId, title: candidate.title,
-          content: candidate.content, source: candidate.source, verifiedAt: candidate.verifiedAt, resolution: resolutionProjection.parse(candidate.resolution),
+          content: candidate.content, source: candidate.source, verifiedAt: candidate.verifiedAt, resolution: cardSizeFix ? compactSavRetrievalResolution(resolution) : resolution,
           key, requestIds: [row.requestId], grounding: "unassessed", signals: [{ requestId: row.requestId, ...signals }] };
-        if (sources.size >= SAV_RETRIEVAL_LIMITS.sources || bytes(source) > SAV_RETRIEVAL_LIMITS.sourceBytes
-          || bytes({ rows, sources: [...sources.values(), source], alerts: alerts.slice(0, 60) }) > SAV_RETRIEVAL_LIMITS.contextBytes - 1_500) {
+        // On: a card's size is never a reason to drop it; only the source count limits here, the overall bound is met below.
+        if (sources.size >= SAV_RETRIEVAL_LIMITS.sources || (!cardSizeFix && (bytes(source) > SAV_RETRIEVAL_LIMITS.sourceBytes
+          || bytes({ rows, sources: [...sources.values(), source], alerts: alerts.slice(0, 60) }) > SAV_RETRIEVAL_LIMITS.contextBytes - 1_500))) {
           if (!row.limitations.includes("source_context_budget")) row.limitations.push("source_context_budget");
           if (!row.candidateKeys.length) row.status = "budget_exceeded";
           continue;
         }
         sources.set(key, source); row.candidateKeys.push(key); row.status = "candidates";
       }
-      const uniqueAlerts = [...new Map(alerts.map(alert => [`${alert.code}:${alert.sourceKey ?? ""}`, alert])).values()];
-      const shownAlerts = uniqueAlerts.slice(0, 60);
-      if (uniqueAlerts.length > 60) shownAlerts.push({ code: "additional_validity_alerts_omitted" });
-      const result = finish(revision, rows, [...sources.values()], shownAlerts);
+      const shown = () => {
+        const uniqueAlerts = [...new Map(alerts.map(alert => [`${alert.code}:${alert.sourceKey ?? ""}`, alert])).values()];
+        const shownAlerts = uniqueAlerts.slice(0, 60);
+        if (uniqueAlerts.length > 60) shownAlerts.push({ code: "additional_validity_alerts_omitted" });
+        return shownAlerts;
+      };
+      // On: when the whole result exceeds the model-input bound, the lowest-ranked card (placed last) gives way first: the
+      // end of its text with a visible marker, then, only if still over, its structured procedure (identity, symptoms and
+      // escalation stay). It stays listed and named in the alerts; no card is dropped. The bound below stays a safety net.
+      const over = () => bytes(finish(revision, rows, [...sources.values()], shown())) - SAV_RETRIEVAL_LIMITS.contextBytes;
+      if (cardSizeFix) for (const source of [...sources.values()].reverse()) {
+        if (over() <= 0) break;
+        alerts.push({ code: "source_truncated", sourceKey: source.key });
+        source.content = truncateSavRetrievalText(source.content, over());
+        if (over() > 0 && source.resolution) {
+          const { symptoms, escalation, validUntil, audience, conflictsWith, supersedes } = source.resolution;
+          source.resolution = { steps: [], symptoms, escalation, validUntil, audience, conflictsWith, supersedes };
+        }
+      }
+      const result = finish(revision, rows, [...sources.values()], shown());
       if (bytes(result) > SAV_RETRIEVAL_LIMITS.contextBytes) return unavailable("budget_exceeded", "context_budget");
       return result;
     } catch (error) {

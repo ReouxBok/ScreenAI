@@ -125,5 +125,25 @@ describe("SAV72 production query against an isolated database", () => {
     expect(await index.readExact([{ knowledgeId: item.id, contentVersionId: version.id }])).toEqual([]);
     process.stdout.write(JSON.stringify([{ fixture: "db-large-card", beforeBytes: Buffer.byteLength(body), afterBytes: Buffer.byteLength(on[0][0].content), sourceReadBound: 512_000 }]) + "\n");
   });
+  it("SAV_RETRIEVAL_CARD_SIZE_FIX: a 20 KB fiche with a 13 KB resolution is unavailable off, retrieved whole on (V1 search and V2 exact read)", async () => {
+    const body = Array.from({ length: 37 }, (_, i) => `Étape fictive ${i} : ouvrir le panneau synthétique Exemple et vérifier le réglage numéro ${i}. `.repeat(6)).join("\n\n");
+    const { item, version } = await seed("fiche détaillée fictive", { content: body });
+    if (!("resolution" in version.metadata)) throw Error("Synthetic article required");
+    await f.db.update(contentVersions).set({ metadata: { ...version.metadata, resolution: { ...version.metadata.resolution!, steps: ["Ouvrir le panneau synthétique Exemple."],
+      exceptions: Array.from({ length: 24 }, (_, i) => `Exception fictive ${i} : ${"ne pas appliquer au compte de démonstration. ".repeat(11)}`) } } }).where(eq(contentVersions.id, version.id));
+    expect(Buffer.byteLength(body)).toBeGreaterThan(20_000);
+    const off = await searchSavKnowledgeByRequest({ requests: [{ id: "a", summary: "Fiche détaillée fictive" }], now });
+    expect(off.sources).toEqual([]); expect(off.alerts[0].code).toBe("source_budget");
+    vi.stubEnv("SAV_RETRIEVAL_CARD_SIZE_FIX", "on");
+    try {
+      const on = await searchSavKnowledgeByRequest({ requests: [{ id: "a", summary: "Fiche détaillée fictive" }], now });
+      expect(on.sources.map(source => source.key)).toEqual([`${item.id}:${version.id}`]);
+      expect(on.sources[0].content).toBe(body);
+      expect(Buffer.byteLength(JSON.stringify(on.sources[0].resolution))).toBeGreaterThan(12_000);
+      expect(Buffer.byteLength(JSON.stringify(on))).toBeLessThanOrEqual(36_000);
+      const [exact] = await createSavKnowledgeVectorIndex({ now, compact: true }).readExact([{ knowledgeId: item.id, contentVersionId: version.id }]);
+      expect(exact).toMatchObject({ sourceTooLarge: false }); expect(exact.resolution).not.toBeNull();
+    } finally { vi.unstubAllEnvs(); }
+  });
 
 });

@@ -24,6 +24,8 @@ const VERIFICATION = sql`CASE WHEN item.verified_at IS NULL THEN NULL ELSE
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** At most the scope's own bound of sources per exact read. */
 export const SAV_RETRIEVAL_EXACT_READ_MAX = 200;
+/** The per-part read envelope when SAV_RETRIEVAL_CARD_SIZE_FIX is on: the V2 compact read's own body bound. */
+export const SAV_RETRIEVAL_CARD_READ_BYTES = 512_000;
 const withinBudget = (queries: readonly string[], limit: number) =>
   queries.length <= SAV_RETRIEVAL_LIMITS.queriesPerAttempt && Number.isInteger(limit) && limit >= 1 && limit <= SAV_RETRIEVAL_LIMITS.candidatesPerQuery;
 const validVectors = (queries: readonly string[], vectors: readonly (readonly number[])[]) =>
@@ -37,11 +39,14 @@ const validVectors = (queries: readonly string[], vectors: readonly (readonly nu
 export function createSavKnowledgeVectorIndex(options: { locale?: string; audience?: "support" | "lead"; now?: Date; compact?: boolean } = {}) {
   const locale = options.locale ?? "fr-FR", audience = options.audience ?? "support", now = options.now ?? new Date();
   const db = requireDb();
+  // SAV_RETRIEVAL_CARD_SIZE_FIX=on: a fiche's size is never a reason to leave it out; body and resolution are read up to
+  // the compact read envelope and the retrieval meets the model-input bound by shortening text. Off: the legacy bound.
+  const readBytes = process.env.SAV_RETRIEVAL_CARD_SIZE_FIX === "on" ? SAV_RETRIEVAL_CARD_READ_BYTES : SAV_RETRIEVAL_LIMITS.sourceBytes;
   // V2 opt-in only. V1 retains the exact legacy SQL and mapping. Oversized raw
   // sources remain refused above this local read envelope; never cut mid-passage.
   const contentSql = options.compact
     ? sql`CASE WHEN octet_length(version.body_markdown) <= 512000 THEN version.body_markdown ELSE '' END`
-    : sql`CASE WHEN octet_length(version.body_markdown) <= ${SAV_RETRIEVAL_LIMITS.sourceBytes} THEN version.body_markdown ELSE '' END`;
+    : sql`CASE WHEN octet_length(version.body_markdown) <= ${readBytes} THEN version.body_markdown ELSE '' END`;
   const project = (card: SavRetrievalCandidate, query: string): SavRetrievalCandidate => {
     if (!options.compact || !card.content || !card.resolution) return card;
     const excerpt = selectCaseKnowledgePassages(card.content, card.resolution, query, Math.max(0, 10_000 - new TextEncoder().encode(JSON.stringify(card.resolution)).length));
@@ -80,8 +85,8 @@ export function createSavKnowledgeVectorIndex(options: { locale?: string; audien
             SELECT item.id, version.id AS "contentVersionId", activation.title AS title, item.slug AS source,
               ${contentSql} AS content,
               ${verification} AS "verifiedAt", item.locale,
-              CASE WHEN octet_length(${resolution}::text) <= ${SAV_RETRIEVAL_LIMITS.sourceBytes} THEN ${resolution} ELSE NULL END AS resolution,
-              (octet_length(version.body_markdown) > ${SAV_RETRIEVAL_LIMITS.sourceBytes} OR octet_length(COALESCE(${resolution}::text, '')) > ${SAV_RETRIEVAL_LIMITS.sourceBytes}) AS "sourceTooLarge",
+              CASE WHEN octet_length(${resolution}::text) <= ${readBytes} THEN ${resolution} ELSE NULL END AS resolution,
+              (octet_length(version.body_markdown) > ${readBytes} OR octet_length(COALESCE(${resolution}::text, '')) > ${readBytes}) AS "sourceTooLarge",
               COALESCE(version.metadata -> 'resolution' ->> 'audience', 'support') AS audience,
               (1 - (chunk.embedding <=> ${vector}::vector))::float AS "semanticScore",
               ts_rank_cd(to_tsvector('french', activation.title || ' ' || chunk.heading || ' ' || chunk.content), websearch_to_tsquery('french', ${fullTextQuery}))::float AS lexical
@@ -133,8 +138,8 @@ export function createSavKnowledgeVectorIndex(options: { locale?: string; audien
         SELECT item.id, version.id AS "contentVersionId", activation.title AS title, item.slug AS source,
           ${contentSql} AS content,
           ${VERIFICATION} AS "verifiedAt", item.locale,
-          CASE WHEN octet_length(${RESOLUTION}::text) <= ${SAV_RETRIEVAL_LIMITS.sourceBytes} THEN ${RESOLUTION} ELSE NULL END AS resolution,
-          (octet_length(version.body_markdown) > ${SAV_RETRIEVAL_LIMITS.sourceBytes} OR octet_length(COALESCE(${RESOLUTION}::text, '')) > ${SAV_RETRIEVAL_LIMITS.sourceBytes}) AS "sourceTooLarge",
+          CASE WHEN octet_length(${RESOLUTION}::text) <= ${readBytes} THEN ${RESOLUTION} ELSE NULL END AS resolution,
+          (octet_length(version.body_markdown) > ${readBytes} OR octet_length(COALESCE(${RESOLUTION}::text, '')) > ${readBytes}) AS "sourceTooLarge",
           COALESCE(version.metadata -> 'resolution' ->> 'audience', 'support') AS audience
         FROM content_items item
         JOIN sav_knowledge_activations activation ON activation.item_id = item.id
