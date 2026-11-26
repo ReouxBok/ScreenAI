@@ -57,6 +57,11 @@ export const smartNeedSchema = z.object({
   theme: clippedNullable(80).default(null),
   /** The words to search the cards with; null when nothing is searchable. */
   search: clippedNullable(300).default(null),
+  /**
+   * 25/11 (`SAV_V2_SMART_COMMERCIAL_SPLIT`): a pre-sales question (which plan suits me, a demo), asked of the reading only when the switch is on.
+   * Only a JSON `true` counts; absent unless the model writes it, and dropped by the agent when the switch is off.
+   */
+  commercial: z.boolean().optional().catch(undefined),
 });
 export type SmartNeed = z.infer<typeof smartNeedSchema>;
 
@@ -218,15 +223,22 @@ export const SAV_SMART_VERIFY_CODES = [
   "unsourced_claim",
 ] as const;
 export type SmartVerifyCode = typeof SAV_SMART_VERIFY_CODES[number];
-export const smartVerdictSchema = z.object({
+/**
+ * 26/11 (`SAV_V2_SMART_COMMERCIAL_SPLIT=on` only): the counter-read may also say the reply speaks of the customer's commercial question (a plan, a price,
+ * a demo) or says it was passed on. Off, the list and the schema below are today's exactly (the code is read as `unlisted_claim` like any unknown word).
+ */
+export const SAV_SMART_COMMERCIAL_VERIFY_CODES = [...SAV_SMART_VERIFY_CODES, "commercial_in_reply"] as const;
+const verdictSchemaOf = <C extends readonly [string, ...string[]]>(codes: C) => z.object({
   verdict: looseEnum(["conforme", "non_conforme"]),
   /** A problem with a code outside the list still refuses (read as `unlisted_claim`): a counter-read never fails the turn for a word. */
   problems: z.preprocess(value => value === null ? undefined : Array.isArray(value) ? value.slice(0, 10) : value,
-    z.array(z.object({ code: looseEnum(SAV_SMART_VERIFY_CODES).catch("unlisted_claim"), sentence: clippedOr(600, "") })).max(10).default([])),
+    z.array(z.object({ code: looseEnum(codes).catch("unlisted_claim"), sentence: clippedOr(600, "") })).max(10).default([])),
 }).superRefine((value, ctx) => {
   if (value.verdict === "non_conforme" && !value.problems.length) ctx.addIssue({ code: "custom", message: "NON_CONFORME_WITHOUT_PROBLEM" });
 });
-export type SmartVerdict = z.infer<typeof smartVerdictSchema>;
+export const smartVerdictSchema = verdictSchemaOf(SAV_SMART_VERIFY_CODES);
+export const smartCommercialVerdictSchema = verdictSchemaOf(SAV_SMART_COMMERCIAL_VERIFY_CODES);
+export type SmartVerdict = z.infer<typeof smartCommercialVerdictSchema>;
 
 /** The server's own checks (no model): closed codes. Any of them refuses the reply, whatever the counter-read says. */
 export const SAV_SMART_CHECK_CODES = [
@@ -240,6 +252,8 @@ export const SAV_SMART_CHECK_CODES = [
   "sensitive_commitment",
   // SAV-122 (PORTE 2E, P1): a sentence of the reply takes up the instruction the reading found in the mail.
   "instruction_followed",
+  // 26/11 (`SAV_V2_SMART_COMMERCIAL_SPLIT=on` only): the reply carries a fact for a commercial need or takes up its words (never emitted off).
+  "commercial_in_reply",
 ] as const;
 export type SmartCheckCode = typeof SAV_SMART_CHECK_CODES[number];
 

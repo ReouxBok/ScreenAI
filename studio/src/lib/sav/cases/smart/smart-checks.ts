@@ -56,6 +56,17 @@ export type SmartCheckInput = Readonly<{
   academy?: readonly SmartAcademyEvidence[];
   /** The case memory before this turn: a question already answered or a trial already failed is refused (v2, the progress rule). */
   memory?: SmartCaseMemory;
+  /**
+   * Smart images (`SAV_V2_SMART_ATTACHMENT_IMAGES=on`), ONLY when the files were really sent to the model this turn: the files by their id (`pj1`...),
+   * with V1's earlier reading when stored. A customer fact marked with one of these ids (`toolCallId`) is read on that file: its excerpt must be in
+   * the stored reading when there is one; without a reading the marker of an admitted file is accepted. Absent: the exact previous checks.
+   */
+  files?: readonly Readonly<{ id: string; reading: string | null }>[];
+  /**
+   * 26/11 (`SAV_V2_SMART_COMMERCIAL_SPLIT=on` only, absent otherwise): the needs the reading marked commercial. The reply must say nothing of them: a fact
+   * written for one, or a sentence taking up its own words (same comparison as the injected instruction, no word list), refuses (`commercial_in_reply`).
+   */
+  commercial?: ReadonlyArray<Readonly<{ id: string; ask: string }>>;
 }>;
 /**
  * `factProblems` (SAV-122, bench v8: `fact_source_invalid` again at the second pass on expiree-01 / autreoutil-06): the fact-level codes WITH
@@ -344,6 +355,8 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   // The fact named to the correction: its sentence hint, else its excerpt (the sentence is optional since SAV-122).
   const factLabel = (fact: SmartDecision["facts"][number]) => fact.sentence.trim() || (fact.excerpt?.trim() ? `extrait : « ${fact.excerpt.trim()} »` : `fait du besoin ${fact.needId}`);
   const flag = (code: SmartCheckCode, sentence: string) => { codes.add(code); factProblems.push({ code, sentence: String(sentence ?? "").slice(0, 300) }); };
+  /** Smart images: what the customer showed on a file the model saw (accepted file facts, V1's readings of the sent files); empty without files. */
+  const fileTexts: string[] = (input.files ?? []).flatMap(row => row.reading ? [row.reading] : []);
   for (const fact of decision.facts) {
     // SAV-122 (prod bench 21/11): no `fact_sentence_missing` any more. It only checked that a DECLARED fact's sentence was copied into the
     // reply (never an undeclared invention) and refused good replies the model had reworded. A fact's `sentence` is a hint for the
@@ -368,7 +381,11 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
     }
     if (fact.type === "dit_par_le_client") {
       if (fact.sourceKind !== "client" || !fact.excerpt?.trim()) { flag("fact_source_invalid", factLabel(fact)); continue; }
-      if (!smartExcerptInSource(input.customerText, fact.excerpt)) flag("excerpt_not_found", factLabel(fact));
+      if (smartExcerptInSource(input.customerText, fact.excerpt)) continue;
+      // Smart images: a fact read on a file the model really saw (its id as marker), checked against V1's stored reading of it when there is one.
+      const file = fact.toolCallId ? input.files?.find(row => row.id === fact.toolCallId) : undefined;
+      if (file && (!file.reading || smartExcerptInSource(file.reading, fact.excerpt))) { fileTexts.push(fact.excerpt); continue; }
+      flag("excerpt_not_found", factLabel(fact));
       continue;
     }
     // conseil: no source by definition; a source given to advice is ignored.
@@ -407,9 +424,11 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   for (const link of refusedLinks) flag("link_not_allowed", `Lien non autorisé, à retirer seul (garder les autres liens) : ${link}`);
 
   // Other platforms: an invitation or a praise is refused even when the customer named it; a name is allowed only from the customer or a cited card.
-  const customer = fold(input.customerText);
+  // Smart images: a tool the customer showed on a file (« Yahoo », « Nylas » on a screenshot) counts as named by the customer; without files, unchanged.
+  const customerSeen = fileTexts.length ? [input.customerText, ...fileTexts].join("\n") : input.customerText;
+  const customer = fold(customerSeen);
   const citedCardText = [...cited.values()].map(source => cardText(source)).join("\n");
-  if (smartOtherPlatformSentences(reply, input.customerText, citedCardText).length) codes.add("other_platform_recommended");
+  if (smartOtherPlatformSentences(reply, customerSeen, citedCardText).length) codes.add("other_platform_recommended");
   for (const sentence of sentencesOf(reply)) {
     for (const name of [...fold(sentence).matchAll(THIRD_PARTY)].map(match => match[1]!)) if (!customer.includes(name) && !citedText.includes(name)) codes.add("third_party_named");
   }
@@ -429,6 +448,10 @@ export function smartServerChecks(input: SmartCheckInput): SmartCheckResult {
   // SAV-122 (PORTE 2E, P1): a sentence of OUR reply that takes up the instruction found in the mail (never a word list on the mail).
   for (const sentence of smartInstructionEchoes(reply, input.instruction ?? reading.instructionText ?? null)) {
     codes.add("instruction_followed"); factProblems.push({ code: "instruction_followed", sentence: sentence.slice(0, 300) });
+  }
+  for (const need of input.commercial ?? []) {
+    for (const fact of decision.facts.filter(row => row.needId === need.id)) flag("commercial_in_reply", factLabel(fact));
+    for (const sentence of smartInstructionEchoes(reply, need.ask)) flag("commercial_in_reply", sentence);
   }
   return { ok: codes.size === 0, codes: [...codes], factProblems };
 }

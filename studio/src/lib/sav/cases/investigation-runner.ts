@@ -1,5 +1,5 @@
 import type { CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
-import { assessSavKnowledgeValidity, type SavRetrievalCandidate } from "../request-retrieval";
+import { assessSavKnowledgeValidity, savRetrievalCardSizeFixOn, savRetrievalModelCard, type SavRetrievalCandidate } from "../request-retrieval";
 import { SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_HOLDS_KEEPING_TIMERS, type CaseEvent, type CaseSnapshot, type KnowledgeRef, type SourceRef } from "./case-types";
 import { buildCaseDecisionContext, type CaseDecisionContextProblem } from "./decision-context";
 import { caseAccessScopeStamp, caseStampBlockId, readCaseAccessScope, type CaseAccessScopeStamp, type CaseBlockScope } from "./investigation-access-scope";
@@ -508,7 +508,9 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
         try {
           const read = await ports.readScopeCards(missing), at = ports.now();
           fetchedCards = read.filter(card => missing.some(ref => ref.knowledgeId === card.id && ref.contentVersionId === card.contentVersionId)
-            && assessSavKnowledgeValidity(card, ports.scope.locale, ports.scope.audience, at).eligible);
+            && assessSavKnowledgeValidity(card, ports.scope.locale, ports.scope.audience, at).eligible)
+            // SAV_RETRIEVAL_CARD_SIZE_FIX on: an exact scope read is bounded like a retrieved card, never sent raw.
+            .map(card => savRetrievalCardSizeFixOn() ? savRetrievalModelCard(card) : card);
         } catch {
           // An unread scope source is never silently left out: the case waits, nothing is sent.
           await keep(wait("technical_wait"));

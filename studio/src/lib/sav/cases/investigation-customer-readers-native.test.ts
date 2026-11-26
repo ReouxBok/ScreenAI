@@ -14,6 +14,11 @@ import { caseCustomerAttachmentMedia } from "./investigation-customer-attachment
 import type { CaseAttachmentDownload } from "./investigation-customer-attachments-reader";
 import { caseCustomerContextReader } from "./investigation-customer-context-reader";
 import { emptyCaseBody, SAV_CASE_CONTRACT_REVISION, type CaseEvent, type CaseSnapshot } from "./case-types";
+import { smartCaseAttachments, type SmartFilesBudget } from "./smart/smart-attachments";
+import { syntheticImage } from "../../../../test/sav-attachments";
+
+/** A synthetic reservation (1 micro-USD per token): only the reader's grant and the fit are under test here. */
+const SYNTHETIC_BUDGET: SmartFilesBudget = { reserveMicroUsd: 10_000_000, maxOutputTokens: 1_024, cost: usage => usage ? usage.inputTokens + usage.outputTokens : 10_000_000 };
 
 /*
  * SAV-92: the SQL of the V2 customer-context and attachments readers on a REAL database. Locally on PGlite; the same file runs on native
@@ -314,5 +319,51 @@ describe("attachments reader SQL and references", () => {
     expect(context.latestMessage).toBeNull();
     expect(context.attachments?.missing ?? []).toEqual(expect.arrayContaining(["attachments_unavailable"]));
     expect(context.revision).toBeTruthy();
+  });
+});
+
+describe("smart images (SAV_V2_SMART_ATTACHMENT_IMAGES): the same reader, for a smart case only", () => {
+  const SMART_ON = { SAV_V2_SMART_ATTACHMENT_IMAGES: "on", SAV_V2_ENTRY_SMART: "on" };
+  const smartSnapshot = (threadIds: string[]): CaseSnapshot => ({ ...snapshot(threadIds), admission: { admission: "smart_support" } as never });
+  const mailWithImage = async () => {
+    const threadId = await newThread(), latest = gm("latest");
+    const [thread] = await f.db.select({ gmailThreadId: savThreads.gmailThreadId, email: savMailboxes.email }).from(savThreads).innerJoin(savMailboxes, eq(savMailboxes.id, savThreads.mailboxId)).where(eq(savThreads.id, threadId));
+    const reference = { version: 1 as const, mailboxEmail: thread!.email, gmailMessageId: latest, gmailThreadId: thread!.gmailThreadId, partId: "1", attachmentId: "att-1", contentId: null, disposition: "attachment" as const };
+    const bytes = await syntheticImage("png");
+    await addMail({ threadId, gmail: latest, minute: 5, body: { text: "Pouvez-vous résoudre cela ?", attachments: [{ ...attachment("image0.png", "image/png", bytes.length), reference }] } });
+    return { threadId, latest, reference, bytes };
+  };
+
+  it("flag on + smart case (SAV_V2_ATTACHMENT_MEDIA off): the image is downloaded once through V1's path, admitted, bound and granted to the brain", async () => {
+    const { threadId, latest, reference, bytes } = await mailWithImage();
+    const download = vi.fn<CaseAttachmentDownload>(async () => bytes);
+    const context = await caseCustomerContextReader({ env: () => SMART_ON, download })(smartSnapshot([threadId]), [inbound(latest, 5)]);
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(download.mock.calls[0]![0]).toEqual(reference);
+    expect(context.attachments!.files[0]).toMatchObject({ name: "image0.png", kind: "image", part: 0, notAttached: null });
+    expect(caseCustomerAttachmentMedia(context).map(item => item.mimeType)).toEqual(["image/png"]);
+    expect(smartCaseAttachments(context, () => ({ model: "gemini-3.6-flash", mediaTokens: 8_192, budget: SYNTHETIC_BUDGET }))?.trace).toEqual({ admitted: 1, refused: [] });
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it("flag off, or a case the smart entry did not admit: the exact previous context, nothing downloaded, no grant", async () => {
+    const { threadId, latest } = await mailWithImage();
+    const download = vi.fn<CaseAttachmentDownload>(async () => Buffer.alloc(0));
+    const runs: Array<[Record<string, string>, CaseSnapshot]> = [[{ SAV_V2_ENTRY_SMART: "on" }, smartSnapshot([threadId])], [{ ...SMART_ON, SAV_V2_SMART_ATTACHMENT_IMAGES: "yes" }, smartSnapshot([threadId])],
+      [SMART_ON, snapshot([threadId])], [{ SAV_V2_SMART_ATTACHMENT_IMAGES: "on" }, smartSnapshot([threadId])]];
+    for (const [env, snap] of runs) {
+      const context = await caseCustomerContextReader({ env: () => env, download })(snap, [inbound(latest, 5)]);
+      expect(context.attachments).toBeUndefined();
+      expect(context.evidence).toBeUndefined();
+      expect(smartCaseAttachments(context, () => { throw Error("fit read without a grant"); })).toBeNull();
+    }
+    expect(download).not.toHaveBeenCalled();
+  });
+
+  it("a failing download is a reason on the file (text only for the brain), never an error of the case", async () => {
+    const { threadId, latest } = await mailWithImage();
+    const context = await caseCustomerContextReader({ env: () => SMART_ON, download: async () => { throw Error("GMAIL_DOWN"); } })(smartSnapshot([threadId]), [inbound(latest, 5)]);
+    expect(context.latestMessage!.text).toBe("Pouvez-vous résoudre cela ?");
+    expect(smartCaseAttachments(context, () => ({ model: "gemini-3.6-flash", mediaTokens: 8_192, budget: SYNTHETIC_BUDGET }))).toEqual({ turn: null, trace: { admitted: 0, refused: ["download_failed"] } });
   });
 });

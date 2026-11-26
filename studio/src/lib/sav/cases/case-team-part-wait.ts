@@ -22,7 +22,7 @@ export const CASE_TEAM_PART_WAIT_MARK = { action: "sav_v2_continuation_team_part
 export const SAV_CASE_TEAM_PART_WAIT_BOUNDS = Object.freeze({ maxPasses: 6, maxWaitMs: 2 * 60 * 60 * 1000 });
 /** Closed details only (the passage's own codes); anything else is `other`. */
 export const SAV_CASE_TEAM_PART_WAIT_DETAILS = ["disabled", "token_missing", "channel_invalid", "owner_invalid", "portal_invalid", "notice_unreadable",
-  "execution_policy_absent", "trigger_refused", "other"] as const;
+  "execution_policy_absent", "trigger_refused", "commercial_forward_unavailable", "other"] as const;
 export type CaseTeamPartWaitDetail = typeof SAV_CASE_TEAM_PART_WAIT_DETAILS[number];
 
 export type CaseTeamPartWait = Readonly<{ code: typeof SAV_CASE_TEAM_PART_WAIT_CODE; detail: CaseTeamPartWaitDetail; passes: number; since: string; lastAt: string; handedToTeam: string | null }>;

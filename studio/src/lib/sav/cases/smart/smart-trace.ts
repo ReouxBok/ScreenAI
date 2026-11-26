@@ -1,6 +1,7 @@
 import type { CaseDecisionProposal } from "../decision-contract";
 import type { CaseInvestigationModelRequest } from "../investigation-runner";
 import type { SmartKnowledgePort, SmartTurnResult } from "./smart-agent";
+import type { SmartAttachmentTrace } from "./smart-attachments";
 
 /*
  * Trace of one REAL smart turn (Ugo, 22/11: « pour chaque tour réel, pouvoir relire ce que l'agent a compris, cherché, décidé et pourquoi »).
@@ -46,6 +47,8 @@ export type SmartCaseTrace = Readonly<{
   costMicroUsd: number | null;
   tools: readonly Readonly<{ pass: number; tool: string; status: string; code: string | null }>[];
   missing: readonly Readonly<{ needId: string; theme: string | null }>[];
+  /** Smart images (`SAV_V2_SMART_ATTACHMENT_IMAGES=on` only): files attached, the calls that carried them, why the others were not (closed codes). */
+  attachments?: SmartAttachmentTrace;
 }>;
 export type SmartCaseTraceSink = (trace: SmartCaseTrace) => Promise<void> | void;
 
@@ -70,7 +73,8 @@ export function traceSmartKnowledge(port: SmartKnowledgePort, sink: SmartTraceSe
 type Request = Pick<CaseInvestigationModelRequest, "caseId" | "inputKey" | "call" | "caseVersion" | "feedback" | "knowledge">;
 
 /** The trace of one turn (or of the second refusal, `result` null). Bounded: lists capped, texts cut, then the reply and note shortened to fit. */
-export function buildSmartCaseTrace(input: Readonly<{ request: Request; result: SmartTurnResult | null; proposal: CaseDecisionProposal | null; searches: readonly SmartTraceSearch[]; at: Date }>): SmartCaseTrace {
+export function buildSmartCaseTrace(input: Readonly<{ request: Request; result: SmartTurnResult | null; proposal: CaseDecisionProposal | null; searches: readonly SmartTraceSearch[]; at: Date;
+  attachments?: SmartAttachmentTrace }>): SmartCaseTrace {
   const { request, result, proposal } = input;
   const titleOf = (id: string, version: string) => cut(request.knowledge.find(card => card.id === id && card.contentVersionId === version)?.title ?? "", 160);
   const action = proposal?.nextAction ?? null;
@@ -101,6 +105,8 @@ export function buildSmartCaseTrace(input: Readonly<{ request: Request; result: 
     calls, modelCalls: sent.length, tokens: result ? tokens : null, costMicroUsd: null,
     tools: (result?.steps ?? []).filter(step => step.kind === "tool").slice(0, 8).map(step => ({ pass: step.pass, tool: cut(step.tool, 60), status: cut(step.status, 40), code: step.code ? cut(step.code, 60) : null })),
     missing: (result?.missing ?? []).slice(0, 9).map(row => ({ needId: row.needId, theme: row.theme ? cut(row.theme, 80) : null })),
+    ...(input.attachments ? { attachments: { admitted: input.attachments.admitted, refused: input.attachments.refused.slice(0, 12).map(code => cut(code, 60)),
+      sentWith: input.attachments.sentWith.slice(0, 8).map(kind => cut(kind, 20)) } } : {}),
   };
   return fitSmartCaseTrace(trace);
 }

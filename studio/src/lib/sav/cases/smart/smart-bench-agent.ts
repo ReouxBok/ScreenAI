@@ -2,6 +2,7 @@ import type { SavBenchAgent, SavBenchAgentInput, SavBenchAgentTurn, SavBenchCard
 import { runSmartTurn, type SmartKnowledgePort, type SmartTurnResult } from "./smart-agent";
 import { smartFactDiagnostics, type SmartSource } from "./smart-checks";
 import { smartEmptyMemory, smartMaxExchanges, type SmartCaseMemory } from "./smart-memory";
+import { smartCommercialSet } from "./smart-switch";
 import type { AcademyTool } from "./tools/academy";
 import { SAV_SMART_PROMPT_REVISION, smartPromptSha256 } from "./smart-prompt";
 import { smartGeminiModel, smartInputCap, smartWireBody, type SmartModelPort } from "./smart-model";
@@ -86,7 +87,7 @@ export function createSavBenchAgent(context: Readonly<{ dryRun: boolean; network
   // The case memory of each conversation, across its turns (reset on its first turn).
   const memories = new Map<string, SmartCaseMemory>();
   return {
-    name: "new", revision: `${SAV_SMART_PROMPT_REVISION}:${smartPromptSha256().slice(0, 12)}:${context.env.SAV_V2_MODEL ?? "?"}`,
+    name: "new", revision: `${SAV_SMART_PROMPT_REVISION}:${smartPromptSha256(smartCommercialSet(context.env)).slice(0, 12)}:${context.env.SAV_V2_MODEL ?? "?"}`,
     async respond(input) {
       const now = new Date(input.now);
       const model = context.dryRun ? dryRunModel(context.network, context.env)
@@ -94,7 +95,7 @@ export function createSavBenchAgent(context: Readonly<{ dryRun: boolean; network
       const knowledge: SmartKnowledgePort = async needs => ({ status: "ok", sources: input.knowledge.map(card => smartBenchSource(card, needs.map(need => need.id))), codes: [] });
       const memory = input.turn <= 1 ? smartEmptyMemory() : memories.get(input.conversationId) ?? smartEmptyMemory(input.messages.filter(row => row.from === "client").length - 1);
       const result = await runSmartTurn({ ...smartBenchInput(input), memory }, { model, knowledge, maxInputBytes: smartInputCap(context.env, now) ?? 100_000, today: input.now.slice(0, 10),
-        academy: context.academy ?? [], recordOwn: true, maxExchanges: smartMaxExchanges(context.env) });
+        academy: context.academy ?? [], recordOwn: true, maxExchanges: smartMaxExchanges(context.env), ...smartCommercialSet(context.env) });
       memories.set(input.conversationId, result.memory);
       return smartBenchTurn(result);
     },

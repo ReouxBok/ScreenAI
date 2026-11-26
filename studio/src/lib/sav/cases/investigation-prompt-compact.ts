@@ -1,3 +1,5 @@
+import { savRetrievalCardSizeFixOn } from "../request-retrieval";
+
 /** Explicit opt-in only. Unknown values keep the legacy prompt. */
 export const casePromptCompactOn = (env: Readonly<Record<string, string | undefined>>) => env.SAV_V2_PROMPT_COMPACT?.trim() === "on";
 
@@ -15,6 +17,10 @@ export function compactCaseKnowledgeContent(content: string, resolution: unknown
     warning: "warnings", warnings: "warnings", source: "sources", sources: "sources", version: "productVersion", versions: "productVersion",
   };
   const metadata = resolution && typeof resolution === "object" ? resolution as Record<string, unknown> : {};
+  // SAV_RETRIEVAL_CARD_SIZE_FIX on: a procedure card's steps may reach a reader only through its body (the retrieval
+  // projection empties `steps`), so its step sections are never deduplicated away.
+  const delivery = metadata.delivery && typeof metadata.delivery === "object" ? metadata.delivery as Record<string, unknown> : null;
+  const keepSteps = savRetrievalCardSizeFixOn() && delivery?.mode === "procedure";
   // Sections are never cut midway. Only recognised sections can be deduplicated;
   // a heading itself may carry a warning, so keep it when any prose remains.
   const sections = content.split(/(?=^#{1,6}\s)/m);
@@ -22,7 +28,7 @@ export function compactCaseKnowledgeContent(content: string, resolution: unknown
     const match = /^(#{1,6}\s+([^\n]+)\n)([\s\S]*)$/.exec(section);
     if (!match) return section;
     const key = fields[match[2].trim().toLowerCase()];
-    if (!Object.hasOwn(fields, match[2].trim().toLowerCase()) || !Object.hasOwn(metadata, key)) return section;
+    if (!Object.hasOwn(fields, match[2].trim().toLowerCase()) || !Object.hasOwn(metadata, key) || (keepSteps && key === "steps")) return section;
     const value = metadata[key];
     const literals = new Set((Array.isArray(value) ? value : [value]).filter((row): row is string => typeof row === "string").map(row => row.trim()));
     const paragraphs = match[3].split(/\n\s*\n/);

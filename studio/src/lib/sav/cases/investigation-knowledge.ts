@@ -1,5 +1,5 @@
 import { savLexicalRank } from "../knowledge-lexical";
-import { assessSavKnowledgeValidity, retrieveSavKnowledgeByRequest, savRetrievalRanking, SAV_RETRIEVAL_LIMITS, type SavRetrievalBackend, type SavRetrievalCandidate } from "../request-retrieval";
+import { assessSavKnowledgeValidity, retrieveSavKnowledgeByRequest, savRetrievalCardSizeFixOn, savRetrievalModelCard, savRetrievalRanking, SAV_RETRIEVAL_LIMITS, type SavRetrievalBackend, type SavRetrievalCandidate } from "../request-retrieval";
 import { caseRequestSearchText, caseRequestSubject, SAV_CASE_SENSITIVE_FAMILIES, type CaseRequestFamily, type CaseSnapshot } from "./case-types";
 import type { CaseKnowledgeCoverage, CaseKnowledgeCoverageStatus } from "./decision-contract";
 import type { CaseInvestigationOwnerStop } from "./investigation-runner";
@@ -157,6 +157,10 @@ export async function selectCaseKnowledge(snapshot: CaseSnapshot, backend: SavRe
   if (failed) return { status: "unavailable", reason: failed.status === "revision_unstable" ? "revision_unstable" : "search_unavailable" };
 
   const cards = new Map<string, SavRetrievalCandidate>(), relevance: CaseKnowledgeRelevance[] = [], pool: CaseKnowledgePoolEntry[] = [];
+  // SAV_RETRIEVAL_CARD_SIZE_FIX on: the cards handed on (to V2 and the smart brain) are the retrieval's compact, bounded copies,
+  // never the raw read of a large fiche; relevance and validity above were still judged on the cards the backend returned.
+  const sent = new Map(result.sources.map(source => [source.key, source])), sizeFix = savRetrievalCardSizeFixOn();
+  const forModel = (card: SavRetrievalCandidate) => sizeFix ? savRetrievalModelCard(card, sent.get(cardKeyOf(card))) : card;
   const wordsFound = wordsSearched ? result.requests.find(entry => entry.requestId === WORDS_ALIAS) : undefined;
   const context = { locale: scope.locale, audience: scope.audience, now: scope.now };
   let recalledFor: string | null = null;
@@ -180,7 +184,7 @@ export async function selectCaseKnowledge(snapshot: CaseSnapshot, backend: SavRe
         recalledFor = recalled.length ? row.id : recalledFor;
       }
     } else selected = subject!.cards.map((card, index) => ({ card, verdict: subject!.verdicts[index]! }));
-    for (const { card } of selected) cards.set(cardKeyOf(card), card);
+    for (const { card } of selected) cards.set(cardKeyOf(card), forModel(card));
     const knowledge = selected.map(({ card }) => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId }));
     selected.forEach(({ verdict }, rank) => relevance.push({ ...knowledge[rank]!, requestId: row.id, rank, verdict }));
     const queries = [...(plan && found ? [plan.summary] : []), ...(withWords ? [words] : [])];
@@ -188,7 +192,7 @@ export async function selectCaseKnowledge(snapshot: CaseSnapshot, backend: SavRe
     for (const card of queries.flatMap(query => byQuery.get(query) ?? [])) {
       const key = cardKeyOf(card);
       if (seen.has(key) || !assessSavKnowledgeValidity(card, scope.locale, scope.audience, scope.now).eligible) continue;
-      seen.add(key); pool.push({ requestId: row.id, card });
+      seen.add(key); pool.push({ requestId: row.id, card: forModel(card) });
     }
     const statuses = [...(found ? [found.status] : []), ...(withWords ? [wordsFound!.status] : [])];
     // A card found but too large to be read whole is knowledge we could not use, not an absence of knowledge.

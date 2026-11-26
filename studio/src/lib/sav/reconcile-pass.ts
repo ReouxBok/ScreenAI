@@ -20,6 +20,7 @@ import { randomUUID } from "node:crypto";
 import { recordSavWorkerPulse } from "@/lib/sav/monitor";
 import { savV2OwnerHandoverEnabled, savV2OwnerHandoverPollEnabled } from "@/lib/sav/cases/owner-handover-config";
 import { savAppTicketsMode } from "@/lib/sav/cases/app-tickets-config";
+import { commercialForwardSweepOn } from "@/lib/sav/cases/smart/smart-switch";
 
 export type SavReconcileTrigger = "vercel_cron" | "gmail_webhook" | "heartbeat_workflow";
 export type SavReconcilePassOptions = { trigger: SavReconcileTrigger; pulseId?: string; budgetMs?: number };
@@ -107,6 +108,13 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     if (Date.now() + 20_000 > derivedDeadline) return { skipped: "deadline" };
     return (await import("@/lib/sav/intake/routing-store")).reconcileIntakeRoutings(3, Math.min(derivedDeadline, Date.now() + 20_000));
   });
+  // Ugo 26/11: recovery of the commercial part forwarded to sales (the reply passage is the fast path). Review M2: runs while EITHER commercial switch is on,
+  // so a forward queued before the forward switch was turned off is still drained; both off: no step, no query.
+  const commercialForwards = commercialForwardSweepOn(process.env)
+    ? await runStep<Awaited<ReturnType<typeof import("@/lib/sav/cases/commercial-forward-store").reconcileCommercialForwards>> | { skipped: string }>("v2_commercial_forward", async () => {
+      if (Date.now() + 20_000 > derivedDeadline) return { skipped: "deadline" };
+      return (await import("@/lib/sav/cases/commercial-forward-store")).reconcileCommercialForwards(3, Math.min(derivedDeadline, Date.now() + 20_000));
+    }) : null;
   const intakeRead = await runStep<Awaited<ReturnType<typeof reconcileHandledIntakeGmailRead>> | { skipped: string }>("intake_gmail_read", () => Date.now()+1000>=derivedDeadline ? Promise.resolve({skipped:"deadline"}) : reconcileHandledIntakeGmailRead(3,Math.min(derivedDeadline,Date.now()+30000)));
   // Four model runs leave enough headroom for the 45 s grounded-agent budget,
   // a guarded legacy fallback and the remaining integrations inside the 300 s
@@ -159,7 +167,7 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     return runSmartBenchSelfTestPass({ env: () => process.env, now: () => new Date(), deadlineMs: derivedDeadline });
   }) : undefined;
   // V2 effects (replies, handoff notices, ticket stages, closures) have their own worker: /api/cron/sav-v2-effects (11/11).
-  const payload = { ...(ownerHandoverPoll ? { ownerHandoverPoll } : {}), ...(ownerHandovers ? { ownerHandovers } : {}), ...(appTickets ? { appTickets } : {}), ...(accessSkillSelfTest ? { accessSkillSelfTest } : {}), ...(smartShadow ? { smartShadow } : {}), ...(smartShadowReplay ? { smartShadowReplay } : {}), ...(smartBenchSelfTest ? { smartBenchSelfTest } : {}), caseReminders, ticketSafetyNet, ackClosures, intakeRouting, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { ...(ownerHandoverPoll ? { ownerHandoverPoll } : {}), ...(ownerHandovers ? { ownerHandovers } : {}), ...(appTickets ? { appTickets } : {}), ...(accessSkillSelfTest ? { accessSkillSelfTest } : {}), ...(smartShadow ? { smartShadow } : {}), ...(smartShadowReplay ? { smartShadowReplay } : {}), ...(smartBenchSelfTest ? { smartBenchSelfTest } : {}), caseReminders, ticketSafetyNet, ackClosures, intakeRouting, ...(commercialForwards ? { commercialForwards } : {}), intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return { payload, hasStepFailure, pulseId };

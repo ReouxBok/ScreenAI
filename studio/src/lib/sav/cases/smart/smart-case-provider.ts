@@ -1,3 +1,4 @@
+import { savCustomerProcedureSteps, savRetrievalCardSizeFixOn } from "../../request-retrieval";
 import { caseRequestSearchText, type CaseEvent, type CaseSnapshot } from "../case-types";
 import type { CaseDecisionProposal } from "../decision-contract";
 import { SAV_CASE_LEXICAL_RECALL } from "../investigation-knowledge";
@@ -5,10 +6,12 @@ import type { CaseInvestigationModelRequest } from "../investigation-runner";
 import type { CaseV2ModelTransport, CaseV2SpendUsage } from "../investigation-v2-spend";
 import { SAV_SMART_ENTRY_ADMISSION, savV2EntrySmartOn } from "../smart-entry-switch";
 import { runSmartTurn, type SmartKnowledgePort, type SmartThreadMessage, type SmartTurnInput, type SmartTurnPorts, type SmartTurnResult } from "./smart-agent";
+import { SAV_SMART_ATTACHMENT_TRACE_CODES, smartCaseAttachments, type SmartFilesBudget } from "./smart-attachments";
 import type { SmartSource } from "./smart-checks";
 import type { SmartFact, SmartTeamNote } from "./smart-contract";
 import { smartEmptyMemory, type SmartCaseMemory } from "./smart-memory";
 import type { SmartModelPort } from "./smart-model";
+import { smartCommercialForwardOn, smartCommercialSet } from "./smart-switch";
 import { buildSmartCaseTrace, traceSmartKnowledge, type SmartCaseTraceSink, type SmartTraceSearch } from "./smart-trace";
 
 /*
@@ -71,7 +74,9 @@ export function smartCaseKnowledge(request: Pick<CaseInvestigationModelRequest, 
     const sources: SmartSource[] = request.knowledge.map(card => ({
       ...(recalled.has(`${card.id}:${card.contentVersionId}`) ? { lowRelevance: true } : {}),
       cardId: card.id, version: card.contentVersionId, title: card.title, content: card.content,
-      steps: Array.isArray(card.resolution?.steps) ? (card.resolution!.steps as unknown[]).filter((step): step is string => typeof step === "string") : [],
+      // SAV_RETRIEVAL_CARD_SIZE_FIX on: a procedure card's customer steps, as the V1 planner reads them (never an internal step).
+      steps: (savRetrievalCardSizeFixOn() ? savCustomerProcedureSteps(card.resolution) : null)
+        ?? (Array.isArray(card.resolution?.steps) ? (card.resolution!.steps as unknown[]).filter((step): step is string => typeof step === "string") : []),
       needIds, validUntil: typeof card.resolution?.validUntil === "string" && card.resolution.validUntil ? card.resolution.validUntil : null,
     }));
     return { status: "ok", sources, codes: [...(sources.length ? ["circuit_cards"] : ["no_circuit_card"]), ...(sources.some(card => card.lowRelevance) ? ["lexical_recall"] : [])] };
@@ -140,7 +145,13 @@ export function smartProposalFromTurn(result: SmartTurnResult, request: Pick<Cas
   // circuit has no closing outcome, Ugo decides later between closing silently, a polite reply or the team), but its note says what it is, never « aucune
   // fiche retrouvée ». The proposed courtesy text is given to the team, not sent.
   if (result.reasons.includes("understand:no_need") && !result.reading?.needs.length) return handoff("diagnosis_out_of_tools", smartCourtesyNote(text ?? null));
-  if (!decision || !text || !open.length || decision.coverage.some(row => row.status === "handed")) return handoff(noteReason);
+  // 26/11 (`SAV_V2_SMART_COMMERCIAL_FORWARD`): the turn says every other need is answered or asked; its commercial needs are the only ones handed and
+  // leave with the proposal (`commercialPart`), forwarded to sales by the reply passage. Without it, one handed need still hands the whole mail over.
+  const commercial = result.commercialForward ? new Set((result.reading?.needs ?? []).filter(need => need.commercial === true).map(need => need.id)) : null;
+  const asks = commercial?.size ? (result.commercialForward?.asks ?? []).map(ask => cut(ask, 600)).filter(Boolean).slice(0, 4) : [];
+  const commercialPart = asks.length ? { commercialPart: { asks } } : {};
+  if (commercial && !asks.length) return handoff(noteReason);
+  if (!decision || !text || !open.length || decision.coverage.some(row => row.status === "handed" && !commercial?.has(row.needId))) return handoff(noteReason);
   const understanding = { requests: open.map(row => ({ id: row.id, summary: cut(caseRequestSearchText(row) || "Demande du client", 600) || "Demande du client", family: row.family, status: "open" as const })), newFacts: [] };
   /*
    * SAV-122 (contract v5: a fact's sentence is optional): the step's text, required non-empty by the decision contract. It is INTERNAL only (the
@@ -155,12 +166,12 @@ export function smartProposalFromTurn(result: SmartTurnResult, request: Pick<Cas
   const reply = { text: cut(text, 6000), citations: cited.slice(0, 10).map(({ knowledgeId, contentVersionId }) => ({ knowledgeId, contentVersionId })), impossibilityClaims: [], accountAdvice: "none" as const };
   if (result.outcome === "ask") {
     const question = cut(decision.memory.question || text, 600);
-    return { caseVersion: request.snapshot.version, understanding, reply,
+    return { caseVersion: request.snapshot.version, understanding, reply, ...commercialPart,
       nextAction: { kind: "ask", questions: open.slice(0, 5).map(row => ({ text: question, requestId: row.id, reducesUncertainty: "Préciser la situation du client avant de répondre.", seeks: [{ kind: "other" as const }] })) } };
   }
   if (!cited.length) return handoff("knowledge_missing", result.teamNote ?? { raison: "no_source", besoin: cut(text, 600) || "Réponse sans fiche retrouvée", compris: "", verifie: [], essaye: [], hypotheses: [],
     prochaineVerification: "La réponse proposée ne s'appuie sur aucune fiche retrouvée par le circuit : vérifier et répondre.", ditAuClient: null });
-  return { caseVersion: request.snapshot.version, understanding, reply,
+  return { caseVersion: request.snapshot.version, understanding, reply, ...commercialPart,
     nextAction: { kind: "answer", requestIds: open.map(row => row.id).slice(0, 6), steps: cited.slice(0, 8).map(row => ({ text: row.sentence, knowledge: { knowledgeId: row.knowledgeId, contentVersionId: row.contentVersionId }, newFactIds: [] })),
       expectedResult: "Le client peut reprendre son usage avec les étapes indiquées." } };
 }
@@ -187,6 +198,12 @@ export type SmartCaseProviderDeps = Readonly<{
    * texts, checks, verdicts, calls). Called after the turn; its failure or slowness (bounded) never changes the turn's result.
    */
   trace?: SmartCaseTraceSink;
+  /**
+   * Smart images: the model, the token allowance of the files one call may carry and the turn's reservation (production: `SAV_V2_MODEL`,
+   * `smartAttachmentTokenRoom`, `smartFilesBudget`). Read only for a context the reader granted (`SAV_V2_SMART_ATTACHMENT_IMAGES=on`, smart case);
+   * absent: no file is sent (`input_budget`).
+   */
+  attachmentFit?: () => Readonly<{ model: string; mediaTokens: number; budget: SmartFilesBudget | null }>;
 }>;
 
 /**
@@ -220,13 +237,19 @@ export function smartCaseDecisionProvider(deps: SmartCaseProviderDeps): CaseV2Mo
     const input = smartTurnInputFromCase(request), cap = deps.maxInputBytes();
     if (!input || cap === null) return { result: { status: "failed", uncertain: false, diagnostic: { stage: "preflight", code: input ? "policy_invalid" : "empty_response", networkAttempted: false } }, usage: none };
     const searches: SmartTraceSearch[] = [];
+    // Smart images: null unless the reader granted this context (flag on, smart case); then the admitted files, or text only with the reasons.
+    const files = smartCaseAttachments(request.customerContext, deps.attachmentFit ?? (() => ({ model: "", mediaTokens: 0, budget: null })));
     const result = await runSmartTurn(input, {
       model: smartModelWithFeedback(deps.model, request.feedback), knowledge: deps.trace ? traceSmartKnowledge(smartCaseKnowledge(request), searches) : smartCaseKnowledge(request), maxInputBytes: cap,
       today: deps.now().toISOString().slice(0, 10), recordOwn: true, ...(deps.academy ? { academy: deps.academy } : {}), ...(deps.maxExchanges ? { maxExchanges: deps.maxExchanges } : {}),
+      ...(files?.turn ? { attachments: files.turn } : {}), ...smartCommercialSet(deps.env()),
+      ...(smartCommercialForwardOn(deps.env()) ? { commercialForward: true } : {}),
     });
     deps.observe?.(result);
     const usage = smartTurnUsage(result), proposal = smartProposalFromTurn(result, request);
-    await recordSmartTrace(deps.trace, () => buildSmartCaseTrace({ request, result, proposal, searches, at: deps.now() }));
+    const attachments = files ? { admitted: files.trace.admitted, sentWith: result.attachments?.sentWith ?? [],
+      refused: [...files.trace.refused, ...(result.attachments?.dropped ?? [])].slice(0, SAV_SMART_ATTACHMENT_TRACE_CODES) } : null;
+    await recordSmartTrace(deps.trace, () => buildSmartCaseTrace({ request, result, proposal, searches, at: deps.now(), ...(attachments ? { attachments } : {}) }));
     if (!proposal) return { result: { status: "failed", uncertain: result.calls.some(call => call.uncertain),
       diagnostic: { stage: "content", code: "empty_response", networkAttempted: result.calls.some(call => call.sent) } }, usage };
     return { result: { status: "ok", output: proposal }, usage };
