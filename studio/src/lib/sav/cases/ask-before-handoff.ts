@@ -41,6 +41,9 @@ type Question = Extract<CaseDecisionProposal["nextAction"], { kind: "ask" }>["qu
 export function caseReaskBeforeHandoff(proposal: CaseDecisionProposal, context: CaseDecisionValidationContext): CaseDecisionProposal | null {
   const action = proposal.nextAction;
   if (action.kind !== "handoff" || !REASK_REASONS.has(action.reason)) return null;
+  // 26/11 (`SAV_V2_SMART_NUDGE_RESPECTS_DECISION=on`, smart case): a smart question's stored text is the brain's internal label (`memory.question`), not the
+  // wording sent, and the brain already read the latest mail: its hand-over stands.
+  if (context.smartRespectsDecision === true) return null;
   if (context.sensitiveCategories.length || [...context.requests, ...proposal.understanding.requests].some(row => isSensitiveCaseFamily(row.family))) return null;
   const open = context.requests.filter(row => row.status === "open");
   // Several open requests are one problem told again (Ugo's real case: the same login trouble relayed from 3 mails) only when they share one family

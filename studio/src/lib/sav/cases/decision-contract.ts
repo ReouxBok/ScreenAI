@@ -149,6 +149,9 @@ export type CaseDecisionValidationContext = {
   /** 26/11: set only with `SAV_V2_SMART_NO_REPEAT=on` on a case admitted by the smart entry (absent: main's shape). A question followed by a customer mail is then
    * answered, and the server's re-ask before a hand-over never restates it (`ask-before-handoff.ts`). */
   smartNoRepeat?: true;
+  /** 26/11: set only with `SAV_V2_SMART_NUDGE_RESPECTS_DECISION=on` on a case admitted by the smart entry (absent: main's shape). The brain's decision stands: the
+   * server never replaces its hand-over by the re-ask (`ask-before-handoff.ts`), whose questions would be the brain's internal labels, not the wording sent. */
+  smartRespectsDecision?: true;
   trials: Array<{ id: string; requestId: string; knowledge: CaseDecisionKnowledgeRef; askedAt: string; outcome: CaseTrial["outcome"]; resultAt: string | null }>;
   /** `order` null: known only by its date (body handoff), so it cannot be placed safely against a message. */
   handoffs: Array<{ at: string; order: number | null }>;
