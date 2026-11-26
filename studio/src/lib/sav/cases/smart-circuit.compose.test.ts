@@ -15,6 +15,9 @@ import { smartCaseDecisionProvider } from "./smart/smart-case-provider";
 import { SAV_SMART_SUPPORT_STAMP } from "./smart-support-scope";
 import { SMART_CONFORME, smartGoodDecision, smartReading, smartScriptedModel, type SmartScript } from "./smart/smart-test-doubles";
 import type { SmartTurnResult } from "./smart/smart-agent";
+import { buildCaseCustomerAttachments, withCaseCustomerAttachments } from "./investigation-customer-attachments";
+import { grantSmartCaseAttachments } from "./smart/smart-attachments";
+import { smartFilesBudget } from "./smart/smart-model";
 
 /*
  * SAV-123 (N8): the smart brain in the REAL V2 decision path, end to end on in-memory ports: the production runner (`runCaseInvestigation`), the real
@@ -57,14 +60,19 @@ const contextOf = (subject: string, text: string): NonNullable<CaseInvestigation
   thread: [], threadOmitted: 0, crm: null, missing: [] } as unknown as NonNullable<CaseInvestigationModelRequest["customerContext"]>);
 
 type Run = { report: Awaited<ReturnType<typeof runCaseInvestigation>>; records: CaseInvestigationRecord[]; circuitCalls: CaseInvestigationModelRequest[]; brainCalls: Array<{ kind: string; payload: unknown }>;
-  geminiCalls: number; turns: SmartTurnResult[] };
+  geminiCalls: number; turns: SmartTurnResult[]; media: Array<{ kind: string; files: number }> };
 
 /** One pass of the production runner on in-memory ports, the decision chosen by the REAL provider selection. */
 async function runTurn(options: { env: Record<string, string>; script?: SmartScript; mail: [string, string]; knowledge?: SavRetrievalCandidate[]; snapshot?: CaseSnapshot;
-  policyRevision?: string; geminiOutput?: unknown; pilot?: false }): Promise<Run> {
+  policyRevision?: string; geminiOutput?: unknown; pilot?: false;
+  /** Smart images: the customer context as the reader returns it (e.g. files bound and granted), and the provider's file fit. */
+  context?: (base: NonNullable<CaseInvestigationModelRequest["customerContext"]>) => NonNullable<CaseInvestigationModelRequest["customerContext"]>;
+  attachmentModel?: string }): Promise<Run> {
   const env: Record<string, string> = { ...GEMINI_ENV, ...options.env }, snap = options.snapshot ?? snapshotOf(), knowledge = options.knowledge ?? [SHEET_CARD];
-  const brain = smartScriptedModel(options.script ?? {}), turns: SmartTurnResult[] = [];
-  const smart = smartCaseDecisionProvider({ model: brain.model, env: () => env, now: () => NOW, maxInputBytes: () => 100_000, observe: result => turns.push(result) });
+  const brain = smartScriptedModel(options.script ?? {}), turns: SmartTurnResult[] = [], media: Run["media"] = [];
+  const smart = smartCaseDecisionProvider({ model: async call => { media.push({ kind: call.kind, files: call.media?.length ?? 0 }); return brain.model(call); },
+    env: () => env, now: () => NOW, maxInputBytes: () => 100_000, observe: result => turns.push(result),
+    ...(options.attachmentModel ? { attachmentFit: () => ({ model: options.attachmentModel!, mediaTokens: 31_072, budget: smartFilesBudget(env, NOW) }) } : {}) });
   const network = vi.fn(async () => Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify(options.geminiOutput ?? {}) }] }, finishReason: "STOP" }],
     usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10 } }));
   const provider: CaseV2ModelTransport = caseGeminiDecisionProvider({ env: () => env, network, smart });
@@ -80,7 +88,7 @@ async function runTurn(options: { env: Record<string, string>; script?: SmartScr
     claim: async () => ({ token: "lease-1", actionsPaused: false }),
     release: async () => {},
     knowledge: async () => knowledge,
-    customerContext: async () => contextOf(options.mail[0], options.mail[1]),
+    customerContext: async () => (options.context ?? (base => base))(contextOf(options.mail[0], options.mail[1])),
     customerTexts: async () => ({ "email:m1": options.mail[1] }),
     revisions: async () => ({ rules: "rules", playbookId: "playbook", model: "synthetic-model", prompt: "prompt" }),
     callModel: async modelRequest => {
@@ -99,7 +107,7 @@ async function runTurn(options: { env: Record<string, string>; script?: SmartScr
     smartSupport: () => env.SAV_V2_ENTRY_SMART === "on",
   };
   const report = await runCaseInvestigation("case-1", "observe", ports);
-  return { report, records, circuitCalls, brainCalls: brain.calls, geminiCalls: network.mock.calls.length, turns };
+  return { report, records, circuitCalls, brainCalls: brain.calls, geminiCalls: network.mock.calls.length, turns, media };
 }
 
 const decision = (record: CaseInvestigationRecord) => record.validation.outcome === "accepted" ? record.validation.decision : null;
@@ -239,5 +247,25 @@ describe("SAV-123 (N8) — sans périmètre pilote pour un cas smart, interrupte
     const run = await runTurn({ env: ON, mail: SHEET_MAIL, snapshot: mixed, script: { understand: { output: sheetReading } } });
     expect(run.report).toMatchObject({ status: "skipped", modelCalls: 0 });
     expect(run.brainCalls).toEqual([]);
+  });
+});
+
+describe("images jointes smart — du runner au fournisseur, l'autorisation du lecteur survit", () => {
+  const withFile = (base: NonNullable<CaseInvestigationModelRequest["customerContext"]>) => grantSmartCaseAttachments(withCaseCustomerAttachments(base, buildCaseCustomerAttachments([
+    { message: "latest", filename: "capture.png", mimeType: "image/png", size: 4096, reading: null, media: { ok: true, value: { mimeType: "image/png", bytes: Buffer.from("fausse-image"), hash: "h1", pages: null } } }])), true);
+  const script = { understand: { output: sheetReading }, decide: { output: sheetDecision() }, verify: { output: SMART_CONFORME } };
+
+  it("contexte autorisé par le lecteur → le vrai runner le passe tel quel : l'image part avec understand et le premier decide (budget de la vraie politique)", async () => {
+    const run = await runTurn({ env: ON, mail: SHEET_MAIL, script, context: withFile, attachmentModel: "gemini-3.6-flash" });
+    expect(run.report).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 1 });
+    expect(run.media).toEqual([{ kind: "understand", files: 1 }, { kind: "decide", files: 1 }, { kind: "verify", files: 0 }]);
+    expect(run.turns[0]!.attachments).toEqual({ sentWith: ["understand", "decide"], dropped: [] });
+  });
+
+  it("sans autorisation du lecteur (drapeau éteint) → le même runner, aucun fichier, aucun champ ajouté", async () => {
+    const run = await runTurn({ env: ON, mail: SHEET_MAIL, script, attachmentModel: "gemini-3.6-flash" });
+    expect(run.report).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 1 });
+    expect(run.media.every(row => row.files === 0)).toBe(true);
+    expect(run.turns[0]).not.toHaveProperty("attachments");
   });
 });

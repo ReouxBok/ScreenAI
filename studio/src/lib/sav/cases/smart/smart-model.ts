@@ -4,7 +4,7 @@ import { readAccessSkillWireResponse, SAV_ACCESS_SKILL_GEMINI_URL, type AccessSk
 import { resolveCaseV2GeminiKey, SAV_V2_EMBEDDING_MODEL_ENV, SAV_V2_MODEL_ENV, type CaseV2Network } from "../investigation-v2-providers";
 import { readCaseV2SpendPolicy, readCaseV2TransportPolicy } from "../investigation-v2-spend";
 import { appendCaseAttachmentParts, type CaseCustomerAttachmentMedia } from "../investigation-customer-attachments";
-import { SAV_SMART_ATTACHMENT_CALLS } from "./smart-attachments";
+import type { SmartFilesBudget } from "./smart-attachments";
 import type { SmartCallKind } from "./smart-contract";
 
 /*
@@ -206,15 +206,23 @@ function smartNetworkWithMedia(network: CaseV2Network | undefined, media: readon
 }
 
 /**
- * Smart images: the token allowance of the files ONE call may carry. The policy leaves `maxInputTokens - maxInputBytes` tokens above the text bound
- * of a call (≥ 16 384); the turn's single reservation is computed from `maxInputTokens`. That room is shared by every call of the turn that may carry
- * the files (`SAV_SMART_ATTACHMENT_CALLS`), so all the image tokens of a turn fit inside it. 0 (nothing attached) when the policy cannot be read.
+ * Smart images: the token allowance of the files ONE call may carry, as V2's decision call: the room the policy leaves above the text bound
+ * (`maxInputTokens - maxInputBytes`, ≥ 16 384). This bounds one call only; whether a call of the turn may carry them at all is decided against the
+ * turn's single reservation (`smartFilesBudget` + `smartFilesFit`). 0 (nothing attached) when the policy cannot be read.
  */
 export function smartAttachmentTokenRoom(env: Env, now: Date): number {
   try {
     const bounds = readCaseV2TransportPolicy(env, now);
-    return Math.max(0, Math.floor((bounds.maxInputTokens - bounds.maxInputBytes) / SAV_SMART_ATTACHMENT_CALLS));
+    return Math.max(0, bounds.maxInputTokens - bounds.maxInputBytes);
   } catch { return 0; }
+}
+
+/** Smart images: the turn's reservation (V2's `reserveMicroUsdPerCall`), its prices and output bound, read from the approved policy; null when unreadable. */
+export function smartFilesBudget(env: Env, now: Date): SmartFilesBudget | null {
+  try {
+    const bounds = readCaseV2TransportPolicy(env, now), prices = smartPrices(env);
+    return prices ? { reserveMicroUsd: prices.modelReserve, maxOutputTokens: bounds.maxOutputTokens, cost: prices.modelCost } : null;
+  } catch { return null; }
 }
 
 const MODEL_ID = /^[a-z0-9][a-z0-9.-]{0,99}$/;

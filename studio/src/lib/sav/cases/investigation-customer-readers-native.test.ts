@@ -14,8 +14,11 @@ import { caseCustomerAttachmentMedia } from "./investigation-customer-attachment
 import type { CaseAttachmentDownload } from "./investigation-customer-attachments-reader";
 import { caseCustomerContextReader } from "./investigation-customer-context-reader";
 import { emptyCaseBody, SAV_CASE_CONTRACT_REVISION, type CaseEvent, type CaseSnapshot } from "./case-types";
-import { smartCaseAttachments } from "./smart/smart-attachments";
+import { smartCaseAttachments, type SmartFilesBudget } from "./smart/smart-attachments";
 import { syntheticImage } from "../../../../test/sav-attachments";
+
+/** A synthetic reservation (1 micro-USD per token): only the reader's grant and the fit are under test here. */
+const SYNTHETIC_BUDGET: SmartFilesBudget = { reserveMicroUsd: 10_000_000, maxOutputTokens: 1_024, cost: usage => usage ? usage.inputTokens + usage.outputTokens : 10_000_000 };
 
 /*
  * SAV-92: the SQL of the V2 customer-context and attachments readers on a REAL database. Locally on PGlite; the same file runs on native
@@ -339,7 +342,7 @@ describe("smart images (SAV_V2_SMART_ATTACHMENT_IMAGES): the same reader, for a 
     expect(download.mock.calls[0]![0]).toEqual(reference);
     expect(context.attachments!.files[0]).toMatchObject({ name: "image0.png", kind: "image", part: 0, notAttached: null });
     expect(caseCustomerAttachmentMedia(context).map(item => item.mimeType)).toEqual(["image/png"]);
-    expect(smartCaseAttachments(context, () => ({ model: "gemini-3.6-flash", mediaTokens: 8_192 }))?.trace).toEqual({ admitted: 1, refused: [] });
+    expect(smartCaseAttachments(context, () => ({ model: "gemini-3.6-flash", mediaTokens: 8_192, budget: SYNTHETIC_BUDGET }))?.trace).toEqual({ admitted: 1, refused: [] });
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 
@@ -361,6 +364,6 @@ describe("smart images (SAV_V2_SMART_ATTACHMENT_IMAGES): the same reader, for a 
     const { threadId, latest } = await mailWithImage();
     const context = await caseCustomerContextReader({ env: () => SMART_ON, download: async () => { throw Error("GMAIL_DOWN"); } })(smartSnapshot([threadId]), [inbound(latest, 5)]);
     expect(context.latestMessage!.text).toBe("Pouvez-vous résoudre cela ?");
-    expect(smartCaseAttachments(context, () => ({ model: "gemini-3.6-flash", mediaTokens: 8_192 }))).toEqual({ turn: null, trace: { admitted: 0, refused: ["download_failed"] } });
+    expect(smartCaseAttachments(context, () => ({ model: "gemini-3.6-flash", mediaTokens: 8_192, budget: SYNTHETIC_BUDGET }))).toEqual({ turn: null, trace: { admitted: 0, refused: ["download_failed"] } });
   });
 });

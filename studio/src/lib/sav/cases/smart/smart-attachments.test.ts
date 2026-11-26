@@ -9,12 +9,13 @@ import {
 } from "../investigation-customer-attachments";
 import type { CaseCustomerContext } from "../investigation-customer-context";
 import type { CaseInvestigationModelRequest } from "../investigation-runner";
-import { SAV_SMART_MAX_DECIDE_PASSES } from "./smart-agent";
 import {
-  grantSmartCaseAttachments, SAV_SMART_ATTACHMENT_CALLS, smartAttachmentImagesOn, smartCaseAttachments, smartCaseWantsAttachments,
+  grantSmartCaseAttachments, SAV_SMART_FILES_FACTS_NOTE, SAV_SMART_FILES_VERIFY_NOTE, smartAttachmentImagesOn, smartCaseAttachments,
+  smartCaseWantsAttachments, smartFilesFit, type SmartFilesBudget,
 } from "./smart-attachments";
+import { smartServerChecks } from "./smart-checks";
 import { smartCaseDecisionProvider } from "./smart-case-provider";
-import { smartAttachmentTokenRoom, smartGeminiModel, smartWireBytes, type SmartModelPort } from "./smart-model";
+import { smartAttachmentTokenRoom, smartFilesBudget, smartGeminiModel, smartWireBytes, type SmartModelPort } from "./smart-model";
 import { SAV_SMART_PROMPT_SHA256, smartCorrectionPrompt, smartDecidePrompt, smartPromptSha256, smartUnderstandPrompt, smartVerifyPrompt } from "./smart-prompt";
 import { SMART_CONFORME, smartGoodDecision, smartReading, smartScriptedModel, type SmartScript } from "./smart-test-doubles";
 import type { SmartCaseTrace } from "./smart-trace";
@@ -36,7 +37,8 @@ const baseContext = () => ({ latestMessage: { at: "2026-11-26T07:00:00Z", from: 
   thread: [] }) as unknown as CaseCustomerContext;
 
 const image = (hash: string): CaseCustomerAttachmentMedia => ({ mimeType: "image/png", bytes: Buffer.from(`fausse-image-${hash}`), hash, pages: null });
-const file = (filename: string, media: CaseCustomerRawAttachment["media"]): CaseCustomerRawAttachment => ({ message: "latest", filename, mimeType: "image/png", size: 4096, reading: null, media });
+const file = (filename: string, media: CaseCustomerRawAttachment["media"], reading: string | null = null): CaseCustomerRawAttachment => ({ message: "latest", filename, mimeType: "image/png", size: 4096,
+  reading: reading ? { status: "analyzed", text: reading, uncertainties: [] } : null, media });
 const ok = (hash: string): CaseCustomerRawAttachment["media"] => ({ ok: true, value: image(hash) });
 const refused = (reason: CaseAttachmentReason): CaseCustomerRawAttachment["media"] => ({ ok: false, reason });
 /** A context as the reader returns it: the files' view and media bound; `grant` as the reader does with the flag on for a smart case. */
@@ -55,7 +57,12 @@ const brainOf = (script: SmartScript) => {
   const model: SmartModelPort = async call => { media.push({ kind: call.kind, media: call.media }); return scripted.model(call); };
   return { model, calls: scripted.calls, media };
 };
-const providerOf = (script: SmartScript, fit = { model: "gemini-3.6-flash", mediaTokens: 3 * SAV_CASE_ATTACHMENT_LIMITS.imageTokens }, maxInputBytes = 100_000) => {
+/** A synthetic reservation priced 1 micro-USD per token (in and out), output bound 1 024: `reserve` decides how many calls may carry the files. */
+const budgetOf = (reserve: number): SmartFilesBudget => ({ reserveMicroUsd: reserve, maxOutputTokens: 1_024,
+  cost: usage => usage ? usage.inputTokens + usage.outputTokens : reserve });
+type Fit = { model: string; mediaTokens: number; budget: SmartFilesBudget | null };
+const FIT: Fit = { model: "gemini-3.6-flash", mediaTokens: 3 * SAV_CASE_ATTACHMENT_LIMITS.imageTokens, budget: budgetOf(10_000_000) };
+const providerOf = (script: SmartScript, fit: Fit = FIT, maxInputBytes = 100_000) => {
   const brain = brainOf(script), traces: SmartCaseTrace[] = [];
   const run = smartCaseDecisionProvider({ model: brain.model, env: () => ({ SAV_V2_ENTRY_SMART: "on" }), now: () => new Date("2026-11-26T08:00:00Z"), maxInputBytes: () => maxInputBytes,
     attachmentFit: () => fit, trace: trace => { traces.push(trace); } });
@@ -71,8 +78,6 @@ describe("smart images: the flag", () => {
     expect(smartCaseWantsAttachments({ ...env, SAV_V2_ENTRY_SMART: undefined }, SNAPSHOT)).toBe(false);
     expect(smartCaseWantsAttachments(env, { admission: null })).toBe(false);
     expect(smartCaseWantsAttachments({ SAV_V2_ENTRY_SMART: "on" }, SNAPSHOT)).toBe(false);
-    // The calls that may carry the files: understand + every decide pass (the budget room is shared by exactly these).
-    expect(SAV_SMART_ATTACHMENT_CALLS).toBe(1 + SAV_SMART_MAX_DECIDE_PASSES);
   });
 });
 
@@ -92,7 +97,7 @@ describe("smart images: flag off is the exact previous turn", () => {
 });
 
 describe("smart images: flag on", () => {
-  it("the admitted image goes with understand and every decide pass, with its view and the attachments instruction; never with verify or correct", async () => {
+  it("the admitted image goes with understand and the first decide pass, with its view and the attachments instruction; never with verify or correct", async () => {
     const script: SmartScript = { ...GOOD, verify: { output: { verdict: "non_conforme", problems: [{ code: "need_forgotten", sentence: "" }] } }, correct: { output: smartGoodDecision() }, reverify: { output: SMART_CONFORME } };
     const { brain, traces, run } = providerOf(script);
     const out = await run(requestOf(contextWith([file("capture-yahoo.png", ok("y"))])));
@@ -103,9 +108,11 @@ describe("smart images: flag on", () => {
     expect(brain.media[0]!.media![0]!.bytes.equals(Buffer.from("fausse-image-y"))).toBe(true);
     const [understand, decide, verify, correct] = brain.calls;
     expect(understand!.system).toBe(`${smartUnderstandPrompt()}\n\n${SAV_CASE_ATTACHMENTS_INSTRUCTION}`);
-    expect(decide!.system).toBe(`${smartDecidePrompt()}\n\n${SAV_CASE_ATTACHMENTS_INSTRUCTION}`);
-    expect(verify!.system).toBe(smartVerifyPrompt());
-    expect(correct!.system).toBe(smartCorrectionPrompt());
+    expect(decide!.system).toBe(`${smartDecidePrompt()}\n\n${SAV_CASE_ATTACHMENTS_INSTRUCTION}\n\n${SAV_SMART_FILES_FACTS_NOTE}`);
+    // Verify and correct never see the files: they are told, in text, that files were sent and by which ids.
+    expect(verify!.system).toBe(`${smartVerifyPrompt()}\n\n${SAV_SMART_FILES_VERIFY_NOTE}`);
+    expect(correct!.system).toBe(`${smartCorrectionPrompt()}\n\n${SAV_SMART_FILES_FACTS_NOTE}`);
+    for (const row of [verify, correct]) expect(row!.payload).toMatchObject({ customerFiles: { count: 1, ids: ["pj1"] } });
     for (const row of [understand, decide]) expect((row!.payload as { customerContext: { attachments: { files: unknown[] } } }).customerContext.attachments.files)
       .toEqual([expect.objectContaining({ id: "pj1", name: "capture-yahoo.png", kind: "image", part: 0, notAttached: null })]);
     for (const row of [verify, correct]) expect(row!.payload).not.toHaveProperty("customerContext");
@@ -115,12 +122,17 @@ describe("smart images: flag on", () => {
   });
 
   it("refused files: text only (the exact prompts of the flag-off turn) and the reason codes in the trace, never silent", async () => {
-    const cases: Array<[CaseCustomerContext, { model: string; mediaTokens: number }, string[]]> = [
-      [contextWith([file("trop-grand.png", refused("byte_limit"))]), { model: "gemini-3.6-flash", mediaTokens: 8_192 }, ["byte_limit"]],
-      [contextWith([file("capture.png", refused("download_failed"))]), { model: "gemini-3.6-flash", mediaTokens: 8_192 }, ["download_failed"]],
-      [contextWith([file("capture.png", ok("a"))]), { model: "gemini-2.5-flash", mediaTokens: 8_192 }, ["model_unsupported"]],
-      [contextWith([file("capture.png", ok("a"))]), { model: "gemini-3.6-flash", mediaTokens: 1_000 }, ["input_budget"]],
-      [grantSmartCaseAttachments(withCaseCustomerAttachments(baseContext(), null), false), { model: "gemini-3.6-flash", mediaTokens: 8_192 }, ["attachments_unavailable"]],
+    const room = (mediaTokens: number, model = "gemini-3.6-flash", budget: SmartFilesBudget | null = budgetOf(10_000_000)): Fit => ({ model, mediaTokens, budget });
+    const cases: Array<[CaseCustomerContext, Fit, string[]]> = [
+      [contextWith([file("trop-grand.png", refused("byte_limit"))]), room(8_192), ["byte_limit"]],
+      [contextWith([file("capture.png", refused("download_failed"))]), room(8_192), ["download_failed"]],
+      [contextWith([file("capture.png", ok("a"))]), room(8_192, "gemini-2.5-flash"), ["model_unsupported"]],
+      [contextWith([file("capture.png", ok("a"))]), room(1_000), ["input_budget"]],
+      [grantSmartCaseAttachments(withCaseCustomerAttachments(baseContext(), null), false), room(8_192), ["attachments_unavailable"]],
+      // No readable reservation (policy unreadable): nothing sent, the reason recorded.
+      [contextWith([file("capture.png", ok("a"))]), room(8_192, "gemini-3.6-flash", null), ["turn_budget"]],
+      // A reservation too small for even the reading with the file: each call text only, the turn's budget named.
+      [contextWith([file("capture.png", ok("a"))]), room(8_192, "gemini-3.6-flash", budgetOf(50_000)), ["understand:turn_budget", "decide:turn_budget"]],
     ];
     const plain = providerOf(GOOD);
     await plain.run(requestOf(baseContext()));
@@ -129,7 +141,8 @@ describe("smart images: flag on", () => {
       expect((await run(requestOf(context))).result.status).toBe("ok");
       expect(brain.calls).toEqual(plain.brain.calls);
       expect(brain.media.every(row => row.media === undefined)).toBe(true);
-      expect(traces[0]!.attachments).toEqual({ admitted: 0, refused: codes, sentWith: [] });
+      // A file admitted by the fit but dropped by every call for the turn's budget is counted admitted, then named per call.
+      expect(traces[0]!.attachments).toEqual({ admitted: codes[0]!.includes(":") ? 1 : 0, refused: codes, sentWith: [] });
     }
   });
 
@@ -140,7 +153,7 @@ describe("smart images: flag on", () => {
     expect(all.brain.media[0]!.media!.map(item => item.hash)).toEqual(["a", "b", "c"]);
     expect(all.traces[0]!.attachments).toEqual({ admitted: 3, refused: ["image_limit"], sentWith: ["understand", "decide"] });
     // A room of two image allowances: the third file is input_budget, the parts renumbered in the view.
-    const two = providerOf(GOOD, { model: "gemini-3.6-flash", mediaTokens: 2 * SAV_CASE_ATTACHMENT_LIMITS.imageTokens });
+    const two = providerOf(GOOD, { ...FIT, mediaTokens: 2 * SAV_CASE_ATTACHMENT_LIMITS.imageTokens });
     await two.run(requestOf(contextWith([file("a.png", ok("a")), file("b.png", ok("b")), file("c.png", ok("c"))])));
     expect(two.brain.media[0]!.media!.map(item => item.hash)).toEqual(["a", "b"]);
     expect(two.traces[0]!.attachments!.refused).toEqual(["input_budget"]);
@@ -148,14 +161,113 @@ describe("smart images: flag on", () => {
     expect(view.map(row => [row.part, row.notAttached])).toEqual([[0, null], [1, null], [null, "input_budget"]]);
   });
 
-  it("budget: the room of one call is the policy's room above the text bound, shared by the calls that may carry files", () => {
+  it("budget: one call's image room is the policy's room above the text bound; the turn's reservation and prices come from the approved policy", () => {
     const env = { SAV_V2_GEMINI_API_KEY: "synthetic-key-not-real", SAV_V2_MODEL: "synthetic-model", SAV_V2_EMBEDDING_MODEL: "synthetic-embedding", SAV_V2_SPEND_POLICY_JSON: JSON.stringify(ACCESS_SKILL_TEST_POLICY) };
-    const { maxInputTokens, maxInputBytes } = ACCESS_SKILL_TEST_POLICY.transport;
-    const room = smartAttachmentTokenRoom(env, new Date());
-    expect(room).toBe(Math.floor((maxInputTokens - maxInputBytes) / SAV_SMART_ATTACHMENT_CALLS));
-    // Every image of a turn, on every call that may carry it, stays inside the room the reservation (computed from maxInputTokens) leaves above the text.
-    expect(room * SAV_SMART_ATTACHMENT_CALLS).toBeLessThanOrEqual(maxInputTokens - maxInputBytes);
+    const { maxInputTokens, maxInputBytes, maxOutputTokens } = ACCESS_SKILL_TEST_POLICY.transport;
+    expect(smartAttachmentTokenRoom(env, new Date())).toBe(maxInputTokens - maxInputBytes);
     expect(smartAttachmentTokenRoom({}, new Date())).toBe(0);
+    const budget = smartFilesBudget(env, new Date())!;
+    expect(budget).toMatchObject({ reserveMicroUsd: ACCESS_SKILL_TEST_POLICY.model.reserveMicroUsdPerCall, maxOutputTokens });
+    expect(budget.cost(null)).toBe(ACCESS_SKILL_TEST_POLICY.model.reserveMicroUsdPerCall);
+    expect(smartFilesBudget({}, new Date())).toBeNull();
+    // The gate: spent so far (a sent call without usage = the whole reservation) + this call's worst case within the reservation.
+    const small = budgetOf(110_000), call = (usage: { inputTokens: number; outputTokens: number } | null, sent = true) => ({ sent, usage });
+    expect(smartFilesFit(small, [], 100_000, 4_096)).toBe(true);
+    expect(smartFilesFit(small, [call({ inputTokens: 3_000, outputTokens: 900 })], 100_000, 4_096)).toBe(true);
+    expect(smartFilesFit(small, [call({ inputTokens: 5_000, outputTokens: 900 })], 100_000, 4_096)).toBe(false);
+    expect(smartFilesFit(small, [call(null)], 100_000, 4_096)).toBe(false);
+    expect(smartFilesFit(small, [call(null, false)], 100_000, 4_096)).toBe(true);
+  });
+
+  it("files on the FIRST decide pass only: a pass after a tool call is text only (no files, no instruction)", async () => {
+    const tools = { output: { thinking: "", action: "tools", calls: [{ id: "t1", tool: "chercher_fiches", needId: "n1", args: { query: "connexion" } }] } };
+    const { brain, traces, run } = providerOf({ ...GOOD, decide: [tools, { output: smartGoodDecision() }] });
+    await run(requestOf(contextWith([file("capture.png", ok("a"))])));
+    const decides = brain.calls.map((call, index) => ({ call, media: brain.media[index]!.media })).filter(row => row.call.kind === "decide");
+    expect(decides).toHaveLength(2);
+    expect(decides[0]!.media?.map(item => item.hash)).toEqual(["a"]);
+    expect(decides[0]!.call.payload).toHaveProperty("customerContext");
+    expect(decides[1]!.media).toBeUndefined();
+    expect(decides[1]!.call.system).toBe(smartDecidePrompt());
+    expect(decides[1]!.call.payload).not.toHaveProperty("customerContext");
+    expect(traces[0]!.attachments).toEqual({ admitted: 1, refused: [], sentWith: ["understand", "decide"] });
+  });
+
+  it("decide cap: when the view and instruction no longer fit the first decide pass, it goes text only and the trace says decide:input_budget", async () => {
+    const context = contextWith([file("capture.png", ok("a"))]);
+    // Room for the reading with the files, not for the first decide pass with them (it carries needs, resources and cards too).
+    const understandWithFiles = smartWireBytes(`${smartUnderstandPrompt()}\n\n${SAV_CASE_ATTACHMENTS_INSTRUCTION}`,
+      { customer: { subject: "Problème", mail: "Pouvez-vous résoudre cela ?", thread: [] }, customerContext: { attachments: (context.attachments!), evidence: context.evidence ?? null } });
+    const { brain, traces, run } = providerOf(GOOD, FIT, Math.max(understandWithFiles + 10, 9_000));
+    await run(requestOf(context));
+    const sent = brain.media.map(row => [row.kind, row.media?.length ?? 0]);
+    expect(sent.find(row => row[0] === "understand")).toEqual(["understand", 1]);
+    expect(sent.filter(row => row[0] === "decide").every(row => row[1] === 0)).toBe(true);
+    expect(traces[0]!.attachments!.refused).toContain("decide:input_budget");
+    expect(traces[0]!.attachments!.sentWith).toEqual(["understand"]);
+  });
+
+  it("heavy turn: each call billed at its worst case; files go only while the reservation covers them, and the turn never exceeds it because of them", async () => {
+    const cap = 100_000, maxOutput = 1_024, mediaTokens = SAV_CASE_ATTACHMENT_LIMITS.imageTokens;
+    // Every call bills its whole text cap + its files' allowance in, the output bound out (the worst a call can cost).
+    const heavy = (media: number) => ({ inputTokens: cap + media * mediaTokens, outputTokens: maxOutput });
+    const reserve = heavy(1).inputTokens + maxOutput + 500; // room for exactly one call with the file
+    const budget = budgetOf(reserve), billed: Array<{ kind: string; media: number; cost: number }> = [];
+    const scripted = smartScriptedModel({ ...GOOD, verify: { output: { verdict: "non_conforme", problems: [{ code: "need_forgotten", sentence: "" }] } }, correct: { output: smartGoodDecision() }, reverify: { output: SMART_CONFORME } });
+    const model: SmartModelPort = async call => {
+      const result = await scripted.model(call);
+      const usage = heavy(call.media?.length ?? 0);
+      billed.push({ kind: call.kind, media: call.media?.length ?? 0, cost: budget.cost(usage) });
+      return result.status === "ok" ? { ...result, usage } : result;
+    };
+    const traces: SmartCaseTrace[] = [];
+    const run = smartCaseDecisionProvider({ model, env: () => ({ SAV_V2_ENTRY_SMART: "on" }), now: () => new Date("2026-11-26T08:00:00Z"), maxInputBytes: () => cap,
+      attachmentFit: () => ({ ...FIT, budget }), trace: trace => { traces.push(trace); } });
+    await run(requestOf(contextWith([file("capture.png", ok("a"))])));
+    expect(billed.map(row => [row.kind, row.media])).toEqual([["understand", 1], ["decide", 0], ["verify", 0], ["correct", 0], ["reverify", 0]]);
+    expect(traces[0]!.attachments).toEqual({ admitted: 1, refused: ["decide:turn_budget"], sentWith: ["understand"] });
+    // Up to and including the last call that carried files, the turn stays within its reservation.
+    const lastWithFiles = billed.map(row => row.media > 0).lastIndexOf(true);
+    expect(billed.slice(0, lastWithFiles + 1).reduce((sum, row) => sum + row.cost, 0)).toBeLessThanOrEqual(reserve);
+    // The files add at most one call's allowance to the turn: the text-only calls after it are billed exactly as the flag-off turn.
+    const filesExtra = billed.reduce((sum, row) => sum + row.media * mediaTokens, 0);
+    expect(filesExtra).toBe(mediaTokens);
+  });
+
+  it("screenshot only: a customer fact read on the image (marked pj1) passes the server checks once the files were sent; never without files", async () => {
+    const reply = "Bonjour,\n\nSur votre capture, je vois le message « Code expiré ». Utilisez l'adresse e-mail de votre invitation. Si le code n'arrive pas, regardez dans le dossier des indésirables.\n\nSi cela bloque encore, dites-nous quel message s'affiche.\n\nBelle journée.";
+    const decision = smartGoodDecision({ reply, facts: [...smartGoodDecision().facts,
+      { sentence: "Sur votre capture, je vois le message « Code expiré ».", needId: "n1", type: "dit_par_le_client", sourceKind: "client", toolCallId: "pj1", cardId: null, version: null, excerpt: "Code expiré" }] });
+    const script: SmartScript = { understand: { output: smartReading() }, decide: { output: decision }, verify: { output: SMART_CONFORME } };
+    // Flag on, file sent: accepted at the first verify; the counter-read is told the file exists (text only).
+    const on = providerOf(script);
+    const accepted = await on.run(requestOf(contextWith([file("capture.png", ok("a"))])));
+    expect(accepted.result.status).toBe("ok");
+    expect(on.brain.calls.map(call => call.kind)).toEqual(["understand", "decide", "verify"]);
+    expect(on.brain.calls[2]!.payload).toMatchObject({ customerFiles: { count: 1, ids: ["pj1"] }, facts: expect.arrayContaining([expect.objectContaining({ source: "pj1", excerpt: "Code expiré" })]) });
+    expect(on.traces[0]!.checks?.first ?? []).toEqual([]);
+    // Same decision without files (flag off): the excerpt is not in the customer's text, refused as before.
+    const off = providerOf(script);
+    await off.run(requestOf(baseContext()));
+    expect(off.brain.calls.map(call => call.kind)).toContain("correct");
+    expect(off.brain.calls[2]!.system).toBe(smartVerifyPrompt());
+    expect(off.brain.calls[2]!.payload).not.toHaveProperty("customerFiles");
+  });
+
+  it("server checks: a file fact needs a file really sent; a stored V1 reading must hold the excerpt; a tool shown on the capture counts as named by the customer", () => {
+    const reading = smartReading() as never, base = { reading, customerText: "Pouvez-vous résoudre cela ?", sources: [] };
+    const fact = (excerpt: string, toolCallId = "pj1") => smartGoodDecision({ reply: "Bonjour,\n\nSur votre capture, je vois une erreur.\n\nBelle journée.",
+      facts: [{ sentence: "", needId: "n1", type: "dit_par_le_client", sourceKind: "client", toolCallId, cardId: null, version: null, excerpt }] }) as never;
+    expect(smartServerChecks({ ...base, decision: fact("Erreur 403") }).codes).toContain("excerpt_not_found");
+    expect(smartServerChecks({ ...base, decision: fact("Erreur 403"), files: [{ id: "pj1", reading: null }] }).codes).not.toContain("excerpt_not_found");
+    expect(smartServerChecks({ ...base, decision: fact("Erreur 403", "pj2"), files: [{ id: "pj1", reading: null }] }).codes).toContain("excerpt_not_found");
+    expect(smartServerChecks({ ...base, decision: fact("Erreur 403"), files: [{ id: "pj1", reading: "Message : Erreur 403, accès refusé" }] }).codes).not.toContain("excerpt_not_found");
+    expect(smartServerChecks({ ...base, decision: fact("Erreur 500"), files: [{ id: "pj1", reading: "Message : Erreur 403, accès refusé" }] }).codes).toContain("excerpt_not_found");
+    // A tool visible only on the capture (« Zapier » in the error), named back in the reply: refused without files, allowed once read on the sent file.
+    const zap = smartGoodDecision({ reply: "Bonjour,\n\nSur votre capture, Zapier affiche une erreur de connexion.\n\nBelle journée.",
+      facts: [{ sentence: "", needId: "n1", type: "dit_par_le_client", sourceKind: "client", toolCallId: "pj1", cardId: null, version: null, excerpt: "Zapier : connexion refusée" }] }) as never;
+    expect(smartServerChecks({ ...base, decision: zap }).codes).toContain("third_party_named");
+    expect(smartServerChecks({ ...base, decision: zap, files: [{ id: "pj1", reading: null }] }).codes).not.toContain("third_party_named");
   });
 
   it("a cap the view and instruction would exceed: each call goes text only (never refused for the files) and the trace says which call dropped them", async () => {

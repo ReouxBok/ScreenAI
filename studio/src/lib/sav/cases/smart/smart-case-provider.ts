@@ -6,7 +6,7 @@ import type { CaseInvestigationModelRequest } from "../investigation-runner";
 import type { CaseV2ModelTransport, CaseV2SpendUsage } from "../investigation-v2-spend";
 import { SAV_SMART_ENTRY_ADMISSION, savV2EntrySmartOn } from "../smart-entry-switch";
 import { runSmartTurn, type SmartKnowledgePort, type SmartThreadMessage, type SmartTurnInput, type SmartTurnPorts, type SmartTurnResult } from "./smart-agent";
-import { SAV_SMART_ATTACHMENT_TRACE_CODES, smartCaseAttachments } from "./smart-attachments";
+import { SAV_SMART_ATTACHMENT_TRACE_CODES, smartCaseAttachments, type SmartFilesBudget } from "./smart-attachments";
 import type { SmartSource } from "./smart-checks";
 import type { SmartFact, SmartTeamNote } from "./smart-contract";
 import { smartEmptyMemory, type SmartCaseMemory } from "./smart-memory";
@@ -192,10 +192,11 @@ export type SmartCaseProviderDeps = Readonly<{
    */
   trace?: SmartCaseTraceSink;
   /**
-   * Smart images: the model and the token allowance of the files one call may carry (production: `SAV_V2_MODEL` and `smartAttachmentTokenRoom`).
-   * Read only for a context the reader granted (`SAV_V2_SMART_ATTACHMENT_IMAGES=on`, smart case); absent: no file fits (`input_budget`).
+   * Smart images: the model, the token allowance of the files one call may carry and the turn's reservation (production: `SAV_V2_MODEL`,
+   * `smartAttachmentTokenRoom`, `smartFilesBudget`). Read only for a context the reader granted (`SAV_V2_SMART_ATTACHMENT_IMAGES=on`, smart case);
+   * absent: no file is sent (`input_budget`).
    */
-  attachmentFit?: () => Readonly<{ model: string; mediaTokens: number }>;
+  attachmentFit?: () => Readonly<{ model: string; mediaTokens: number; budget: SmartFilesBudget | null }>;
 }>;
 
 /**
@@ -230,7 +231,7 @@ export function smartCaseDecisionProvider(deps: SmartCaseProviderDeps): CaseV2Mo
     if (!input || cap === null) return { result: { status: "failed", uncertain: false, diagnostic: { stage: "preflight", code: input ? "policy_invalid" : "empty_response", networkAttempted: false } }, usage: none };
     const searches: SmartTraceSearch[] = [];
     // Smart images: null unless the reader granted this context (flag on, smart case); then the admitted files, or text only with the reasons.
-    const files = smartCaseAttachments(request.customerContext, deps.attachmentFit ?? (() => ({ model: "", mediaTokens: 0 })));
+    const files = smartCaseAttachments(request.customerContext, deps.attachmentFit ?? (() => ({ model: "", mediaTokens: 0, budget: null })));
     const result = await runSmartTurn(input, {
       model: smartModelWithFeedback(deps.model, request.feedback), knowledge: deps.trace ? traceSmartKnowledge(smartCaseKnowledge(request), searches) : smartCaseKnowledge(request), maxInputBytes: cap,
       today: deps.now().toISOString().slice(0, 10), recordOwn: true, ...(deps.academy ? { academy: deps.academy } : {}), ...(deps.maxExchanges ? { maxExchanges: deps.maxExchanges } : {}),
