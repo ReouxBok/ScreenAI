@@ -27,7 +27,6 @@ import type { CaseV2ModelTransport } from "./investigation-v2-spend";
 import { isSmartCaseRequest, smartCaseDecisionProvider, type SmartCaseProviderDeps } from "./smart/smart-case-provider";
 import { smartAttachmentTokenRoom, smartFilesBudget, smartGeminiModel, smartInputCap } from "./smart/smart-model";
 import { smartMaxExchanges } from "./smart/smart-memory";
-import type { SmartTurnPorts } from "./smart/smart-agent";
 import type { SmartCaseTraceSink } from "./smart/smart-trace";
 
 /*
@@ -334,7 +333,7 @@ export function caseGeminiDecisionPreflight(env: () => Env) {
 /** Academy tools are injected by the caller (`getAcademyTools()`), never imported here: the bench reaches this module and must not reach the Academy client. */
 /** `trace` (recording only, injected by the production factory, absent on the bench): the trace of each real smart turn. */
 type SmartLivePorts = Pick<SmartCaseProviderDeps, "liveSearch" | "liveFound">;
-export function caseSmartDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; now?: () => Date; academy?: SmartTurnPorts["academy"]; trace?: SmartCaseTraceSink;
+export function caseSmartDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; now?: () => Date; academy?: SmartCaseProviderDeps["academy"]; trace?: SmartCaseTraceSink;
   sentReplies?: SmartCaseProviderDeps["sentReplies"] } & SmartLivePorts>): CaseV2ModelTransport {
   const now = input.now ?? (() => new Date());
   return smartCaseDecisionProvider({ env: input.env, now, maxInputBytes: () => smartInputCap(input.env(), now()), maxExchanges: smartMaxExchanges(input.env()), ...(input.academy ? { academy: input.academy } : {}),
@@ -345,7 +344,9 @@ export function caseSmartDecisionProvider(input: Readonly<{ env: () => Env; netw
     model: smartGeminiModel({ env: input.env, now, ...(input.network ? { network: input.network } : {}), ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}) }) });
 }
 
+/** `academy` (production factory: `getAcademyTools`, a getter read at each smart turn): forwarded to the smart brain only, never used by the Gemini decision. */
 export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number; smart?: CaseV2ModelTransport; trace?: SmartCaseTraceSink;
+  academy?: SmartCaseProviderDeps["academy"];
   sentReplies?: SmartCaseProviderDeps["sentReplies"] } & SmartLivePorts>): CaseV2ModelTransport {
   const network = input.network ?? ((url, init) => fetch(url, init));
   let smart = input.smart;

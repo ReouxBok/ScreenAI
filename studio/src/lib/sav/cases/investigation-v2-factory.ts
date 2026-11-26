@@ -4,6 +4,7 @@ import { savV2EntrySmartOn } from "./smart-entry-switch";
 import { readSmartSentReplies, smartCaseTraceStore } from "./smart/smart-trace-store";
 import { smartCaseLiveSearch } from "./investigation-smart-live-search";
 import { createSmartLiveFoundRegistry, savV2SmartLiveSearchOn } from "./smart/smart-live-search";
+import { getAcademyTools } from "./smart/tools/academy";
 import { readCase } from "./case-store";
 import { caseInvestigationQualify, type CaseApprovedRulePort } from "./admission-investigation-ports";
 import { caseTicketOwnerPortFromTransport } from "./admission-owner-reader";
@@ -139,7 +140,9 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
       // Recording only: the trace of each real smart turn, encrypted with the case (`smart-trace-store.ts`); never changes a decision.
       trace: smartCaseTraceStore({ env: input.env, now }), liveSearch, liveFound: liveFound.put,
       // `SAV_V2_SMART_NO_REPEAT=on` only (read only, never called when off): the case's confirmed reply mails, so the brain never sends one again.
-      sentReplies: readSmartSentReplies })) },
+      sentReplies: readSmartSentReplies,
+      // `SAV_V2_SMART_ACADEMY=on` only: the Academy tools, read at each smart turn (a getter, never evaluated at load). Off: none, the same turn as before.
+      academy: getAcademyTools })) },
   };
   return { ok: true, deps, provenance };
 }
