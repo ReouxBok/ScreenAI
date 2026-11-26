@@ -5,7 +5,7 @@ import type { CaseEmbeddingSpendPort, CaseKnowledgeVectorSearch } from "../inves
 import type { CaseCallLedgerPort } from "../investigation-call-ledger";
 import type { CaseCustomerContext } from "../investigation-customer-context";
 import type { SmartSource } from "./smart-checks";
-import { smartCaseLiveSearch } from "./smart-knowledge";
+import { smartCaseLiveSearch } from "../investigation-smart-live-search";
 import {
   createSmartLiveFoundRegistry, savV2SmartLiveSearchOn, smartContinuationSearchText, smartLiveKnowledge, type SmartLiveSearch, type SmartLiveSearchResult,
 } from "./smart-live-search";

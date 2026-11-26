@@ -2,7 +2,7 @@ import "server-only";
 import { readConfirmedV1Context } from "./admission-context-reader";
 import { savV2EntrySmartOn } from "./smart-entry-switch";
 import { smartCaseTraceStore } from "./smart/smart-trace-store";
-import { smartCaseLiveSearch } from "./smart/smart-knowledge";
+import { smartCaseLiveSearch } from "./investigation-smart-live-search";
 import { createSmartLiveFoundRegistry, savV2SmartLiveSearchOn } from "./smart/smart-live-search";
 import { readCase } from "./case-store";
 import { caseInvestigationQualify, type CaseApprovedRulePort } from "./admission-investigation-ports";

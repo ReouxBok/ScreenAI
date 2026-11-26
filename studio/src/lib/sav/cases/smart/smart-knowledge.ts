@@ -1,10 +1,7 @@
 import { createSavKnowledgeVectorIndex, SAV_RETRIEVAL_EMBEDDING_DIMENSION } from "../../request-retrieval-db";
-import { retrieveSavKnowledgeByRequest, savCustomerProcedureSteps, savRetrievalCardSizeFixOn, type SavRetrievalBackend, type SavRetrievalCandidate, type SavRequestRetrievalResult } from "../../request-retrieval";
-import { createCaseBudgetedRetrieval, type CaseBudgetedRetrievalDeps } from "../investigation-budgeted-retrieval";
-import type { CaseInvestigationModelRequest } from "../investigation-runner";
+import { retrieveSavKnowledgeByRequest, savCustomerProcedureSteps, savRetrievalCardSizeFixOn, type SavRetrievalBackend, type SavRequestRetrievalResult } from "../../request-retrieval";
 import type { SmartKnowledgePort, SmartKnowledgeResult } from "./smart-agent";
 import type { SmartSource } from "./smart-checks";
-import type { SmartLiveSearch } from "./smart-live-search";
 import type { SmartEmbedPort } from "./smart-model";
 
 /*
@@ -60,40 +57,5 @@ export function smartDbKnowledge(deps: Readonly<{ now: () => Date; embed: SmartE
     } catch {
       return { status: "unavailable", sources: [], codes: ["search_failed"] };
     }
-  };
-}
-
-/**
- * Live search (26/11): `chercher_fiches` in production (`SAV_V2_SMART_LIVE_SEARCH=on`, smart-live-search.ts): the same engine on the circuit's budgeted search
- * of one case input (V2 index, V2 embedding budget, the input's call ledger). One budgeted retrieval per turn: a stop is final for it.
- */
-export function smartCaseLiveSearch(deps: Omit<CaseBudgetedRetrievalDeps, "snapshot" | "inputKey"> & Readonly<{ scope: Readonly<{ locale: string; audience: "support" | "lead" }>; now: () => Date }>) {
-  return (request: Pick<CaseInvestigationModelRequest, "snapshot" | "inputKey">): SmartLiveSearch => {
-    const retrieval = createCaseBudgetedRetrieval({ ...deps, snapshot: request.snapshot, inputKey: request.inputKey });
-    return async needs => {
-      const requests = smartRetrievalRequests(needs);
-      if (!requests.length) return { status: "ok", sources: [], cards: [], codes: ["no_searchable_need"] };
-      // The original cards, as the circuit keeps them (`selectCaseKnowledge`): the proposal is built on them, never on a copy.
-      const returned = new Map<string, SavRetrievalCandidate>();
-      const capturing: SavRetrievalBackend = {
-        readRevision: () => retrieval.backend.readRevision(),
-        search: async (queries, limit) => {
-          const batches = await retrieval.backend.search(queries, limit);
-          for (const batch of batches ?? []) for (const card of batch) returned.set(`${card.id}:${card.contentVersionId}`, card);
-          return batches;
-        },
-      };
-      try {
-        const result = await retrieveSavKnowledgeByRequest({ requests, locale: deps.scope.locale, audience: deps.scope.audience, now: deps.now() }, capturing);
-        const stopped = retrieval.stop();
-        if (stopped) return { status: "unavailable", sources: [], cards: [], codes: [`live_${stopped.reason}`] };
-        const sources = smartSourcesOf(result);
-        return { status: result.revision === null ? "unavailable" : "ok", sources, codes: smartRetrievalCodes(result),
-          cards: sources.flatMap(source => { const card = returned.get(`${source.cardId}:${source.version}`); return card ? [card] : []; }) };
-      } catch {
-        const stopped = retrieval.stop();
-        return { status: "unavailable", sources: [], cards: [], codes: [stopped ? `live_${stopped.reason}` : "live_search_failed"] };
-      }
-    };
   };
 }

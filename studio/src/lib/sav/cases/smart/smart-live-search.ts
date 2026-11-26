@@ -1,5 +1,5 @@
 import type { SavRetrievalCandidate } from "../../request-retrieval";
-import type { KnowledgeRef } from "../decision-contract";
+import type { KnowledgeRef } from "../case-types";
 import type { CaseCustomerContext } from "../investigation-customer-context";
 import type { SmartKnowledgePort, SmartKnowledgeResult } from "./smart-agent";
 
@@ -8,7 +8,7 @@ import type { SmartKnowledgePort, SmartKnowledgeResult } from "./smart-agent";
  * Before, the production port (`smartCaseKnowledge`) gave back the circuit's first cards whatever the query (real case 26/11: « agents créés
  * depuis Limova 3 », the agent could not reach the card « agent téléphonique ou chatbot » and asked its question again).
  *
- * Same engine as the shadow and the bench (`retrieveSavKnowledgeByRequest`, `smartSourcesOf`: `smartCaseLiveSearch`, smart-knowledge.ts), on the circuit's OWN search ports: the V2 vector
+ * Same engine as the shadow and the bench (`retrieveSavKnowledgeByRequest`, `smartSourcesOf`: `smartCaseLiveSearch`, investigation-smart-live-search.ts), on the circuit's OWN search ports: the V2 vector
  * index (published, AI enabled, support audience, valid, not expired: the same filters as the first search), the V2 embedding budget and the call
  * ledger of the input (`createCaseBudgetedRetrieval`: pause, owner and case version read before every embedding, at most 3 embeddings per input in
  * all, a query already paid is reused at no cost). Never the model's reservation: no `reservationExceeded` from a search.
@@ -33,7 +33,7 @@ export type SmartLiveSearch = (needs: Parameters<SmartKnowledgePort>[0]) => Prom
  */
 export function smartLiveKnowledge(input: Readonly<{
   circuit: SmartKnowledgePort; circuitCards: readonly SavRetrievalCandidate[]; search: SmartLiveSearch;
-  limits?: Partial<typeof SAV_SMART_LIVE_SEARCH_LIMITS>;
+  limits?: Partial<Readonly<Record<keyof typeof SAV_SMART_LIVE_SEARCH_LIMITS, number>>>;
 }>): Readonly<{ port: SmartKnowledgePort; found: () => SavRetrievalCandidate[] }> {
   const limits = { ...SAV_SMART_LIVE_SEARCH_LIMITS, ...input.limits };
   const found: SavRetrievalCandidate[] = [];
