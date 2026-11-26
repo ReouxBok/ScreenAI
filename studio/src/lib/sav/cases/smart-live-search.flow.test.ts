@@ -69,7 +69,9 @@ const customerContext = { revision: "sav-case-customer-context-2026-11-12.v1", n
     { at: "2026-11-25T09:00:00Z", from: "support", text: "Bonjour, s'agit-il d'un agent téléphonique ou d'un chatbot ?", truncated: false },
   ], threadOmitted: 0, crm: null, missing: [] } as unknown as NonNullable<CaseInvestigationModelRequest["customerContext"]>;
 
-async function runCase(options: { live: boolean; search?: SmartLiveSearch; proven?: SavRetrievalCandidate[]; selection?: boolean }) {
+/** `progress`: shared between two runs (a resumed input); `crashOnRecord`: the run dies before recording; `known`: the call ledger already holds this output. */
+async function runCase(options: { live: boolean; search?: SmartLiveSearch; proven?: SavRetrievalCandidate[]; selection?: boolean;
+  progress?: Map<string, CaseInvestigationProgress>; crashOnRecord?: boolean; known?: unknown; outputs?: unknown[] }) {
   const env: Record<string, string> = { ...BASE_ENV, ...(options.live ? { SAV_V2_SMART_LIVE_SEARCH: "on" } : {}) };
   const brain = smartScriptedModel(script()), registry = createSmartLiveFoundRegistry(), traces: SmartCaseTrace[] = [];
   const searched: string[] = [], customerWords: Array<string | undefined> = [], exactReads: string[][] = [];
@@ -83,7 +85,7 @@ async function runCase(options: { live: boolean; search?: SmartLiveSearch; prove
   const network = vi.fn(async () => Response.json({}));
   const provider: CaseV2ModelTransport = caseGeminiDecisionProvider({ env: () => env, network, smart });
   const preflight = caseGeminiDecisionPreflight(() => env);
-  const records: CaseInvestigationRecord[] = [], progress = new Map<string, CaseInvestigationProgress>();
+  const records: CaseInvestigationRecord[] = [], progress = options.progress ?? new Map<string, CaseInvestigationProgress>();
   const ports: CaseInvestigationPorts = {
     scope: { locale: "fr-FR", audience: "support" },
     pauseState: async () => "running",
@@ -104,10 +106,14 @@ async function runCase(options: { live: boolean; search?: SmartLiveSearch; prove
     callModel: async modelRequest => {
       const refused = preflight(modelRequest);
       if (refused) return { status: "input_rejected", diagnostic: refused };
-      return (await provider(modelRequest)).result;
+      // The ledger's « known » exit: the output of a call already settled, returned without the provider (so without the live registry).
+      if (options.known !== undefined) return { status: "ok", output: structuredClone(options.known) };
+      const result = (await provider(modelRequest)).result;
+      if (result.status === "ok") options.outputs?.push(structuredClone(result.output));
+      return result;
     },
     progress: { load: async (caseId, key) => structuredClone(progress.get(`${caseId}:${key}`) ?? null), save: async (caseId, key, value) => { progress.set(`${caseId}:${key}`, structuredClone(value)); } },
-    record: async record => { records.push(record); },
+    record: async record => { if (options.crashOnRecord) throw Error("CRASH_BEFORE_RECORD"); records.push(record); },
     now: () => NOW,
     readTicketOwner: async () => "v2",
     accessScope: async () => null,
@@ -117,7 +123,7 @@ async function runCase(options: { live: boolean; search?: SmartLiveSearch; prove
   };
   const report = await runCaseInvestigation("case-1", "observe", ports);
   const toolPayload = brain.calls.filter(call => call.kind === "decide")[1]?.payload as { toolResults?: Array<{ status: string; cards?: Array<{ cardId: string }> }> } | undefined;
-  return { report, records, searched, customerWords, exactReads, traces, toolResults: toolPayload?.toolResults ?? [], geminiCalls: network.mock.calls.length };
+  return { report, records, brainCalls: brain.calls.length, searched, customerWords, exactReads, traces, toolResults: toolPayload?.toolResults ?? [], geminiCalls: network.mock.calls.length };
 }
 const accepted = (record: CaseInvestigationRecord | undefined) => record?.validation.outcome === "accepted" ? record.validation.decision : null;
 
@@ -184,5 +190,36 @@ describe("Recherche réelle — chercher_fiches cherche vraiment en production (
     expect(run.toolResults).toMatchObject([{ status: "ok", cards: [{ cardId: MIGRATION.id }] }]);
     expect(run.traces[0]!.searches[1]!.codes).toEqual(expect.arrayContaining(["circuit_cards", "live_search_failed"]));
     expect(run.exactReads).toEqual([]);
+  });
+
+  it("reprise : le run 1 accepte la carte live puis plante avant l'enregistrement ; le run 2 (nouveau processus) accepte la proposition stockée sans nouvel appel modèle", async () => {
+    const progress = new Map<string, CaseInvestigationProgress>();
+    await expect(runCase({ live: true, progress, crashOnRecord: true })).rejects.toThrow("CRASH_BEFORE_RECORD");
+    const resumed = await runCase({ live: true, progress });
+    expect(resumed.brainCalls).toBe(0);
+    expect(resumed.searched).toEqual([]);
+    expect(resumed.report).toMatchObject({ status: "recorded", outcome: "accepted", refusal: null, modelCalls: 1 });
+    expect(accepted(resumed.records[0])!.reply).toMatchObject({ citations: [{ knowledgeId: AGENT.id, contentVersionId: "v2" }] });
+    expect(resumed.exactReads).toEqual([[AGENT.id]]);
+    expect(resumed.records[0]!.knowledge).toContainEqual({ knowledgeId: AGENT.id, contentVersionId: "v2" });
+  });
+
+  it("sortie « known » du registre d'appels (sortie déjà payée, rendue sans le provider ni le registre live) : la carte citée est prouvée, la décision acceptée, aucun appel au cerveau", async () => {
+    const outputs: unknown[] = [];
+    await expect(runCase({ live: true, crashOnRecord: true, outputs })).rejects.toThrow("CRASH_BEFORE_RECORD");
+    expect(outputs).toHaveLength(1);
+    const replay = await runCase({ live: true, known: outputs[0] });
+    expect(replay.brainCalls).toBe(0);
+    expect(replay.report).toMatchObject({ status: "recorded", outcome: "accepted", refusal: null, modelCalls: 1 });
+    expect(accepted(replay.records[0])!.reply).toMatchObject({ citations: [{ knowledgeId: AGENT.id, contentVersionId: "v2" }] });
+    expect(replay.exactReads).toEqual([[AGENT.id]]);
+  });
+
+  it("interrupteur éteint à la reprise : aucune relecture ni adoption (ancien comportement), la carte live n'est pas connue du validateur", async () => {
+    const progress = new Map<string, CaseInvestigationProgress>();
+    await expect(runCase({ live: true, progress, crashOnRecord: true })).rejects.toThrow("CRASH_BEFORE_RECORD");
+    const off = await runCase({ live: false, progress });
+    expect(off.exactReads).toEqual([]);
+    for (const record of off.records) expect(accepted(record)?.reply?.citations ?? []).not.toContainEqual({ knowledgeId: AGENT.id, contentVersionId: "v2" });
   });
 });

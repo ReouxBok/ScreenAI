@@ -10,8 +10,9 @@ import type { SmartKnowledgePort, SmartKnowledgeResult } from "./smart-agent";
  *
  * Same engine as the shadow and the bench (`retrieveSavKnowledgeByRequest`, `smartSourcesOf`: `smartCaseLiveSearch`, investigation-smart-live-search.ts), on the circuit's OWN search ports: the V2 vector
  * index (published, AI enabled, support audience, valid, not expired: the same filters as the first search), the V2 embedding budget and the call
- * ledger of the input (`createCaseBudgetedRetrieval`: pause, owner and case version read before every embedding, at most 3 embeddings per input in
- * all, a query already paid is reused at no cost). Never the model's reservation: no `reservationExceeded` from a search.
+ * ledger of the input (`createCaseBudgetedRetrieval`: pause, owner and case version read before every embedding; live searches on their OWN ledger
+ * subject `<input>.knowledge.live`, at most 3 embeddings per input, so the circuit's first search keeps its own keys; a query already paid is reused
+ * at no cost). Never the model's reservation: no `reservationExceeded` from a search.
  * Bounds of one turn: 2 live searches, 3 new cards each, 8 s each (past it the turn goes on). A card already in hand is not given twice.
  * A failure, a timeout or the bound: the circuit's cards, as before, with a closed code in the trace (`live_search_*`).
  * The cards found are proven again by the runner at their exact version (`readScopeCards`) before the validator reads them.
@@ -29,7 +30,7 @@ export type SmartLiveSearch = (needs: Parameters<SmartKnowledgePort>[0]) => Prom
 
 /**
  * The brain's knowledge port with live search: its first call (the turn's initial search) gives the circuit's cards, unchanged; each later call
- * (`chercher_fiches`) runs the live search within the turn's bounds. Live searches run one at a time (one ledger subject per input).
+ * (`chercher_fiches`) runs the live search within the turn's bounds. Live searches run one at a time (one live ledger subject per input).
  */
 export function smartLiveKnowledge(input: Readonly<{
   circuit: SmartKnowledgePort; circuitCards: readonly SavRetrievalCandidate[]; search: SmartLiveSearch;
@@ -90,6 +91,25 @@ export function createSmartLiveFoundRegistry(max = 32) {
       return refs;
     },
   };
+}
+
+/**
+ * The knowledge references a decision proposal shows (reply citations, answer steps, impossibility claims, handoff report), read defensively from the
+ * unvalidated output: only `{ knowledgeId, contentVersionId }` strings, at most 12. The runner proves each one again (exact version, valid now) before
+ * the validator reads it: a stored proposal citing a card found live is re-checked without a new model call.
+ */
+export function smartProposalKnowledgeRefs(output: unknown): KnowledgeRef[] {
+  const out = new Map<string, KnowledgeRef>();
+  const walk = (value: unknown, depth: number) => {
+    if (out.size >= 12 || depth > 6 || !value || typeof value !== "object") return;
+    if (Array.isArray(value)) { for (const item of value.slice(0, 40)) walk(item, depth + 1); return; }
+    const row = value as Record<string, unknown>;
+    if (typeof row.knowledgeId === "string" && typeof row.contentVersionId === "string" && row.knowledgeId && row.contentVersionId)
+      out.set(`${row.knowledgeId}:${row.contentVersionId}`, { knowledgeId: row.knowledgeId.slice(0, 200), contentVersionId: row.contentVersionId.slice(0, 200) });
+    for (const key of Object.keys(row).slice(0, 40)) walk(row[key], depth + 1);
+  };
+  walk(output, 0);
+  return [...out.values()];
 }
 
 const clean = (value: string) => value.replace(/\[[^\]]{0,40}masqu[ée]e?s?\]/g, " ").replace(/\s+/g, " ").trim();

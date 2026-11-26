@@ -89,6 +89,8 @@ export type CaseBudgetedRetrievalDeps = {
   embed: CaseEmbeddingTransport;
   ledger: CaseCallLedgerPort;
   spend: CaseEmbeddingSpendPort;
+  /** Live search (26/11): a ledger subject of its own beside the input's knowledge subject (`.live`), with the same ceiling. Absent: unchanged. */
+  subjectSuffix?: ".live";
 } & Pick<CaseInvestigationPorts, "pauseState" | "readTicketOwner" | "readCase">;
 
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -114,7 +116,7 @@ class KnowledgeStopped extends Error {
 }
 
 export function createCaseBudgetedRetrieval(deps: CaseBudgetedRetrievalDeps) {
-  const { snapshot } = deps, caseId = snapshot.caseId, subjectKey = caseKnowledgeSubjectKey(caseId, deps.inputKey);
+  const { snapshot } = deps, caseId = snapshot.caseId, subjectKey = `${caseKnowledgeSubjectKey(caseId, deps.inputKey)}${deps.subjectSuffix ?? ""}`;
   let stopped: CaseKnowledgeStop | null = null, embeddingCalls = 0;
   // A stop is final for this search: the retrieval's own retry gets the same refusal, and nothing is asked again.
   const stop = (reason: CaseKnowledgeStop): never => { stopped ??= reason; throw new KnowledgeStopped(); };

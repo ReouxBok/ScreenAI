@@ -15,7 +15,8 @@ import type { SmartLiveSearch } from "./smart/smart-live-search";
  */
 export function smartCaseLiveSearch(deps: Omit<CaseBudgetedRetrievalDeps, "snapshot" | "inputKey"> & Readonly<{ scope: Readonly<{ locale: string; audience: "support" | "lead" }>; now: () => Date }>) {
   return (request: Pick<CaseInvestigationModelRequest, "snapshot" | "inputKey">): SmartLiveSearch => {
-    const retrieval = createCaseBudgetedRetrieval({ ...deps, snapshot: request.snapshot, inputKey: request.inputKey });
+    // Its own ledger subject (`<input>.knowledge.live`, 3 embeddings at most): the circuit's first search keeps all of its own keys, a relaunch included.
+    const retrieval = createCaseBudgetedRetrieval({ ...deps, snapshot: request.snapshot, inputKey: request.inputKey, subjectSuffix: ".live" });
     return async needs => {
       const requests = smartRetrievalRequests(needs);
       if (!requests.length) return { status: "ok", sources: [], cards: [], codes: ["no_searchable_need"] };

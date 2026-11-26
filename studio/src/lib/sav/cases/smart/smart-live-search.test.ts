@@ -7,7 +7,7 @@ import type { CaseCustomerContext } from "../investigation-customer-context";
 import type { SmartSource } from "./smart-checks";
 import { smartCaseLiveSearch } from "../investigation-smart-live-search";
 import {
-  createSmartLiveFoundRegistry, savV2SmartLiveSearchOn, smartContinuationSearchText, smartLiveKnowledge, type SmartLiveSearch, type SmartLiveSearchResult,
+  createSmartLiveFoundRegistry, savV2SmartLiveSearchOn, smartContinuationSearchText, smartLiveKnowledge, smartProposalKnowledgeRefs, type SmartLiveSearch, type SmartLiveSearchResult,
 } from "./smart-live-search";
 
 /*
@@ -105,6 +105,17 @@ describe("Live search, smartLiveKnowledge: the brain's port with live search", (
   });
 });
 
+describe("Live search: the references a stored proposal shows", () => {
+  it("reads citations, steps, claims and report refs defensively (strings only, unique, at most 12)", () => {
+    const ref = (id: string) => ({ knowledgeId: id, contentVersionId: "v1" });
+    const output = { reply: { citations: [ref("a"), ref("a")], impossibilityClaims: [{ knowledge: ref("b") }] },
+      nextAction: { steps: [{ knowledge: ref("c") }, { knowledge: { knowledgeId: 7, contentVersionId: "v1" } }], report: { knowledge: [ref("d")] } } };
+    expect(smartProposalKnowledgeRefs(output).map(row => row.knowledgeId).sort()).toEqual(["a", "b", "c", "d"]);
+    expect(smartProposalKnowledgeRefs({ steps: Array.from({ length: 30 }, (_, index) => ({ knowledge: ref(`k${index}`) })) })).toHaveLength(12);
+    for (const value of [null, "texte", 3, undefined]) expect(smartProposalKnowledgeRefs(value)).toEqual([]);
+  });
+});
+
 describe("Live search: the provider → runner registry", () => {
   it("gives each call's refs once, and stays bounded", () => {
     const registry = createSmartLiveFoundRegistry(2);
@@ -170,25 +181,35 @@ describe("Live search, smartCaseLiveSearch: the same engine on the circuit's bud
     return { search: search({ snapshot, inputKey: INPUT }), keys, embedded, spent, rows };
   }
 
-  it("embeds the model's words on the input's knowledge subject (V2 embedding budget), returns the original cards, and reuses a query already paid", async () => {
+  it("embeds the model's words on the input's OWN live subject (V2 embedding budget), returns the original cards, and reuses a query already paid", async () => {
     const run = doubles();
     const result = await run.search(need("recréer agent téléphonique Limova 3"));
     expect(result.status).toBe("ok");
     expect(result.cards.map(card => card.id)).toEqual(expect.arrayContaining(["fiche-agent-telephonique"]));
     expect(result.cards.every(card => card.availability.published)).toBe(true);
     expect(run.embedded).toEqual([["recréer agent téléphonique Limova 3"]]);
-    expect(run.keys[0]).toBe(`sav-case:${CASE}:${INPUT}.knowledge:call1`);
+    expect(run.keys[0]).toBe(`sav-case:${CASE}:${INPUT}.knowledge.live:call1`);
     expect(run.spent).toHaveLength(1);
     await run.search(need("recréer agent téléphonique Limova 3"));
     expect(run.embedded).toHaveLength(1);
   });
 
-  it("at most 3 embeddings per input in all (the circuit's included): past it, unavailable with a closed code, nothing paid", async () => {
+  it("at most 3 live embeddings per input: past it, unavailable with a closed code, nothing paid", async () => {
     const run = doubles();
     for (const query of ["un un", "deux deux", "trois trois"]) await run.search(need(query));
     const fourth = await run.search(need("quatre quatre"));
     expect(fourth).toMatchObject({ status: "unavailable", sources: [], codes: ["live_knowledge_calls_exhausted"] });
     expect(run.spent).toHaveLength(3);
+  });
+
+  it("the circuit's own knowledge subject is never touched: its 3 keys already used (a relaunch with other words) do not block a live search, and live searches leave its keys free", async () => {
+    const run = doubles();
+    const circuitSubject = `sav-case:${CASE}:${INPUT}.knowledge`;
+    for (const n of [1, 2, 3]) run.rows.set(`${circuitSubject}:call${n}`, { subjectKey: circuitSubject, state: "settled", result: { status: "ok", output: { queriesHash: "other", vectors: [] } } });
+    expect((await run.search(need("agent téléphonique"))).status).toBe("ok");
+    for (const query of ["un un", "deux deux"]) await run.search(need(query));
+    expect(run.keys.every(key => key.startsWith(`${circuitSubject}.live:call`))).toBe(true);
+    expect([...run.rows.values()].filter(row => row.subjectKey === circuitSubject)).toHaveLength(3);
   });
 
   it("the V2 pause is read before any embedding: nothing paid, a closed code", async () => {
